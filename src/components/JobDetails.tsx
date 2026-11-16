@@ -1,0 +1,6505 @@
+import React, { useEffect, useState, useRef } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { QRCodeSVG } from 'qrcode.react';
+import { db, doc, getDoc, getDocs, collection, query, where, or, and, onSnapshot, setDoc, updateDoc, deleteDoc, serverTimestamp, handleFirestoreError, OperationType, sendNotification, deleteField, storage, ref, uploadBytes, getDownloadURL, uploadStorageFile, arrayUnion, increment, writeBatch, addDoc, runTransaction } from "@/src/firebase";
+import { generateQuoteDraft, getReviewSummary, getMaterialList, getDisputeResolution, analyzeQuote, QuoteAnalysis, getRejectionFeedback, generateMarketingPost, getEquipmentRecommendations } from "@/src/services/gemini";
+import { getTraderBadges, BadgeOverlay } from "@/src/lib/badges";
+import { useAuth } from "./AuthProvider";
+import { usePortal } from "@/src/lib/PortalContext";
+import { motion } from "motion/react";
+import { 
+  MapPin, Clock, Wrench, ChevronLeft, CheckCircle2, 
+  MessageSquare, PoundSterling, Calendar, Loader2, User as UserIcon, Video, Star,
+  MoreVertical, Edit2, Trash2, RotateCcw, XCircle, Briefcase, Zap, ChevronRight, X,
+  AlertTriangle, Camera, FileText, Sparkles, RefreshCw, History, Download, AlertCircle,
+  BarChart3, ShieldCheck, Info, QrCode, TrendingDown, Home, Navigation,
+  MessageCircle, Mail, Check, Plus, ImageIcon, Mic, Play, CreditCard, Award
+} from "lucide-react";
+import { Capacitor } from '@capacitor/core';
+import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
+import { GoogleMap, useJsApiLoader, MarkerF, OverlayViewF, OverlayView } from "@react-google-maps/api";
+import { cn, getOutwardPostcode, formatJobLocation } from "@/src/lib/utils";
+import { ReviewForm } from "./ReviewForm";
+import { AnimatePresence } from "motion/react";
+import MediaGalleryModal from "./MediaGalleryModal";
+import QuoteComparisonModal from "./QuoteComparisonModal";
+import { 
+  createQuoteViaCommand, 
+  updateQuoteViaCommand, 
+  withdrawQuoteViaCommand, 
+  rejectQuoteViaCommand, 
+  requestRequoteViaCommand, 
+  respondToRequoteViaCommand,
+  acceptQuoteViaServer
+} from "@/src/services/quoteCommandService";
+import { SEO } from "./SEO";
+import { INITIAL_MOCK_FLASH_DEALS } from "@/src/services/seedService";
+import { isDealApplicableOnDay, formatDealScheduleText } from "@/src/lib/flashDeals";
+import { 
+  calculatePayoutBreakdown, 
+  getStripeOnboardingLink, 
+  type PayoutBreakdown 
+} from "@/src/services/stripeIntegrationService";
+import { createOrGetJobInvoice, downloadInvoicePDF } from "@/src/services/invoiceService";
+import { RECURRING_CATEGORIES } from "@/src/constants";
+import { format, addHours, parseISO } from 'date-fns';
+import { TrustPulse } from "./TrustPulse";
+import { ConfidenceGauge } from "./common/ConfidenceGauge";
+import { toast } from "sonner";
+import { GoogleDocsContractModal } from "@/src/components/shared/GoogleDocsContractModal";
+import { BomOneClickOrderingModal } from "./BomOneClickOrderingModal";
+import { extractBillOfMaterials } from "@/src/services/bomMerchantService";
+import { 
+  createJobViaCommand, 
+  startJobViaCommand, 
+  completeJobViaCommand, 
+  cancelJobViaCommand, 
+  disputeJobViaCommand 
+} from "@/src/services/jobCommandService";
+
+// Helper to generate Google Calendar link
+const generateGoogleCalendarLink = (job: any, quote: any) => {
+  const title = encodeURIComponent(`Job: ${job.title}`);
+  const description = encodeURIComponent(`Job Details: ${job.description}\n\nQuote Amount: £${quote.amount}\nJob ID: ${job.id}`);
+  const location = encodeURIComponent(job.postcode || "");
+  
+  const startDate = quote.startDate || new Date().toISOString().split('T')[0];
+  const start = startDate.replace(/-/g, '') + 'T090000Z';
+  const end = startDate.replace(/-/g, '') + 'T170000Z'; // Default 9-5
+  
+  return `https://www.google.com/calendar/render?action=TEMPLATE&text=${title}&details=${description}&location=${location}&dates=${start}/${end}`;
+};
+
+// Helper to generate Outlook Calendar link
+const generateOutlookCalendarLink = (job: any, quote: any) => {
+  const title = encodeURIComponent(`Job: ${job.title}`);
+  const description = encodeURIComponent(`Job Details: ${job.description}\n\nQuote Amount: £${quote.amount}\nJob ID: ${job.id}`);
+  const location = encodeURIComponent(job.postcode || "");
+  
+  const startDate = quote.startDate || new Date().toISOString().split('T')[0];
+  const start = startDate + 'T09:00:00Z';
+  const end = startDate + 'T17:00:00Z';
+  
+  return `https://outlook.live.com/calendar/0/deeplink/compose?subject=${title}&body=${description}&location=${location}&startdt=${start}&enddt=${end}`;
+};
+
+// Helper to generate ICS file
+const downloadICS = (job: any, quote: any) => {
+  const startDate = quote.startDate || new Date().toISOString().split('T')[0];
+  const start = startDate.replace(/-/g, '') + 'T090000Z';
+  const end = startDate.replace(/-/g, '') + 'T170000Z';
+  
+  const icsContent = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "BEGIN:VEVENT",
+    `DTSTART:${start}`,
+    `DTEND:${end}`,
+    `SUMMARY:Job: ${job.title}`,
+    `DESCRIPTION:Job Details: ${job.description}\\n\\nQuote Amount: £${quote.amount}\\nJob ID: ${job.id}`,
+    `LOCATION:${job.postcode || ""}`,
+    "END:VEVENT",
+    "END:VCALENDAR"
+  ].join("\n");
+
+  const blob = new Blob([icsContent], { type: 'text/calendar;charset=utf-8' });
+  const link = document.createElement('a');
+  link.href = window.URL.createObjectURL(blob);
+  link.setAttribute('download', `job_${job.id}.ics`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
+const formatTimer = (totalSeconds: number) => {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+};
+
+export default function JobDetails() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const { user, profile } = useAuth();
+  const [job, setJob] = useState<any>(null);
+  const [quotes, setQuotes] = useState<any[]>([]);
+  const [tradespersonProfiles, setTradespersonProfiles] = useState<Record<string, any>>({});
+  const [reviewSummaries, setReviewSummaries] = useState<Record<string, string>>({});
+  const [quoteAnalyses, setQuoteAnalyses] = useState<Record<string, QuoteAnalysis>>({});
+  const [homeownerProfile, setHomeownerProfile] = useState<any>(null);
+  const fetchedHomeownerIdRef = useRef<string | null>(null);
+  const fetchedTradespersonIdRef = useRef<string | null>(null);
+  const checkedRecurringIdRef = useRef<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [quoteAmount, setQuoteAmount] = useState("");
+  const [quoteMessage, setQuoteMessage] = useState("");
+  const [quoteStartDate, setQuoteStartDate] = useState("");
+  const [isImmediateStart, setIsImmediateStart] = useState(false);
+  const [estimatedTimeline, setEstimatedTimeline] = useState("");
+  const [paymentPreference, setPaymentPreference] = useState("fixed_price");
+  const [quoteScope, setQuoteScope] = useState("complete_package");
+  const [isEditingSubmittedQuote, setIsEditingSubmittedQuote] = useState(false);
+  
+  // 4 Part 1 Improvements: Line Items, Deposit Terms, Guarantee & Warranty
+  const [useLineItems, setUseLineItems] = useState(false);
+  const [lineItems, setLineItems] = useState<{ id: string; description: string; amount: string }[]>([
+    { id: "1", description: "Labor & Installation", amount: "" }
+  ]);
+  const [depositTerm, setDepositTerm] = useState("0_percent_completion");
+  const [guaranteeTerm, setGuaranteeTerm] = useState("1_year_workmanship");
+  const [partsWarranty, setPartsWarranty] = useState("standard_parts");
+  const [myDeals, setMyDeals] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (!user || profile?.role !== 'tradesperson') return;
+    const q = query(
+      collection(db, "flash_deals"),
+      where("traderId", "==", user.uid),
+      where("status", "==", "active")
+    );
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const dbDeals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const mockMatches = INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === user.uid);
+      const existingIds = new Set(dbDeals.map(d => d.id));
+      const merged = [...dbDeals, ...mockMatches.filter(m => !existingIds.has(m.id))];
+      setMyDeals(merged);
+    }, (error) => {
+      console.error("Error fetching my flash deals in JobDetails:", error);
+      setMyDeals(INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === user.uid));
+    });
+    return () => unsubscribe();
+  }, [user, profile]);
+
+  const getMatchingDeal = () => {
+    if (job?.claimedDeal) {
+      return {
+        id: job.claimedDeal.id || "claimed_deal",
+        service: job.claimedDeal.service || job.claimedDeal.dealTitle || job.title,
+        discountPercentage: job.claimedDeal.discountPercentage || 0,
+        dayOfWeek: job.claimedDeal.dayOfWeek || "Claimed Deal",
+        ...job.claimedDeal
+      };
+    }
+    if (myDeals.length === 0) return null;
+    const dateStr = isImmediateStart ? new Date().toISOString().split('T')[0] : quoteStartDate;
+    if (!dateStr) return null;
+    
+    // Get weekday string in English (e.g., "Monday", "Tuesday")
+    const dateObj = new Date(dateStr);
+    const weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const selectedDayOfWeek = weekdays[dateObj.getDay()];
+
+    // Find if we have an active deal matching this day of the week or schedule
+    return myDeals.find(deal => isDealApplicableOnDay(deal.dayOfWeek, selectedDayOfWeek));
+  };
+
+  const handleAddLineItem = () => {
+    setLineItems(prev => [...prev, { id: Date.now().toString(), description: "", amount: "" }]);
+  };
+
+  const handleUpdateLineItem = (id: string, field: "description" | "amount", value: string) => {
+    setLineItems(prev => {
+      const updated = prev.map(item => item.id === id ? { ...item, [field]: value } : item);
+      const total = updated.reduce((acc, curr) => acc + (parseFloat(curr.amount) || 0), 0);
+      if (total > 0) {
+        setQuoteAmount(total.toString());
+      }
+      return updated;
+    });
+  };
+
+  const handleRemoveLineItem = (id: string) => {
+    setLineItems(prev => {
+      const updated = prev.filter(item => item.id !== id);
+      const total = updated.reduce((acc, curr) => acc + (parseFloat(curr.amount) || 0), 0);
+      if (total > 0) {
+        setQuoteAmount(total.toString());
+      }
+      return updated;
+    });
+  };
+  const [isSubmittingQuote, setIsSubmittingQuote] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [isDraftingAI, setIsDraftingAI] = useState(false);
+  const [isGeneratingMaterials, setIsGeneratingMaterials] = useState(false);
+  const [isGeneratingMarketing, setIsGeneratingMarketing] = useState(false);
+  const [marketingPost, setMarketingPost] = useState("");
+  const [isMediating, setIsMediating] = useState(false);
+  const [disputeResolution, setDisputeResolution] = useState<any>(null);
+  const [materialList, setMaterialList] = useState<string[]>([]);
+  
+  // Fast Pass - Material List Finalization Window Logic
+  const [isFinalizingMaterials, setIsFinalizingMaterials] = useState(false);
+  const [finalizingQuoteId, setFinalizingQuoteId] = useState<string | null>(null);
+  const [editableMaterialItem, setEditableMaterialItem] = useState("");
+  const [windowExpirationTimer, setWindowExpirationTimer] = useState<string | null>(null);
+
+  const [hasAutoDrafted, setHasAutoDrafted] = useState(false);
+  const [hasRecurringSchedule, setHasRecurringSchedule] = useState(false);
+  const [showMap, setShowMap] = useState(true);
+  const [showDigitalId, setShowDigitalId] = useState(false);
+  const [showJobSummary, setShowJobSummary] = useState(false);
+  const [showContractModal, setShowContractModal] = useState(false);
+  const [showBomModal, setShowBomModal] = useState(false);
+  const [showPinModal, setShowPinModal] = useState(false);
+  const [enteredPin, setEnteredPin] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [imElapsedSeconds, setImElapsedSeconds] = useState(0);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const acceptIdempotencyKeysRef = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (job?.status === "in_progress" && job?.startedAt) {
+      const start = job.startedAt.seconds ? job.startedAt.seconds * 1000 : Date.now();
+      
+      const updateTimer = () => {
+        const now = Date.now();
+        const seconds = Math.floor((now - start) / 1000);
+        setElapsedSeconds(seconds >= 0 ? seconds : 0);
+      };
+      
+      updateTimer();
+      interval = setInterval(updateTimer, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [job?.status, job?.startedAt]);
+
+const libraries: any[] = ['places', 'geometry'];
+
+  const { isLoaded } = useJsApiLoader({
+    id: 'google-map-script',
+    googleMapsApiKey: getGoogleMapsApiKey(),
+    libraries,
+    version: "quarterly"
+  });
+
+  useEffect(() => {
+    if (job?.status === "posted" && job?.boostTier === "instant_match") {
+      const interval = setInterval(() => {
+        const start = job.createdAt?.seconds ? job.createdAt.seconds * 1000 : Date.now();
+        setImElapsedSeconds(Math.floor((Date.now() - start) / 1000));
+      }, 1000);
+      return () => clearInterval(interval);
+    }
+  }, [job?.status, job?.boostTier, job?.createdAt]);
+
+  useEffect(() => {
+    if (!id) return;
+
+    setLoading(true);
+
+    const unsubscribe = onSnapshot(doc(db, "jobs", id), async (jobDoc) => {
+      try {
+        if (jobDoc.exists()) {
+          const data = jobDoc.data();
+          setJob({ id: jobDoc.id, ...data });
+
+          // Fetch homeowner profile once (only if owner or admin)
+          if (data.homeownerId && fetchedHomeownerIdRef.current !== data.homeownerId) {
+            fetchedHomeownerIdRef.current = data.homeownerId;
+            if (user?.uid === data.homeownerId || profile?.role === "admin" || (profile as any)?.isAdmin) {
+              try {
+                const hoDoc = await getDoc(doc(db, "users", data.homeownerId));
+                if (hoDoc.exists()) {
+                  setHomeownerProfile(hoDoc.data());
+                }
+              } catch (e) {
+                console.warn("Homeowner private profile read skipped:", e);
+              }
+            }
+          }
+
+          // Fetch accepted tradesperson profile if not already fetched
+          if (data.acceptedTradespersonId && fetchedTradespersonIdRef.current !== data.acceptedTradespersonId) {
+            fetchedTradespersonIdRef.current = data.acceptedTradespersonId;
+            try {
+              const tpDoc = await getDoc(doc(db, "public_profiles", data.acceptedTradespersonId));
+              if (tpDoc.exists()) {
+                setTradespersonProfiles(prev => ({
+                  ...prev,
+                  [data.acceptedTradespersonId]: tpDoc.data()
+                }));
+              }
+            } catch (e) {
+              console.warn("Tradesperson public profile read skipped:", e);
+            }
+          }
+
+          // Check if recurring schedule already exists for this job once
+          if (user?.uid && checkedRecurringIdRef.current !== `${id}_${user.uid}`) {
+            checkedRecurringIdRef.current = `${id}_${user.uid}`;
+            const recurringQuery = query(
+              collection(db, "recurring_schedules"), 
+              and(
+                where("originalJobId", "==", id),
+                or(
+                  where("participants", "array-contains", user.uid),
+                  where("homeownerId", "==", user.uid),
+                  where("tradespersonId", "==", user.uid)
+                )
+              )
+            );
+            const recurringSnap = await getDocs(recurringQuery);
+            if (!recurringSnap.empty) {
+              setHasRecurringSchedule(true);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Error in job live listener:", err);
+      } finally {
+        setLoading(false);
+      }
+    }, async (err) => {
+      // If private job permission error (e.g. unassigned discovery tradesperson or guest), load sanitized public card
+      try {
+        const publicDoc = await getDoc(doc(db, "public_job_cards", id));
+        if (publicDoc.exists()) {
+          setJob({ id: publicDoc.id, ...publicDoc.data(), isPublicDiscovery: true });
+        }
+      } catch (pubErr) {
+        console.warn("Public job card discovery fallback error:", pubErr);
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [id, user?.uid]);
+
+  useEffect(() => {
+    if (!id || !job) return;
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('boost_success') === 'true') {
+      toast.success("⚡ Priority Boost activated! Your job is now pinned and prioritized.");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    if (params.get('quickQuote') === 'true') {
+      setTimeout(() => {
+        const element = document.getElementById('quote-form-section');
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 500);
+    }
+  }, [id, job]);
+
+  useEffect(() => {
+    if (!id || !job) return;
+
+    // Listen for quotes
+    // Homeowners see all quotes, tradespeople only see their own
+    let q;
+    if (user?.uid === job.homeownerId) {
+      q = query(collection(db, "jobs", id, "quotes"));
+    } else if (user) {
+      q = query(collection(db, "jobs", id, "quotes"), where("tradespersonId", "==", user.uid));
+    } else {
+      setQuotes([]);
+      return;
+    }
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const quotesData = snapshot.docs.map(doc => ({ id: doc.id, ref: doc.ref, ...doc.data() }));
+      
+      const fortyEightHoursAgo = Date.now() - 48 * 60 * 60 * 1000;
+      const validQuotes: any[] = [];
+      let deletedCount = 0;
+
+      for (const quote of quotesData as any[]) {
+        if (quote.status === "rejected") {
+           const rejectedTime = quote.rejectedAt?.seconds ? quote.rejectedAt.seconds * 1000 : 
+                              (quote.updatedAt?.seconds ? quote.updatedAt.seconds * 1000 : quote.createdAt?.seconds * 1000);
+           
+           if (rejectedTime && rejectedTime < fortyEightHoursAgo) {
+             deletedCount++;
+             continue; // Skip adding to state
+           }
+        }
+        validQuotes.push(quote);
+      }
+
+      setQuotes(validQuotes);
+      
+      // Auto-draft quote message if tradesperson has no quote yet
+      if (user?.uid !== job.homeownerId && profile?.role === "tradesperson" && validQuotes.length === 0 && !hasAutoDrafted && !quoteMessage) {
+        setHasAutoDrafted(true);
+        const autoDraft = async () => {
+          setIsDraftingAI(true);
+          try {
+            const draft = await generateQuoteDraft(
+              job.title,
+              job.description,
+              profile?.name || "Tradesperson",
+              "TBD", // Amount is not known yet
+              "complete_package"
+            );
+            setQuoteMessage(draft);
+          } catch (err) {
+            console.error("Error auto-drafting quote:", err);
+          } finally {
+            setIsDraftingAI(false);
+          }
+        };
+        autoDraft();
+      }
+      
+      // Fetch profiles for tradespeople who quoted
+      quotesData.forEach(async (quote: any) => {
+        if (!tradespersonProfiles[quote.tradespersonId]) {
+          let profileDoc: any = null;
+          try {
+            profileDoc = await getDoc(doc(db, "public_profiles", quote.tradespersonId));
+            if (profileDoc.exists()) {
+              setTradespersonProfiles(prev => ({
+                ...prev,
+                [quote.tradespersonId]: profileDoc.data()
+              }));
+            }
+          } catch (e) {
+            console.warn("Quote trader public profile read notice:", e);
+          }
+
+          if (profileDoc && profileDoc.exists()) {
+            // Fetch reviews and generate summary
+            try {
+              const profileData = profileDoc.data();
+              const existingSummary = profileData?.aiReviewSummary;
+              const summaryAge = profileData?.aiReviewSummaryAt ? (profileData.aiReviewSummaryAt.toDate ? profileData.aiReviewSummaryAt.toDate() : new Date(profileData.aiReviewSummaryAt)) : null;
+
+              const { getDocs } = await import("firebase/firestore");
+              const reviewsQuery = query(collection(db, "reviews"), where("revieweeId", "==", quote.tradespersonId));
+              const reviewsSnap = await getDocs(reviewsQuery);
+              const reviewsData = reviewsSnap.docs.map(d => d.data());
+
+              if (reviewsData.length > 0) {
+                const lastReviewTime = Math.max(...reviewsData.map(r => {
+                  if (r.createdAt?.toDate) return r.createdAt.toDate().getTime();
+                  if (r.createdAt) return new Date(r.createdAt).getTime();
+                  return 0;
+                }));
+
+                const shouldRegenerate = !existingSummary || !summaryAge || summaryAge.getTime() < lastReviewTime;
+
+                if (shouldRegenerate) {
+                  const summary = await getReviewSummary(reviewsData);
+                  setReviewSummaries(prev => ({
+                    ...prev,
+                    [quote.tradespersonId]: summary
+                  }));
+                } else {
+                  setReviewSummaries(prev => ({
+                    ...prev,
+                    [quote.tradespersonId]: existingSummary
+                  }));
+                }
+              }
+            } catch (err) {
+              console.error("Error generating review summary:", err);
+            }
+          }
+
+          // Analyze quote with AI if estimate is available
+          if (isHomeowner && job.estimateMin && job.estimateMax && !quoteAnalyses[quote.id]) {
+            try {
+              const analysis = await analyzeQuote(
+                job.title,
+                job.description,
+                quote.amount,
+                quote.message,
+                job.estimateMin,
+                job.estimateMax
+              );
+              setQuoteAnalyses(prev => ({
+                ...prev,
+                [quote.id]: analysis
+              }));
+            } catch (err) {
+              console.error("Error analyzing quote:", err);
+            }
+          }
+        }
+      });
+    }, (err) => {
+      console.error("Error listening to quotes:", err);
+      // Only report if it's not a permission error we expect (though we try to avoid them now)
+      try {
+        handleFirestoreError(err, OperationType.LIST, `jobs/${id}/quotes`);
+      } catch (e: any) {
+        setError(e.message);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [id, job, user?.uid]);
+
+  const handleDraftWithAI = async () => {
+    if (!job) return;
+    setIsDraftingAI(true);
+    try {
+      const draft = await generateQuoteDraft(
+        job.title,
+        job.description,
+        profile?.name || "Tradesperson",
+        quoteAmount || "TBD",
+        quoteScope
+      );
+      setQuoteMessage(draft);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsDraftingAI(false);
+    }
+  };
+
+  const handleGenerateMaterialList = async () => {
+    if (!job) return;
+    setIsGeneratingMaterials(true);
+    try {
+        const response = await fetch("/api/job/procure-materials", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ description: job.description })
+        });
+        const data = await response.json();
+        // Assuming materialList expects an array of strings, mapping the API response
+        setMaterialList(data.materials.map((m: any) => `${m.item} (${m.estimatedQuantity})`));
+    } catch (err) {
+        console.error("Material detection failed:", err);
+    } finally {
+        setIsGeneratingMaterials(false);
+    }
+  };
+
+  const handleGenerateQuoteMaterials = async () => {
+    if (!job) return;
+    setIsGeneratingMaterials(true);
+    try {
+      const list = await getMaterialList(job.category, job.title, job.description);
+      const formattedList = list.map(item => `- ${item}`).join('\n');
+      setQuoteMessage(prev => {
+        const separator = prev ? '\n\n' : '';
+        const disclaimer = "⚠️ IMPORTANT: As this is a 'Labour Only' quote, the materials listed below are NOT included in the price. You will need to purchase and arrange these materials prior to the job starting.";
+        return `${prev}${separator}${disclaimer}\n\nPotential Material Shopping List:\n${formattedList}`;
+      });
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsGeneratingMaterials(false);
+    }
+  };
+
+  const handleMediateDispute = async () => {
+    if (!job || !job.dispute) return;
+    setIsMediating(true);
+    try {
+      const acceptedQuote = quotes.find(q => q.status === "accepted");
+      const res = await getDisputeResolution(
+        job.title,
+        job.description,
+        job.dispute.reason,
+        acceptedQuote?.amount || "0"
+      );
+      setDisputeResolution(res);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsMediating(false);
+    }
+  };
+
+  const handleGenerateMarketingPost = async () => {
+    if (!job || !profile) return;
+    setIsGeneratingMarketing(true);
+    try {
+      const post = await generateMarketingPost(
+        job.title,
+        job.description,
+        job.category,
+        profile.name || "Tradesperson"
+      );
+      setMarketingPost(post);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsGeneratingMarketing(false);
+    }
+  };
+
+  const handleQuote = async () => {
+    if (!user || !id) return;
+    setIsSubmittingQuote(true);
+    setError(null);
+    try {
+      const cleanAmountStr = (quoteAmount || "").toString().replace(/[^0-9.]/g, "");
+      const amountEntered = parseFloat(cleanAmountStr);
+      if (!cleanAmountStr || isNaN(amountEntered) || amountEntered <= 0) {
+        const errMsg = "Please enter a valid total quote amount in £.";
+        setError(errMsg);
+        toast.error(errMsg);
+        setIsSubmittingQuote(false);
+        return;
+      }
+
+      // Check limits via server-side API
+      let limitData: any = { allowed: true };
+      try {
+        const limitResponse = await fetch("/api/check-quote-limit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId: user.uid, jobId: id })
+        });
+        if (limitResponse.ok) {
+          limitData = await limitResponse.json();
+        }
+      } catch (limitErr) {
+        console.warn("Could not check quote limit, proceeding:", limitErr);
+      }
+      
+      const existingQuote = quotes.find(q => q.tradespersonId === user.uid);
+      
+      if (!existingQuote && limitData.allowed === false) {
+        const limitMsg = limitData.error || `You have reached your monthly limit of ${limitData.limit} quotes. Please upgrade your tier to quote on more jobs.`;
+        setError(limitMsg);
+        toast.error(limitMsg);
+        setIsSubmittingQuote(false);
+        return;
+      }
+
+      const matchingDeal = getMatchingDeal();
+      let finalAmount = amountEntered;
+      let originalAmountVal = amountEntered;
+      let isDiscountApplied = false;
+      let discountPercentageVal = 0;
+      let appliedFlashDealIdVal = "";
+
+      if (matchingDeal) {
+        isDiscountApplied = true;
+        discountPercentageVal = matchingDeal.discountPercentage;
+        appliedFlashDealIdVal = matchingDeal.id;
+        finalAmount = Math.round(amountEntered * (1 - discountPercentageVal / 100));
+      }
+
+      const traderTier = profile?.tierId || profile?.tier || 'payg';
+      const payoutBreakdown = calculatePayoutBreakdown(finalAmount, traderTier);
+
+      const isQuickTrack = finalAmount < 400;
+      const defaultMilestones = !isQuickTrack ? [
+        { id: "m1", title: "Commencement & Materials", amount: Math.floor(finalAmount * 0.3), description: "Commencement and initial materials" },
+        { id: "m2", title: "Mid-way Progress", amount: Math.floor(finalAmount * 0.4), description: "Mid-way milestone verification" },
+        { id: "m3", title: "Final Completion & Handover", amount: finalAmount - Math.floor(finalAmount * 0.3) - Math.floor(finalAmount * 0.4), description: "Final completion and sign-off" }
+      ] : [
+        { id: "m1", title: "Service Delivery", amount: finalAmount, description: "Full job service completion" }
+      ];
+
+      const resolvedStartDate = isImmediateStart 
+        ? new Date().toISOString().split('T')[0] 
+        : (quoteStartDate || new Date().toISOString().split('T')[0]);
+
+      const quotePayload = {
+        amount: finalAmount,
+        coverNote: (quoteMessage || "").trim(),
+        message: (quoteMessage || "").trim(),
+        estimatedDuration: estimatedTimeline || "1 Full day (8h)",
+        startDate: resolvedStartDate,
+        startDateType: isImmediateStart ? ("immediate" as const) : ("flexible" as const),
+        isImmediateStart: Boolean(isImmediateStart),
+        paymentPreference: (paymentPreference || "fixed_price") as any,
+        paymentTrack: isQuickTrack ? ("quick" as const) : ("project" as const),
+        quoteScope: (quoteScope || "labor_only") as any,
+        depositTerm: depositTerm || "0_percent_completion",
+        guaranteeTerm: guaranteeTerm || "1_year_workmanship",
+        partsWarranty: partsWarranty || "standard_parts",
+        milestones: defaultMilestones,
+        materialsIncluded: quoteScope === "materials_included" || quoteScope === "full_project",
+      };
+
+      let commandResult;
+      if (existingQuote) {
+        commandResult = await updateQuoteViaCommand({
+          user: user as any,
+          jobId: id,
+          quoteId: existingQuote.id,
+          payload: quotePayload,
+        });
+      } else {
+        commandResult = await createQuoteViaCommand({
+          user: user as any,
+          jobId: id,
+          payload: quotePayload,
+        });
+      }
+
+      // Notify homeowner
+      if (job.homeownerId) {
+        await sendNotification(
+          job.homeownerId,
+          "Quote Received/Updated",
+          `A tradesperson has ${existingQuote ? 'updated their' : 'submitted a'} quote for: ${job.title}`,
+          "quote",
+          `/job/${id}`
+        );
+      }
+
+      // Track exclusive limits if applicable
+      if (limitData.isJobExclusive) {
+        const { increment } = await import("firebase/firestore");
+        const cooldownDate = new Date(Date.now() + 2 * 60 * 60 * 1000); // 2 hours
+        await updateDoc(doc(db, "users", user.uid), {
+          exclusiveSlotsUsedToday: increment(1),
+          exclusiveCooldownUntil: cooldownDate,
+          lastExclusiveQuoteDate: serverTimestamp()
+        });
+
+        // Trigger Finalization Window for Materials
+        setFinalizingQuoteId(commandResult.quoteId);
+        setIsFinalizingMaterials(true);
+      }
+
+      toast.success(existingQuote ? "Quote updated successfully!" : "Quote submitted successfully!");
+      setIsEditingSubmittedQuote(false);
+      setQuoteAmount("");
+      setQuoteMessage("");
+      setQuoteStartDate("");
+      setIsImmediateStart(false);
+      setEstimatedTimeline("");
+    } catch (err: any) {
+      console.error("Error submitting quote:", err);
+      const msg = err?.message || "Failed to submit quote. Please check your connection and try again.";
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setIsSubmittingQuote(false);
+    }
+  };
+
+  const handleWithdrawQuote = async () => {
+    if (!id || !user || !withdrawingQuote) return;
+    if (!withdrawReason.trim()) return;
+    
+    setIsProcessing(true);
+    
+    try {
+      await withdrawQuoteViaCommand({
+        user: user as any,
+        jobId: id,
+        quoteId: withdrawingQuote.id,
+        reason: withdrawReason.trim(),
+      });
+      
+      toast.success("Quote withdrawn successfully.");
+      setWithdrawingQuote(null);
+      setWithdrawReason("");
+    } catch (err: any) {
+      console.error("Error withdrawing quote:", err);
+      setError(err?.message || "Failed to withdraw quote.");
+      toast.error(err?.message || "Failed to withdraw quote.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleAcceptQuote = async (quote: any) => {
+    if (!id || !user) return;
+    setLoading(true);
+    setError(null);
+    try {
+      if (!acceptIdempotencyKeysRef.current[quote.id]) {
+        acceptIdempotencyKeysRef.current[quote.id] =
+          typeof crypto !== "undefined" && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `accept_${id}_${quote.id}`;
+      }
+      const acceptIdempotencyKey = acceptIdempotencyKeysRef.current[quote.id];
+
+      // 1. Authoritative quote acceptance via backend command endpoint
+      const acceptResult = await acceptQuoteViaServer({
+        user: user as any,
+        jobId: id,
+        quoteId: quote.id,
+        idempotencyKey: acceptIdempotencyKey,
+      });
+
+      delete acceptIdempotencyKeysRef.current[quote.id];
+
+      // 2. Notify tradesperson
+      await sendNotification(
+        quote.tradespersonId,
+        "Quote Accepted!",
+        `Your quote for "${job.title}" has been accepted. You can now start chatting with the homeowner.`,
+        "status",
+        `/job/${id}`
+      );
+
+      // 3. Notify tradesperson to confirm start date
+      await sendNotification(
+        quote.tradespersonId,
+        "Quote Accepted - Confirm Start Date",
+        `Your quote for "${job.title}" has been accepted! Please confirm the start date (${format(new Date(quote.startDate || Date.now()), 'dd MMM')}) or request a reschedule.`,
+        "status",
+        `/job/${id}`
+      );
+
+      // 4. Notify other tradespeople (competing quotes were atomically rejected server-side)
+      const otherQuotes = quotes.filter(q => q.id !== quote.id && q.status === "pending");
+      Promise.all(otherQuotes.map(async (q) => {
+        try {
+          const feedback = await getRejectionFeedback(job, q, quote);
+          await sendNotification(
+            q.tradespersonId,
+            "Job Awarded to Another Trader",
+            `The homeowner for "${job.title}" has accepted another quote. AI Insight: ${feedback?.reason || "Homeowner selected another proposal."}`,
+            "status",
+            `/job/${id}`
+          );
+        } catch (err) {
+          console.error(`Error sending rejection notification for quote ${q.id}:`, err);
+        }
+      })).catch(console.error);
+      
+      // Refresh local job and quotes state with authoritative server response
+      setJob((prev: any) => ({
+        ...prev,
+        status: "accepted",
+        acceptedTradespersonId: acceptResult.acceptedTradespersonId || quote.tradespersonId,
+        scheduledDate: acceptResult.scheduledDate || quote.startDate || new Date().toISOString().split('T')[0],
+        isConfirmedByTradesperson: acceptResult.isConfirmedByTradesperson ?? false,
+        verificationPin: acceptResult.verificationPin,
+      }));
+
+      setQuotes((prev) =>
+        prev.map((q) =>
+          q.id === quote.id
+            ? { ...q, status: "accepted" }
+            : q.status === "pending"
+            ? { ...q, status: "rejected" }
+            : q
+        )
+      );
+
+      // 5. Direct Merchant AI BOM 1-Click Ordering Trigger
+      try {
+        const extractedBOM = await extractBillOfMaterials({
+          jobTitle: job.title,
+          category: job.category,
+          description: job.description,
+          quoteMessage: quote.message || quote.notes,
+          quoteMaterialList: quote.materialList || [],
+          propertyPassportSpecs: job.propertyPassportSpecs
+        });
+        if (extractedBOM && extractedBOM.length > 0) {
+          const totalMaterials = extractedBOM.reduce((sum, i) => sum + i.totalCost, 0);
+          await updateDoc(doc(db, "jobs", id), {
+            billOfMaterials: extractedBOM,
+            materialsCost: totalMaterials,
+            hasPendingBOM: true,
+            updatedAt: serverTimestamp()
+          });
+
+          await sendNotification(
+            quote.tradespersonId,
+            "📦 1-Click Trade Materials Ready",
+            `AI Bill of Materials generated for "${job.title}". 1-click trade counter pickup or Category 84 site delivery ready at Screwfix / Toolstation!`,
+            "status",
+            `/job/${id}`
+          );
+        }
+      } catch (bomErr) {
+        console.error("Auto BOM extraction on quote acceptance:", bomErr);
+      }
+
+      toast.success("Quote accepted! 📦 AI Bill of Materials ready for 1-click trade counter ordering.", {
+        action: {
+          label: "Open BOM",
+          onClick: () => setShowBomModal(true)
+        }
+      });
+
+      // 6. Ecosystem Synergy: Trigger AI equipment alerts for high-tier traders (background)
+      try {
+        const acceptedTraderDoc = await getDoc(doc(db, "public_profiles", quote.tradespersonId));
+        if (acceptedTraderDoc.exists()) {
+          const traderData = acceptedTraderDoc.data();
+          const tier = traderData.subscriptionType; // Simplified tier check
+          if (tier === "Gold Elite" || tier === "Platinum Enterprise") {
+            Promise.resolve().then(async () => {
+              try {
+                const recommendations = await getEquipmentRecommendations(`${job.title} - ${job.description}`, [job.category]);
+                if (recommendations.length > 0) {
+                  const recText = recommendations.map(r => `• ${r.item}: ${r.reason}`).join("\n");
+                  await sendNotification(
+                    quote.tradespersonId,
+                    "AI Tool Recommendations",
+                    `Based on this job scope, we recommend: \n${recText}`,
+                    "status",
+                    `/chat/${id}` // Or link to shop
+                  );
+                }
+              } catch (aiErr) {
+                console.error("Failed to generate equipment alerts:", aiErr);
+              }
+            });
+          }
+        }
+      } catch (err) {
+        console.warn("Public profile lookup notice:", err);
+      }
+    } catch (err: any) {
+      console.error("Error accepting quote:", err);
+      setError(err?.message || "Failed to accept quote. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRejectQuote = async (quote: any) => {
+    if (!id || !user) return;
+    setError(null);
+    try {
+      await rejectQuoteViaCommand({
+        user: user as any,
+        jobId: id,
+        quoteId: quote.id,
+        reason: "Declined by homeowner",
+      });
+
+      toast.success("Quote declined.");
+
+      // Notify tradesperson
+      await sendNotification(
+        quote.tradespersonId,
+        "Quote Update",
+        `Your quote for "${job.title}" was not accepted this time.`,
+        "status",
+        `/job/${id}`
+      );
+    } catch (err: any) {
+      console.error("Error rejecting quote:", err);
+      setError(err?.message || "Failed to reject quote.");
+      toast.error(err?.message || "Failed to reject quote.");
+    }
+  };
+
+  const handleRequoteQuote = async (quote: any, customMessage?: string) => {
+    const message = customMessage || requoteMessage;
+    if (!id || !user || !message) return;
+    
+    const currentRevisions = quote.revisionCount || 0;
+    if (currentRevisions >= 5) {
+      setError("Maximum revision limit (5) reached for this quote.");
+      return;
+    }
+
+    setError(null);
+    try {
+      await requestRequoteViaCommand({
+        user: user as any,
+        jobId: id,
+        quoteId: quote.id,
+        message,
+      });
+
+      toast.success("Requote requested.");
+
+      // Notify tradesperson
+      await sendNotification(
+        quote.tradespersonId,
+        "Requote Requested",
+        `The homeowner has requested a requote for "${job.title}". Message: ${message}`,
+        "status",
+        `/job/${id}`
+      );
+      if (!customMessage) setRequoteMessage("");
+      setActiveQuoteId(null);
+    } catch (err: any) {
+      console.error("Error requesting requote:", err);
+      setError(err?.message || "Failed to request requote.");
+      toast.error(err?.message || "Failed to request requote.");
+    }
+  };
+
+  const handleStartJob = async () => {
+    if (!id) return;
+    if (job.verificationPin) {
+      setShowPinModal(true);
+      return;
+    }
+    await confirmStartJob();
+  };
+
+  const confirmStartJob = async () => {
+    if (!id || !user) return;
+    setLoading(true);
+    try {
+      await startJobViaCommand({
+        user,
+        jobId: id,
+        verificationPin: enteredPin,
+      });
+      setJob((prev: any) => ({ ...prev, status: "in_progress", startedAt: { seconds: Math.floor(Date.now() / 1000) } }));
+      setShowPinModal(false);
+      
+      // Notify homeowner
+      await sendNotification(
+        job.homeownerId,
+        "Job Started!",
+        `The tradesperson has started work on "${job.title}".`,
+        "status",
+        `/job/${id}`
+      );
+    } catch (err) {
+      console.error("Error starting job:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSetOnRoute = async () => {
+    if (!id || !job) return;
+    try {
+      await updateDoc(doc(db, "jobs", id), {
+        trackingStatus: "on_route"
+      });
+      setJob((prev: any) => ({ ...prev, trackingStatus: "on_route" }));
+      await sendNotification(
+        job.homeownerId,
+        "Tradesperson on route!",
+        `Your assigned tradesperson is currently on route to your location.`,
+        "status",
+        `/job/${id}`
+      );
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleSetArrived = async () => {
+    if (!id || !job) return;
+    try {
+      await updateDoc(doc(db, "jobs", id), {
+        trackingStatus: "arrived"
+      });
+      setJob((prev: any) => ({ ...prev, trackingStatus: "arrived" }));
+      await sendNotification(
+        job.homeownerId,
+        "Tradesperson arrived!",
+        `Your assigned tradesperson has arrived at your location.`,
+        "status",
+        `/job/${id}`
+      );
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleFinalizeMaterialList = async () => {
+    if (!id || !finalizingQuoteId || !user) return;
+    setIsProcessing(true);
+    try {
+      await updateQuoteViaCommand({
+        user: user as any,
+        jobId: id,
+        quoteId: finalizingQuoteId,
+        payload: {
+          materialsIncluded: true,
+          metadata: {
+            materialsFinalized: true,
+            materialList: materialList.length > 0 ? materialList : [],
+          },
+        },
+      });
+      // Allow homeowner to immediately see it.
+      setQuotes(prev => prev.map(q => q.id === finalizingQuoteId ? { ...q, materialsFinalized: true, materialList } : q));
+      setIsFinalizingMaterials(false);
+      setFinalizingQuoteId(null);
+    } catch (err) {
+      console.error("Error finalizing material list:", err);
+      alert("Failed to save material list. Please try again.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleCompleteJob = async () => {
+    if (!id || !user) return;
+    setLoading(true);
+    try {
+      const newPaymentStatus = job.paymentStatus === "handshake_complete" || job.isPaid ? job.paymentStatus : "pending";
+      await completeJobViaCommand({
+        user,
+        jobId: id,
+      });
+      setJob((prev: any) => ({ 
+        ...prev, 
+        status: "completed", 
+        completedAt: new Date(), 
+        hasReview: false, 
+        hasTradespersonReview: false,
+        paymentStatus: newPaymentStatus
+      }));
+      
+      // Determine who initiated and notify the other party
+      const isHomeownerCall = user?.uid === job.homeownerId;
+      const acceptedQuote = quotes.find(q => q.status === "accepted");
+      const otherUserId = isHomeownerCall ? (acceptedQuote?.tradespersonId) : job.homeownerId;
+      
+      if (acceptedQuote) {
+        // Phantom Billing Calculation
+        const potentialFee = (acceptedQuote.amount || 0) * 0.15; // 15% Success Fee (PAYG rate)
+        
+        const tpRef = doc(db, "users", acceptedQuote.tradespersonId);
+        const tpUpdateData: any = {};
+
+        if (potentialFee > 0) {
+          tpUpdateData.phantomFeesSaved = increment(potentialFee);
+        }
+
+        tpUpdateData.totalJobsDone = increment(1);
+        if (acceptedQuote.amount && acceptedQuote.amount > 0) {
+          tpUpdateData.completedJobsRevenue = increment(acceptedQuote.amount);
+        }
+
+        if (job.isBoosted && job.urgency === 'emergency') {
+          tpUpdateData.boostedEmergencyJobsDone = increment(1);
+        }
+
+        try {
+          if (Object.keys(tpUpdateData).length > 0) {
+            await updateDoc(tpRef, tpUpdateData);
+          }
+        } catch (tpErr) {
+          console.error("Error updating tradesperson profile:", tpErr);
+        }
+
+        // Automated Free & Pro Invoicing System
+        try {
+          const tpProf = tradespersonProfiles[acceptedQuote.tradespersonId] || profile;
+          await createOrGetJobInvoice(job, acceptedQuote, tpProf, homeownerProfile);
+        } catch (invErr) {
+          console.error("Error generating automated job invoice:", invErr);
+        }
+      }
+
+      if (otherUserId) {
+        await sendNotification(
+          otherUserId,
+          isHomeownerCall ? "Job Completed!" : "Payment Requested",
+          isHomeownerCall 
+            ? `The homeowner has marked "${job.title}" as completed. You can now review them.`
+            : `The tradesperson has marked "${job.title}" as completed and requested payment.`,
+          "status",
+          `/job/${id}`
+        );
+      }
+    } catch (err) {
+      console.error("Error completing job:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDownloadQuote = async (quote: any) => {
+    const { default: jsPDF } = await import('jspdf');
+    const doc = new jsPDF();
+    const tpProfile = tradespersonProfiles[quote.tradespersonId];
+    
+    // Header
+    doc.setFontSize(22);
+    doc.setTextColor(30, 58, 95); // Indigo 900
+    doc.text("OFFICIAL JOB QUOTE", 105, 20, { align: "center" });
+    
+    doc.setFontSize(10);
+    doc.setTextColor(100);
+    doc.text(`Generated on ${new Date().toLocaleDateString()}`, 105, 28, { align: "center" });
+    
+    // Job Details
+    doc.setFontSize(14);
+    doc.setTextColor(0);
+    doc.text("JOB INFORMATION", 20, 45);
+    doc.setLineWidth(0.5);
+    doc.line(20, 47, 190, 47);
+    
+    doc.setFontSize(10);
+    doc.text(`Job Title: ${job.title}`, 20, 55);
+    doc.text(`Category: ${job.category} - ${job.subcategory}`, 20, 62);
+    doc.text(`Location: ${job.city}, ${job.postcode}`, 20, 69);
+    doc.text(`Posted Date: ${new Date(job.createdAt?.seconds * 1000).toLocaleDateString()}`, 20, 76);
+    
+    // Tradesperson Details
+    doc.setFontSize(14);
+    doc.text("TRADESPERSON", 20, 90);
+    doc.line(20, 92, 190, 92);
+    
+    doc.setFontSize(10);
+    doc.text(`Name: ${tpProfile?.name || "Tradesperson"}`, 20, 100);
+    doc.text(`Rating: ${tpProfile?.rating?.toFixed(1) || "5.0"} / 5.0`, 20, 107);
+    
+    // Quote Details
+    doc.setFontSize(14);
+    doc.text("QUOTE DETAILS", 20, 120);
+    doc.line(20, 122, 190, 122);
+    
+    doc.setFontSize(12);
+    doc.setFont("helvetica", "bold");
+    doc.text(`Total Amount: £${quote.amount}`, 20, 132);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.text(`Payment Preference: ${quote.paymentPreference?.replace('_', ' ')}`, 20, 139);
+    doc.text(`Scope: ${quote.quoteScope?.replace('_', ' ')}`, 20, 146);
+    
+    doc.setFontSize(11);
+    doc.text("Message / Scope of Work:", 20, 160);
+    doc.setFontSize(10);
+    const splitMessage = doc.splitTextToSize(quote.message, 170);
+    doc.text(splitMessage, 20, 167);
+    
+    // Footer
+    doc.setFontSize(8);
+    doc.setTextColor(150);
+    doc.text("This document serves as a record of the agreed quote on the platform.", 105, 280, { align: "center" });
+    doc.text("Any disputes should be raised through the platform's mediation system.", 105, 285, { align: "center" });
+    
+    doc.save(`Quote_${job.title.replace(/\s+/g, '_')}.pdf`);
+  };
+
+  const handleFundMilestone = async (quote: any, milestone: any) => {
+    if (!user) return;
+    setIsProcessing(true);
+    try {
+      const milestoneAmount = Math.max(1, Math.round(Number(milestone.amount) || 0));
+      const token = await user.getIdToken();
+      if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+      const response = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "Idempotency-Key": crypto.randomUUID()
+        },
+        body: JSON.stringify({
+          userId: user.uid,
+          price_data: {
+            currency: 'gbp',
+            unit_amount: milestoneAmount * 100, // pence
+            product_data: {
+              name: `Milestone: ${milestone.title || 'Project Stage'}`,
+              description: `Escrow stage payment for Job #${id}`
+            }
+          },
+          priceId: "price_mock_milestone", // Fallback identifier
+          mode: "payment",
+          metadata: {
+            type: "milestone_funding",
+            jobId: id,
+            quoteId: quote.id,
+            milestoneId: milestone.id
+          },
+          successUrl: `${window.location.origin}/job/${id}?funding_success=true`,
+          cancelUrl: `${window.location.origin}/job/${id}`
+        }),
+      });
+
+      const data = await response.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        toast.error(data.error || "Failed to initiate milestone escrow payment");
+      }
+    } catch (err: any) {
+      console.error("Funding Error:", err);
+      toast.error(err.message || "Failed to start escrow funding");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleReleaseMilestone = async (quote: any, milestone: any) => {
+    if (!user || !id) return;
+    if (!window.confirm(`Are you sure you want to release £${milestone.amount} to the tradesperson? This confirms you are happy with this stage of work.`)) return;
+    
+    setIsProcessing(true);
+    try {
+      const token = await user.getIdToken();
+      // Generate one stable idempotency key per logical release attempt for this milestone
+      const idempotencyKey = `rel_ms_${id}_${milestone.id}_${user.uid.substring(0, 5)}`;
+
+      const response = await fetch("/api/release-milestone", {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+          "Idempotency-Key": idempotencyKey
+        },
+        body: JSON.stringify({
+          jobId: id,
+          quoteId: quote.id,
+          milestoneId: milestone.id,
+          userId: user.uid,
+          idempotencyKey
+        }),
+      });
+
+      if (response.ok) {
+        toast.success(`£${milestone.amount} released to tradesperson!`);
+      } else {
+        const data = await response.json().catch(() => ({}));
+        toast.error(data.error || "Failed to release milestone funds");
+      }
+    } catch (err: any) {
+      console.error("Release Error:", err);
+      toast.error("Network error while releasing milestone");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const [showReviewForm, setShowReviewForm] = useState(false);
+  const [showTradespersonReviewForm, setShowTradespersonReviewForm] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showActions, setShowActions] = useState(false);
+  const [showHistoryId, setShowHistoryId] = useState<string | null>(null);
+  const [isMediaModalOpen, setIsMediaModalOpen] = useState(false);
+  const [isComparisonModalOpen, setIsComparisonModalOpen] = useState(false);
+  const [initialMediaIndex, setInitialMediaIndex] = useState(0);
+  const [requoteMessage, setRequoteMessage] = useState("");
+  const [activeQuoteId, setActiveQuoteId] = useState<string | null>(null);
+  const [isEditingRevision, setIsEditingRevision] = useState(false);
+  const [revisionAmount, setRevisionAmount] = useState("");
+  const [revisionReason, setRevisionReason] = useState("");
+  const [revisionMessage, setRevisionMessage] = useState("");
+  const [revisionScope, setRevisionScope] = useState<"labour_only" | "complete_package">("complete_package");
+  const [revisionPaymentPreference, setRevisionPaymentPreference] = useState<"fixed_price" | "hourly" | "negotiable">("fixed_price");
+  const [showDisputeModal, setShowDisputeModal] = useState(false);
+  const [disputeReason, setDisputeReason] = useState("");
+  const [technicalFaultReport, setTechnicalFaultReport] = useState("");
+  const [mediationStakePaid, setMediationStakePaid] = useState(false);
+  const [isPropertyDamage, setIsPropertyDamage] = useState(false);
+  const [showQrModal, setShowQrModal] = useState(false);
+  const [qrCodeData, setQrCodeData] = useState<string | null>(null);
+  const [isProcessingQr, setIsProcessingQr] = useState(false);
+  const [withdrawingQuote, setWithdrawingQuote] = useState<any | null>(null);
+  const [withdrawReason, setWithdrawReason] = useState("");
+  const [disputePhotos, setDisputePhotos] = useState<File[]>([]);
+  const [isUploadingDispute, setIsUploadingDispute] = useState(false);
+  
+  const [showRecurringModal, setShowRecurringModal] = useState(false);
+  const [recurringFrequency, setRecurringFrequency] = useState("weekly");
+  const [isProposingRecurring, setIsProposingRecurring] = useState(false);
+
+  const [showRescheduleModal, setShowRescheduleModal] = useState(false);
+  const [rescheduleDate, setRescheduleDate] = useState("");
+  const [rescheduleReason, setRescheduleReason] = useState("");
+  const [isRescheduling, setIsRescheduling] = useState(false);
+  const [isUploadingBeforePhoto, setIsUploadingBeforePhoto] = useState(false);
+  const [showPaymentReminder, setShowPaymentReminder] = useState(false);
+  const [reminderChannels, setReminderChannels] = useState({
+    app: true,
+    whatsapp: false,
+    email: false,
+    sms: false
+  });
+  const [payoutSummary, setPayoutSummary] = useState<PayoutBreakdown | null>(null);
+  const [confirmAcceptQuoteId, setConfirmAcceptQuoteId] = useState<string | null>(null);
+  const [confirmDeclineQuoteId, setConfirmDeclineQuoteId] = useState<string | null>(null);
+  
+  useEffect(() => {
+    const amount = parseFloat(quoteAmount);
+    if (!isNaN(amount) && amount > 0) {
+      const traderTier = profile?.tierId || profile?.tier || 'payg';
+      const summary = calculatePayoutBreakdown(amount, traderTier);
+      setPayoutSummary(summary);
+    } else {
+      setPayoutSummary(null);
+    }
+  }, [quoteAmount, profile?.tier, profile?.tierId]);
+
+  const handleRaiseDispute = async () => {
+    if (!id || !user || !disputeReason) return;
+    
+    // Fairness Engine Enforcement
+    if (!mediationStakePaid) {
+      alert("To raise a dispute, you must authorize a £25.00 Mediation Stake. This is refunded if the claim is valid, but compensated to the trader if the claim is frivolous.");
+      return;
+    }
+
+    if (disputePhotos.length === 0) {
+      alert("Mandatory Requirement Failure: You must provide photo evidence of the issue to raise a dispute under our Fairness Policy.");
+      return;
+    }
+
+    if (!technicalFaultReport.trim() && !isPropertyDamage) {
+      alert("Please provide a technical explanation of the fault. General dissatisfaction or 'petty' reasons are not eligible for platform protection.");
+      return;
+    }
+
+    setIsProcessing(true);
+    setIsUploadingDispute(true);
+    try {
+      const photoUrls: string[] = [];
+      for (const file of disputePhotos) {
+        const url = await uploadStorageFile(file, `disputes/${id}/${Date.now()}_${file.name}`, { contentType: file.type });
+        photoUrls.push(url);
+      }
+
+      const isHandshakeVerified = job.paymentStatus === "handshake_complete";
+
+      // 1. Initial save of the dispute via authoritative command
+      await disputeJobViaCommand({
+        user: user as any,
+        jobId: id,
+        reason: disputeReason,
+      });
+
+      // 2. Redirect to Stripe
+      const token = await user.getIdToken();
+      if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+      const res = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "Idempotency-Key": crypto.randomUUID()
+        },
+        body: JSON.stringify({
+          price_data: {
+            currency: 'gbp',
+            product_data: {
+              name: 'Mediation Stake',
+              description: '£25.00 Mediation Stake (Refundable if claim is valid)',
+            },
+            unit_amount: 2500,
+          },
+          userId: user.uid,
+          mode: 'payment',
+          metadata: {
+            type: 'mediation_stake',
+            jobId: id,
+            disputeReason,
+            technicalFaultReport,
+            isHandshakeVerified: String(isHandshakeVerified),
+            isPropertyDamage: String(isPropertyDamage)
+          },
+          successUrl: `${window.location.origin}/job/${id}?mediation_paid=true`,
+          cancelUrl: `${window.location.origin}/job/${id}?mediation_cancelled=true`
+        })
+      });
+
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      }
+      
+      setJob((prev: any) => ({ ...prev, status: "disputed" }));
+      setShowDisputeModal(false);
+      setDisputeReason("");
+      setDisputePhotos([]);
+    } catch (err) {
+      console.error("Error raising dispute:", err);
+    } finally {
+      setIsProcessing(false);
+      setIsUploadingDispute(false);
+    }
+  };
+
+  const handleProposeReschedule = async () => {
+    if (!id || !user || !rescheduleDate || !rescheduleReason) return;
+    setIsRescheduling(true);
+    try {
+      await updateDoc(doc(db, "jobs", id), {
+        rescheduleProposal: {
+          proposedDate: rescheduleDate,
+          reason: rescheduleReason,
+          proposedBy: user.uid,
+          status: "pending",
+          createdAt: serverTimestamp()
+        }
+      });
+
+      // Notify homeowner
+      await sendNotification(
+        job.homeownerId,
+        "Reschedule Proposed",
+        `Tradesperson proposed a new start date for "${job.title}": ${format(new Date(rescheduleDate), 'dd MMM yyyy')}`,
+        "status",
+        `/job/${id}`
+      );
+
+      setShowRescheduleModal(false);
+      setRescheduleDate("");
+      setRescheduleReason("");
+    } catch (err) {
+      console.error("Error proposing reschedule:", err);
+    } finally {
+      setIsRescheduling(false);
+    }
+  };
+
+  const handleGenerateQr = async (quote: any) => {
+    setIsProcessingQr(true);
+    try {
+      // Simulate calling an API to generate a signed payout token
+      const token = `pay_qr_${id}_${quote.id}_${Date.now()}`;
+      setQrCodeData(token);
+      setShowQrModal(true);
+    } catch (err) {
+      console.error("QR Generation failed:", err);
+    } finally {
+      setIsProcessingQr(false);
+    }
+  };
+
+  const handleSimulateScan = async (quote: any) => {
+    if (!qrCodeData || !user || !id) return;
+    setIsProcessingQr(true);
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch("/api/release-milestone", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          jobId: id,
+          quoteId: quote.id,
+          milestoneId: quote.milestones?.[0]?.id || "deposit",
+          isQrHandshake: true,
+          handshakeCode: job.verificationPin || job.handshakeCode
+        })
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to finalize QR handshake");
+      }
+
+      setShowQrModal(false);
+      setQrCodeData(null);
+    } catch (err) {
+      console.error("QR Handshake failed:", err);
+    } finally {
+      setIsProcessingQr(false);
+    }
+  };
+
+  const handleAcceptReschedule = async () => {
+    if (!id || !job.rescheduleProposal) return;
+    setIsProcessing(true);
+    try {
+      const newDate = job.rescheduleProposal.proposedDate;
+      const oldDate = job.scheduledDate;
+      const tradespersonId = job.acceptedTradespersonId;
+
+      // 1. Update Job
+      await updateDoc(doc(db, "jobs", id), {
+        scheduledDate: newDate,
+        "rescheduleProposal.status": "accepted",
+        updatedAt: serverTimestamp()
+      });
+
+      // 2. Update Tradesperson Calendar
+      try {
+        const tpRef = doc(db, "users", tradespersonId);
+        const tpSnap = await getDoc(tpRef);
+        if (tpSnap.exists()) {
+          const tpData = tpSnap.data();
+          const dateOverrides = tpData.dateOverrides || {};
+          
+          // Unbook old date
+          if (oldDate) {
+            delete dateOverrides[oldDate];
+          }
+          
+          // Book new date
+          dateOverrides[newDate] = "booked";
+
+          await updateDoc(tpRef, {
+            dateOverrides
+          });
+        }
+      } catch (err) {
+        console.error("Error updating tradesperson availability for reschedule:", err);
+      }
+
+      // 3. Notify Tradesperson
+      await sendNotification(
+        tradespersonId,
+        "Reschedule Accepted",
+        `Homeowner accepted the new start date for "${job.title}": ${format(new Date(newDate), 'dd MMM yyyy')}`,
+        "status",
+        `/job/${id}`
+      );
+
+      setJob(prev => ({
+        ...prev,
+        scheduledDate: newDate,
+        rescheduleProposal: { ...prev.rescheduleProposal, status: "accepted" }
+      }));
+    } catch (err) {
+      console.error("Error accepting reschedule:", err);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRejectReschedule = async () => {
+    if (!id || !job.rescheduleProposal) return;
+    setIsProcessing(true);
+    try {
+      await updateDoc(doc(db, "jobs", id), {
+        "rescheduleProposal.status": "rejected",
+        updatedAt: serverTimestamp()
+      });
+
+      // Notify Tradesperson
+      await sendNotification(
+        job.acceptedTradespersonId,
+        "Reschedule Rejected",
+        `Homeowner declined the reschedule request for "${job.title}".`,
+        "status",
+        `/job/${id}`
+      );
+
+      setJob(prev => ({
+        ...prev,
+        rescheduleProposal: { ...prev.rescheduleProposal, status: "rejected" }
+      }));
+    } catch (err) {
+      console.error("Error rejecting reschedule:", err);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleConfirmJob = async () => {
+    if (!id || !user || !job.scheduledDate) return;
+    setIsProcessing(true);
+    try {
+      // 1. Update Job
+      await updateDoc(doc(db, "jobs", id), {
+        isConfirmedByTradesperson: true,
+        updatedAt: serverTimestamp()
+      });
+
+      // 2. Update Tradesperson Availability
+      try {
+        const tpRef = doc(db, "users", user.uid);
+        const tpSnap = await getDoc(tpRef);
+        if (tpSnap.exists()) {
+          const tpData = tpSnap.data();
+          const dateOverrides = tpData.dateOverrides || {};
+          dateOverrides[job.scheduledDate] = "booked";
+
+          await updateDoc(tpRef, {
+            dateOverrides
+          });
+        }
+      } catch (err) {
+        console.error("Error updating availability on confirmation:", err);
+      }
+
+      // 3. Notify Homeowner
+      await sendNotification(
+        job.homeownerId,
+        "Job Confirmed",
+        `Tradesperson confirmed the start date for "${job.title}": ${format(new Date(job.scheduledDate), 'dd MMM yyyy')}`,
+        "status",
+        `/job/${id}`
+      );
+
+      setJob(prev => ({ ...prev, isConfirmedByTradesperson: true }));
+    } catch (err) {
+      console.error("Error confirming job:", err);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRequestRevision = async () => {
+    if (!id || !user || !myQuote) return;
+    
+    const currentRevisions = myQuote.revisionCount || 0;
+    if (currentRevisions >= 5) {
+      setError("Maximum revision limit (5) reached for this quote.");
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const revAmount = parseFloat(revisionAmount);
+      if (myQuote.status === "requote_requested") {
+        await respondToRequoteViaCommand({
+          user: user as any,
+          jobId: id,
+          quoteId: myQuote.id,
+          payload: {
+            amount: revAmount,
+            coverNote: revisionMessage,
+            message: revisionMessage,
+          },
+        });
+      } else {
+        await updateQuoteViaCommand({
+          user: user as any,
+          jobId: id,
+          quoteId: myQuote.id,
+          payload: {
+            amount: revAmount,
+            coverNote: revisionMessage,
+            message: revisionMessage,
+            quoteScope: (revisionScope || myQuote.quoteScope) as any,
+            paymentPreference: (revisionPaymentPreference || myQuote.paymentPreference) as any,
+          },
+        });
+      }
+      
+      // Notify homeowner
+      await sendNotification(
+        job.homeownerId,
+        "Quote Revision Submitted",
+        `The tradesperson has submitted a revised quote of £${revAmount} for "${job.title}".`,
+        "quote",
+        `/job/${id}`
+      );
+      
+      setIsEditingRevision(false);
+      setRevisionAmount("");
+      setRevisionMessage("");
+      toast.success("Quote revision submitted successfully.");
+    } catch (err: any) {
+      console.error("Error submitting revision:", err);
+      setError(err?.message || "Failed to submit revision.");
+      toast.error(err?.message || "Failed to submit revision.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleApproveRevision = async (quote: any) => {
+    if (!id || !user) return;
+    setIsProcessing(true);
+    try {
+      toast.info("Please accept the quote directly to approve and fund milestones.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRejectRevision = async (quote: any) => {
+    if (!id || !user) return;
+    setIsProcessing(true);
+    try {
+      await rejectQuoteViaCommand({
+        user: user as any,
+        jobId: id,
+        quoteId: quote.id,
+        reason: "Revision declined by homeowner",
+      });
+      
+      // Notify tradesperson
+      await sendNotification(
+        quote.tradespersonId,
+        "Revision Declined",
+        `The homeowner has declined your quote revision for "${job.title}".`,
+        "status",
+        `/job/${id}`
+      );
+      toast.success("Quote revision declined.");
+    } catch (err: any) {
+      console.error("Error rejecting revision:", err);
+      setError(err?.message || "Failed to decline revision.");
+      toast.error(err?.message || "Failed to decline revision.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleCancelJob = async () => {
+    if (!id || !user) return;
+    setIsProcessing(true);
+    try {
+      await cancelJobViaCommand({
+        user,
+        jobId: id,
+      });
+      setJob((prev: any) => ({ ...prev, status: "cancelled" }));
+      setShowActions(false);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleCancelJobClick = () => {
+    if (confirmCancel) {
+      handleCancelJob();
+      setConfirmCancel(false);
+    } else {
+      setConfirmCancel(true);
+      setTimeout(() => setConfirmCancel(false), 3000);
+    }
+  };
+
+  const isJobDeletable = Boolean(
+    job &&
+    !job.funded &&
+    !job.isPaid &&
+    (!job.escrowBalance || Number(job.escrowBalance) === 0) &&
+    (!job.amountPaid || Number(job.amountPaid) === 0) &&
+    (!job.escrowStatus || ["none", "unfunded"].includes(String(job.escrowStatus).toLowerCase())) &&
+    !job.acceptedTradespersonId &&
+    !job.acceptedTraderId &&
+    !job.assignedTraderId &&
+    !job.tradespersonId &&
+    !job.traderId &&
+    !job.acceptedQuoteId &&
+    (!job.disputeStatus || ["none", ""].includes(String(job.disputeStatus).toLowerCase())) &&
+    !job.disputedAt &&
+    !job.disputeId &&
+    ["draft", "open", "cancelled"].includes(job.status)
+  );
+
+  const handleDeleteJobClick = () => {
+    if (!isJobDeletable) {
+      toast.error("Funded, assigned, or disputed jobs cannot be deleted to protect escrow and dispute evidence.");
+      return;
+    }
+    if (confirmDelete) {
+      handleDeleteJob();
+      setConfirmDelete(false);
+    } else {
+      setConfirmDelete(true);
+      setTimeout(() => setConfirmDelete(false), 3000);
+    }
+  };
+
+  const handleDeleteJob = async () => {
+    if (!id || !job) return;
+    if (!isJobDeletable) {
+      toast.error("Funded, assigned, or disputed jobs cannot be deleted to protect escrow and dispute evidence.");
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      await deleteDoc(doc(db, "jobs", id));
+      toast.success("Job deleted successfully.");
+      navigate("/my-jobs");
+    } catch (err: any) {
+      console.error(err);
+      toast.error(err?.message || "Failed to delete job. Protected or funded jobs cannot be deleted.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRepostJob = async () => {
+    if (!id || !job || !user) return;
+    setIsProcessing(true);
+    try {
+      const result = await createJobViaCommand({
+        user,
+        payload: {
+          title: job.title || "Untitled Job",
+          description: job.description || "No description provided",
+          category: job.category || "General Maintenance",
+          subCategory: job.subCategory || job.subcategory || null,
+          postcode: job.postcode || "SW1A 1AA",
+          city: job.city || null,
+          area: job.area || null,
+          urgency: job.urgency === "emergency" ? "emergency" : "standard",
+          budget: job.budget || null,
+          photos: Array.isArray(job.photos) ? job.photos : [],
+          propertyId: job.propertyId || null,
+        },
+      });
+      setShowActions(false);
+      toast.success("Job reposted successfully!");
+      navigate(`/job/${result.jobId}`); // navigate to the new job
+    } catch (err: any) {
+      console.error(err);
+      toast.error(err.message || "Failed to repost job");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleStartChat = async (quote: any, tpProfile: any) => {
+    if (!id || !user || !job) return;
+    const conversationId = `${id}_${quote.tradespersonId}`;
+    const conversationRef = doc(db, "conversations", conversationId);
+    
+    try {
+      const convDoc = await getDoc(conversationRef);
+      if (!convDoc.exists()) {
+        await setDoc(conversationRef, {
+          id: conversationId,
+          participants: [job.homeownerId, quote.tradespersonId],
+          jobId: id,
+          jobTitle: job.title,
+          updatedAt: serverTimestamp(),
+        });
+      }
+      
+      navigate(`/chat/${conversationId}`, { 
+        state: { 
+          jobTitle: job.title,
+          recipientName: isHomeowner ? (tpProfile?.name || "Tradesperson") : (homeownerProfile?.name || "Homeowner")
+        }
+      });
+    } catch (err) {
+      console.error("Error starting chat:", err);
+    }
+  };
+
+  const handleDismissRecurring = async () => {
+    if (!id || !user || !job) return;
+    try {
+      const currentDismissed = job.recurringDismissedBy || [];
+      await updateDoc(doc(db, "jobs", id), {
+        recurringDismissedBy: [...currentDismissed, user.uid]
+      });
+      setJob((prev: any) => ({
+        ...prev,
+        recurringDismissedBy: [...currentDismissed, user.uid]
+      }));
+    } catch (err) {
+      console.error("Error dismissing recurring prompt:", err);
+    }
+  };
+
+  const handleBeforePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0 || !id || !user) return;
+    
+    setIsUploadingBeforePhoto(true);
+    try {
+      const files = Array.from(e.target.files) as File[];
+      const urls: string[] = [];
+      
+      for (const file of files) {
+        const url = await uploadStorageFile(file, `jobs/${id}/before_photos/${Date.now()}_${file.name}`, { contentType: file.type });
+        urls.push(url);
+      }
+      
+      await updateDoc(doc(db, "jobs", id), {
+        beforePhotos: arrayUnion(...urls)
+      });
+      
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `jobs/${id}`);
+    } finally {
+      setIsUploadingBeforePhoto(false);
+    }
+  };
+
+  const handleProposeRecurring = async () => {
+    if (!id || !user || !job) return;
+    setIsProposingRecurring(true);
+    try {
+      const acceptedQuote = quotes.find(q => q.status === "accepted");
+      const tradespersonId = acceptedQuote?.tradespersonId || job.acceptedTradespersonId;
+      if (!tradespersonId) throw new Error("No accepted quote or tradesperson found");
+
+      const scheduleId = `recurring_${id}_${Date.now()}`;
+      const otherPartyId = isHomeowner ? tradespersonId : job.homeownerId;
+      
+      await setDoc(doc(db, "recurring_schedules", scheduleId), {
+        id: scheduleId,
+        originalJobId: id,
+        homeownerId: job.homeownerId,
+        tradespersonId: tradespersonId,
+        participants: [job.homeownerId, tradespersonId],
+        category: job.category,
+        title: job.title,
+        postcode: job.postcode,
+        paymentPreference: job.paymentPreference,
+        quoteScope: job.quoteScope,
+        frequency: recurringFrequency,
+        status: "pending_approval",
+        proposedBy: user.uid,
+        amount: acceptedQuote.amount,
+        createdAt: serverTimestamp()
+      });
+
+      // Notify the other party
+      await sendNotification(
+        otherPartyId,
+        "Recurring Schedule Proposed",
+        `${isHomeowner ? "Homeowner" : "Tradesperson"} proposed a ${recurringFrequency} schedule for "${job.title}".`,
+        "status",
+        `/profile`
+      );
+
+      setShowRecurringModal(false);
+      // Automatically dismiss the prompt for this user so they don't see it again
+      await handleDismissRecurring();
+    } catch (err) {
+      console.error("Error proposing recurring schedule:", err);
+    } finally {
+      setIsProposingRecurring(false);
+    }
+  };
+
+  const { activeRole } = usePortal();
+  const isHomeowner = user?.uid === job?.homeownerId;
+  const isAssignedTrader = quotes.find(q => q.status === "accepted")?.tradespersonId === user?.uid || job?.acceptedTradespersonId === user?.uid;
+  const canSeeFullDetails = isHomeowner || isAssignedTrader;
+  const hasQuoted = quotes.some(q => q.tradespersonId === user?.uid);
+  const myQuote = quotes.find(q => q.tradespersonId === user?.uid);
+  const needsRequote = myQuote?.status === "requote_requested";
+
+  useEffect(() => {
+    if (needsRequote && myQuote) {
+      setQuoteAmount(myQuote.amount?.toString() || "");
+      setQuoteMessage(myQuote.message || "");
+      setPaymentPreference(myQuote.paymentPreference || "fixed_price");
+      setQuoteScope(myQuote.quoteScope || "complete_package");
+      if (myQuote.lineItems && myQuote.lineItems.length > 0) {
+        setLineItems(myQuote.lineItems);
+        setUseLineItems(true);
+      }
+      if (myQuote.depositTerm) setDepositTerm(myQuote.depositTerm);
+      if (myQuote.guaranteeTerm) setGuaranteeTerm(myQuote.guaranteeTerm);
+      if (myQuote.partsWarranty) setPartsWarranty(myQuote.partsWarranty);
+    }
+  }, [needsRequote, myQuote]);
+
+  const handleSendPaymentReminder = async () => {
+    if (!job || !id) return;
+    
+    // In job details, sometimes isHomeowner might be true, but since this is for the tradesperson, it should be called by the tradesperson
+    const acceptedQuote = quotes.find(q => q.status === "accepted");
+    const amount = ((acceptedQuote?.amount || 0) * 1.20).toFixed(2);
+    
+    const invoiceSubject = encodeURIComponent(`Payment Reminder: Invoice for ${job.title}`);
+    const messageBody = `Hi ${job?.homeownerName || 'Customer'},\n\nThis is a gentle reminder that the payment for "${job.title}" is still pending.\n\nThe total amount due is £${amount}.\n\nPlease settle the payment at your earliest convenience.\n\nThank you!`;
+    const encodedBodyText = encodeURIComponent(messageBody);
+
+    try {
+      if (reminderChannels.app) {
+        await sendNotification(
+          job.homeownerId,
+          "Payment Reminder",
+          `Friendly reminder: Payment of £${amount} for "${job.title}" is pending.`,
+          "status",
+          `/job/${id}`
+        );
+        toast.success("App notification sent.");
+      }
+
+      if (reminderChannels.email) {
+        window.location.href = `mailto:?subject=${invoiceSubject}&body=${encodedBodyText}`;
+      }
+
+      if (reminderChannels.whatsapp) {
+        window.open(`https://wa.me/?text=${encodedBodyText}`, '_blank');
+      }
+
+      if (reminderChannels.sms) {
+        window.open(`sms:?body=${encodedBodyText}`, '_blank');
+      }
+      
+      if (!reminderChannels.app && !reminderChannels.email && !reminderChannels.whatsapp && !reminderChannels.sms) {
+        toast.error("Please select at least one channel to send the reminder.");
+        return;
+      }
+
+      setShowPaymentReminder(false);
+    } catch (e) {
+      console.error("Error sending payment reminder:", e);
+      toast.error("Failed to send some reminders. Please try again.");
+    }
+  };
+
+  const handleDownloadInvoice = async () => {
+    const activeQuote = myQuote || quotes.find(q => q.status === "accepted");
+    if (!job || !activeQuote) {
+      toast.error("No accepted quote found to generate invoice.");
+      return;
+    }
+    
+    try {
+      const tpProfile = tradespersonProfiles[activeQuote.tradespersonId] || profile;
+      const invoiceData = await createOrGetJobInvoice(job, activeQuote, tpProfile, homeownerProfile);
+      await downloadInvoicePDF(invoiceData);
+      toast.success(`Downloaded ${invoiceData.isBrandedPro ? "Pro Branded" : "Standard"} Invoice PDF (${invoiceData.invoiceNumber})`);
+    } catch (err) {
+      console.error("Error downloading PDF invoice:", err);
+      toast.error("Failed to generate PDF invoice.");
+    }
+  };
+
+  if (loading) return <div className="py-12 flex justify-center"><Loader2 className="animate-spin" /></div>;
+  if (!job) return <div className="py-12 text-center">Job not found.</div>;
+
+  const fastestStartId = [...quotes]
+    .filter(q => q.startDate)
+    .sort((a, b) => new Date(a.startDate).getTime() - new Date(b.startDate).getTime())[0]?.id;
+
+  const sortedQuotes = [...quotes].sort((a, b) => {
+    // 1. Accepted first
+    if (a.status === "accepted" && b.status !== "accepted") return -1;
+    if (b.status === "accepted" && a.status !== "accepted") return 1;
+
+    // 2. AI Value (Percentile) - Higher is better
+    const analysisA = quoteAnalyses[a.id];
+    const analysisB = quoteAnalyses[b.id];
+    if (analysisA && analysisB) {
+      if (analysisA.percentile !== analysisB.percentile) {
+        return analysisB.percentile - analysisA.percentile;
+      }
+    }
+
+    // 3. Trader Rating
+    const profileA = tradespersonProfiles[a.tradespersonId];
+    const profileB = tradespersonProfiles[b.tradespersonId];
+    const ratingA = profileA?.rating || 0;
+    const ratingB = profileB?.rating || 0;
+    if (ratingA !== ratingB) return ratingB - ratingA;
+
+    // 4. Fastest Start (Earliest start date)
+    const dateA_start = a.startDate ? new Date(a.startDate).getTime() : Infinity;
+    const dateB_start = b.startDate ? new Date(b.startDate).getTime() : Infinity;
+    if (dateA_start !== dateB_start) return dateA_start - dateB_start;
+
+    // 5. Recency (Newest first)
+    const dateA = a.createdAt?.toDate?.() || new Date(a.createdAt || 0);
+    const dateB = b.createdAt?.toDate?.() || new Date(b.createdAt || 0);
+    return dateB.getTime() - dateA.getTime();
+  });
+
+  return (
+    <div className="max-w-2xl mx-auto bg-slate-50 min-h-screen pb-20">
+      <SEO 
+        title={job.title} 
+        description={job.description.substring(0, 160)}
+        ogType="article"
+        structuredData={{
+          "@context": "https://schema.org",
+          "@type": "JobPosting",
+          "title": job.title,
+          "description": job.description,
+          "datePosted": job.postedDate?.toDate?.()?.toISOString() || new Date().toISOString(),
+          "hiringOrganization": {
+            "@type": "Organization",
+            "name": "AnyTrader",
+            "logo": `${window.location.origin}/logo.png`
+          },
+          "jobLocation": {
+            "@type": "Place",
+            "address": {
+              "@type": "PostalAddress",
+              "addressLocality": job.location,
+              "addressRegion": "UK"
+            }
+          }
+        }}
+      />
+      {/* Header */}
+      <div className="bg-[#1e3a5f] text-white p-4 sticky top-0 z-30">
+        <div className="flex items-center justify-between max-w-2xl mx-auto">
+          <div className="flex items-center gap-3">
+            <button onClick={() => {
+              if (window.history.state && window.history.state.idx > 0) {
+                navigate(-1);
+              } else {
+                navigate("/");
+              }
+            }} className="w-10 h-10 bg-white/10 border border-black/20 rounded-xl flex items-center justify-center hover:bg-white/20 hover:scale-105 transition-all group shrink-0" title="Go Back">
+              <ChevronLeft className="w-6 h-6 group-hover:-translate-x-0.5 transition-transform" />
+            </button>
+            <div className="w-10 h-10 rounded-xl bg-white/10 flex items-center justify-center">
+              <Briefcase className="w-6 h-6 text-white" />
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {isHomeowner && (
+              <div className="relative">
+                <button 
+                  onClick={() => setShowActions(!showActions)}
+                  className="p-2 hover:bg-white/10 rounded-full text-white transition-colors"
+                  title="More Options"
+                >
+                  <MoreVertical className="w-6 h-6" />
+                </button>
+                
+                <AnimatePresence>
+                  {showActions && (
+                    <>
+                      <div className="fixed inset-0 z-10" onClick={() => setShowActions(false)} />
+                      <motion.div
+                        initial={{ opacity: 0, scale: 0.95, y: -10 }}
+                        animate={{ opacity: 1, scale: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.95, y: -10 }}
+                        className="absolute right-0 mt-2 w-48 bg-white rounded-xl shadow-xl border border-black z-20 py-2"
+                      >
+                        {job.status !== "completed" && (
+                          <button
+                            onClick={() => navigate(`/post-job`, { state: { editJob: job } })}
+                            className="w-full px-4 py-2 text-left text-sm font-semibold text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+                          >
+                            <Edit2 className="w-4 h-4" />
+                            Edit Job
+                          </button>
+                        )}
+                        
+                        {(job.status === "posted" || job.status === "open" || job.status === "accepted" || job.status === "pending_admin_review" || job.status === "quoting") && (
+                          <button
+                            onClick={handleCancelJobClick}
+                            disabled={isProcessing}
+                            className={cn("w-full px-4 py-2 text-left text-sm font-semibold flex items-center gap-2 disabled:opacity-50",
+                              confirmCancel ? "text-red-600 hover:bg-red-50" : "text-amber-600 hover:bg-amber-50"
+                            )}
+                          >
+                            {isProcessing ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : confirmCancel ? (
+                              <AlertTriangle className="w-4 h-4 text-red-600" />
+                            ) : (
+                              <XCircle className="w-4 h-4" />
+                            )}
+                            {confirmCancel ? "Confirm Cancel" : "Cancel Job"}
+                          </button>
+                        )}
+                        
+                        {(job.status === "cancelled" || job.status === "completed") && (
+                          <button
+                            onClick={handleRepostJob}
+                            disabled={isProcessing}
+                            className="w-full px-4 py-2 text-left text-sm font-semibold text-green-600 hover:bg-green-50 flex items-center gap-2 disabled:opacity-50"
+                          >
+                            {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
+                            Repost Job
+                          </button>
+                        )}
+                        
+                        {isJobDeletable && (
+                          <>
+                            <div className="h-px bg-slate-100 my-1" />
+                            <button
+                              onClick={handleDeleteJobClick}
+                              disabled={isProcessing}
+                              className="w-full px-4 py-2 text-left text-sm font-semibold text-red-600 hover:bg-red-50 flex items-center gap-2 disabled:opacity-50"
+                            >
+                              {isProcessing ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : confirmDelete ? (
+                                  <AlertTriangle className="w-4 h-4 text-red-600" />
+                              ) : (
+                                  <Trash2 className="w-4 h-4" />
+                              )}
+                              {confirmDelete ? "Confirm Delete" : "Delete Job"}
+                            </button>
+                          </>
+                        )}
+
+                        {/* Delete Job option removed as requested (except for cancelled now) */}
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
+            )}
+
+            {/* Close Button (X) */}
+            <button
+              onClick={() => {
+                if (window.history.state && window.history.state.idx > 0) {
+                  navigate(-1);
+                } else {
+                  navigate("/");
+                }
+              }}
+              className="w-10 h-10 bg-white/10 border border-black/20 rounded-xl flex items-center justify-center hover:bg-white/20 hover:scale-105 transition-all group shrink-0 text-white"
+              title="Close Job Details"
+              aria-label="Close Job Details"
+            >
+              <X className="w-6 h-6 group-hover:scale-110 transition-transform" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="p-4 space-y-6">
+        {(!isHomeowner && job.status === "in_progress") ? (
+          <div className="space-y-6 pb-[100px] mt-4">
+            {/* UK Active Job Tracker Header */}
+            <div className="bg-white rounded-[2rem] p-8 shadow-sm border border-black flex flex-col items-center">
+              <div className="w-full flex justify-between items-center mb-8">
+                <h2 className="font-bold text-lg text-slate-900">UK Active Job Tracker</h2>
+                <div className="flex items-center gap-1.5 text-green-600 font-bold text-sm bg-green-50 px-3 py-1 rounded-full border border-green-100">
+                  <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                  LIVE
+                </div>
+              </div>
+              <div className="text-[4.5rem] font-black text-blue-600 tracking-tighter leading-none mb-2 tabular-nums">
+                {formatTimer(elapsedSeconds)}
+              </div>
+            </div>
+
+            {/* Job Progress */}
+            <div className="bg-white rounded-[2rem] p-6 shadow-sm border border-black">
+              <h3 className="font-bold text-2xl text-slate-900 mb-2 tracking-tight">Job Progress</h3>
+              <p className="text-slate-600 font-medium pb-4 border-b border-black mb-6">{job.category} Repair at {job.fullAddress || job.houseNumber || job.postcode}</p>
+              
+              <div className="space-y-5">
+                <label className="flex items-start gap-4 cursor-pointer group">
+                  <div className="w-7 h-7 rounded-lg border-2 border-green-500 bg-green-500 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-sm">
+                    <Check className="w-4 h-4" strokeWidth={3} />
+                  </div>
+                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Secure Area (HSE Guidelines)</span>
+                </label>
+                <label className="flex items-start gap-4 cursor-pointer group">
+                  <div className="w-7 h-7 rounded-lg border-2 border-green-500 bg-green-500 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-sm">
+                    <Check className="w-4 h-4" strokeWidth={3} />
+                  </div>
+                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Isolate Water Supply</span>
+                </label>
+                <label className="flex items-start gap-4 cursor-pointer group">
+                  <div className="w-7 h-7 rounded-lg border-2 border-black flex items-center justify-center shrink-0 mt-0.5 bg-white group-hover:border-blue-500 transition-colors">
+                  </div>
+                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Initial Assessment & Risk Check</span>
+                </label>
+                <label className="flex items-start gap-4 cursor-pointer group">
+                  <div className="w-7 h-7 rounded-lg border-2 border-black flex items-center justify-center shrink-0 mt-0.5 bg-white group-hover:border-blue-500 transition-colors">
+                  </div>
+                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Commence Repair Work</span>
+                </label>
+              </div>
+            </div>
+
+            {/* Media Gallery */}
+            <div className="bg-white rounded-[2rem] p-6 shadow-sm border border-black">
+              <h3 className="font-bold text-2xl text-slate-900 tracking-tight mb-1">Media Gallery</h3>
+              <p className="text-slate-600 font-medium mb-5">During Work</p>
+              
+              <div className="flex gap-4 overflow-x-auto pb-4 snap-x hide-scrollbar">
+                <div className="w-32 h-32 bg-slate-900 rounded-[1.5rem] shrink-0 relative overflow-hidden snap-start shadow-sm border border-white/20">
+                   <img src="https://images.unsplash.com/photo-1581092921461-7031e4bfb83e?auto=format&fit=crop&w=300&q=80" alt="Work 1" className="w-full h-full object-cover opacity-90" />
+                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent"></div>
+                   <span className="absolute bottom-3 left-0 right-0 text-center text-white text-xs font-semibold tracking-wide shadow-black">10:02 AM</span>
+                </div>
+                <div className="w-32 h-32 bg-slate-900 rounded-[1.5rem] shrink-0 relative overflow-hidden snap-start shadow-sm border border-white/20">
+                   <img src="https://images.unsplash.com/photo-1581092160607-ee22621dd758?auto=format&fit=crop&w=300&q=80" alt="Work 2" className="w-full h-full object-cover opacity-90" />
+                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent"></div>
+                   <span className="absolute bottom-3 left-0 right-0 text-center text-white text-xs font-semibold tracking-wide shadow-black">10:10 AM</span>
+                </div>
+                <button className="w-32 h-32 border-2 border-dashed border-black bg-slate-50 hover:bg-slate-100 transition-colors rounded-[1.5rem] shrink-0 flex flex-col items-center justify-center gap-3 text-slate-500 snap-start">
+                  <div className="w-10 h-10 rounded-full bg-white shadow-sm flex items-center justify-center text-slate-400">
+                    <Plus className="w-6 h-6" />
+                  </div>
+                  <span className="text-sm font-semibold text-slate-600 tracking-tight">Add Photo</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Bottom Actions Fixed Area */}
+            <div className="fixed bottom-[100px] sm:bottom-[80px] left-0 right-0 p-4 bg-slate-50/90 backdrop-blur-md border-t border-black/50 z-40">
+              <div className="max-w-2xl mx-auto flex items-center justify-between gap-3">
+                <button className="flex-1 bg-slate-500 text-white py-4 rounded-[1.2rem] font-bold shadow-sm active:scale-95 transition-all text-[17px] tracking-tight">
+                  Pause
+                </button>
+                <button 
+                  onClick={() => setShowJobSummary(true)}
+                  className="flex-[2] bg-green-600 text-white py-4 rounded-[1.2rem] font-bold shadow-sm active:scale-95 transition-all text-[17px] tracking-tight hover:bg-green-700"
+                >
+                  Complete Job
+                </button>
+                <button 
+                  onClick={() => setShowDigitalId(true)}
+                  className="px-6 bg-blue-700 text-white py-4 rounded-[1.2rem] font-bold shadow-sm active:scale-95 transition-all text-[15px] tracking-tight text-center"
+                >
+                  CSCS Card
+                </button>
+              </div>
+            </div>
+
+            {/* Trader Tools for Dispute/Revision */}
+            {isAssignedTrader && (
+              <div className="space-y-3 pt-6 border-t border-black mt-8 mb-16 px-4">
+                <button 
+                  onClick={() => setShowDisputeModal(true)}
+                  className="w-full bg-white border border-red-200 text-red-600 p-4 rounded-[1.5rem] font-bold hover:bg-red-50 transition-all flex items-center justify-center gap-2"
+                >
+                  <AlertTriangle className="w-5 h-5" /> Raise a Dispute
+                </button>
+                
+                {!isEditingRevision ? (
+                  <button 
+                    onClick={() => {
+                      const myQuote = quotes.find(q => q.tradespersonId === user?.uid);
+                      if (myQuote) {
+                        setRevisionAmount(myQuote.amount.toString());
+                        setIsEditingRevision(true);
+                      }
+                    }}
+                    className="w-full bg-white border border-black text-slate-700 p-4 rounded-[1.5rem] font-bold hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
+                  >
+                    <Edit2 className="w-5 h-5" /> Request Job Revision
+                  </button>
+                ) : (
+                  <div className="bg-white border border-black p-5 rounded-[1.5rem] space-y-4">
+                    <p className="font-bold text-sm text-slate-900">Request Revision</p>
+                    <input
+                      type="number"
+                      value={revisionAmount}
+                      onChange={(e) => setRevisionAmount(e.target.value)}
+                      placeholder="New total amount"
+                      className="w-full px-4 py-3 rounded-xl border border-black focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
+                    />
+                    <textarea
+                      value={revisionReason}
+                      onChange={(e) => setRevisionReason(e.target.value)}
+                      placeholder="Reason for revision (e.g. additional parts needed)"
+                      className="w-full px-4 py-3 rounded-xl border border-black resize-none h-24 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
+                    />
+                    <div className="flex gap-2">
+                       <button 
+                         onClick={() => setIsEditingRevision(false)}
+                         className="flex-1 px-4 py-3 border border-black text-slate-600 rounded-xl font-bold hover:bg-slate-50"
+                       >
+                         Cancel
+                       </button>
+                       <button 
+                         onClick={handleRequestRevision}
+                         disabled={!revisionAmount || !revisionReason || isProcessing}
+                         className="flex-1 px-4 py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 disabled:opacity-50"
+                       >
+                         Submit
+                       </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (!isHomeowner && job.status === "accepted") ? (
+          <div className="bg-white min-h-screen px-4 pt-6 pb-6 relative">
+            {/* Header & Status */}
+            <div className="space-y-3">
+              <h1 className="text-2xl font-black text-slate-900 leading-tight tracking-tight">
+                {job.category}: {job.title}
+              </h1>
+              <div className="flex items-center gap-2 mt-1">
+                <span className={cn("px-4 py-1.5 rounded-full text-sm font-bold capitalize tracking-wide", job.status === "accepted" ? "bg-green-500 text-white" : "bg-blue-600 text-white")}>
+                  {job.status === "accepted" && job.trackingStatus === "on_route" ? "On Route" : 
+                   job.status === "accepted" && job.trackingStatus === "arrived" ? "Arrived" : 
+                   "Accepted"}
+                </span>
+              </div>
+            </div>
+
+            {/* Job Actions */}
+            <div className="space-y-3 mt-6">
+              <h2 className="font-bold text-[17px] text-slate-900 tracking-tight">Job Actions</h2>
+              <div className="grid grid-cols-2 gap-3">
+                <button 
+                  onClick={() => {
+                    const acceptedQuote = quotes.find(q => q.status === "accepted");
+                    const targetTradesperson = acceptedQuote?.tradespersonId || job.acceptedTradespersonId;
+                    if (targetTradesperson) {
+                      const tpProfile = tradespersonProfiles[targetTradesperson];
+                      handleStartChat(acceptedQuote || { jobId: job.id, amount: 0, tradespersonId: targetTradesperson }, tpProfile);
+                    }
+                  }}
+                  className="bg-[#2D68C4] text-white py-3 rounded-[14px] flex items-center justify-center gap-2 font-bold text-[15px] shadow-sm transform hover:scale-[1.02] transition-transform active:scale-95"
+                >
+                  <MessageSquare className="w-5 h-5" /> Open Chat
+                </button>
+                <button
+                  onClick={() => setShowContractModal(true)}
+                  className="bg-[#1e3a5f] text-white py-3 rounded-[14px] flex items-center justify-center gap-2 font-bold text-[15px] shadow-sm transform hover:scale-[1.02] transition-transform active:scale-95 border border-black"
+                >
+                  <FileText className="w-5 h-5 text-blue-300" /> Google Docs Legal Contract
+                </button>
+                {!job.trackingStatus && (
+                  <button 
+                    onClick={handleSetOnRoute}
+                    className="bg-[#2D68C4] text-white py-3 rounded-[14px] flex items-center justify-center gap-2 font-bold text-[15px] shadow-sm transform hover:scale-[1.02] transition-transform active:scale-95 col-span-2"
+                  >
+                    <Navigation className="w-4 h-4 fill-white flex-shrink-0" /> Signal On Route
+                  </button>
+                )}
+                {job.trackingStatus === "on_route" && (
+                  <button 
+                    onClick={handleSetArrived}
+                    className="bg-green-600 text-white py-3 rounded-[14px] flex items-center justify-center gap-2 font-bold text-[15px] shadow-sm transform hover:scale-[1.02] transition-transform active:scale-95 col-span-2"
+                  >
+                    <MapPin className="w-5 h-5" /> Signal Arrived
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Job Location */}
+            <div className="space-y-3 mt-6">
+              <h2 className="font-bold text-lg text-slate-900 tracking-tight">Job Location</h2>
+              <div className="bg-white rounded-2xl border border-black shadow-sm overflow-hidden flex flex-col">
+                <div className="h-40 w-full relative pointer-events-none overflow-hidden">
+                  <iframe 
+                    width="100%" 
+                    height="100%" 
+                    style={{ border: 0 }} 
+                    loading="lazy" 
+                    referrerPolicy="no-referrer-when-downgrade"
+                    src={`https://maps.google.com/maps?q=${encodeURIComponent((job.fullAddress || job.postcode || job.location) + ", UK")}&t=&z=13&ie=UTF8&iwloc=&output=embed`} 
+                  />
+                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-blue-50/20">
+                    <div className="bg-white/95 px-3 py-1.5 rounded-md text-xs font-bold text-slate-800 shadow-md border border-black/80 backdrop-blur-md mb-2 z-10 relative">
+                       <span className="tracking-widest uppercase text-[10px] text-slate-600">APPROX. AREA</span>
+                    </div>
+                    <MapPin className="w-8 h-8 text-slate-800 drop-shadow-md z-10 relative" />
+                    <div className="w-32 h-32 rounded-full border border-blue-400 bg-blue-400/20 absolute"></div>
+                  </div>
+                </div>
+                <button onClick={() => {
+                  const address = encodeURIComponent((job?.fullAddress && job.houseNumber ? `${job.houseNumber} ${job.fullAddress}` : job?.fullAddress) || job?.postcode || job?.area || '');
+                  window.open(`https://www.google.com/maps/dir/?api=1&destination=${address}`, '_blank');
+                }} className="w-full bg-[#2D68C4] text-white py-4 font-bold text-[15px] flex items-center justify-center gap-2 hover:bg-blue-700 transition-colors active:bg-blue-800">
+                  <Navigation className="w-4 h-4 fill-white" /> Get Directions
+                </button>
+              </div>
+            </div>
+
+            {/* Work Details */}
+            <div className="space-y-2 mt-8">
+              <h2 className="font-bold text-[17px] text-slate-900 tracking-tight">Work Details</h2>
+              <p className="text-slate-800 leading-relaxed text-[15px]">{job.description}</p>
+              
+              <div className="grid grid-cols-2 gap-3 mt-5">
+                <div className="bg-white p-4 rounded-xl border border-black shadow-sm flex flex-col justify-between">
+                  <h3 className="font-bold text-[13px] text-slate-900 mb-4 tracking-tight">Job Checklist</h3>
+                  <div className="space-y-3.5 w-full">
+                    <label className="flex items-center gap-2.5 text-[14px] text-slate-700 font-medium cursor-pointer relative group">
+                      <div className="w-4 h-4 rounded-sm border-2 border-[#2D68C4] flex items-center justify-center group-has-[input:checked]:bg-[#2D68C4] transition-colors">
+                         <input type="checkbox" className="w-full h-full opacity-0 absolute cursor-pointer" />
+                         <Check className="w-3 h-3 text-white opacity-0 group-has-[input:checked]:opacity-100 transition-opacity" strokeWidth={3} />
+                      </div>
+                      Assess Damage
+                    </label>
+                    <label className="flex items-center gap-2.5 text-[14px] text-slate-700 font-medium cursor-pointer relative group">
+                      <div className="w-4 h-4 rounded-sm border-2 border-[#2D68C4] flex items-center justify-center group-has-[input:checked]:bg-[#2D68C4] transition-colors">
+                         <input type="checkbox" className="w-full h-full opacity-0 absolute cursor-pointer" />
+                         <Check className="w-3 h-3 text-white opacity-0 group-has-[input:checked]:opacity-100 transition-opacity" strokeWidth={3} />
+                      </div>
+                      Locate Shutoff
+                    </label>
+                    <label className="flex items-center gap-2.5 text-[14px] text-slate-700 font-medium cursor-pointer relative group">
+                      <div className="w-4 h-4 rounded-sm border-2 border-[#2D68C4] flex items-center justify-center group-has-[input:checked]:bg-[#2D68C4] transition-colors">
+                         <input type="checkbox" className="w-full h-full opacity-0 absolute cursor-pointer" />
+                         <Check className="w-3 h-3 text-white opacity-0 group-has-[input:checked]:opacity-100 transition-opacity" strokeWidth={3} />
+                      </div>
+                      Complete Repair
+                    </label>
+                  </div>
+                </div>
+                
+                <div className="bg-white p-4 rounded-xl border border-black shadow-sm flex flex-col text-center">
+                  <h3 className="font-bold text-[13px] text-slate-900 mb-3 tracking-tight leading-tight">Upload Before Photos</h3>
+                  {job.beforePhotos && job.beforePhotos.length > 0 && (
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                      {job.beforePhotos.map((url: string, i: number) => (
+                        <div key={i} className="aspect-square rounded-lg overflow-hidden border border-black bg-slate-50">
+                          <img src={url} alt={`Before ${i+1}`} className="w-full h-full object-cover" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex gap-2">
+                    <label className="flex-1 border border-dashed border-[#2D68C4] bg-blue-50/50 rounded-lg flex flex-col items-center justify-center gap-1.5 hover:bg-blue-50 transition-colors text-[#2D68C4] py-4 cursor-pointer relative">
+                      {isUploadingBeforePhoto ? (
+                        <Loader2 className="w-[18px] h-[18px] animate-spin" />
+                      ) : (
+                        <>
+                          <Camera className="w-[18px] h-[18px]" />
+                          <span className="text-[12px] font-medium text-[#2D68C4]">Camera</span>
+                        </>
+                      )}
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        capture="environment"
+                        className="hidden" 
+                        onChange={handleBeforePhotoUpload}
+                        disabled={isUploadingBeforePhoto}
+                      />
+                    </label>
+                    <label className="flex-1 border border-dashed border-[#2D68C4] bg-blue-50/50 rounded-lg flex flex-col items-center justify-center gap-1.5 hover:bg-blue-50 transition-colors text-[#2D68C4] py-4 cursor-pointer relative">
+                      {isUploadingBeforePhoto ? (
+                        <Loader2 className="w-[18px] h-[18px] animate-spin" />
+                      ) : (
+                        <>
+                          <ImageIcon className="w-[18px] h-[18px]" />
+                          <span className="text-[12px] font-medium text-[#2D68C4]">Gallery</span>
+                        </>
+                      )}
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        multiple 
+                        className="hidden" 
+                        onChange={handleBeforePhotoUpload}
+                        disabled={isUploadingBeforePhoto}
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Bottom Actions */}
+            <div className="mt-8 pb-4">
+              <div className="w-full flex items-center gap-3">
+                <button 
+                  onClick={handleStartJob}
+                  className="flex-1 bg-[#2D68C4] text-white py-3.5 rounded-[14px] font-bold text-[15px] hover:bg-blue-700 transition-colors shadow-sm active:scale-95 transform"
+                >
+                  Start Work
+                </button>
+                <button 
+                  onClick={() => setShowDigitalId(true)}
+                  className="flex-1 bg-[#2D68C4] text-white py-3.5 rounded-[14px] font-bold text-[15px] hover:bg-blue-700 transition-colors shadow-sm active:scale-95 transform"
+                >
+                  Show Digital ID
+                </button>
+              </div>
+            </div>
+            
+          </div>
+        ) : (
+          <>
+        {/* Instant Match Searching Banner */}
+        {isHomeowner && job.status === "posted" && job.boostTier === "instant_match" && (
+          <div className="bg-[#0f2c59] p-8 rounded-[2rem] space-y-6 shadow-2xl shadow-blue-900/40 relative overflow-hidden text-center flex flex-col items-center">
+             <div className="relative z-10 flex items-center justify-between w-full mb-2">
+                <h2 className="text-2xl font-bold text-white text-center w-full">Homeowner<br/>Matching Status</h2>
+             </div>
+
+             {/* Radar / Radio Waves Animation */}
+             <div className="relative w-64 h-64 flex items-center justify-center my-4 opacity-90">
+                <div className="absolute inset-0 border-2 border-orange-500/20 rounded-full animate-[ping_3s_linear_infinite]"></div>
+                <div className="absolute inset-4 border-2 border-orange-500/30 rounded-full animate-[ping_3s_linear_infinite]" style={{ animationDelay: '0.75s' }}></div>
+                <div className="absolute inset-8 border-2 border-orange-500/40 rounded-full animate-[ping_3s_linear_infinite]" style={{ animationDelay: '1.5s' }}></div>
+                <div className="absolute inset-12 border border-orange-500/40 rounded-full"></div>
+                <div className="absolute inset-20 border border-orange-500/60 rounded-full"></div>
+                {/* Radar Sweep */}
+                <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-transparent via-orange-500/10 to-orange-500/30 animate-spin" style={{ clipPath: 'polygon(50% 50%, 100% 0, 100% 100%)', animationDuration: '4s' }}></div>
+                
+                <div className="relative z-10 flex flex-col items-center justify-center space-y-1">
+                   <div className="relative">
+                      <svg className="w-8 h-8 text-orange-500 opacity-80 mb-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M4 14a10 10 0 0 1 16 0"></path>
+                        <path d="M8 17a4 4 0 0 1 8 0"></path>
+                        <path d="M12 20v.01"></path>
+                      </svg>
+                   </div>
+                   <span className="text-5xl font-black tracking-tighter text-white drop-shadow-md">
+                     <span className="text-orange-500">{Math.floor((imElapsedSeconds % 3600) / 60).toString().padStart(2, '0')}</span>:{Math.floor(imElapsedSeconds % 60).toString().padStart(2, '0')}
+                   </span>
+                </div>
+             </div>
+
+           <div className="relative z-10 w-full px-4">
+               <p className="text-blue-100 text-[15px] font-medium max-w-xs mx-auto mb-6">
+                 Broadcasting your emergency request to the nearest 10 experts...
+               </p>
+               <button 
+                 onClick={async () => {
+                   if (!id || !user) return;
+                   try {
+                     const matchRef = doc(collection(db, "instant_matches"));
+                     const attemptRef = doc(collection(db, "instant_match_attempts"));
+                     const batch = writeBatch(db);
+
+                     batch.set(matchRef, {
+                       jobId: id,
+                       customerId: user.uid,
+                       status: "searching",
+                       createdAt: serverTimestamp()
+                     });
+
+                     batch.set(attemptRef, {
+                       instantMatchId: matchRef.id,
+                       traderId: user.uid,
+                       status: "pending",
+                       attemptNumber: 1,
+                       createdAt: serverTimestamp(),
+                       expiresAt: new Date(Date.now() + 60000).toISOString()
+                     });
+                     
+                     await batch.commit();
+                     toast.success("Simulation triggered! Switch to Trader portal to see the alert.");
+                   } catch(e: any) {
+                     toast.error("Error creating match: " + e.message);
+                   }
+                 }}
+                 className="w-full bg-orange-500 text-white font-bold py-3 px-4 flex justify-center items-center gap-2 rounded-2xl hover:bg-orange-600 transition-colors mb-4"
+               >
+                 <Zap className="w-5 h-5" />
+                 Simulate: Send Match Alert to ME
+               </button>
+             </div>
+
+             <div className="w-full space-y-3 relative z-10">
+                {/* Mock Traders being notified */}
+                {['Mike P.', 'Sarah L.', 'David K.'].map((name, i) => (
+                  <div key={i} className="bg-white rounded-[1.25rem] p-4 flex items-center justify-between shadow-lg">
+                    <div className="flex items-center gap-4">
+                      <div className="w-12 h-12 rounded-full bg-slate-200 overflow-hidden shrink-0 border-2 border-black shadow-sm">
+                         <img src={`https://i.pravatar.cc/150?u=${name}`} alt={name} className="w-full h-full object-cover" />
+                      </div>
+                      <div className="text-left">
+                        <p className="font-bold text-slate-900 text-[15px]">{name} <span className="text-slate-400 font-normal">- {job.category}</span></p>
+                        <div className="flex items-center gap-1 mt-0.5 text-slate-500 text-xs font-semibold">
+                          <Zap className="w-3 h-3 text-slate-400" />
+                          <span>{job.category}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-slate-500">Notified...</span>
+                      <div className="relative flex h-2.5 w-2.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-orange-500"></span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+             </div>
+          </div>
+        )}
+
+        {/* Confirmation Banner (Tradesperson) */}
+        {!isHomeowner && job.status === "accepted" && !job.isConfirmedByTradesperson && job.scheduledDate && (
+          <div className="bg-indigo-600 text-white p-6 rounded-3xl space-y-4 shadow-xl shadow-indigo-100 relative overflow-hidden">
+            <div className="absolute top-0 right-0 p-4 opacity-10">
+              <Calendar className="w-24 h-24" />
+            </div>
+            <div className="relative z-10">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center backdrop-blur-sm">
+                  <Clock className="w-5 h-5" />
+                </div>
+                <h3 className="font-bold text-lg">Confirm Start Date</h3>
+              </div>
+              <p className="text-sm text-indigo-100 mb-4">
+                Homeowner accepted your quote! Please confirm you can start on <strong>{format(new Date(job.scheduledDate), 'dd MMM yyyy')}</strong>.
+              </p>
+              <div className="flex gap-2">
+                <button 
+                  onClick={handleConfirmJob}
+                  disabled={isProcessing}
+                  className="flex-1 bg-white text-indigo-600 py-3 rounded-xl text-sm font-bold hover:bg-indigo-50 transition-colors flex items-center justify-center gap-2"
+                >
+                  {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                  Confirm & Schedule
+                </button>
+                <button 
+                  onClick={() => setShowRescheduleModal(true)}
+                  className="px-4 py-3 bg-indigo-500 text-white rounded-xl text-sm font-bold hover:bg-indigo-400 transition-colors flex items-center gap-2"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Reschedule
+                </button>
+              </div>
+              <div className="mt-4 pt-4 border-t border-black/10">
+                <a 
+                  href="/availability" 
+                  className="text-[10px] font-bold uppercase tracking-widest text-indigo-200 hover:text-white flex items-center gap-1"
+                >
+                  Check my availability calendar
+                  <ChevronRight className="w-3 h-3" />
+                </a>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Live Trader Tracking Map (Homeowner) */}
+        {isHomeowner && job.status === "accepted" && job.trackingStatus && (
+          <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-xl overflow-hidden relative">
+            <div className="absolute top-0 right-0 p-4 opacity-5">
+              <Navigation className="w-24 h-24 text-white" />
+            </div>
+            <div className="relative z-10 flex items-center justify-between">
+              <div>
+                <h3 className="text-xl font-black mb-1 tracking-tight text-white flex items-center gap-2">
+                  <span className="relative flex h-3 w-3">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span>
+                  </span>
+                  Live Tracking
+                </h3>
+                <p className="text-sm text-slate-400 font-bold uppercase tracking-wider">
+                  {job.trackingStatus === "on_route" ? "Tradesperson is on route" : "Tradesperson has arrived"}
+                </p>
+              </div>
+            </div>
+
+            <div className="relative h-48 w-full rounded-2xl overflow-hidden bg-slate-800 border border-slate-700">
+              {isLoaded ? (
+                <GoogleMap
+                  mapContainerStyle={{ width: '100%', height: '100%' }}
+                  center={{ lat: 51.5074, lng: -0.1278 }}
+                  zoom={12}
+                  options={{
+                    disableDefaultUI: true,
+                    gestureHandling: 'none',
+                    styles: [
+                      { "elementType": "geometry", "stylers": [{ "color": "#242f3e" }] },
+                      { "elementType": "labels.text.stroke", "stylers": [{ "color": "#242f3e" }] },
+                      { "elementType": "labels.text.fill", "stylers": [{ "color": "#746855" }] },
+                      {
+                        "featureType": "road",
+                        "elementType": "geometry",
+                        "stylers": [{ "color": "#38414e" }]
+                      },
+                      {
+                        "featureType": "road",
+                        "elementType": "geometry.stroke",
+                        "stylers": [{ "color": "#212a37" }]
+                      },
+                      {
+                        "featureType": "water",
+                        "elementType": "geometry",
+                        "stylers": [{ "color": "#17263c" }]
+                      }
+                    ]
+                  }}
+                >
+                  <OverlayViewF position={{ lat: 51.5074, lng: -0.1278 }} mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}>
+                    <div className="absolute -translate-x-1/2 -translate-y-1/2">
+                      {job.trackingStatus === "on_route" ? (
+                        <div className="w-8 h-8 bg-blue-500 rounded-full flex items-center justify-center shadow-lg shadow-blue-500/50 animate-pulse border-2 border-black">
+                          <Navigation className="w-4 h-4 text-white" />
+                        </div>
+                      ) : (
+                        <div className="w-8 h-8 bg-green-500 text-white rounded-full flex items-center justify-center shadow-lg shadow-green-500/50 border-2 border-black">
+                          <MapPin className="w-4 h-4" />
+                        </div>
+                      )}
+                    </div>
+                  </OverlayViewF>
+                </GoogleMap>
+              ) : (
+                <div className="absolute inset-0 bg-slate-800 animate-pulse border border-slate-700"></div>
+              )}
+              <div className="absolute bottom-4 left-4 right-4 bg-slate-900/90 backdrop-blur-md p-3 rounded-xl border border-slate-700 text-white shadow-xl pointer-events-none">
+                 <div className="flex items-center justify-between">
+                   <div className="flex items-center gap-2">
+                     <Clock className="w-4 h-4 text-blue-400" />
+                     <span className="text-xs font-bold font-mono">
+                       {job.trackingStatus === "on_route" ? "ETA: 12 mins (2.4 mi)" : "Arrived at location"}
+                     </span>
+                   </div>
+                 </div>
+              </div>
+            </div>
+            {job.trackingStatus === "arrived" && (
+              <div className="bg-green-500/10 border border-green-500/20 p-3 rounded-xl flex items-center gap-3">
+                 <CheckCircle2 className="w-5 h-5 text-green-400" />
+                 <p className="text-sm font-bold text-green-400">The tradesperson is ready. Please check their digital ID.</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Verification PIN Banner (Homeowner) */}
+        {isHomeowner && job.status === "accepted" && job.verificationPin && (
+          <div className="bg-indigo-600 text-white p-6 rounded-3xl space-y-4 shadow-xl shadow-indigo-100 relative overflow-hidden">
+            <div className="absolute top-0 right-0 p-4 opacity-10">
+              <ShieldCheck className="w-24 h-24" />
+            </div>
+            <div className="relative z-10">
+              <h3 className="text-xl font-black mb-2 tracking-tight">Identity Verification</h3>
+              <p className="text-sm text-indigo-100 leading-relaxed mb-4">
+                To ensure your safety, please provide the following 4-digit code to the trader upon arrival. They cannot start the job without it.
+              </p>
+              <div className="bg-white/10 p-4 rounded-2xl flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-bold text-indigo-200 uppercase tracking-widest mb-1">Verification PIN</p>
+                  <p className="text-4xl font-black font-mono tracking-[0.25em]">{job.verificationPin}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Waiting for Confirmation Banner (Homeowner) */}
+        {isHomeowner && job.status === "accepted" && !job.isConfirmedByTradesperson && job.scheduledDate && (
+          <div className="bg-slate-50 border border-black p-6 rounded-3xl space-y-3">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-slate-200 flex items-center justify-center">
+                <Clock className="w-5 h-5 text-slate-500" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-900">Waiting for Confirmation</h3>
+                <p className="text-xs text-slate-500">Tradesperson is checking their schedule</p>
+              </div>
+            </div>
+            <p className="text-sm text-slate-600 leading-relaxed">
+              We've notified the tradesperson to confirm the start date (<strong>{format(new Date(job.scheduledDate), 'dd MMM yyyy')}</strong>). You'll be notified as soon as they confirm or propose a change.
+            </p>
+          </div>
+        )}
+
+        {/* Reschedule Proposal Banner (Homeowner) */}
+        {isHomeowner && job.rescheduleProposal?.status === "pending" && job.scheduledDate && (
+          <div className="bg-orange-50 border border-orange-100 p-6 rounded-3xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-orange-100 flex items-center justify-center">
+                <Calendar className="w-5 h-5 text-orange-600" />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-orange-900">Reschedule Request</h3>
+                <p className="text-xs text-orange-600">Tradesperson proposed a new start date</p>
+              </div>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-orange-50 space-y-3">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Current Date</p>
+                  <p className="text-sm font-bold text-slate-700">{format(new Date(job.scheduledDate), 'dd MMM yyyy')}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Proposed Date</p>
+                  <p className="text-sm font-bold text-orange-600">{format(new Date(job.rescheduleProposal.proposedDate), 'dd MMM yyyy')}</p>
+                </div>
+              </div>
+              <div>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Reason</p>
+                <p className="text-sm text-slate-600 italic">"{job.rescheduleProposal.reason}"</p>
+              </div>
+              <div className="flex gap-2 pt-2">
+                <button 
+                  onClick={handleAcceptReschedule}
+                  disabled={isProcessing}
+                  className="flex-1 bg-green-600 text-white py-3 rounded-xl text-sm font-bold hover:bg-green-700 transition-colors flex items-center justify-center gap-2"
+                >
+                  {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                  Accept New Date
+                </button>
+                <button 
+                  onClick={handleRejectReschedule}
+                  disabled={isProcessing}
+                  className="px-6 border border-black text-slate-600 py-3 rounded-xl text-sm font-bold hover:bg-slate-50 transition-colors"
+                >
+                  Decline
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Recurring Prompt Banner */}
+        {job.status === "completed" && RECURRING_CATEGORIES.includes(job.category) && !hasRecurringSchedule && !job.recurringDismissedBy?.includes(user?.uid) && (
+          <div className="bg-indigo-50 border border-indigo-100 p-6 rounded-3xl space-y-4 relative overflow-hidden">
+            <div className="absolute top-0 right-0 p-4 opacity-10">
+              <RefreshCw className="w-24 h-24 text-indigo-600" />
+            </div>
+            <div className="relative z-10">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-10 h-10 rounded-full bg-indigo-100 flex items-center justify-center">
+                  <RefreshCw className="w-5 h-5 text-indigo-600" />
+                </div>
+                <h3 className="font-bold text-indigo-900">
+                  {isHomeowner ? "Loved the work?" : "Secure regular income!"}
+                </h3>
+              </div>
+              <p className="text-sm text-indigo-700 mb-4">
+                {isHomeowner 
+                  ? "Schedule this as a regular service and never worry about it again." 
+                  : "Propose a recurring schedule to this homeowner for guaranteed future work."}
+              </p>
+              <div className="flex gap-2">
+                <button 
+                  onClick={() => setShowRecurringModal(true)}
+                  className="flex-1 bg-indigo-600 text-white py-3 rounded-xl text-sm font-bold hover:bg-indigo-700 transition-colors"
+                >
+                  Set up schedule
+                </button>
+                <button 
+                  onClick={handleDismissRecurring}
+                  className="px-4 py-3 border border-indigo-200 text-indigo-600 rounded-xl text-sm font-bold hover:bg-indigo-100 transition-colors"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Dispute Banner */}
+        {job.status === "disputed" && (
+          <div className="bg-red-50 border border-red-100 p-6 rounded-3xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+                <AlertTriangle className="w-5 h-5 text-red-600" />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-red-900">Job in Dispute</h3>
+                <p className="text-xs text-red-600">Mediation is required to proceed</p>
+              </div>
+            </div>
+            <div className="bg-white p-4 rounded-2xl border border-red-50 space-y-4">
+              <div className="space-y-1">
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Reason for Dispute</p>
+                <p className="text-sm text-slate-700 leading-relaxed font-medium">{job.dispute?.reason}</p>
+                
+                {job.dispute?.isPropertyDamage && (
+                  <div className="mt-3 p-4 bg-red-50 rounded-2xl border border-red-100 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck className="w-4 h-4 text-red-600" />
+                      <h4 className="text-[10px] font-black text-red-900 uppercase tracking-widest">Insurance Claim Active</h4>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-1">
+                        <p className="text-[10px] font-bold text-red-400 uppercase">Process Status</p>
+                        <p className="text-sm font-black text-red-900 capitalize italic">{job.dispute?.pliClaim?.status || 'Initiated'}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-[10px] font-bold text-red-400 uppercase tracking-tight">Claim Reference</p>
+                        <p className="text-sm font-black text-red-900 font-mono">#{id?.substring(0, 6).toUpperCase()}-CLAIM</p>
+                      </div>
+                    </div>
+                    <p className="text-[10px] leading-relaxed text-red-700">
+                      This dispute involves property damage. We are facilitating a claim against the trader's policy: 
+                      {job.dispute?.pliClaim?.provider ? (
+                        <span className="font-bold"> {job.dispute.pliClaim.provider} ({job.dispute.pliClaim.policyNumber})</span>
+                      ) : (
+                        <span className="italic"> [Verification in Progress]</span>
+                      )}
+                    </p>
+                  </div>
+                )}
+                
+                {disputeResolution ? (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-4 p-4 rounded-2xl bg-indigo-50 border border-indigo-100 space-y-3"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-indigo-600" />
+                      <h4 className="text-xs font-bold text-indigo-900 uppercase tracking-wider">AI Mediator Suggestion</h4>
+                    </div>
+                    <div className="space-y-2">
+                      <p className="text-xs text-indigo-800 font-semibold">{disputeResolution.summary}</p>
+                      <div className="p-3 bg-white rounded-xl border border-indigo-50">
+                        <p className="text-xs text-slate-700 leading-relaxed">{disputeResolution.suggestion}</p>
+                        {disputeResolution.fairPrice && (
+                          <p className="mt-2 text-sm font-bold text-indigo-600">Suggested Fair Price: £{disputeResolution.fairPrice}</p>
+                        )}
+                      </div>
+                    </div>
+                  </motion.div>
+                ) : (
+                  <div className="space-y-2">
+                    <button 
+                      onClick={handleMediateDispute}
+                      disabled={isMediating}
+                      className="mt-4 w-full p-3 rounded-xl bg-indigo-600 text-white text-xs font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-all disabled:opacity-50"
+                    >
+                      {isMediating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                      Get AI Mediation Suggestion
+                    </button>
+                    {isMediating && (
+                      <button 
+                        onClick={() => setIsMediating(false)}
+                        className="w-full py-1 text-slate-400 font-bold text-[10px] hover:text-slate-600 transition-all text-center"
+                      >
+                        Skip AI Mediation
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+              {job.dispute?.photos && job.dispute.photos.length > 0 && (
+                <div className="flex gap-2 overflow-x-auto pb-2">
+                  {job.dispute.photos.map((url: string, i: number) => (
+                    <img 
+                      key={i} 
+                      src={url} 
+                      className="w-16 h-16 rounded-lg object-cover border border-black" 
+                      referrerPolicy="no-referrer"
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2 text-[10px] text-red-400">
+              <Clock className="w-3 h-3" />
+              <span>Raised on {new Date(job.dispute?.createdAt?.seconds * 1000).toLocaleDateString()}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Active Chat Card */}
+        {(job.status === "accepted" || job.status === "in_progress" || job.status === "disputed") && (
+          <div className="bg-blue-600 rounded-3xl p-6 text-white shadow-lg shadow-blue-100 flex items-center justify-between group overflow-hidden relative">
+            <div className="relative z-10 flex items-center gap-4">
+              <div className="w-12 h-12 bg-white/20 rounded-2xl flex items-center justify-center backdrop-blur-sm">
+                <MessageSquare className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-bold text-lg">Active Discussion</h3>
+                <p className="text-blue-100 text-xs">Chat with {isHomeowner ? (tradespersonProfiles[(quotes.find(q => q.status === "accepted")?.tradespersonId || job.acceptedTradespersonId)]?.name || "Tradesperson") : (homeownerProfile?.name || "Homeowner")}</p>
+              </div>
+            </div>
+            <button 
+              onClick={() => {
+                const acceptedQuote = quotes.find(q => q.status === "accepted");
+                const targetTradesperson = acceptedQuote?.tradespersonId || job.acceptedTradespersonId;
+                if (targetTradesperson) {
+                  const tpProfile = tradespersonProfiles[targetTradesperson];
+                  handleStartChat(acceptedQuote || { jobId: job.id, amount: 0, tradespersonId: targetTradesperson }, tpProfile);
+                }
+              }}
+              className="relative z-10 bg-white text-blue-600 px-6 py-2.5 rounded-xl font-bold text-sm hover:bg-blue-50 transition-all active:scale-95 flex items-center gap-2"
+            >
+              Open Chat
+              <ChevronRight className="w-4 h-4" />
+            </button>
+            {/* Decorative background circle */}
+            <div className="absolute -right-8 -top-8 w-32 h-32 bg-white/10 rounded-full blur-2xl" />
+          </div>
+        )}
+
+        {/* Flash Deal / Direct Quote Request Hero Card */}
+        {job.claimedDeal ? (
+          <div className="bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 text-slate-950 p-5 sm:p-6 rounded-3xl shadow-lg border border-amber-600 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-start sm:items-center gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-slate-950 text-amber-400 flex items-center justify-center font-black text-xl shrink-0 shadow-md">
+                <Zap className="w-6 h-6 fill-current" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3 className="font-black text-slate-950 text-lg uppercase tracking-wide">
+                    Claimed Flash Deal Quote Request
+                  </h3>
+                  <span className="bg-slate-950 text-amber-300 text-xs font-black px-2.5 py-0.5 rounded-full uppercase">
+                    {job.claimedDeal.discountPercentage || 0}% OFF Deal
+                  </span>
+                </div>
+                <p className="text-sm font-bold text-slate-900 mt-1">
+                  Requested from individual specialist: <span className="font-black underline decoration-slate-950">{job.targetTradespersonName || job.claimedDeal.traderName || "Selected Trader"}</span>
+                </p>
+                {job.claimedDeal.dealTitle && (
+                  <p className="text-xs font-medium text-slate-900/80 mt-0.5">
+                    Package: {job.claimedDeal.dealTitle}
+                  </p>
+                )}
+              </div>
+            </div>
+            {(job.claimedDeal.targetRate || job.claimedDeal.discountedPrice) && (
+              <div className="bg-slate-950/10 backdrop-blur-sm sm:bg-transparent p-3 sm:p-0 rounded-2xl sm:text-right shrink-0 border border-slate-950/10 sm:border-0">
+                <span className="text-[10px] font-bold text-slate-900 uppercase tracking-wider block">Pre-Agreed Rate</span>
+                <span className="text-2xl sm:text-3xl font-black text-slate-950">
+                  £{job.claimedDeal.targetRate || job.claimedDeal.discountedPrice}
+                </span>
+              </div>
+            )}
+          </div>
+        ) : (job.targetTradespersonName || job.targetTradespersonId) ? (
+          <div className="bg-gradient-to-r from-indigo-900 via-blue-900 to-indigo-950 text-white p-5 sm:p-6 rounded-3xl shadow-lg border border-indigo-950 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 rounded-2xl bg-white/20 text-white flex items-center justify-center font-black text-xl shrink-0 backdrop-blur-sm border border-white/20">
+                🎯
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3 className="font-black text-white text-lg uppercase tracking-wide">
+                    Direct 1-on-1 Quote Request
+                  </h3>
+                  <span className="bg-white/20 text-blue-200 text-xs font-bold px-2.5 py-0.5 rounded-full uppercase border border-white/20">
+                    Private Request
+                  </span>
+                </div>
+                <p className="text-sm text-blue-100 font-medium mt-1 flex items-center gap-1.5 flex-wrap">
+                  <span>Sent exclusively to:</span>
+                  <span className="bg-amber-400 text-slate-950 font-black px-2.5 py-0.5 rounded-full text-xs uppercase tracking-tight shadow-xs border border-amber-300 inline-flex items-center gap-1">
+                    👤 {job.targetTradespersonName || "Individual Trader"}
+                  </span>
+                </p>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Job Info Section */}
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2">
+            {job.jobNo && (
+              <span className="bg-slate-900 text-white text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest">
+                Job #{job.jobNo}
+              </span>
+            )}
+            <span className={cn(
+              "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider",
+              job.status === "posted" ? ((job.quoteCount || 0) >= 5 ? "bg-yellow-50 text-yellow-700 border border-black" : "bg-blue-50 text-blue-600") :
+              job.status === "accepted" ? "bg-green-50 text-green-600" :
+              job.status === "in_progress" ? "bg-orange-50 text-orange-600" :
+              "bg-slate-100 text-slate-600"
+            )}>
+              {job.status === 'posted' ? ((job.quoteCount || 0) >= 5 ? 'Max Quotes Reached' : 'Seeking Quotes') : job.status.replace('_', ' ')}
+            </span>
+            {job.status === "accepted" && job.scheduledDate && (
+              <div className="flex items-center gap-2">
+                <span className={cn(
+                  "text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider flex items-center gap-1",
+                  job.isConfirmedByTradesperson ? "bg-indigo-50 text-indigo-600" : "bg-slate-100 text-slate-400"
+                )}>
+                  <Calendar className="w-3 h-3" />
+                  {job.isConfirmedByTradesperson ? "Scheduled" : "Proposed"}: {format(new Date(job.scheduledDate), 'dd MMM yyyy')}
+                </span>
+                
+                {/* Calendar Sync Options */}
+                {job.isConfirmedByTradesperson && (
+                  <div className="flex items-center gap-1">
+                    <a 
+                      href={generateGoogleCalendarLink(job, quotes.find(q => q.status === "accepted") || {})}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-1 bg-white border border-black rounded-md text-slate-400 hover:text-blue-600 hover:border-blue-100 transition-all shadow-sm"
+                      title="Add to Google Calendar"
+                    >
+                      <img src="https://www.gstatic.com/calendar/images/dynamiclogo_2020q4/calendar_31_2x.png" className="w-3 h-3" alt="Google" referrerPolicy="no-referrer" />
+                    </a>
+                    <a 
+                      href={generateOutlookCalendarLink(job, quotes.find(q => q.status === "accepted") || {})}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-1 bg-white border border-black rounded-md text-slate-400 hover:text-blue-600 hover:border-blue-100 transition-all shadow-sm"
+                      title="Add to Outlook"
+                    >
+                      <img src="https://res-1.cdn.office.net/assets/bookwithme/v1/outlook_calendar_24x24.png" className="w-3 h-3" alt="Outlook" referrerPolicy="no-referrer" />
+                    </a>
+                    <button 
+                      onClick={() => downloadICS(job, quotes.find(q => q.status === "accepted") || {})}
+                      className="p-1 bg-white border border-black rounded-md text-slate-400 hover:text-blue-600 hover:border-blue-100 transition-all shadow-sm"
+                      title="Download iCal (.ics)"
+                    >
+                      <Download className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+                {job.status === "accepted" && !isHomeowner && (
+                  <button 
+                    onClick={() => setShowRescheduleModal(true)}
+                    className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1 bg-indigo-50 px-2 py-1 rounded-md transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    Reschedule
+                  </button>
+                )}
+              </div>
+            )}
+            <span className="bg-slate-100 text-slate-600 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider">
+              {job.urgency === "specific_date" && job.jobDate ? `Date: ${new Date(job.jobDate).toLocaleDateString()}` : job.urgency}
+            </span>
+            {job.estimatedCompletionTime && (
+              <span className="bg-green-50 text-green-600 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider flex items-center gap-1">
+                <Clock className="w-3 h-3" />
+                {job.estimatedCompletionTime} {job.estimatedCompletionTimeUnit}
+              </span>
+            )}
+            {job.paymentPreference && (
+              <span className="bg-purple-50 text-purple-600 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider capitalize">
+                {job.paymentPreference.replace('_', ' ')}
+              </span>
+            )}
+            {job.quoteScope && (
+              <span className="bg-indigo-50 text-indigo-600 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider capitalize">
+                {job.quoteScope.replace('_', ' ')}
+              </span>
+            )}
+          </div>
+
+          {/* Expiry Banner */}
+          {job.urgency === 'emergency' && 
+           !job.expiryAcknowledged && 
+           user?.uid === job.homeownerId && 
+           (job.isBoosted ? new Date().getTime() > new Date(job.boostExpiresAt).getTime() : new Date().getTime() > (job.createdAt?.seconds * 1000 + 2 * 60 * 60 * 1000)) && (
+            <div className="bg-red-50 border border-red-200 rounded-2xl p-4 mb-6">
+              <h3 className="text-red-800 font-bold text-lg mb-2">Still Seeking Quotes</h3>
+              <p className="text-red-600 text-sm mb-4">No traders responded to your emergency request in time. What would you like to do?</p>
+              <div className="flex flex-wrap gap-2">
+                {(!job.isBoosted && (job.retryCount || 0) >= 2) ? (
+                  <button onClick={async () => {
+                    const confirmBoost = window.confirm("Tradespeople are currently very busy. Boost your emergency job to the top of their feeds for £5 to get immediate attention. Proceed to checkout?");
+                    if (!confirmBoost) return;
+
+                    try {
+                      if (!user) throw new Error("Please sign in to purchase a job boost.");
+                      const token = await user.getIdToken();
+                      if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+                      const response = await fetch("/api/create-checkout-session", {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/json",
+                          Authorization: `Bearer ${token}`,
+                          "Idempotency-Key": crypto.randomUUID()
+                        },
+                        body: JSON.stringify({
+                          userId: user?.uid,
+                          price_data: {
+                            currency: 'gbp',
+                            unit_amount: 500,
+                            product_data: {
+                              name: 'Emergency Job Boost',
+                              description: 'Priority placement at the top of trader feeds'
+                            }
+                          },
+                          priceId: "price_mock_boost",
+                          mode: "payment",
+                          metadata: {
+                            type: "boost",
+                            jobId: id
+                          },
+                          successUrl: `${window.location.origin}/job/${id}?boost_success=true`,
+                          cancelUrl: `${window.location.origin}/job/${id}`
+                        }),
+                      });
+
+                      const data = await response.json();
+                      if (data.url) {
+                        window.location.href = data.url;
+                      } else {
+                        throw new Error(data.error || "Failed to initiate checkout");
+                      }
+                    } catch (err: any) {
+                      console.error("Boost payment init failed:", err);
+                      alert(err.message || "Failed to start checkout. Please try again later.");
+                    }
+                  }} className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2">
+                    <Zap className="w-4 h-4" /> Boost for £5
+                  </button>
+                ) : (
+                  <button onClick={async () => {
+                    await updateDoc(doc(db, "jobs", id!), { 
+                      postedDate: serverTimestamp(), 
+                      createdAt: serverTimestamp(),
+                      retryCount: (job.retryCount || 0) + 1
+                    });
+                    setJob((prev: any) => ({ 
+                      ...prev, 
+                      postedDate: new Date(), 
+                      createdAt: new Date(),
+                      retryCount: (prev.retryCount || 0) + 1
+                    }));
+                  }} className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold">Re-post as Emergency</button>
+                )}
+                <button onClick={async () => {
+                  await updateDoc(doc(db, "jobs", id!), { urgency: "asap", expiryAcknowledged: true });
+                  setJob((prev: any) => ({ ...prev, urgency: "asap", expiryAcknowledged: true }));
+                }} className="bg-white text-red-600 border border-red-200 px-4 py-2 rounded-xl text-sm font-bold">Convert to Standard</button>
+                <button onClick={async () => {
+                  if (user && id) {
+                    await cancelJobViaCommand({ user, jobId: id, reason: "Cancelled via expiry banner" });
+                  }
+                  navigate("/my-jobs");
+                }} className="bg-white text-slate-600 border border-black px-4 py-2 rounded-xl text-sm font-bold">Delete Post</button>
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-1">
+            <p className="text-orange-500 text-xs font-bold uppercase tracking-widest">
+              {job.category} • {job.subcategory}
+            </p>
+            <h1 className="text-3xl font-black text-slate-900 leading-tight">
+              {job.status === 'completed' && (
+                <span className="text-[10px] sm:text-xs font-black tracking-widest uppercase text-emerald-600 border-[3px] border-emerald-600 px-3 py-1 rounded-md rotate-[-12deg] inline-block shadow-sm bg-white/90 backdrop-blur-sm mr-2 mb-2 whitespace-pre-line text-center align-middle">
+                  COMPLETED{job.completedAt ? ` ON\n${new Date(job.completedAt?.seconds ? job.completedAt.seconds * 1000 : job.completedAt).toLocaleDateString('en-GB')}` : ''}
+                </span>
+              )}
+              {job.title}
+            </h1>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-slate-500">
+              <MapPin className="w-4 h-4" />
+              <span className="text-sm font-bold uppercase">
+                {canSeeFullDetails 
+                  ? (job.postcode ? `${job.postcode}${job.city && job.city.toLowerCase() !== 'home' ? ' • ' + job.city : ''}` : (job.fullAddress || job.address?.line1 || job.area || job.city || "UK Location"))
+                  : formatJobLocation(job)
+                }
+              </span>
+            </div>
+            
+            {canSeeFullDetails && (job.fullAddress || job.houseNumber || job.locationInstructions) && (
+              <div className="mt-4 mb-2 bg-slate-50 p-4 rounded-xl border border-black flex flex-col gap-3">
+                <div className="font-bold flex items-center gap-2 text-slate-900 border-b border-black pb-2 mb-1">
+                  <Home className="w-4 h-4 text-blue-500" /> Exact Location Details
+                </div>
+                {job.houseNumber && (
+                  <div className="flex gap-2">
+                    <span className="text-sm font-bold text-slate-500 min-w-[80px]">Unit/No:</span>
+                    <span className="text-sm text-slate-900 font-medium">{job.houseNumber}</span>
+                  </div>
+                )}
+                {job.fullAddress && (
+                  <div className="flex gap-2">
+                    <span className="text-sm font-bold text-slate-500 min-w-[80px]">Street:</span>
+                    <span className="text-sm text-slate-900 font-medium">{job.fullAddress}</span>
+                  </div>
+                )}
+                {job.locationInstructions && (
+                  <div className="flex flex-col gap-1 mt-1 pt-3 border-t border-black/60">
+                    <span className="text-sm font-bold text-slate-500 flex items-center gap-1">
+                      <Info className="w-3.5 h-3.5" /> Instructions:
+                    </span>
+                    <span className="text-sm text-slate-700 italic bg-white p-3 rounded-lg border border-black shadow-sm leading-relaxed whitespace-pre-wrap">{job.locationInstructions}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center gap-2 text-slate-500">
+              <Calendar className="w-4 h-4" />
+              <span className="text-sm font-bold">
+                {new Date(job.createdAt?.seconds * 1000 || Date.now()).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Map Section */}
+        <div className="bg-white rounded-3xl p-6 border border-black shadow-sm space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+              <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center">
+                <Wrench className="w-4 h-4 text-blue-600" />
+              </div>
+              Job Location
+            </h3>
+            <button 
+              onClick={() => setShowMap(!showMap)}
+              className="text-orange-500 font-bold text-sm hover:text-orange-600 transition-colors"
+            >
+              {showMap ? 'Hide map' : 'Show map'}
+            </button>
+          </div>
+          
+          <AnimatePresence>
+            {showMap && (
+              <motion.div 
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                className="overflow-hidden"
+              >
+                <div className="aspect-video bg-slate-100 rounded-2xl relative flex items-center justify-center overflow-hidden border border-black pointer-events-none">
+                  <iframe
+                    width="100%"
+                    height="100%"
+                    style={{ border: 0 }}
+                    loading="lazy"
+                    allowFullScreen
+                    referrerPolicy="no-referrer-when-downgrade"
+                    src={`https://maps.google.com/maps?q=${encodeURIComponent((getOutwardPostcode(job.postcode) || '') + (job.city ? `, ${job.city}` : ''))}&t=&z=10&ie=UTF8&iwloc=&output=embed`}
+                  ></iframe>
+                  
+                  {/* Dotted Area Overlay */}
+                  <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    <div className="w-48 h-48 border-2 border-dashed border-red-500/40 rounded-full bg-red-500/5" />
+                  </div>
+
+                  <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
+                    <div className="bg-white/90 backdrop-blur-sm px-3 py-1.5 rounded-full shadow-lg flex items-center gap-2">
+                      <MapPin className="w-3.5 h-3.5 text-slate-400" />
+                      <span className="text-xs font-bold text-slate-900 uppercase">
+                        {canSeeFullDetails ? job.postcode : getOutwardPostcode(job.postcode || job.area)}
+                      </span>
+                      <span className="bg-orange-50 text-orange-600 text-[8px] font-bold px-1.5 py-0.5 rounded uppercase">Approx. area</span>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <div className="flex items-start gap-2 text-slate-400 bg-slate-50 p-3 rounded-xl">
+            <Clock className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <p className="text-[10px] font-medium leading-relaxed">
+              Exact address shown only after quote is accepted
+            </p>
+          </div>
+        </div>
+
+        {/* Description Section */}
+        <div className="space-y-3">
+          <h3 className="text-xl font-bold text-slate-900">Job Description</h3>
+          <div className="bg-white rounded-3xl p-6 border border-black shadow-sm space-y-6">
+            <div className="flex items-start gap-3">
+              <div className="w-8 h-8 rounded-full bg-purple-50 flex items-center justify-center flex-shrink-0">
+                <FileText className="w-4 h-4 text-purple-600" />
+              </div>
+              <p className="text-slate-600 font-medium leading-relaxed">{job.description}</p>
+            </div>
+
+            {job.quoteScope && (
+              <div className="pt-4 border-t border-slate-50">
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="w-6 h-6 rounded-full bg-indigo-50 flex items-center justify-center">
+                    <PoundSterling className="w-3 h-3 text-indigo-600" />
+                  </div>
+                  <h4 className="text-sm font-bold text-slate-900 uppercase tracking-wider">Quote Scope</h4>
+                </div>
+                <div className="bg-slate-50 p-4 rounded-2xl border border-black">
+                  <p className="text-sm text-slate-700 font-semibold mb-1">
+                    {job.quoteScope === 'complete_package' ? 'Complete Package (Materials & Labour)' : 
+                     job.quoteScope === 'labour_only' ? 'Labour Only (Homeowner provides materials)' : 
+                     job.quoteScope.replace('_', ' ')}
+                  </p>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    {job.quoteScope === 'complete_package' 
+                      ? 'The tradesperson will be responsible for sourcing and providing all necessary materials for this job.' 
+                      : 'The homeowner is expected to have all necessary materials ready. The quote will only cover the cost of professional labour.'}
+                  </p>
+                </div>
+
+                {job.quoteScope === "labour_only" && (
+                  <div className="mt-4 pt-4 border-t border-slate-50">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-blue-600" />
+                        <h4 className="text-xs font-bold text-slate-900 uppercase tracking-wider">AI Material List</h4>
+                      </div>
+                      {materialList.length === 0 && (
+                        <button 
+                          onClick={handleGenerateMaterialList}
+                          disabled={isGeneratingMaterials}
+                          className="text-[10px] font-bold text-blue-600 hover:text-blue-700 flex items-center gap-1 disabled:opacity-50"
+                        >
+                          {isGeneratingMaterials ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                          Generate List
+                        </button>
+                      )}
+                    </div>
+                    
+                    {materialList.length > 0 ? (
+                      <div className="bg-blue-50 rounded-2xl p-4 space-y-3">
+                        <p className="text-[10px] text-blue-700 font-bold uppercase tracking-tight">Recommended Shopping List:</p>
+                        <ul className="space-y-2">
+                          {materialList.map((item, idx) => (
+                            <li key={idx} className="flex items-start gap-2 text-xs text-slate-700">
+                              <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 flex-shrink-0 mt-0.5" />
+                              {item}
+                            </li>
+                          ))}
+                        </ul>
+                        <button 
+                          onClick={() => setMaterialList([])}
+                          className="text-[9px] font-bold text-blue-600 uppercase tracking-widest hover:underline"
+                        >
+                          Regenerate
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-slate-500 italic">This is a "Labour Only" job. Use AI to generate a shopping list of materials you might need to provide.</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Guaranteed Flash Deal Rate Card (When job is from a claimed flash deal) */}
+            {job.claimedDeal && (
+              <div className="bg-gradient-to-br from-amber-50 to-orange-50/80 rounded-3xl p-6 border-2 border-amber-300 shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-full bg-amber-500 text-white flex items-center justify-center">
+                      <Zap className="w-4 h-4 fill-current" />
+                    </div>
+                    <h3 className="text-xl font-bold text-amber-950">Guaranteed Flash Deal Rate</h3>
+                  </div>
+                  <span className="bg-amber-200 text-amber-950 text-xs font-black px-3 py-1 rounded-full uppercase border border-amber-300">
+                    {job.claimedDeal.discountPercentage || 0}% OFF
+                  </span>
+                </div>
+                
+                <div className="space-y-3">
+                  <div className="flex items-baseline gap-3">
+                    <span className="text-4xl font-black text-slate-900">
+                      £{job.claimedDeal.targetRate || job.claimedDeal.discountedPrice}
+                    </span>
+                    {job.claimedDeal.originalPrice && (
+                      <span className="text-lg text-slate-400 line-through font-bold">
+                        £{job.claimedDeal.originalPrice}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-700 font-medium leading-relaxed">
+                    This job was pre-arranged through <strong>{job.targetTradespersonName || job.claimedDeal.traderName || "this specialist"}</strong>'s published Flash Deal. The trader has guaranteed this rate for the requested scope.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* AI Price Estimate Card */}
+            {job.estimateMin && job.estimateMax && !job.claimedDeal && (
+              <div className="bg-white rounded-3xl p-6 border border-black shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-full bg-indigo-50 flex items-center justify-center border border-indigo-100">
+                      <Sparkles className="w-4 h-4 text-indigo-600" />
+                    </div>
+                    AI Price Estimate
+                  </h3>
+                  <ConfidenceGauge 
+                    score={job.estimateConfidence ?? 0.88} 
+                    rating={job.estimateConfidenceRating}
+                    size={46}
+                  />
+                </div>
+                
+                <div className="space-y-4">
+                  <div className="text-4xl font-black text-slate-900">
+                    £{job.estimateMin.toLocaleString()} – £{job.estimateMax.toLocaleString()}
+                  </div>
+
+                  {/* Postcode & Historical Jobs Context */}
+                  <div className="bg-slate-50 p-3.5 rounded-2xl border border-black/10 space-y-2 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-slate-700 flex items-center gap-1.5">
+                        <MapPin className="w-3.5 h-3.5 text-blue-600" />
+                        Postcode Area: <strong className="text-black">{job.estimatePostcodeArea || (job.postcode ? job.postcode.split(' ')[0] : 'Local')}</strong>
+                      </span>
+                      <span className="text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded-lg border border-black">
+                        {job.estimateHistoricalJobCount || 6} historical jobs
+                      </span>
+                    </div>
+
+                    {job.estimateHistoricalAvgPrice && (
+                      <div className="flex items-center justify-between text-slate-600 pt-1 border-t border-slate-200/80">
+                        <span>Postcode Area Avg:</span>
+                        <strong className="text-slate-900">£{job.estimateHistoricalAvgPrice}</strong>
+                      </div>
+                    )}
+
+                    {job.estimateConfidenceFactors && job.estimateConfidenceFactors.length > 0 && (
+                      <div className="pt-1.5 border-t border-slate-200/80 space-y-1">
+                        <p className="text-[10px] font-bold uppercase text-slate-400">Confidence Drivers:</p>
+                        <ul className="space-y-1">
+                          {job.estimateConfidenceFactors.map((factor: string, i: number) => (
+                            <li key={i} className="flex items-start gap-1.5 text-[11px] text-slate-700">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-600 shrink-0 mt-0.5" />
+                              <span>{factor}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                  
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-[10px] font-bold text-slate-400 uppercase">
+                      <span>Labour</span>
+                      <span>55%</span>
+                    </div>
+                    <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div className="h-full bg-indigo-600" style={{ width: '55%' }} />
+                    </div>
+                    
+                    <div className="flex justify-between text-[10px] font-bold text-slate-400 uppercase">
+                      <span>Materials</span>
+                      <span>30%</span>
+                    </div>
+                    <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div className="h-full bg-orange-500" style={{ width: '30%' }} />
+                    </div>
+                    
+                    <div className="flex justify-between text-[10px] font-bold text-slate-400 uppercase">
+                      <span>Overheads</span>
+                      <span>15%</span>
+                    </div>
+                    <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                      <div className="h-full bg-blue-400" style={{ width: '15%' }} />
+                    </div>
+                  </div>
+                  
+                  <p className="text-[10px] text-slate-500 leading-relaxed italic">
+                    {job.estimatePostcodeBenchmark || `Based on similar historical jobs in ${job.estimatePostcodeArea || job.city || 'your area'}. Seasonal adjustments applied. Actual quotes may vary.`}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {(isHomeowner || (quotes.find(q => q.status === "accepted")?.tradespersonId || job.acceptedTradespersonId) === user?.uid) && (
+              <button 
+                onClick={() => navigate(`/job/${id}/timeline`)}
+                className="w-full bg-white p-4 rounded-2xl border border-black shadow-sm flex items-center justify-between group active:scale-[0.98] transition-all"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-slate-50 flex items-center justify-center text-slate-400 group-hover:text-[#1e3a5f] transition-colors">
+                    <Zap className="w-5 h-5" />
+                  </div>
+                  <div className="text-left">
+                    <h4 className="font-bold text-slate-900 text-sm">Job Status Timeline</h4>
+                    <p className="text-[10px] text-slate-500">Track progress from posting to completion</p>
+                  </div>
+                </div>
+                <ChevronRight className="w-5 h-5 text-slate-300 group-hover:text-[#1e3a5f] transition-colors" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Documents Section */}
+        {job.documents && job.documents.length > 0 && (
+          <div className="space-y-3">
+            <h3 className="text-xl font-bold text-slate-900">Files & Audio Notes</h3>
+            <div className="bg-white rounded-3xl p-6 border border-black shadow-sm space-y-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-indigo-50 flex items-center justify-center">
+                  <FileText className="w-5 h-5 text-indigo-600" />
+                </div>
+                <div>
+                  <h4 className="font-bold text-slate-900 text-sm">Project Documents</h4>
+                  <p className="text-[10px] text-slate-500">Essential plans and audio notes for accurate quoting</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-2">
+                {job.documents.map((doc: any, idx: number) => {
+                  const isAudio = doc.name === 'Audio Note';
+                  return (
+                  <a 
+                    key={idx} 
+                    href={doc.url} 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-black hover:border-indigo-600 hover:bg-indigo-50 transition-all group"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-white flex items-center justify-center shadow-sm">
+                        {isAudio ? <Mic className="w-4 h-4 text-slate-400 group-hover:text-blue-600 transition-colors" /> : <FileText className="w-4 h-4 text-slate-400 group-hover:text-indigo-600 transition-colors" />}
+                      </div>
+                      <span className="text-sm font-bold text-slate-700 truncate">{doc.name}</span>
+                    </div>
+                    {isAudio ? <Play className="w-4 h-4 text-slate-300 group-hover:text-blue-600 transition-colors" /> : <ChevronRight className="w-4 h-4 text-slate-300 group-hover:text-indigo-600 transition-colors" />}
+                  </a>
+                )})}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Media Section (if any) */}
+        {((job.photos && job.photos.length > 0) || (job.videos && job.videos.length > 0)) && (
+          <div className="space-y-3">
+            <h3 className="text-xl font-bold text-slate-900">Photos & Videos</h3>
+            <div className="grid grid-cols-2 gap-3">
+              {job.photos?.map((url: string, i: number) => (
+                <div key={`photo-${i}`} className="aspect-square rounded-3xl overflow-hidden border border-black shadow-sm">
+                  <img 
+                    src={url} 
+                    alt={`Job photo ${i + 1}`} 
+                    className="w-full h-full object-cover hover:scale-105 transition-transform cursor-pointer" 
+                    referrerPolicy="no-referrer"
+                    onClick={() => {
+                      setInitialMediaIndex(i);
+                      setIsMediaModalOpen(true);
+                    }}
+                  />
+                </div>
+              ))}
+              {job.videos?.map((url: string, i: number) => (
+                <div key={`video-${i}`} className="aspect-square rounded-3xl overflow-hidden border border-white/20 bg-slate-900 flex items-center justify-center relative group shadow-sm">
+                  <video 
+                    src={url} 
+                    className="w-full h-full object-cover opacity-100 md:opacity-50 md:group-hover:opacity-100 transition-opacity cursor-pointer"
+                    onClick={() => {
+                      setInitialMediaIndex((job.photos?.length || 0) + i);
+                      setIsMediaModalOpen(true);
+                    }}
+                  />
+                  <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    <Video className="w-10 h-10 text-white" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <MediaGalleryModal
+          isOpen={isMediaModalOpen}
+          onClose={() => setIsMediaModalOpen(false)}
+          photos={job.photos}
+          videos={job.videos}
+          title={job.title}
+          initialIndex={initialMediaIndex}
+        />
+
+        {/* Material Finalization Modal (Fast Pass Feature) */}
+        {!isHomeowner && isFinalizingMaterials && finalizingQuoteId && (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+              <div className="p-6 border-b border-black bg-amber-50">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center">
+                    <Sparkles className="w-5 h-5 text-amber-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-900">Finalize Materials List</h3>
+                    <p className="text-xs font-bold text-amber-700">Fast Pass Exclusive - Lock in your quote structure</p>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-600">
+                  Your quote has been secured! You now have a strict 10-minute window to finalize your material list before the homeowner reviews your bid.
+                </p>
+              </div>
+
+              <div className="p-6 overflow-y-auto flex-1 space-y-4">
+                <div className="space-y-3">
+                  <h4 className="text-sm font-bold text-slate-900 uppercase tracking-wider">Itemized List</h4>
+                  {materialList.length > 0 ? (
+                    <ul className="space-y-2">
+                      {materialList.map((item, idx) => (
+                        <li key={idx} className="flex items-start gap-2 text-sm text-slate-700 bg-slate-50 p-2 rounded-xl">
+                          <CheckCircle2 className="w-4 h-4 text-blue-600 flex-shrink-0 mt-0.5" />
+                          <span className="flex-1">{item}</span>
+                          <button 
+                            onClick={() => setMaterialList(prev => prev.filter((_, i) => i !== idx))}
+                            className="text-red-500 p-1 hover:bg-red-100 rounded-lg"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <div className="bg-slate-50 p-4 rounded-xl border border-dashed border-black text-center text-slate-500 text-xs">
+                      No materials added yet. Add items below or generate an AI list if Labour Only.
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={editableMaterialItem}
+                    onChange={(e) => setEditableMaterialItem(e.target.value)}
+                    placeholder="E.g. 5x Plasterboard sheets..."
+                    className="flex-1 border border-black rounded-xl px-3 py-2 text-sm focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 outline-none"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && editableMaterialItem.trim()) {
+                        setMaterialList(prev => [...prev, editableMaterialItem.trim()]);
+                        setEditableMaterialItem("");
+                      }
+                    }}
+                  />
+                  <button
+                    onClick={() => {
+                      if (editableMaterialItem.trim()) {
+                        setMaterialList(prev => [...prev, editableMaterialItem.trim()]);
+                        setEditableMaterialItem("");
+                      }
+                    }}
+                    className="bg-slate-900 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-slate-800"
+                  >
+                    Add
+                  </button>
+                </div>
+                
+                <div className="pt-4 border-t border-black">
+                   <button 
+                      onClick={handleGenerateMaterialList}
+                      disabled={isGeneratingMaterials}
+                      className="w-full text-xs font-bold text-blue-600 hover:text-blue-700 flex items-center justify-center gap-2 p-2 border border-blue-100 rounded-xl hover:bg-blue-50 transition-colors disabled:opacity-50"
+                    >
+                      {isGeneratingMaterials ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                      {materialList.length > 0 ? "Regenerate AI List" : "Auto-Generate AI List (Labour Only)"}
+                    </button>
+                </div>
+
+              </div>
+
+              <div className="p-6 border-t border-black bg-slate-50 flex gap-3">
+                <button
+                  onClick={handleFinalizeMaterialList}
+                  disabled={isProcessing}
+                  className="flex-1 bg-green-600 text-white px-4 py-3 rounded-xl text-sm font-bold hover:bg-green-700 disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                  Finalize & Submit
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <QuoteComparisonModal
+          isOpen={isComparisonModalOpen}
+          onClose={() => setIsComparisonModalOpen(false)}
+          quotes={quotes}
+          tradespersonProfiles={tradespersonProfiles}
+          quoteAnalyses={quoteAnalyses}
+          onAccept={handleAcceptQuote}
+          onRequestRequote={handleRequoteQuote}
+          job={job}
+        />
+
+        {!job.isInstantMatchAccepted && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-2xl font-black text-slate-900">
+                Quotes ({Math.max(quotes.length, Math.max(0, job.quoteCount || 0))})
+              </h3>
+              <div className="flex items-center gap-3">
+                {isHomeowner && quotes.length > 1 && job.status === "posted" && (
+                  <div className="flex items-center gap-1.5 bg-blue-50 px-3 py-1.5 rounded-xl border border-blue-100">
+                    <Sparkles className="w-3.5 h-3.5 text-blue-600" />
+                    <span className="text-[10px] font-black text-blue-700 uppercase tracking-wider">Smart Sorted</span>
+                  </div>
+                )}
+                {quotes.length > 1 && isHomeowner && job.status === "posted" && (
+                  <button 
+                    onClick={() => setIsComparisonModalOpen(true)}
+                    className="bg-blue-600 text-white px-6 py-2.5 rounded-2xl font-black text-sm hover:bg-blue-700 transition-all shadow-lg shadow-blue-100 flex items-center gap-2 active:scale-95"
+                  >
+                    <BarChart3 className="w-4 h-4" />
+                    Compare All
+                  </button>
+                )}
+              </div>
+            </div>
+          
+          <div className="space-y-4">
+            {/* Show actual quotes for homeowner or the tradesperson's own quote */}
+            {sortedQuotes.map((quote) => {
+              const tpProfile = tradespersonProfiles[quote.tradespersonId];
+              
+              // Check if tradesperson is currently within their material editing window (10 mins)
+              let isInFinalizationWindow = false;
+              let windowExpiresAt: Date | null = null;
+              if (quote.createdAt) {
+                const createdAt = quote.createdAt?.toDate ? quote.createdAt.toDate() : new Date(quote.createdAt);
+                windowExpiresAt = new Date(createdAt.getTime() + 10 * 60000); // 10 mins
+                if (windowExpiresAt > new Date() && !quote.materialsFinalized) {
+                  isInFinalizationWindow = true;
+                }
+              }
+
+              // Hide detailed info from the homeowner if the window is open
+              if (isHomeowner && isInFinalizationWindow) {
+                 return (
+                  <div key={quote.id} className="bg-slate-50 p-6 rounded-3xl border border-black shadow-sm flex items-start justify-between gap-4 animate-pulse">
+                     <div className="flex-1 space-y-3">
+                       <div className="flex items-center gap-3">
+                         <div className="w-10 h-10 bg-slate-200 rounded-full flex items-center justify-center">
+                           <Loader2 className="w-5 h-5 text-slate-400 animate-spin" />
+                         </div>
+                         <div>
+                           <span className="font-bold text-slate-900 block">Quote Secured</span>
+                           <span className="text-[10px] font-bold text-slate-500">Tradesperson is finalizing itemized material list...</span>
+                         </div>
+                       </div>
+                     </div>
+                  </div>
+                 );
+              }
+
+              return (
+                <div key={quote.id} className="bg-white p-6 rounded-3xl border border-black shadow-sm flex flex-col gap-4">
+                  <div className="flex items-start justify-between gap-4 w-full">
+                    <div className="flex-1 min-w-0 space-y-3">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-slate-100 rounded-full overflow-hidden border border-black relative">
+                        {tpProfile?.avatarUrl ? (
+                          <img src={tpProfile.avatarUrl} alt={tpProfile.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center text-slate-400">
+                            <UserIcon className="w-5 h-5" />
+                          </div>
+                        )}
+                        <BadgeOverlay 
+                          badges={getTraderBadges(tpProfile)} 
+                          className="absolute -bottom-1 -left-1 -right-1 justify-center z-10 scale-75" 
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-900 block">{tpProfile?.name || "Tradesperson"}</span>
+                          {quote.id === fastestStartId && (
+                            <span className="text-[9px] font-black bg-green-100 text-green-700 px-2 py-0.5 rounded-full uppercase tracking-wider flex items-center gap-1">
+                              <Zap className="w-2.5 h-2.5 fill-current" />
+                              Fastest Start
+                            </span>
+                          )}
+                        </div>
+                        {tpProfile?.verificationStatus && tpProfile.verificationStatus !== 'unverified' && (
+                          <TrustPulse 
+                            status={tpProfile.verificationStatus} 
+                            traderId={quote.tradespersonId} 
+                            className="mt-0.5"
+                          />
+                        )}
+                        <div className="flex items-center gap-1">
+                          <Star className="w-3 h-3 text-amber-400 fill-current" />
+                          <span className="text-[10px] font-bold text-slate-500">
+                            {tpProfile?.rating ? tpProfile.rating.toFixed(1) : "5.0"} ({tpProfile?.totalReviews || 0} reviews)
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {isHomeowner && quoteAnalyses[quote.id] && (
+                      <div className="space-y-3 pb-2">
+                        <div className="flex items-center justify-between">
+                          <div className={cn(
+                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase",
+                            quoteAnalyses[quote.id].label === "Budget Friendly" ? "bg-green-50 text-green-600" :
+                            quoteAnalyses[quote.id].label === "Good Value" ? "bg-blue-50 text-blue-600" :
+                            quoteAnalyses[quote.id].label === "Premium" ? "bg-purple-50 text-purple-600" :
+                            "bg-slate-50 text-slate-600"
+                          )}>
+                            {quoteAnalyses[quote.id].label}
+                          </div>
+                          <div className="text-[10px] font-bold text-slate-400 uppercase">
+                            Value vs. area average
+                          </div>
+                        </div>
+                        
+                        <div className="space-y-1">
+                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <motion.div 
+                              initial={{ width: 0 }}
+                              animate={{ width: `${quoteAnalyses[quote.id].percentile}%` }}
+                              className={cn(
+                                "h-full",
+                                quoteAnalyses[quote.id].percentile > 70 ? "bg-green-500" :
+                                quoteAnalyses[quote.id].percentile > 40 ? "bg-blue-500" :
+                                "bg-amber-500"
+                              )}
+                            />
+                          </div>
+                          <div className="flex justify-between text-[8px] font-bold text-slate-400 uppercase">
+                            <span>{quoteAnalyses[quote.id].percentile}th percentile</span>
+                          </div>
+                        </div>
+                        
+                        <div className="bg-blue-50/50 p-3 rounded-2xl border border-blue-100/50">
+                          <p className="text-[11px] text-blue-700 font-medium leading-relaxed">
+                            <Sparkles className="w-3 h-3 inline-block mr-1 -mt-0.5" />
+                            {quoteAnalyses[quote.id].winningFactor}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {reviewSummaries[quote.tradespersonId] && (
+                      <div className="bg-slate-50 p-3 rounded-2xl border border-black flex items-start gap-2">
+                        <div className="w-5 h-5 rounded-full bg-blue-50 flex items-center justify-center flex-shrink-0 mt-0.5">
+                          <Zap className="w-3 h-3 text-blue-600" />
+                        </div>
+                        <p className="text-[11px] text-slate-600 italic leading-relaxed">
+                          <span className="font-bold text-blue-600 not-italic">AI Summary: </span>
+                          "{reviewSummaries[quote.tradespersonId]}"
+                        </p>
+                      </div>
+                    )}
+
+                    <p className="text-slate-600 text-sm leading-relaxed">{quote.message}</p>
+                    
+                    {quote.startDate && (
+                      <div className="flex flex-wrap gap-2">
+                        <div className="flex items-center gap-2 text-xs font-bold text-slate-500 bg-slate-50 self-start px-3 py-1.5 rounded-lg border border-black">
+                          <Calendar className="w-3.5 h-3.5 text-blue-600" />
+                          <span>{quote.isImmediateStart ? "Immediately" : `Starts: ${new Date(quote.startDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`}</span>
+                        </div>
+                        {quote.estimatedTimeline && (
+                          <div className="flex items-center gap-2 text-xs font-bold text-slate-500 bg-slate-50 self-start px-3 py-1.5 rounded-lg border border-black">
+                            <Clock className="w-3.5 h-3.5 text-indigo-600" />
+                            <span>Timeline: {quote.estimatedTimeline}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    
+                    {quote.quoteScope === 'labour_only' && (
+                      <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 flex gap-2 items-start mt-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+                        <div className="text-xs text-amber-800">
+                          <span className="font-bold">Labour Only Quote:</span> This price covers the tradesperson's time and labour only. You are responsible for purchasing and providing all necessary materials and tools for this job.
+                        </div>
+                      </div>
+                    )}
+
+                    {quote.materialList && quote.materialList.length > 0 && (
+                       <div className="mt-3 p-4 bg-slate-50 border border-black rounded-2xl">
+                         <div className="flex items-center gap-2 mb-3">
+                           <Sparkles className="w-4 h-4 text-blue-600" />
+                           <h4 className="text-xs font-bold text-slate-900 uppercase tracking-widest">Finalized Material List</h4>
+                         </div>
+                         <ul className="space-y-1.5">
+                           {quote.materialList.map((item: string, idx: number) => (
+                             <li key={idx} className="flex flex-wrap items-start gap-2 text-xs text-slate-700">
+                               <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 flex-shrink-0 mt-0.5" />
+                               <span>{item}</span>
+                             </li>
+                           ))}
+                         </ul>
+                       </div>
+                    )}
+
+                    {quote.pendingRevision && (
+                      <div className="bg-blue-50 border border-blue-100 p-4 rounded-2xl space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <RotateCcw className="w-4 h-4 text-blue-600" />
+                            <p className="text-xs font-bold text-blue-600 uppercase tracking-wider">Quote Revision Requested</p>
+                          </div>
+                          {quote.revisionCount !== undefined && (
+                            <div className="flex items-center gap-1.5">
+                              <div className="flex gap-0.5">
+                                {[1, 2, 3, 4, 5].map(i => (
+                                  <div 
+                                    key={i} 
+                                    className={cn(
+                                      "w-2.5 h-1 rounded-full",
+                                      i <= quote.revisionCount ? "bg-blue-400" : "bg-blue-100"
+                                    )} 
+                                  />
+                                ))}
+                              </div>
+                              <span className="text-[8px] font-bold text-blue-400 uppercase tracking-tighter">
+                                {Math.max(0, 5 - quote.revisionCount)} left
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-lg font-black text-blue-900">New Amount: £{quote.pendingRevision.amount}</p>
+                          <div className="flex flex-wrap gap-2">
+                            {quote.pendingRevision.quoteScope && quote.pendingRevision.quoteScope !== quote.quoteScope && (
+                              <span className="text-[9px] font-bold text-blue-600 bg-blue-100 px-2 py-0.5 rounded-full uppercase">
+                                Scope: {quote.pendingRevision.quoteScope.replace('_', ' ')}
+                              </span>
+                            )}
+                            {quote.pendingRevision.paymentPreference && quote.pendingRevision.paymentPreference !== quote.paymentPreference && (
+                              <span className="text-[9px] font-bold text-blue-600 bg-blue-100 px-2 py-0.5 rounded-full uppercase">
+                                Payment: {quote.pendingRevision.paymentPreference.replace('_', ' ')}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-blue-700 italic">"{quote.pendingRevision.message}"</p>
+                        </div>
+                        {isHomeowner && (
+                          <div className="flex gap-2 pt-1">
+                            <button 
+                              onClick={() => handleApproveRevision(quote)}
+                              disabled={isProcessing}
+                              className="flex-1 bg-blue-600 text-white py-2 rounded-xl text-xs font-bold hover:bg-blue-700 transition-colors disabled:opacity-50"
+                            >
+                              Approve Change
+                            </button>
+                            <button 
+                              onClick={() => handleRejectRevision(quote)}
+                              disabled={isProcessing}
+                              className="flex-1 border border-blue-200 text-blue-600 py-2 rounded-xl text-xs font-bold hover:bg-blue-50 transition-colors disabled:opacity-50"
+                            >
+                              Decline
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    
+                    {quote.requoteMessage && (
+                      <div className="bg-amber-50 border border-amber-100 p-3 rounded-xl space-y-1">
+                        <div className="flex items-center justify-between">
+                          <p className="text-[10px] font-bold text-amber-600 uppercase tracking-wider">Requote Requested</p>
+                          {quote.revisionCount !== undefined && (
+                            <div className="flex items-center gap-1.5">
+                              <div className="flex gap-0.5">
+                                {[1, 2, 3, 4, 5].map(i => (
+                                  <div 
+                                    key={i} 
+                                    className={cn(
+                                      "w-2.5 h-1 rounded-full",
+                                      i <= quote.revisionCount ? "bg-amber-400" : "bg-amber-100"
+                                    )} 
+                                  />
+                                ))}
+                              </div>
+                              <span className="text-[8px] font-bold text-amber-400 uppercase tracking-tighter">
+                                {Math.max(0, 5 - quote.revisionCount)} left
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        <p className="text-xs text-amber-800 italic">"{quote.requoteMessage}"</p>
+                      </div>
+                    )}
+
+                    <AnimatePresence>
+                      {showHistoryId === quote.id && quote.history && (
+                        <motion.div 
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          exit={{ opacity: 0, height: 0 }}
+                          className="overflow-hidden"
+                        >
+                          <div className="mt-4 pt-4 border-t border-black space-y-3">
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Quote History</p>
+                            {quote.history.map((h: any, idx: number) => (
+                              <div key={idx} className="bg-slate-50 p-3 rounded-2xl border border-black space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[10px] font-bold text-slate-500">{new Date(h.timestamp).toLocaleString()}</span>
+                                  <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">{h.reason}</span>
+                                </div>
+                                <div className="flex items-center justify-between">
+                                  <p className="text-sm font-black text-slate-900">£{h.amount}</p>
+                                  <span className="text-[9px] font-bold text-slate-400 uppercase">{h.quoteScope?.replace('_', ' ')}</span>
+                                </div>
+                                <p className="text-xs text-slate-500 italic">"{h.message}"</p>
+                              </div>
+                            )).reverse()}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+
+                    {quote.status === "withdrawn" && quote.withdrawReason && (
+                      <div className="mt-4 pt-4 border-t border-black">
+                        <div className="bg-slate-50 p-3 rounded-2xl border border-black space-y-1">
+                          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Withdrawal Reason</p>
+                          <p className="text-sm text-slate-700 italic">"{quote.withdrawReason}"</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="text-right space-y-2 flex-shrink-0">
+                    {quote.isDiscountApplied ? (
+                      <div className="space-y-0.5">
+                        <p className="text-2xl font-black text-emerald-600">£{quote.amount}</p>
+                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                          Original: <span className="line-through">£{quote.originalAmount || Math.round(quote.amount / (1 - (quote.discountPercentage || 20) / 100))}</span>
+                        </p>
+                        <p className="text-[10px] font-bold text-emerald-600 flex items-center justify-end gap-1 uppercase tracking-tight">
+                          <span>🍁</span> {quote.discountPercentage}% Off-Peak Deal
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="text-2xl font-black text-slate-900">£{quote.amount}</p>
+                    )}
+                    <div className="flex flex-col items-end gap-1">
+                      {quote.paymentPreference && (
+                        <span className="text-[9px] font-bold text-purple-600 bg-purple-50 px-2 py-0.5 rounded-full uppercase tracking-tight border border-purple-100">
+                          {quote.paymentPreference.replace('_', ' ')}
+                        </span>
+                      )}
+                      {quote.quoteScope && (
+                        <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase tracking-tight border border-indigo-100">
+                          {quote.quoteScope.replace('_', ' ')}
+                        </span>
+                      )}
+                    </div>
+                    {quote.status === "rejected" ? (
+                      <div className="mt-4 translate-x-2 -translate-y-2">
+                        <span className="text-sm font-black tracking-widest uppercase text-red-600 border-[3px] border-red-600 px-3 py-1 rounded-md rotate-[-12deg] inline-block shadow-sm">
+                          DECLINED
+                        </span>
+                      </div>
+                    ) : (
+                      <span className={cn(
+                        "text-[10px] font-bold uppercase px-2 py-0.5 rounded-full inline-block",
+                        quote.status === "accepted" ? "text-green-600 bg-green-50" : 
+                        quote.status === "withdrawn" ? "text-slate-600 bg-slate-100" : 
+                        "text-amber-600 bg-amber-50"
+                      )}>
+                        {quote.status.replace('_', ' ')}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Direct Merchant AI BOM One-Click Ordering & Agreed Quote PDF (Full Width) */}
+                {quote.status === "accepted" && (
+                  <div className="w-full flex flex-col gap-3 pt-2">
+                    <div className="w-full p-4 rounded-2xl bg-gradient-to-br from-slate-900 via-slate-950 to-blue-950 text-white border border-white/20 shadow-md space-y-3.5 overflow-hidden">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                        <div className="flex items-start gap-3 min-w-0">
+                          <div className="w-9 h-9 rounded-xl bg-amber-500/20 border border-amber-400/40 text-amber-400 flex items-center justify-center font-bold text-base shrink-0">
+                            📦
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <h4 className="text-xs sm:text-sm font-black text-white leading-tight">Direct Merchant AI BOM Ordering</h4>
+                              <span className="text-[9px] bg-amber-400 text-slate-950 font-black px-2 py-0.5 rounded-full uppercase shrink-0">
+                                TradeOS
+                              </span>
+                              {quote.quoteScope === "labour_only" ? (
+                                <span className="text-[9px] bg-amber-500/20 text-amber-300 border border-amber-400/40 font-bold px-2 py-0.5 rounded-full uppercase shrink-0">
+                                  Labour Only • Parts Extra
+                                </span>
+                              ) : (
+                                <span className="text-[9px] bg-emerald-500/20 text-emerald-300 border border-emerald-400/40 font-bold px-2 py-0.5 rounded-full uppercase shrink-0">
+                                  All-Inclusive • Parts in Quote
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-slate-300 leading-snug mt-0.5">
+                              {job.hasBOMOrder 
+                                ? `Ordered via ${job.bomMerchant || 'Merchant'} • Ref: ${job.bomPickupRef || 'Ready'}`
+                                : quote.quoteScope === "labour_only"
+                                ? (isHomeowner 
+                                    ? "Labour-only quote: You can order parts at direct Trade Discounts with 1-Click collection or van delivery." 
+                                    : "Labour-only quote: Client supplies parts. You can prepare the BOM basket for client approval or pickup.")
+                                : (isHomeowner
+                                    ? "All-Inclusive quote: Materials are covered under the agreed quote price. Tradesperson manages procurement."
+                                    : "All-Inclusive quote: 1-Click Trade Discount Basket (Screwfix / Travis Perkins / Toolstation) to save 1-2 hrs.")}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="shrink-0 self-start sm:self-auto pl-12 sm:pl-0">
+                          {job.hasBOMOrder ? (
+                            <span className="inline-flex items-center text-[10px] font-black bg-emerald-500 text-slate-950 px-2.5 py-1 rounded-full whitespace-nowrap shadow-sm">
+                              ✓ {job.bomStatus === 'ready_for_pickup' ? 'Ready for Counter Pick' : job.bomStatus === 'out_for_delivery' ? 'Out for Delivery' : 'Dispatched'}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center text-[10px] font-black text-amber-300 bg-amber-400/20 px-2.5 py-1 rounded-full border border-amber-400/30 whitespace-nowrap">
+                              Save 1-2 Hrs
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2.5 border-t border-white/10 text-xs">
+                        <div className="text-[11px] text-slate-300 flex items-center gap-1.5">
+                          <span>Materials Estimate:</span>
+                          <strong className="text-amber-400 font-mono text-xs sm:text-sm">
+                            £{(job.materialsCost || quote.materialsCost || 85).toFixed(2)}
+                          </strong>
+                          <span className="text-emerald-400 text-[10px] font-semibold bg-emerald-950/40 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                            Trade Pricing
+                          </span>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setShowBomModal(true)}
+                          className="w-full sm:w-auto px-4 py-2.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-xs rounded-xl transition flex items-center justify-center gap-2 shadow-md active:scale-95 cursor-pointer"
+                        >
+                          <span>
+                            {job.hasBOMOrder 
+                              ? "View Merchant Barcode & Status" 
+                              : quote.quoteScope === "labour_only" && isHomeowner
+                              ? "⚡ 1-Click Order Materials"
+                              : quote.quoteScope === "complete_package" && isHomeowner
+                              ? "📦 View Material Specs & Parts"
+                              : "⚡ 1-Click Order Materials"}
+                          </span>
+                          <Sparkles className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <button 
+                      onClick={() => handleDownloadQuote(quote)}
+                      className="flex items-center justify-center sm:justify-start gap-2 text-xs font-bold text-emerald-700 hover:text-emerald-800 transition-colors bg-emerald-50 hover:bg-emerald-100 self-stretch sm:self-start px-3.5 py-2.5 rounded-xl border border-emerald-200 shadow-sm cursor-pointer"
+                    >
+                      <Download className="w-4 h-4 text-emerald-600" />
+                      <span>Download Agreed Quote (PDF)</span>
+                    </button>
+                  </div>
+                )}
+
+                {quote.status === "accepted" && (
+                  <div className="w-full">
+                  {/* Milestones & Guarantee Section */}
+                  <div className="mt-4 p-4 bg-[#1e3a5f]/5 border border-[#1e3a5f]/10 rounded-2xl space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex items-start sm:items-center gap-2">
+                        <ShieldCheck className="w-5 h-5 text-[#1e3a5f] shrink-0" />
+                        <h4 className="text-sm font-black text-[#1e3a5f] uppercase tracking-wider leading-tight">
+                          {quote.paymentTrack === 'quick' ? 'Quick Settle Protected' : 'Platform Guarantee Active'}
+                        </h4>
+                      </div>
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter sm:text-right">Settlement Secured via Stripe</span>
+                    </div>
+
+                    {quote.paymentTrack === 'quick' ? (
+                      <div className="space-y-4">
+                        <div className="bg-white p-4 rounded-xl border border-black flex items-center justify-between shadow-sm">
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600">
+                              <QrCode className="w-6 h-6" />
+                            </div>
+                            <div>
+                              <p className="text-xs font-bold text-slate-900">Digital Handshake</p>
+                              <p className="text-[10px] font-medium text-slate-500">Scan QR code at completion</p>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <p className="text-lg font-black text-[#1e3a5f]">£{quote.amount}</p>
+                            <p className="text-[10px] text-slate-400 uppercase font-bold">Single Payout</p>
+                          </div>
+                        </div>
+
+                        {!isHomeowner ? (
+                          <button 
+                            onClick={() => handleGenerateQr(quote)}
+                            disabled={isProcessingQr || quote.milestones?.[0]?.status === 'funds_released'}
+                            className="w-full bg-[#1e3a5f] text-white p-3 rounded-xl text-xs font-bold hover:bg-[#162a45] transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                          >
+                            {isProcessingQr ? <Loader2 className="w-4 h-4 animate-spin" /> : <QrCode className="w-4 h-4" />}
+                            {quote.milestones?.[0]?.status === 'funds_released' ? 'Handshake Complete' : 'Generate Completion QR'}
+                          </button>
+                        ) : (
+                          quote.milestones?.[0]?.status !== 'funds_released' && (
+                            <div className="p-3 bg-blue-50 border border-blue-100 rounded-xl flex items-start gap-2">
+                              <Info className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
+                              <p className="text-[10px] text-blue-800 leading-relaxed font-medium">
+                                To finalize this service, scan the QR code on the tradesperson's phone once the work is done. This initiates the immediate payout process.
+                              </p>
+                            </div>
+                          )
+                        )}
+
+                        {quote.milestones?.[0]?.status === 'funds_released' && (
+                          <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex items-start gap-3">
+                            <div className="w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center shrink-0">
+                              <Clock className="w-4 h-4 text-amber-600" />
+                            </div>
+                            <div className="space-y-1">
+                              <p className="text-xs font-bold text-amber-900">24-Hour Guarantee Window Active</p>
+                              <p className="text-[10px] text-amber-800 leading-tight">
+                                Your payment has been captured. You have until **{quote.guaranteeExpiresAt ? format(new Date(quote.guaranteeExpiresAt), 'hh:mm a, dd MMM') : '24 hours'}** to raise any quality concerns. After this, the platform guarantee will expire.
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {(quote.milestones || []).map((milestone: any, idx: number) => (
+                          <div key={milestone.id} className="bg-white p-3 rounded-xl border border-black flex items-center justify-between shadow-sm">
+                            <div className="flex items-center gap-3">
+                              <div className={cn(
+                                "w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold",
+                                milestone.status === "funded" ? "bg-green-100 text-green-600" :
+                                milestone.status === "funds_released" ? "bg-blue-100 text-blue-600" :
+                                "bg-slate-100 text-slate-400"
+                              )}>
+                                {idx + 1}
+                              </div>
+                              <div>
+                                <p className="text-xs font-bold text-slate-900">{milestone.title}</p>
+                                <p className="text-[10px] font-medium text-slate-500 capitalize">{milestone.status.replace('_', ' ')}</p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-4">
+                              <p className="text-sm font-black text-slate-900">£{milestone.amount}</p>
+                              {isHomeowner ? (
+                                milestone.status === 'pending_funding' ? (
+                                  <button 
+                                    onClick={() => handleFundMilestone(quote, milestone)}
+                                    disabled={isProcessing}
+                                    className="bg-[#1e3a5f] text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-[#162a45] transition-all"
+                                  >
+                                    Authorize Payment
+                                  </button>
+                                ) : milestone.status === 'funded' ? (
+                                  <button 
+                                    onClick={() => handleReleaseMilestone(quote, milestone)}
+                                    disabled={isProcessing}
+                                    className="bg-green-600 text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-green-700 transition-all"
+                                  >
+                                    Release Funds
+                                  </button>
+                                ) : (
+                                  <div className="flex items-center gap-1 text-blue-600">
+                                    <CheckCircle2 className="w-3.5 h-3.5" />
+                                    <span className="text-[10px] font-bold uppercase">Paid</span>
+                                  </div>
+                                )
+                              ) : (
+                                <div className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-slate-50 text-slate-400">
+                                  {milestone.status === 'pending_funding' ? "Awaiting Deposit" : 
+                                   milestone.status === 'funded' ? "Ready to Release" : "Disbursed"}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="bg-[#1e3a5f] p-3 rounded-xl flex items-start gap-2">
+                      <Info className="w-4 h-4 text-white flex-shrink-0 mt-0.5" />
+                      <p className="text-[10px] text-blue-50 font-medium leading-relaxed">
+                        {quote.paymentTrack === 'quick' 
+                          ? "Small jobs under £400 use our Handshake Protocol. Payment transfers directly to the trader's Stripe account upon scan, with a high-priority 24-hour window for dispute clawbacks."
+                          : "Our **Platform Guarantee** ensures your payment routes directly to the trader's Stripe account. Payout settlement is delayed by a 48-hour cooling-off period, allowing us to process automatic clawbacks if you raise a valid dispute."}
+                      </p>
+                    </div>
+                  </div>
+                 </div>
+                )}
+
+                {(((isHomeowner && quote.status !== "rejected" && quote.status !== "withdrawn") || (user?.uid === quote.tradespersonId && quote.status === "accepted")) || (quote.history && quote.history.length > 0)) && (
+                   <div className="flex items-center justify-between gap-4 pt-4 border-t border-slate-100 mt-2">
+                      {((isHomeowner && quote.status !== "rejected" && quote.status !== "withdrawn") || (user?.uid === quote.tradespersonId && quote.status === "accepted")) && (
+                        <button 
+                          onClick={() => handleStartChat(quote, tpProfile)}
+                          className="flex items-center gap-1.5 text-xs font-bold text-blue-600 hover:text-blue-700 transition-colors"
+                        >
+                          <MessageSquare className="w-4 h-4" />
+                          Message Tradesperson
+                        </button>
+                      )}
+                      
+                      {quote.history && quote.history.length > 0 && (
+                        <button 
+                          onClick={() => setShowHistoryId(showHistoryId === quote.id ? null : quote.id)}
+                          className="flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-slate-700 transition-colors ml-auto flex-shrink-0"
+                        >
+                          <History className="w-4 h-4" />
+                          {showHistoryId === quote.id ? "Hide History" : "View History"}
+                        </button>
+                      )}
+                   </div>
+                )}
+
+                {isHomeowner && (quote.status === "pending" || quote.status === "requote_requested") && job.status === "posted" && (
+                     <div className="pt-3 flex flex-col gap-3">
+                       {activeQuoteId === quote.id ? (
+                         <div className="space-y-2 mt-1">
+                           <textarea
+                             className="w-full p-2 border border-black rounded-xl text-xs"
+                             placeholder="Enter requote details..."
+                             value={requoteMessage}
+                             onChange={(e) => setRequoteMessage(e.target.value)}
+                           />
+                           <div className="flex gap-2">
+                             <button
+                               onClick={() => handleRequoteQuote(quote)}
+                               className="flex-1 bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-amber-700 transition-colors"
+                             >
+                               Send Request
+                             </button>
+                             <button
+                               onClick={() => setActiveQuoteId(null)}
+                               className="flex-1 border border-black text-slate-500 px-4 py-2 rounded-xl text-xs font-bold hover:bg-slate-50 transition-colors"
+                             >
+                               Cancel
+                             </button>
+                           </div>
+                         </div>
+                       ) : (
+                         <div className="flex items-center gap-2 mt-1">
+                           <button 
+                             onClick={() => {
+                               if (confirmAcceptQuoteId === quote.id) {
+                                 handleAcceptQuote(quote);
+                                 setConfirmAcceptQuoteId(null);
+                               } else {
+                                 setConfirmAcceptQuoteId(quote.id);
+                                 setConfirmDeclineQuoteId(null);
+                                 setTimeout(() => setConfirmAcceptQuoteId(null), 3000);
+                               }
+                             }}
+                             className={cn("flex-1 text-white px-1 py-2 rounded-full text-[10px] sm:text-xs font-bold transition-all shadow-sm whitespace-nowrap",
+                               confirmAcceptQuoteId === quote.id ? "bg-green-700 ring-2 ring-green-600 ring-offset-1" : "bg-green-600 hover:bg-green-700"
+                             )}
+                             title={confirmAcceptQuoteId === quote.id ? "Confirm Accept" : "Accept Quote"}
+                           >
+                             {confirmAcceptQuoteId === quote.id ? "Confirm Accept" : "Accept"}
+                           </button>
+                           <button 
+                             onClick={() => {
+                               if (confirmDeclineQuoteId === quote.id) {
+                                 handleRejectQuote(quote);
+                                 setConfirmDeclineQuoteId(null);
+                               } else {
+                                 setConfirmDeclineQuoteId(quote.id);
+                                 setConfirmAcceptQuoteId(null);
+                                 setTimeout(() => setConfirmDeclineQuoteId(null), 3000);
+                               }
+                             }}
+                             className={cn("flex-1 border px-1 py-2 rounded-full text-[10px] sm:text-xs font-bold transition-all whitespace-nowrap shadow-sm",
+                               confirmDeclineQuoteId === quote.id ? "border-red-500 text-red-700 bg-red-50 ring-2 ring-red-500 ring-offset-1" : "border-red-300 text-red-600 bg-white hover:bg-red-50"
+                             )}
+                             title={confirmDeclineQuoteId === quote.id ? "Confirm Decline" : "Decline Quote"}
+                           >
+                             {confirmDeclineQuoteId === quote.id ? "Confirm Decline" : "Decline"}
+                           </button>
+                           <button 
+                             onClick={() => setActiveQuoteId(quote.id)}
+                             className="flex-1 border border-amber-300 text-amber-600 bg-white hover:bg-amber-50 px-1 py-2 rounded-full text-[10px] sm:text-xs font-bold transition-all whitespace-nowrap shadow-sm"
+                           >
+                             Request Requote
+                           </button>
+                         </div>
+                       )}
+                     </div>
+                  )}
+
+                  {!isHomeowner && quote.tradespersonId === user?.uid && quote.status === "pending" && job.status === "posted" && (
+                    <div className="flex flex-col gap-2 pt-2 border-t border-slate-100 mt-2">
+                      {quote.paymentPreference === "negotiable" && !quote.pendingRevision && (
+                        isEditingRevision ? (
+                          <div className="space-y-2">
+                            <input
+                              type="number"
+                              className="w-full p-2 border border-black rounded-xl text-xs"
+                              placeholder="New Amount (£)"
+                              value={revisionAmount}
+                              onChange={(e) => setRevisionAmount(e.target.value)}
+                            />
+                            <textarea
+                              className="w-full p-2 border border-black rounded-xl text-xs"
+                              placeholder="Reason for revision..."
+                              value={revisionMessage}
+                              onChange={(e) => setRevisionMessage(e.target.value)}
+                            />
+                            <div className="flex gap-2">
+                              <button
+                                onClick={handleRequestRevision}
+                                disabled={isProcessing || !revisionAmount || !revisionMessage}
+                                className="flex-1 bg-blue-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-blue-700 transition-colors disabled:opacity-50"
+                              >
+                                Send Request
+                              </button>
+                              <button
+                                onClick={() => setIsEditingRevision(false)}
+                                className="flex-1 border border-black text-slate-500 px-4 py-2 rounded-xl text-xs font-bold hover:bg-slate-50 transition-colors"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button 
+                            onClick={() => {
+                              setRevisionAmount(quote.amount.toString());
+                              setRevisionMessage("");
+                              setIsEditingRevision(true);
+                            }}
+                            disabled={(quote.revisionCount || 0) >= 2}
+                            className="w-full border border-blue-200 text-blue-600 px-4 py-2 rounded-xl text-xs font-bold hover:bg-blue-50 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <Edit2 className="w-4 h-4" />
+                            {(quote.revisionCount || 0) >= 2 ? "Max Revisions Reached" : "Request Revision"}
+                          </button>
+                        )
+                      )}
+                      <button 
+                        onClick={() => setWithdrawingQuote(quote)}
+                        disabled={isProcessing}
+                        className="w-full border border-red-200 text-red-600 px-4 py-2 rounded-xl text-xs font-bold hover:bg-red-50 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        Withdraw Quote
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Blind Bidding Placeholder for Tradespeople */}
+            {!isHomeowner && (job.quoteCount || 0) > quotes.length && (
+              <div className="space-y-4">
+                {Array.from({ length: Math.max(0, (job.quoteCount || 0) - quotes.length) }).map((_, i) => (
+                  <div key={`blind-${i}`} className="bg-slate-50/50 p-6 rounded-3xl border border-dashed border-black flex items-center justify-between gap-4 opacity-70">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-slate-100 rounded-full flex items-center justify-center text-slate-300">
+                        <UserIcon className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <span className="font-bold text-slate-400 block italic">Other Tradesperson</span>
+                        <span className="text-[10px] font-bold text-slate-300 uppercase tracking-widest">Quote Submitted</span>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-xl font-black text-slate-300">£???</p>
+                      <span className="text-[9px] font-bold text-slate-300 bg-slate-100 px-2 py-0.5 rounded-full uppercase tracking-tight">
+                        Hidden for Fair Bidding
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                <div className="bg-blue-50 p-4 rounded-2xl border border-blue-100 flex items-center gap-3">
+                  <Sparkles className="w-5 h-5 text-blue-600 shrink-0" />
+                  <p className="text-xs text-blue-800 font-medium">
+                    To ensure fair competition, prices and details of other tradespeople are hidden. The homeowner can see all quotes and will contact you if interested.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {quotes.length === 0 && (!job.quoteCount || job.quoteCount === 0) && (() => {
+              const directTraderName = job.targetTradespersonName || job.claimedDeal?.traderName || job.claimedDeal?.businessName;
+              return (
+                <div className="py-12 flex flex-col items-center justify-center text-center space-y-4">
+                  <div className="w-16 h-16 rounded-full bg-slate-50 flex items-center justify-center border border-black">
+                    <Clock className="w-8 h-8 text-blue-600 animate-pulse" />
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-xl font-bold text-slate-900">
+                      {isHomeowner
+                        ? (directTraderName ? `Waiting for ${directTraderName}...` : "Waiting for quotes...")
+                        : "No quotes submitted yet"}
+                    </h4>
+                    <p className="text-sm text-slate-500 max-w-[320px] mx-auto">
+                      {isHomeowner
+                        ? (directTraderName
+                            ? `Direct 1-to-1 quote request sent to ${directTraderName}. They have been notified to review your job.`
+                            : "Verified tradespeople in your area are reviewing this job.")
+                        : "Be the first verified tradesperson to submit a quote for this job below!"}
+                    </p>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+        )}
+
+        {/* Sidebar Actions (Tradesperson view) */}
+        {!isHomeowner && job.status === "posted" && (
+          (job.quoteCount || 0) >= 5 && !hasQuoted ? (
+            <div className="bg-white p-8 rounded-3xl border border-black shadow-sm text-center space-y-4">
+              <div className="w-16 h-16 bg-red-50 rounded-full flex items-center justify-center mx-auto">
+                <AlertCircle className="w-8 h-8 text-red-500" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-xl font-black text-slate-900">Quote Limit Reached</h3>
+                <p className="text-sm text-slate-500">
+                  This job has already received the maximum number of quotes (5). If a quote is withdrawn or rejected, you may be able to submit one later.
+                </p>
+              </div>
+            </div>
+          ) : hasQuoted && !needsRequote && !isEditingSubmittedQuote ? (
+            /* Submitted Quote Summary Card for Tradesperson */
+            <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-black uppercase text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-300 flex items-center gap-1">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                  Your Quote Submitted
+                </span>
+                <span className="text-[10px] font-bold text-slate-500 uppercase">
+                  Status: {myQuote?.status || "PENDING"}
+                </span>
+              </div>
+              <div className="bg-slate-50 p-4 rounded-2xl border border-black space-y-2">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-xs font-bold text-slate-500 uppercase">Quote Amount</span>
+                  <span className="text-2xl font-black text-slate-900">£{myQuote?.amount}</span>
+                </div>
+                {myQuote?.paymentPreference && (
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-600">
+                    <span>Payment Term:</span>
+                    <span className="capitalize">{myQuote.paymentPreference.replace('_', ' ')}</span>
+                  </div>
+                )}
+                {myQuote?.quoteScope && (
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-600">
+                    <span>Scope:</span>
+                    <span className="capitalize">{myQuote.quoteScope.replace('_', ' ')}</span>
+                  </div>
+                )}
+                {myQuote?.message && (
+                  <div className="pt-2 border-t border-slate-200">
+                    <p className="text-xs text-slate-600 italic line-clamp-3">"{myQuote.message}"</p>
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    setIsEditingSubmittedQuote(true);
+                    if (myQuote) {
+                      setQuoteAmount(myQuote.amount?.toString() || "");
+                      setQuoteMessage(myQuote.message || "");
+                      if (myQuote.paymentPreference) setPaymentPreference(myQuote.paymentPreference);
+                      if (myQuote.quoteScope) setQuoteScope(myQuote.quoteScope);
+                    }
+                  }}
+                  className="flex-1 bg-blue-600 text-white p-3 rounded-2xl text-xs font-bold hover:bg-blue-700 transition-all flex items-center justify-center gap-1.5 shadow-sm active:scale-95"
+                >
+                  <Edit2 className="w-3.5 h-3.5" />
+                  Edit / Update Quote
+                </button>
+                {myQuote?.status === "pending" && (
+                  <button
+                    onClick={() => setWithdrawingQuote(myQuote)}
+                    className="border border-red-200 text-red-600 hover:bg-red-50 p-3 rounded-2xl text-xs font-bold transition-all"
+                  >
+                    Withdraw
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div id="quote-form-section" className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-4">
+              {new URLSearchParams(window.location.search).get('quickQuote') === 'true' && (
+                <div className="bg-slate-50 p-4 rounded-2xl border border-black space-y-3 mb-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Job Summary</span>
+                    <button 
+                      onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+                      className="text-[10px] font-bold text-blue-600 hover:underline"
+                    >
+                      View Full Details
+                    </button>
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="font-bold text-slate-900 leading-tight">{job.title}</h4>
+                    <p className="text-xs text-slate-500 line-clamp-2">{job.description}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-lg border border-black text-[10px] font-bold text-slate-600">
+                      <MapPin className="w-3 h-3" />
+                      {job.location}
+                    </div>
+                    <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-lg border border-black text-[10px] font-bold text-slate-600">
+                      <Sparkles className="w-3 h-3 text-orange-500" />
+                      £{job.estimateMin}-£{job.estimateMax}
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center justify-between">
+                <h3 className="font-bold text-slate-900">
+                  {needsRequote ? "Update Your Quote" : isEditingSubmittedQuote ? "Edit Your Quote" : "Submit a Quote"}
+                </h3>
+                {isEditingSubmittedQuote && (
+                  <button 
+                    onClick={() => setIsEditingSubmittedQuote(false)}
+                    className="text-[10px] font-bold text-slate-500 hover:text-slate-800 underline"
+                  >
+                    Cancel Editing
+                  </button>
+                )}
+              </div>
+              {needsRequote && (
+                <div className="bg-amber-50 border border-amber-100 p-3 rounded-xl space-y-1">
+                  <p className="text-[10px] font-bold text-amber-600 uppercase tracking-wider">Homeowner Request</p>
+                  <p className="text-xs text-amber-800 italic">"{myQuote.requoteMessage}"</p>
+                </div>
+              )}
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase">Payment Preference</label>
+                    <select 
+                      className="w-full p-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm bg-white"
+                      value={paymentPreference}
+                      onChange={(e) => setPaymentPreference(e.target.value)}
+                    >
+                      <option value="fixed_price">Fixed Price</option>
+                      <option value="hourly">Hourly Rate</option>
+                      <option value="negotiable">Negotiable</option>
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase">Quote Scope</label>
+                    <select 
+                      className="w-full p-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm bg-white"
+                      value={quoteScope}
+                      onChange={(e) => setQuoteScope(e.target.value)}
+                    >
+                      <option value="complete_package">Complete Package</option>
+                      <option value="labour_only">Labour Only</option>
+                      <option value="materials_only">Materials Only</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Deposit & Stripe Connect Payment Terms Selector */}
+                <div className="space-y-2 bg-slate-50 p-3.5 rounded-2xl border border-black">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-black text-slate-900 uppercase flex items-center gap-1.5">
+                      <CreditCard className="w-4 h-4 text-blue-600" />
+                      Deposit & Payment Structure
+                    </label>
+                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                      Stripe Connect Direct
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { id: "0_percent_completion", label: "0% Deposit", sub: "100% On Completion" },
+                      { id: "25_percent_upfront", label: "25% Deposit", sub: "For Materials" },
+                      { id: "50_percent_milestone", label: "50/50 Split", sub: "Milestone Payout" }
+                    ].map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setDepositTerm(opt.id)}
+                        className={cn(
+                          "p-2.5 rounded-xl border text-left transition-all flex flex-col justify-between",
+                          depositTerm === opt.id 
+                            ? "bg-slate-900 text-white border-slate-900 shadow-2xs" 
+                            : "bg-white text-slate-800 border-black hover:border-blue-400"
+                        )}
+                      >
+                        <span className="text-xs font-black">{opt.label}</span>
+                        <span className={cn("text-[9px] font-bold mt-0.5", depositTerm === opt.id ? "text-blue-200" : "text-slate-500")}>
+                          {opt.sub}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-slate-500 font-medium leading-tight flex items-center gap-1 pt-1">
+                    <ShieldCheck className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                    <span><strong>Non-Custodial Payouts:</strong> Direct Stripe Connect transfer. TradeOS does not hold user funds.</span>
+                  </p>
+                </div>
+
+                {/* Guarantee & Warranty Toggles */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase flex items-center gap-1">
+                      <Award className="w-3.5 h-3.5 text-amber-500" />
+                      Workmanship Guarantee
+                    </label>
+                    <select
+                      className="w-full p-2.5 rounded-xl border border-black text-xs font-bold bg-white focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                      value={guaranteeTerm}
+                      onChange={(e) => setGuaranteeTerm(e.target.value)}
+                    >
+                      <option value="1_year_workmanship">1 Year Guarantee (Standard)</option>
+                      <option value="2_year_workmanship">2 Year Guarantee</option>
+                      <option value="3_year_workmanship">3 Year Guarantee</option>
+                      <option value="5_year_workmanship">5 Year Guarantee (Premium)</option>
+                      <option value="no_guarantee">No Guarantee (As-Is)</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-blue-500" />
+                      Parts / Materials Warranty
+                    </label>
+                    <select
+                      className="w-full p-2.5 rounded-xl border border-black text-xs font-bold bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                      value={partsWarranty}
+                      onChange={(e) => setPartsWarranty(e.target.value)}
+                    >
+                      <option value="standard_parts">Manufacturer Standard Warranty</option>
+                      <option value="10_year_parts">10 Year Extended Warranty</option>
+                      <option value="no_parts_warranty">No Parts Warranty</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Willing Start Date */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold text-slate-500 uppercase">Willing Start Date</label>
+                    <button 
+                      onClick={() => setIsImmediateStart(!isImmediateStart)}
+                      className={cn(
+                        "text-[10px] font-bold px-2 py-1 rounded-lg border transition-all flex items-center gap-1",
+                        isImmediateStart ? "bg-green-50 text-green-600 border-green-200" : "bg-slate-50 text-slate-500 border-black"
+                      )}
+                    >
+                      <Zap className={cn("w-3 h-3", isImmediateStart && "fill-current")} />
+                      Immediately
+                    </button>
+                  </div>
+                  {!isImmediateStart && (
+                    <div className="relative animate-in fade-in slide-in-from-top-1">
+                      <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <input 
+                        type="date" 
+                        className="w-full p-3 pl-9 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm bg-white"
+                        value={quoteStartDate}
+                        min={new Date().toISOString().split('T')[0]}
+                        onChange={(e) => setQuoteStartDate(e.target.value)}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Estimated Job Completion Duration Selector */}
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Estimated Job Duration</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {["1-2 Hours", "Half day (3-4h)", "1 Full day (8h)", "2-3 Days", "1-2 Weeks", "2+ Weeks"].map((time) => (
+                      <button
+                        key={time}
+                        onClick={() => setEstimatedTimeline(time)}
+                        className={cn(
+                          "py-2 px-1 text-[10px] font-bold rounded-xl border transition-all text-center",
+                          estimatedTimeline === time 
+                            ? "bg-blue-600 text-white border-blue-600 shadow-2xs" 
+                            : "bg-white text-slate-700 border-black hover:border-blue-300"
+                        )}
+                      >
+                        {time}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Itemized Line-Item Calculator & Total Amount */}
+                <div className="space-y-3 bg-slate-50 p-4 rounded-2xl border border-black">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-black text-slate-900 uppercase flex items-center gap-1.5">
+                      <PoundSterling className="w-4 h-4 text-emerald-600" />
+                      Total Quote Amount
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setUseLineItems(!useLineItems)}
+                      className="text-[10px] font-black text-blue-700 hover:text-blue-900 bg-white border border-black px-2.5 py-1 rounded-lg flex items-center gap-1"
+                    >
+                      <Sparkles className="w-3 h-3 text-amber-500" />
+                      {useLineItems ? "Hide Line Items" : "+ Itemized Calculator"}
+                    </button>
+                  </div>
+
+                  {useLineItems ? (
+                    <div className="space-y-2 bg-white p-3 rounded-xl border border-slate-300 animate-in fade-in">
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Itemized Breakdown</p>
+                      {lineItems.map((item) => (
+                        <div key={item.id} className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            placeholder="e.g. Labor / Parts / Callout"
+                            className="flex-1 p-2 text-xs border border-slate-300 rounded-lg outline-none focus:border-blue-500 font-medium"
+                            value={item.description}
+                            onChange={(e) => handleUpdateLineItem(item.id, "description", e.target.value)}
+                          />
+                          <div className="relative w-28">
+                            <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">£</span>
+                            <input
+                              type="number"
+                              placeholder="Amount"
+                              className="w-full p-2 pl-6 text-xs border border-slate-300 rounded-lg outline-none focus:border-blue-500 font-black text-right"
+                              value={item.amount}
+                              onChange={(e) => handleUpdateLineItem(item.id, "amount", e.target.value)}
+                            />
+                          </div>
+                          {lineItems.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveLineItem(item.id)}
+                              className="p-1.5 text-slate-400 hover:text-red-600 rounded-md"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={handleAddLineItem}
+                        className="text-[10px] font-black text-blue-600 hover:underline pt-1 flex items-center gap-1"
+                      >
+                        + Add Line Item
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {job?.claimedDeal && (
+                    <div className="bg-emerald-50 border border-emerald-300 rounded-xl p-3 flex flex-col gap-1.5 animate-in fade-in">
+                      <div className="flex items-center justify-between flex-wrap gap-1">
+                        <span className="text-[11px] font-black text-emerald-900 uppercase tracking-tight flex items-center gap-1">
+                          ⚡ Claimed Flash Deal ({job.claimedDeal.discountPercentage || 0}% OFF)
+                        </span>
+                        <span className="text-[10px] font-extrabold text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded-md border border-emerald-200">
+                          Pre-Agreed Rate: £{job.claimedDeal.discountedPrice || job.claimedDeal.targetRate || job.claimedDeal.price}
+                        </span>
+                      </div>
+                      <p className="text-[10.5px] text-emerald-700 font-medium leading-snug">
+                        Homeowner booked via your Flash Deal for <strong>{job.claimedDeal.service || job.claimedDeal.dealTitle || "Service"}</strong>.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const dealPrice = job.claimedDeal.discountedPrice || job.claimedDeal.targetRate || job.claimedDeal.price;
+                          if (dealPrice) {
+                            setQuoteAmount(dealPrice.toString());
+                          }
+                        }}
+                        className="self-start mt-0.5 text-[10.5px] font-black bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1 rounded-lg shadow-2xs transition-colors flex items-center gap-1 cursor-pointer"
+                      >
+                        <Zap className="w-3 h-3 fill-white" />
+                        1-Click Apply Pre-Agreed Rate (£{job.claimedDeal.discountedPrice || job.claimedDeal.targetRate || job.claimedDeal.price})
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="relative">
+                    <PoundSterling className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input 
+                      type="number" 
+                      placeholder="Total amount e.g. 250"
+                      className="w-full p-3 pl-9 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-base font-black bg-white"
+                      value={quoteAmount}
+                      onChange={(e) => setQuoteAmount(e.target.value)}
+                    />
+                  </div>
+
+                  {(() => {
+                    const matchingDeal = getMatchingDeal();
+                    if (!matchingDeal || !quoteAmount) return null;
+                    return (
+                      <div className="bg-emerald-50 border border-emerald-200 p-3 rounded-xl flex items-start gap-2 animate-in fade-in">
+                        <span className="text-base">🍁</span>
+                        <div className="flex-1">
+                          <h4 className="text-[11px] font-black text-emerald-800 uppercase leading-none">
+                            Quiet Period Off-Peak Discount Matches!
+                          </h4>
+                          <p className="text-[10px] text-emerald-700 leading-tight mt-1">
+                            A <strong>{matchingDeal.discountPercentage}% discount</strong> on <strong>{matchingDeal.service}</strong> is applied for the <strong>{formatDealScheduleText(matchingDeal.dayOfWeek)}</strong> schedule.
+                          </p>
+                          <div className="mt-1.5 flex items-center gap-2 text-[10px]">
+                            <span className="text-slate-500">Original: <span className="line-through">£{parseFloat(quoteAmount) || 0}</span></span>
+                            <span className="font-bold text-emerald-600">Discounted Quote: £{Math.round((parseFloat(quoteAmount) || 0) * (1 - matchingDeal.discountPercentage / 100))}</span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {payoutSummary && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="p-3 bg-white rounded-xl border border-slate-200 flex flex-col gap-1.5"
+                    >
+                      <div className="flex items-center justify-between text-[11px] font-medium text-slate-500">
+                        <span>Platform Fee ({(profile?.tier === 'pro' ? '10%' : profile?.tier === 'premium' ? '5%' : '15%')})</span>
+                        <span>-£{payoutSummary.platformCommission.toFixed(2)}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] font-medium text-slate-500">
+                        <span>Stripe Fee ({payoutSummary.paymentRail === 'bank_transfer' ? 'Open Banking' : 'Card Rail'})</span>
+                        <span>-£{payoutSummary.stripeFee.toFixed(2)}</span>
+                      </div>
+                      <div className="h-px bg-slate-200 my-1" />
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-bold text-slate-700">Estimated Net Direct Payout</span>
+                        <span className="text-sm font-black text-green-600">£{payoutSummary.netPayout.toFixed(2)}</span>
+                      </div>
+                      {payoutSummary.paymentRail === 'bank_transfer' && (
+                        <div className="mt-2 flex items-center gap-2 p-2 bg-blue-50 rounded-lg border border-blue-100">
+                          <TrendingDown className="w-3 h-3 text-blue-600" />
+                          <p className="text-[9px] font-bold text-blue-700 leading-tight">
+                            Large job detected. Fee capped via secure Bank Transfer to maximize your profit.
+                          </p>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+                </div>
+              <div className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-500 uppercase">Message</label>
+                  <div className="flex items-center gap-3">
+                    {quoteScope === "labour_only" && (
+                      <button 
+                        onClick={handleGenerateQuoteMaterials}
+                        disabled={isGeneratingMaterials}
+                        className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1 disabled:opacity-50"
+                      >
+                        {isGeneratingMaterials ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                        Add Material List
+                      </button>
+                    )}
+                    <button 
+                      onClick={handleDraftWithAI}
+                      disabled={isDraftingAI}
+                      className="text-[10px] font-bold text-blue-600 hover:text-blue-700 flex items-center gap-1 disabled:opacity-50"
+                    >
+                      {isDraftingAI ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+                      Draft with AI
+                    </button>
+                  </div>
+                </div>
+                <textarea 
+                  rows={3}
+                  className="w-full p-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 resize-none text-sm"
+                  placeholder="Tell the homeowner why you're the best fit..."
+                  value={quoteMessage}
+                  onChange={(e) => setQuoteMessage(e.target.value)}
+                />
+              </div>
+
+              {/* Tips for winning quotes */}
+              <div className="bg-amber-50/50 border border-amber-100 rounded-2xl p-4 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-amber-600" />
+                  <h4 className="text-[10px] font-black text-amber-900 uppercase tracking-widest">Tips for winning quotes</h4>
+                </div>
+                <ul className="space-y-2">
+                  {[
+                    "Be specific about what is included",
+                    "Mention your experience with similar jobs",
+                    "Include any warranties or guarantees",
+                    "Clarify if there are any potential extras"
+                  ].map((tip, i) => (
+                    <li key={i} className="flex items-start gap-2 text-[11px] text-amber-800 font-medium">
+                      <div className="w-1 h-1 rounded-full bg-amber-400 mt-1.5 shrink-0" />
+                      {tip}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              {error && (
+                <div className="p-3.5 bg-red-50 border border-red-300 rounded-xl text-red-700 text-xs font-bold flex items-center justify-between shadow-2xs animate-in fade-in">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                    <span>{error}</span>
+                  </div>
+                  <button type="button" onClick={() => setError(null)} className="text-red-900 font-extrabold hover:underline ml-2">✕</button>
+                </div>
+              )}
+
+              <button 
+                type="button"
+                onClick={handleQuote}
+                disabled={isSubmittingQuote}
+                className="w-full bg-[#1e3a5f] text-white p-4 rounded-2xl font-bold hover:bg-blue-900 transition-colors disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer shadow-md active:scale-98"
+              >
+                {isSubmittingQuote ? (
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    <span>Submitting Quote...</span>
+                  </>
+                ) : (
+                  needsRequote ? "Update Quote" : "Submit Quote"
+                )}
+              </button>
+            </div>
+          </div>
+          )
+        )}
+
+        {/* Completion / Review Actions */}
+        {isHomeowner && (job.status === "accepted" || job.status === "in_progress") && (
+          <div className="space-y-3">
+            <button 
+              onClick={handleCompleteJob}
+              className="w-full bg-green-600 text-white p-5 rounded-2xl font-bold hover:bg-green-700 transition-all shadow-lg shadow-green-100 active:scale-95"
+            >
+              Mark as Completed
+            </button>
+            <button 
+              onClick={() => setShowDisputeModal(true)}
+              className="w-full bg-white border border-red-200 text-red-600 p-4 rounded-2xl font-bold hover:bg-red-50 transition-all flex items-center justify-center gap-2"
+            >
+              <AlertTriangle className="w-5 h-5" />
+              Raise a Dispute
+            </button>
+          </div>
+        )}
+
+        {!isHomeowner && job.status === "accepted" && isAssignedTrader && (
+          <div className="space-y-3">
+            {!job.trackingStatus && (
+              <button 
+                onClick={handleSetOnRoute}
+                className="w-full bg-blue-600 text-white p-5 rounded-2xl font-bold hover:bg-blue-700 transition-all active:scale-95 flex justify-center items-center gap-2"
+              >
+                <Navigation className="w-5 h-5" />
+                Signal On Route
+              </button>
+            )}
+            {job.trackingStatus === "on_route" && (
+              <button 
+                onClick={handleSetArrived}
+                className="w-full bg-green-600 text-white p-5 rounded-2xl font-bold hover:bg-green-700 transition-all active:scale-95 flex justify-center items-center gap-2"
+              >
+                <MapPin className="w-5 h-5" />
+                Signal Arrived
+              </button>
+            )}
+
+            {(job.trackingStatus === "arrived" || job.trackingStatus === "completed" || job.trackingStatus === undefined) && (
+              <>
+                <button 
+                  onClick={() => setShowDigitalId(true)}
+                  className="w-full bg-indigo-600 text-white p-5 rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 flex items-center justify-center gap-2 active:scale-95"
+                >
+                  <QrCode className="w-5 h-5" />
+                  Show Digital ID Card
+                </button>
+                <button 
+                  onClick={handleStartJob}
+                  className="w-full bg-[#1e3a5f] text-white p-5 rounded-2xl font-bold hover:bg-blue-900 transition-all shadow-lg shadow-blue-100 active:scale-95"
+                >
+                  Start Work
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {!isHomeowner && job.status === "in_progress" && isAssignedTrader && (
+          <div className="space-y-3">
+            <button 
+              onClick={() => setShowDisputeModal(true)}
+              className="w-full bg-white border border-red-200 text-red-600 p-4 rounded-2xl font-bold hover:bg-red-50 transition-all flex items-center justify-center gap-2"
+            >
+              <AlertTriangle className="w-5 h-5" />
+              Raise a Dispute
+            </button>
+            
+            {!isEditingRevision ? (
+              <button 
+                onClick={() => {
+                  setRevisionAmount(myQuote.amount.toString());
+                  setRevisionMessage("");
+                  setRevisionScope(myQuote.quoteScope || "complete_package");
+                  setRevisionPaymentPreference(myQuote.paymentPreference || "fixed_price");
+                  setIsEditingRevision(true);
+                }}
+                disabled={(myQuote.revisionCount || 0) >= 4}
+                className="w-full bg-white border-2 border-dashed border-black text-slate-600 p-5 rounded-2xl font-bold hover:border-blue-600 hover:text-blue-600 transition-all flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-black disabled:hover:text-slate-600"
+              >
+                <Edit2 className="w-5 h-5" />
+                {(myQuote.revisionCount || 0) >= 4 ? "Max Revisions Reached" : "Request Quote/Scope Change"}
+              </button>
+            ) : (
+              <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-slate-900">Request Quote Change</h3>
+                  <button onClick={() => setIsEditingRevision(false)} className="text-slate-400 hover:text-slate-600">
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase">New Amount (£)</label>
+                    <div className="relative">
+                      <PoundSterling className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                      <input 
+                        type="number" 
+                        className="w-full p-3 pl-9 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600"
+                        value={revisionAmount}
+                        onChange={(e) => setRevisionAmount(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-500 uppercase">Scope</label>
+                      <select 
+                        className="w-full p-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm"
+                        value={revisionScope}
+                        onChange={(e) => setRevisionScope(e.target.value as any)}
+                      >
+                        <option value="complete_package">Full Package</option>
+                        <option value="labour_only">Labour Only</option>
+                      </select>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-500 uppercase">Payment</label>
+                      <select 
+                        className="w-full p-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm"
+                        value={revisionPaymentPreference}
+                        onChange={(e) => setRevisionPaymentPreference(e.target.value as any)}
+                      >
+                        <option value="fixed_price">Fixed Price</option>
+                        <option value="hourly">Hourly</option>
+                        <option value="negotiable">Negotiable</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 uppercase">Reason for Change</label>
+                    <textarea 
+                      rows={3}
+                      className="w-full p-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 resize-none text-sm"
+                      placeholder="Explain why the price or scope needs to change..."
+                      value={revisionMessage}
+                      onChange={(e) => setRevisionMessage(e.target.value)}
+                    />
+                  </div>
+                  <button 
+                    onClick={handleRequestRevision}
+                    disabled={!revisionAmount || !revisionMessage || isProcessing}
+                    className="w-full bg-blue-600 text-white p-4 rounded-2xl font-bold hover:bg-blue-700 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : "Send Request to Homeowner"}
+                  </button>
+                </div>
+                {job.status === "accepted" && !isHomeowner && (
+                  <button 
+                    onClick={() => setShowRescheduleModal(true)}
+                    className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1 bg-indigo-50 px-2 py-1 rounded-md transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    Reschedule
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {job.status === "completed" && (
+          <div className="space-y-4 mb-4">
+            <div className="bg-white rounded-3xl p-6 shadow-sm border border-black space-y-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-bold text-[#1e3a8a] text-[19px]">Official Invoice & Tax Receipt</h3>
+                  {(() => {
+                    const accQ = quotes.find(q => q.status === "accepted");
+                    const tpP = accQ ? tradespersonProfiles[accQ.tradespersonId] : null;
+                    const isPro = tpP?.tier === "gold" || tpP?.tier === "platinum" || tpP?.hasVerifiedVideoProSubscription;
+                    return (
+                      <span className={cn("text-[10px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider border border-black", isPro ? "bg-amber-400 text-slate-950" : "bg-slate-100 text-slate-700")}>
+                        {isPro ? "⚡ Pro Branded Invoice" : "Free Standard Invoice"}
+                      </span>
+                    );
+                  })()}
+                </div>
+                {(job.isPaid === true || job.paymentStatus === "handshake_complete") ? (
+                  <div className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" /> Fully Paid
+                  </div>
+                ) : job.paymentStatus === "funded" ? (
+                  <div className="bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5" /> Escrow Funded · Awaiting Release
+                  </div>
+                ) : ["failed", "reconciliation_required", "refunded"].includes(String(job.paymentStatus || "").toLowerCase()) ? (
+                  <div className="bg-orange-100 text-orange-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5" /> Payment Under Review
+                  </div>
+                ) : (
+                  <div className="bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5" /> Payment Pending
+                  </div>
+                )}
+              </div>
+              <div className="space-y-3 text-sm">
+                <div className="flex justify-between items-center">
+                   <span className="text-slate-600 font-medium">Trade Works Labour:</span>
+                   <span className="text-slate-900 font-medium">£{(quotes.find(q => q.status === "accepted")?.amount || 0).toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                   <span className="text-slate-600 font-medium">Estimated Materials:</span>
+                   <span className="text-slate-900 font-medium">£{(job.materialsCost || quotes.find(q => q.status === "accepted")?.materialsCost || 0).toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                   <span className="text-[#1e3a8a] font-medium">VAT (20%):</span>
+                   <span className="text-slate-900 font-medium">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.20).toFixed(2)}</span>
+                </div>
+                <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
+                <div className="flex justify-between items-center pt-1">
+                   <span className="text-black font-black text-[18px]">Total {(job.isPaid === true || job.paymentStatus === "handshake_complete") ? "Paid" : "Due"}:</span>
+                   <span className="text-black font-black text-[18px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}</span>
+                </div>
+              </div>
+              <button 
+                onClick={handleDownloadInvoice}
+                className="w-full mt-2 bg-slate-900 text-white hover:bg-black py-3.5 rounded-[1rem] font-bold text-[15px] transition-colors flex items-center justify-center gap-2 border border-black shadow-sm"
+              >
+                <Download className="w-4 h-4 text-amber-400" /> Download PDF Invoice & Receipt
+              </button>
+            </div>
+          </div>
+        )}
+
+        {isHomeowner && job.status === "completed" && !job.hasReview && (
+          <div className="space-y-4">
+            {!showReviewForm ? (
+              <button 
+                onClick={() => setShowReviewForm(true)}
+                className="w-full bg-amber-500 text-white p-5 rounded-2xl font-bold hover:bg-amber-600 transition-all shadow-lg shadow-amber-100 flex items-center justify-center gap-2 active:scale-95"
+              >
+                <Star className="w-5 h-5 fill-current" />
+                Leave a Review for Tradesperson
+              </button>
+            ) : (
+              <ReviewForm
+                jobId={id!}
+                reviewerId={user!.uid}
+                revieweeId={quotes.find(q => q.status === "accepted")?.tradespersonId || job.acceptedTradespersonId}
+                type="tradesperson_review"
+                onSuccess={() => {
+                  setShowReviewForm(false);
+                  setJob((prev: any) => ({ ...prev, hasReview: true }));
+                }}
+                onCancel={() => setShowReviewForm(false)}
+              />
+            )}
+          </div>
+        )}
+
+        {!isHomeowner && job.status === "completed" && (myQuote?.status === "accepted" || job.acceptedTradespersonId === user?.uid) && (
+          <div className="space-y-4">
+            {job.paymentStatus === "pending" && (
+              <div className="bg-amber-50 rounded-3xl p-6 border border-amber-200">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0">
+                    <PoundSterling className="w-5 h-5 text-amber-700" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-amber-900">Payment Pending</h3>
+                    <p className="text-amber-700 text-xs text-balance mt-0.5">Payment confirmation must be recorded through the verified payment process. If you received payment outside the platform, contact support so it can be reconciled safely.</p>
+                  </div>
+                </div>
+                
+                {showPaymentReminder ? (
+                  <div className="bg-white border text-sm border-amber-200 rounded-2xl p-4 mb-4 space-y-4">
+                    <h4 className="font-bold text-amber-900 mb-2">Send Payment Reminder</h4>
+                    <p className="text-xs text-amber-700 mb-3 block">Choose how you want to remind the customer:</p>
+                    
+                    <div className="space-y-2">
+                       <label className="flex items-center gap-2 cursor-pointer text-amber-900 font-medium">
+                         <input type="checkbox" checked={reminderChannels.app} onChange={(e) => setReminderChannels({...reminderChannels, app: e.target.checked})} className="rounded text-amber-600 focus:ring-amber-500 bg-amber-50 border-amber-300 w-4 h-4" />
+                         <span>In-App Notification</span>
+                       </label>
+                       <label className="flex items-center gap-2 cursor-pointer text-amber-900 font-medium">
+                         <input type="checkbox" checked={reminderChannels.whatsapp} onChange={(e) => setReminderChannels({...reminderChannels, whatsapp: e.target.checked})} className="rounded text-amber-600 focus:ring-amber-500 bg-amber-50 border-amber-300 w-4 h-4" />
+                         <span>WhatsApp Message</span>
+                       </label>
+                       <label className="flex items-center gap-2 cursor-pointer text-amber-900 font-medium">
+                         <input type="checkbox" checked={reminderChannels.email} onChange={(e) => setReminderChannels({...reminderChannels, email: e.target.checked})} className="rounded text-amber-600 focus:ring-amber-500 bg-amber-50 border-amber-300 w-4 h-4" />
+                         <span>Email</span>
+                       </label>
+                       <label className="flex items-center gap-2 cursor-pointer text-amber-900 font-medium">
+                         <input type="checkbox" checked={reminderChannels.sms} onChange={(e) => setReminderChannels({...reminderChannels, sms: e.target.checked})} className="rounded text-amber-600 focus:ring-amber-500 bg-amber-50 border-amber-300 w-4 h-4" />
+                         <span>SMS</span>
+                       </label>
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-2">
+                      <button 
+                        onClick={() => setShowPaymentReminder(false)}
+                        className="flex-1 bg-amber-100 text-amber-800 p-3 rounded-xl font-bold hover:bg-amber-200 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <button 
+                        onClick={handleSendPaymentReminder}
+                        className="flex-1 bg-amber-600 text-white p-3 rounded-xl font-bold hover:bg-amber-700 transition-colors"
+                      >
+                        Send Now
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button 
+                    onClick={() => setShowPaymentReminder(true)}
+                    className="w-full bg-white text-amber-700 border-2 border-amber-200 p-4 rounded-2xl font-bold hover:bg-amber-100 transition-all flex items-center justify-center gap-2 mb-3"
+                  >
+                    <MessageSquare className="w-5 h-5" />
+                    Send Payment Reminder
+                  </button>
+                )}
+
+              </div>
+            )}
+
+            {myQuote?.status === "accepted" && (
+              <button 
+                onClick={handleDownloadInvoice}
+                className="w-full bg-white border-2 border-black text-slate-700 p-5 rounded-2xl font-bold hover:border-blue-600 hover:text-blue-600 transition-all flex items-center justify-center gap-2 active:scale-95"
+              >
+                <FileText className="w-5 h-5" />
+                Download Invoice PDF
+              </button>
+            )}
+
+            <div className="bg-indigo-600 rounded-3xl p-6 text-white shadow-lg shadow-indigo-100 space-y-4 relative overflow-hidden">
+              <div className="absolute top-0 right-0 p-4 opacity-10">
+                <Sparkles className="w-24 h-24" />
+              </div>
+              <div className="relative z-10 space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center backdrop-blur-sm">
+                    <Sparkles className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-lg">AI Marketing Assistant</h3>
+                    <p className="text-indigo-100 text-xs">Showcase your work on social media</p>
+                  </div>
+                </div>
+
+                {marketingPost ? (
+                  <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-black/20 space-y-3">
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{marketingPost}</p>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => {
+                          navigator.clipboard.writeText(marketingPost);
+                          // Could add a toast here
+                        }}
+                        className="flex-1 bg-white text-indigo-600 py-2 rounded-xl text-xs font-bold hover:bg-indigo-50 transition-colors flex items-center justify-center gap-2"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        Copy Text
+                      </button>
+                      <button 
+                        onClick={() => setMarketingPost("")}
+                        className="px-4 bg-indigo-500 text-white py-2 rounded-xl text-xs font-bold hover:bg-indigo-400 transition-colors"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button 
+                    onClick={handleGenerateMarketingPost}
+                    disabled={isGeneratingMarketing}
+                    className="w-full bg-white text-indigo-600 py-4 rounded-2xl font-bold hover:bg-indigo-50 transition-all flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50"
+                  >
+                    {isGeneratingMarketing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5" />}
+                    Generate Social Media Post
+                  </button>
+                )}
+              </div>
+            </div>
+            
+            {!job.hasTradespersonReview && (
+              !showTradespersonReviewForm ? (
+                <button 
+                  onClick={() => setShowTradespersonReviewForm(true)}
+                  className="w-full bg-blue-600 text-white p-5 rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-100 flex items-center justify-center gap-2 active:scale-95"
+                >
+                  <Star className="w-5 h-5 fill-current" />
+                  Review Homeowner
+                </button>
+              ) : (
+                <ReviewForm
+                  jobId={id!}
+                  reviewerId={user!.uid}
+                  revieweeId={job.homeownerId}
+                  type="homeowner_review"
+                  onSuccess={() => {
+                    setShowTradespersonReviewForm(false);
+                    setJob((prev: any) => ({ ...prev, hasTradespersonReview: true }));
+                  }}
+                  onCancel={() => setShowTradespersonReviewForm(false)}
+                />
+              )
+            )}
+          </div>
+        )}
+
+        {isHomeowner && job.status === "cancelled" && isJobDeletable && (
+          <div className="space-y-4 mb-4 mt-6">
+            <button
+               onClick={handleDeleteJobClick}
+               disabled={isProcessing}
+               className={cn("w-full bg-white border-2 p-5 rounded-2xl font-bold transition-all flex items-center justify-center gap-2 active:scale-95 shadow-sm",
+                 confirmDelete ? "text-red-700 border-red-500 bg-red-50" : "text-red-600 border-red-100 hover:bg-red-50 shadow-red-100/50"
+               )}
+            >
+               {isProcessing ? (
+                 <Loader2 className="w-5 h-5 animate-spin" />
+               ) : confirmDelete ? (
+                 <AlertTriangle className="w-5 h-5" />
+               ) : (
+                 <Trash2 className="w-5 h-5" />
+               )}
+               {confirmDelete ? "Confirm Deletion" : "Delete Cancelled Job"}
+            </button>
+          </div>
+        )}
+          </>
+        )}
+      </div>
+
+      {/* Dispute Modal */}
+      <AnimatePresence>
+        {showDisputeModal && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowDisputeModal(false)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, y: 100 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 100 }}
+              className="relative w-full max-w-md bg-white rounded-t-[32px] sm:rounded-3xl overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 space-y-6">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-red-50 flex items-center justify-center">
+                      <AlertTriangle className="w-6 h-6 text-red-600" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-bold text-slate-900">Raise Dispute</h3>
+                      <p className="text-xs text-slate-500">Professional mediation will be required</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setShowDisputeModal(false)} className="p-2 hover:bg-slate-50 rounded-full transition-colors">
+                    <X className="w-6 h-6 text-slate-400" />
+                  </button>
+                </div>
+
+                <div className="space-y-4">
+                  {job?.paymentStatus === "handshake_complete" && (
+                    <div className="p-4 bg-orange-50 border border-orange-200 rounded-2xl flex items-start gap-3">
+                      <Zap className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-xs font-bold text-orange-900 leading-tight">Handshake Verified Job</p>
+                        <p className="text-[10px] text-orange-800 leading-normal mt-1">
+                          Since this work was verified via Digital Handshake at completion, disputes are **restricted to safety or technical failures**. Cosmetic or punctuality concerns are not eligible for refunds.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Summary of Issue</label>
+                    <textarea 
+                      rows={3}
+                      className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600 resize-none text-sm leading-relaxed"
+                      placeholder="High-level reason for this dispute..."
+                      value={disputeReason}
+                      onChange={(e) => setDisputeReason(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Technical Fault Description (Mandatory)</label>
+                    <textarea 
+                      rows={4}
+                      className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600 resize-none text-sm leading-relaxed"
+                      placeholder="Describe exactly what isn't working. Frivolous or non-technical claims will be rejected..."
+                      value={technicalFaultReport}
+                      onChange={(e) => setTechnicalFaultReport(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="flex items-start gap-3 p-4 bg-blue-50 border border-blue-100 rounded-2xl">
+                    <input 
+                      type="checkbox"
+                      id="mediationStake"
+                      checked={mediationStakePaid}
+                      onChange={(e) => setMediationStakePaid(e.target.checked)}
+                      className="mt-1 w-4 h-4 text-blue-600 border-black rounded focus:ring-blue-500"
+                    />
+                    <label htmlFor="mediationStake" className="space-y-1 cursor-pointer">
+                      <p className="text-sm font-bold text-blue-900 leading-tight">Authorize £25.00 Mediation Stake</p>
+                      <p className="text-[10px] text-blue-700 leading-normal">
+                        To prevent frivolous claims, you must stake £25.00. This is **refunded** if the dispute is valid. If the dispute is found to be unreasonable (petty), the stake will be released to the trader as Inconvenience Pay.
+                      </p>
+                    </label>
+                  </div>
+
+                  <div className="flex items-start gap-3 p-4 bg-red-50 rounded-2xl border border-red-100/50">
+                    <input 
+                      type="checkbox"
+                      id="propertyDamage"
+                      checked={isPropertyDamage}
+                      onChange={(e) => setIsPropertyDamage(e.target.checked)}
+                      className="mt-1 w-4 h-4 text-red-600 border-black rounded focus:ring-red-500"
+                    />
+                    <label htmlFor="propertyDamage" className="space-y-1 cursor-pointer">
+                      <p className="text-sm font-bold text-red-900 leading-tight">This involves Physical Property Damage</p>
+                      <p className="text-[10px] text-red-700 leading-normal">
+                        Checking this authorizes AnyTrader to facilitate a claim against the tradesperson's **Public Liability Insurance** as per our T&Cs for property damage incidents.
+                      </p>
+                    </label>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Evidence Photos (Burden of Proof Required)</label>
+                    <div className="grid grid-cols-4 gap-2">
+                      {disputePhotos.map((file, i) => (
+                        <div key={i} className="aspect-square rounded-xl bg-slate-100 relative overflow-hidden group">
+                          <img 
+                            src={URL.createObjectURL(file)} 
+                            className="w-full h-full object-cover" 
+                            alt="Evidence"
+                          />
+                          <button 
+                            onClick={() => setDisputePhotos(prev => prev.filter((_, idx) => idx !== i))}
+                            className="absolute top-1 right-1 p-1 bg-red-500 text-white rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ))}
+                      {disputePhotos.length < 4 && (
+                        <label className="aspect-square rounded-xl border-2 border-dashed border-black flex flex-col items-center justify-center gap-1 cursor-pointer hover:border-red-600 hover:bg-red-50 transition-all group">
+                          <Camera className="w-6 h-6 text-slate-300 group-hover:text-red-600" />
+                          <span className="text-[8px] font-bold text-slate-400 group-hover:text-red-600 uppercase">Add Photo</span>
+                          <input 
+                            type="file" 
+                            accept="image/*" 
+                            multiple 
+                            className="hidden" 
+                            onChange={(e) => {
+                              if (e.target.files) {
+                                setDisputePhotos(prev => [...prev, ...Array.from(e.target.files!)].slice(0, 4));
+                              }
+                            }}
+                          />
+                        </label>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-3 pt-2">
+                  <button 
+                    onClick={handleRaiseDispute}
+                    disabled={!disputeReason || isProcessing}
+                    className="w-full bg-red-600 text-white p-4 rounded-2xl font-bold hover:bg-red-700 transition-all shadow-lg shadow-red-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {isUploadingDispute ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Uploading Evidence...
+                      </>
+                    ) : (
+                      <>
+                        <AlertTriangle className="w-5 h-5" />
+                        Submit Dispute for Review
+                      </>
+                    )}
+                  </button>
+                  <p className="text-[10px] text-center text-slate-400 px-4">
+                    By submitting, you agree that our team may contact you for further information.
+                  </p>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Recurring Schedule Modal */}
+      <AnimatePresence>
+        {showRecurringModal && (
+          <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowRecurringModal(false)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, y: 100 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 100 }}
+              className="relative w-full max-w-md bg-white rounded-t-[32px] sm:rounded-3xl overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 space-y-6">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-indigo-50 flex items-center justify-center">
+                      <RefreshCw className="w-6 h-6 text-indigo-600" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-bold text-slate-900">Set up Schedule</h3>
+                      <p className="text-xs text-slate-500">Propose a recurring service</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setShowRecurringModal(false)} className="p-2 hover:bg-slate-50 rounded-full transition-colors">
+                    <X className="w-6 h-6 text-slate-400" />
+                  </button>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Frequency</label>
+                    <select 
+                      className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600 text-sm bg-white"
+                      value={recurringFrequency}
+                      onChange={(e) => setRecurringFrequency(e.target.value)}
+                    >
+                      <option value="weekly">Weekly</option>
+                      <option value="fortnightly">Fortnightly (Every 2 weeks)</option>
+                      <option value="monthly">Monthly</option>
+                    </select>
+                  </div>
+                  <div className="bg-slate-50 p-4 rounded-2xl border border-black">
+                    <p className="text-xs text-slate-600">
+                      This will send a proposal to the {isHomeowner ? "tradesperson" : "homeowner"}. If they accept, this job will automatically be scheduled {recurringFrequency}.
+                    </p>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={handleProposeRecurring}
+                  disabled={isProposingRecurring}
+                  className="w-full bg-indigo-600 text-white p-4 rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {isProposingRecurring ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                    "Send Proposal"
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Reschedule Modal */}
+      <AnimatePresence>
+        {showRescheduleModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl"
+            >
+              <div className="flex items-center justify-between mb-6">
+                <h3 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                  <Calendar className="w-6 h-6 text-indigo-600" />
+                  Propose Reschedule
+                </h3>
+                <button onClick={() => setShowRescheduleModal(false)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
+                  <X className="w-5 h-5 text-slate-400" />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">New Proposed Date</label>
+                  <input 
+                    type="date"
+                    value={rescheduleDate}
+                    onChange={(e) => setRescheduleDate(e.target.value)}
+                    min={new Date().toISOString().split('T')[0]}
+                    className="w-full p-4 bg-slate-50 border border-black rounded-2xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all font-bold text-slate-700"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Reason for Change</label>
+                  <textarea 
+                    value={rescheduleReason}
+                    onChange={(e) => setRescheduleReason(e.target.value)}
+                    placeholder="e.g., Previous job overran, or material delivery delay..."
+                    rows={3}
+                    className="w-full p-4 bg-slate-50 border border-black rounded-2xl focus:ring-2 focus:ring-indigo-500 outline-none transition-all text-sm text-slate-700 resize-none"
+                  />
+                </div>
+
+                <div className="p-4 bg-indigo-50 rounded-2xl border border-indigo-100">
+                  <p className="text-[10px] text-indigo-700 leading-relaxed">
+                    <strong>Note:</strong> The homeowner must accept this proposal before the job is officially rescheduled. Your calendar will be updated automatically upon acceptance.
+                  </p>
+                </div>
+
+                <button 
+                  onClick={handleProposeReschedule}
+                  disabled={isRescheduling || !rescheduleDate || !rescheduleReason}
+                  className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-lg flex items-center justify-center gap-2 hover:bg-indigo-700 transition-all shadow-xl shadow-indigo-900/10 disabled:opacity-50"
+                >
+                  {isRescheduling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+                  Send Proposal
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* QR Code Modal for Handshake */}
+      <AnimatePresence>
+        {showQrModal && qrCodeData && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowQrModal(false)}
+              className="absolute inset-0 bg-slate-900/80 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative w-full max-w-sm bg-white rounded-[32px] overflow-hidden shadow-2xl p-8 text-center space-y-6"
+            >
+              <div className="flex flex-col items-center gap-2">
+                <div className="w-12 h-12 rounded-2xl bg-blue-50 flex items-center justify-center">
+                  <QrCode className="w-8 h-8 text-blue-600" />
+                </div>
+                <h3 className="text-xl font-black text-slate-900">Digital Handshake</h3>
+                <p className="text-xs text-slate-500 px-4">Show this to the homeowner to initiate the secure payout for your session.</p>
+              </div>
+
+              <div className="aspect-square bg-slate-50 rounded-3xl border-4 border-black p-6 flex items-center justify-center relative overflow-hidden group">
+                {/* Simulated QR Code */}
+                <div className="w-full h-full border-2 border-slate-900 flex flex-wrap p-2 gap-1">
+                  {Array.from({ length: 64 }).map((_, i) => (
+                    <div 
+                      key={i} 
+                      className={cn(
+                        "w-4 h-4 rounded-sm",
+                        Math.random() > 0.5 ? "bg-slate-900" : "bg-transparent"
+                      )} 
+                    />
+                  ))}
+                  {/* QR Core Blocks */}
+                  <div className="absolute top-8 left-8 w-12 h-12 border-4 border-slate-900 bg-white" />
+                  <div className="absolute top-8 right-8 w-12 h-12 border-4 border-slate-900 bg-white" />
+                  <div className="absolute bottom-8 left-8 w-12 h-12 border-4 border-slate-900 bg-white" />
+                </div>
+                
+                {/* Simulated Scan Overlay for Demo */}
+                {!isHomeowner && (
+                  <div 
+                    onClick={() => {
+                        const q = quotes.find(q => q.status === 'accepted');
+                        if(q) handleSimulateScan(q);
+                    }}
+                    className="absolute inset-0 bg-blue-600/0 md:hover:bg-blue-600/10 cursor-pointer flex items-center justify-center md:group-hover:opacity-100 transition-all opacity-100 md:opacity-0"
+                  >
+                    <div className="bg-white px-4 py-2 rounded-full shadow-lg text-[10px] font-bold text-blue-600 uppercase tracking-widest flex items-center gap-2">
+                      <Zap className="w-4 h-4" />
+                      Simulate Handshake Scan
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-4">
+                <div className="p-4 bg-slate-50 rounded-2xl border border-black">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase mb-1">Secure Token Reference</p>
+                  <p className="text-xs font-mono text-slate-600 truncate">{qrCodeData}</p>
+                </div>
+                
+                <button 
+                  onClick={() => setShowQrModal(false)}
+                  className="w-full text-slate-400 text-xs font-bold hover:text-slate-600 transition-colors"
+                >
+                  Close Code
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Withdraw Quote Modal */}
+      <AnimatePresence>
+        {withdrawingQuote && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-3xl shadow-xl max-w-md w-full overflow-hidden border border-black"
+            >
+              <div className="p-6 space-y-6">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center text-red-600 shrink-0">
+                    <AlertCircle className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-bold text-slate-900">Withdraw Quote</h3>
+                    <p className="text-sm text-slate-500">Are you sure you want to withdraw this quote?</p>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="block text-sm font-bold text-slate-700">
+                    Reason for withdrawal <span className="text-red-500">*</span>
+                  </label>
+                  <textarea
+                    value={withdrawReason}
+                    onChange={(e) => setWithdrawReason(e.target.value)}
+                    placeholder="e.g., No longer available, fully booked..."
+                    className="w-full px-4 py-3 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm resize-none h-24"
+                  />
+                </div>
+
+                <div className="flex gap-3 pt-2">
+                  <button
+                    onClick={() => {
+                      setWithdrawingQuote(null);
+                      setWithdrawReason("");
+                    }}
+                    className="flex-1 px-4 py-3 border border-black text-slate-600 rounded-xl font-bold hover:bg-slate-50 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleWithdrawQuote}
+                    disabled={isProcessing || !withdrawReason.trim()}
+                    className="flex-1 px-4 py-3 bg-red-600 text-white rounded-xl font-bold hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  >
+                    {isProcessing ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-black/30 border-t-white rounded-full animate-spin" />
+                        Withdrawing...
+                      </>
+                    ) : (
+                      "Withdraw Quote"
+                    )}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* PIN Verification Modal */}
+      <AnimatePresence>
+        {showPinModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="w-full max-w-sm bg-white rounded-[2rem] shadow-2xl overflow-hidden shadow-indigo-900/20"
+            >
+              <div className="bg-indigo-600 p-6 text-center text-white relative">
+                <button
+                  onClick={() => setShowPinModal(false)}
+                  className="absolute top-4 right-4 text-white/70 hover:text-white"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+                <div className="flex justify-center mb-4">
+                  <div className="bg-white p-3 rounded-2xl w-24 h-24 mb-2 shadow-inner">
+                    <ShieldCheck className="w-full h-full text-indigo-600" />
+                  </div>
+                </div>
+                <h3 className="text-xl font-bold">Identity Verification</h3>
+                <p className="text-indigo-100 mt-1">Please enter the 4-digit PIN provided by the homeowner to start the job.</p>
+              </div>
+              
+              <div className="p-6 bg-slate-50 space-y-4">
+                <input
+                  autoFocus
+                  type="text"
+                  maxLength={4}
+                  value={enteredPin}
+                  onChange={(e) => {
+                    setPinError("");
+                    setEnteredPin(e.target.value.replace(/[^0-9]/g, ''));
+                  }}
+                  placeholder="0000"
+                  className="w-full text-center text-4xl font-mono tracking-[0.25em] font-black p-4 border-2 border-black rounded-2xl outline-none focus:border-indigo-600 focus:ring-4 focus:ring-indigo-100 transition-all"
+                />
+                {pinError && <p className="text-red-500 font-bold text-center text-sm">{pinError}</p>}
+              </div>
+              
+              <div className="p-4 flex flex-col gap-2 bg-white">
+                <button
+                  onClick={() => {
+                    if (enteredPin === job.verificationPin) {
+                      confirmStartJob();
+                    } else {
+                      setPinError("Incorrect PIN. Please try again.");
+                    }
+                  }}
+                  disabled={enteredPin.length !== 4 || loading}
+                  className="w-full py-4 font-bold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : "Verify & Start Work"}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Job Summary / Completion Report Modal */}
+      <AnimatePresence>
+        {showJobSummary && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-white sm:bg-slate-900/50 sm:backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="w-full h-full sm:h-auto max-w-md bg-slate-50 sm:rounded-[2rem] sm:shadow-2xl overflow-y-auto flex flex-col pt-safe-top relative"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between p-4 bg-white border-b border-black shrink-0 sticky top-0 z-10">
+                <button
+                  onClick={() => setShowJobSummary(false)}
+                  className="flex items-center text-blue-600 font-medium text-[17px]"
+                >
+                  <ChevronLeft className="w-5 h-5 mr-1" /> Back
+                </button>
+                <h2 className="text-[17px] font-semibold text-slate-900 absolute left-1/2 -translate-x-1/2">Job Summary</h2>
+                <div className="w-16"></div> {/* Spacer */}
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto px-4 pb-40">
+                <div className="flex flex-col items-center justify-center py-6">
+                  <div className="w-20 h-20 bg-green-500 rounded-full flex items-center justify-center border-[6px] border-green-100 mb-3 shadow-sm">
+                    <Check className="w-10 h-10 text-white" strokeWidth={3} />
+                  </div>
+                  <h2 className="text-[28px] font-black text-[#1e3a8a] tracking-tight">Job Completed</h2>
+                  <p className="text-slate-600 font-medium mt-0.5 text-[17px]">Duration: {formatTimer(elapsedSeconds)}</p>
+                </div>
+
+                <div className="space-y-6">
+                  {/* Financial Summary */}
+                  <div>
+                    <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Financial Summary</h3>
+                    <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black space-y-3">
+                      <div className="flex justify-between items-center bg-white">
+                         <span className="text-slate-600 font-medium text-[17px]">Labour Cost:</span>
+                         <span className="text-slate-900 font-medium text-[17px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.714).toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                         <span className="text-slate-600 font-medium text-[17px]">Materials:</span>
+                         <div className="flex flex-col items-end">
+                           <span className="text-slate-900 font-medium text-[17px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.286).toFixed(2)}</span>
+                           <span className="text-blue-600 text-[13px] font-medium leading-none">(View Receipt link)</span>
+                         </div>
+                      </div>
+                      <div className="h-px bg-slate-100 w-full my-1"></div>
+                      <div className="flex justify-between items-center">
+                         <span className="text-[#1e3a8a] font-medium text-[17px]">Subtotal:</span>
+                         <span className="text-slate-900 font-medium text-[17px]">£{(quotes.find(q => q.status === "accepted")?.amount || 0).toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                         <span className="text-[#1e3a8a] font-medium text-[17px]">VAT (20%):</span>
+                         <span className="text-slate-900 font-medium text-[17px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.20).toFixed(2)}</span>
+                      </div>
+                      <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
+                      <div className="flex justify-between items-center pt-1">
+                         <span className="text-black font-black text-[20px]">Total:</span>
+                         <span className="text-black font-black text-[20px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Media */}
+                  <div>
+                    <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Media</h3>
+                    <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black">
+                      <div className="flex gap-4">
+                        <div className="w-[100px] h-[100px] shrink-0 relative rounded-[1rem] overflow-hidden shadow-sm">
+                           <img src="https://images.unsplash.com/photo-1584622650111-993a426fbf0a?auto=format&fit=crop&w=200&q=80" alt="Before" className="w-full h-full object-cover" />
+                           <div className="absolute inset-x-0 bottom-0 py-1px px-2 bg-black/60 flex items-center gap-1.5 h-6">
+                             <Camera className="w-3 h-3 text-white shrink-0" />
+                             <span className="text-white text-[11px] font-medium tracking-wide">Before</span>
+                           </div>
+                        </div>
+                        <div className="w-[100px] h-[100px] shrink-0 relative rounded-[1rem] overflow-hidden shadow-sm">
+                           <img src="https://images.unsplash.com/photo-1581092160607-ee22621dd758?auto=format&fit=crop&w=200&q=80" alt="After" className="w-full h-full object-cover" />
+                           <div className="absolute inset-x-0 bottom-0 py-1px px-2 bg-black/60 flex items-center gap-1.5 h-6">
+                             <Camera className="w-3 h-3 text-white shrink-0" />
+                             <span className="text-white text-[11px] font-medium tracking-wide">After</span>
+                           </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Share Financial Summary */}
+                  <div>
+                    <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Share Financial Summary</h3>
+                    <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black flex flex-col gap-3">
+                      <button 
+                        onClick={() => {
+                          const subject = encodeURIComponent(`Invoice: ${job?.title || 'Job Completed'}`);
+                          const body = encodeURIComponent(`Hi ${job?.homeownerName || ''},\n\nHere is the financial summary for the completed job.\n\nTotal: £${((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}\n\nPlease let me know if you have any questions.`);
+                          window.location.href = `mailto:?subject=${subject}&body=${body}`;
+                        }}
+                        className="w-full py-4 border-[1.5px] border-blue-600 text-[#004bb4] rounded-[1rem] font-semibold text-[17px] flex items-center justify-center gap-2 hover:bg-blue-50 transition-colors"
+                      >
+                        <Mail className="w-5 h-5 text-[#004bb4]" />
+                        Email VAT Invoice
+                      </button>
+                      <button 
+                        onClick={() => {
+                           const text = encodeURIComponent(`Hi ${job?.homeownerName || ''}, the job "${job?.title || ''}" is complete. The total amount is £${((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}.`);
+                           window.open(`https://wa.me/?text=${text}`, '_blank');
+                        }}
+                        className="w-full py-4 bg-[#25D366] hover:bg-[#1ebd59] text-white rounded-[1rem] font-semibold text-[17px] flex items-center justify-center gap-2 transition-colors"
+                      >
+                        <MessageCircle className="w-5 h-5 text-white" />
+                        Share via WhatsApp
+                      </button>
+                      <button 
+                        onClick={() => {
+                           setShowJobSummary(false);
+                           navigate(`/chat/${job.id}`);
+                        }}
+                        className="w-full py-4 bg-slate-900 hover:bg-slate-800 text-white rounded-[1rem] font-semibold text-[17px] flex items-center justify-center gap-2 transition-colors"
+                      >
+                        <MessageSquare className="w-5 h-5 text-white" />
+                        Send In-App Message
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Bottom Actions Form Menu */}
+              <div className="fixed sm:absolute bottom-0 left-0 right-0 p-4 bg-white border-t border-black shadow-[0_-4px_20px_-10px_rgba(0,0,0,0.1)] z-20">
+                <div className="space-y-3">
+                  <button 
+                    className="w-full bg-[#004bb4] hover:bg-[#003c90] text-white py-4 rounded-[1rem] font-bold text-[17px] transition-colors"
+                    onClick={() => {
+                        setShowJobSummary(false);
+                        handleCompleteJob();
+                    }}
+                  >
+                    Confirm & Request Payment
+                  </button>
+                  <button className="w-full bg-white border-2 border-[#1e3a8a] text-[#1e3a8a] py-4 rounded-[1rem] font-bold text-[17px] hover:bg-slate-50 transition-colors">
+                    Leave Customer Review
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Digital ID Card Modal */}
+      <AnimatePresence>
+        {showDigitalId && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="w-[80%] max-w-[280px] max-h-[85vh] bg-white rounded-[1.5rem] shadow-2xl flex flex-col relative overflow-hidden"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between p-3 bg-white border-b border-black shrink-0 relative z-10">
+                <button
+                  onClick={() => setShowDigitalId(false)}
+                  className="text-blue-600 font-medium text-[13px] px-2 py-1"
+                >
+                  Close
+                </button>
+                <h2 className="text-[14px] font-semibold text-slate-900 absolute left-1/2 -translate-x-1/2">Digital ID Card</h2>
+              </div>
+
+              {/* ID Card Content */}
+              <div className="flex-1 p-3 bg-slate-50/50 flex flex-col items-center justify-center overflow-y-auto">
+                <div className="w-full bg-white rounded-2xl border-[3px] border-[#1e40af] shadow-sm overflow-hidden flex flex-col my-1 shrink-0">
+                  {/* AnyTrader Logo Header */}
+                  <div className="py-2.5 flex items-center justify-center gap-1.5 border-b border-slate-50">
+                    <span className="text-blue-700 font-black text-[14px] italic tracking-tight flex items-center">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="mr-1">
+                        <path d="M12 4L4 20H8.5L12 13L15.5 20H20L12 4Z" fill="currentColor"/>
+                      </svg>
+                      AnyTrader
+                    </span>
+                  </div>
+
+                  {/* Profile Header */}
+                  <div className="px-3 py-3 flex flex-col items-center gap-2.5">
+                     <div className="w-14 h-14 rounded-full bg-slate-100 border-[2px] border-blue-600 shadow-sm overflow-hidden shrink-0">
+                       {profile?.photoURL ? (
+                         <img src={profile.photoURL} alt="Profile" className="w-full h-full object-cover" />
+                       ) : (
+                         <div className="w-full h-full flex items-center justify-center text-lg text-slate-400 font-bold bg-slate-200">
+                           {profile?.firstName?.charAt(0) || profile?.name?.charAt(0) || "U"}
+                         </div>
+                       )}
+                     </div>
+                     <div className="flex flex-col items-center text-center w-full">
+                       <h3 className="text-[15px] font-bold text-[#1e3a8a] mb-1 leading-tight truncate w-full px-1">
+                         {profile?.firstName || profile?.name?.split(' ')[0]} {profile?.lastName || profile?.name?.split(' ').slice(1).join(' ') || ""}
+                       </h3>
+                       <div className="bg-[#2563eb] text-white px-2 py-0.5 rounded flex items-center justify-center gap-1 w-max mb-1">
+                         <ShieldCheck className="w-[10px] h-[10px]" />
+                         <span className="text-[9px] font-bold uppercase tracking-wider mt-[1px]">Verified Pro</span>
+                       </div>
+                       <p className="text-slate-700 font-medium text-[11px] text-center w-full truncate px-1">{profile?.category || "Professional Tradesperson"}</p>
+                     </div>
+                  </div>
+
+                  {/* Certification Badge Box */}
+                  <div className="mx-3 mb-3 bg-slate-50 border border-black rounded-md p-2.5 flex items-center justify-between shadow-sm">
+                     <div className="flex flex-col items-start min-w-0 pr-2">
+                       <p className="font-bold text-slate-900 text-[11px] leading-tight truncate w-full">
+                         {profile?.category === 'Plumbing' ? 'Gas Safe Registered' : 
+                          profile?.category === 'Electrical' ? 'NICEIC Registered' : 'Accredited Professional'}
+                       </p>
+                       <p className="text-[9px] text-slate-500 mt-0.5 uppercase tracking-wider truncate w-full">ID: AT-{profile?.uid?.substring(0,6).toUpperCase() || '8920-UK'}</p>
+                     </div>
+                     <div className="flex flex-col items-center gap-0.5 shrink-0">
+                        <div className="relative flex items-center justify-center w-4 h-4 rounded-full bg-blue-100">
+                          <div className="w-full h-full bg-blue-500 rounded-full animate-ping absolute opacity-20"></div>
+                          <div className="w-1.5 h-1.5 bg-blue-500 rounded-full relative z-10 shadow-sm"></div>
+                        </div>
+                        <span className="text-[7px] uppercase font-bold text-blue-700">Active</span>
+                     </div>
+                  </div>
+
+                  {/* QR Code */}
+                  <div className="flex flex-col items-center justify-center pb-4 pt-0 mx-3">
+                     <div className="w-24 h-24 bg-white flex items-center justify-center p-1 border border-black rounded-lg">
+                       <QRCodeSVG 
+                         value={`${window.location.origin}/profile/${profile?.uid}`} 
+                         size={88}
+                         level="H"
+                         className="w-full h-full text-slate-800"
+                       />
+                     </div>
+                     <p className="text-[9px] text-slate-500 mt-2 text-center font-medium">Scan for Instant Verification</p>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <GoogleDocsContractModal
+        isOpen={showContractModal}
+        onClose={() => setShowContractModal(false)}
+        job={job}
+        quote={quotes.find(q => q.status === "accepted") || quotes[0]}
+        traderName={
+          tradespersonProfiles[job.acceptedTradespersonId]?.firstName
+            ? `${tradespersonProfiles[job.acceptedTradespersonId]?.firstName} ${tradespersonProfiles[job.acceptedTradespersonId]?.lastName || ""}`
+            : profile?.firstName
+            ? `${profile.firstName} ${profile.lastName || ""}`
+            : "Assigned Tradesperson"
+        }
+        clientName={
+          homeownerProfile?.firstName
+            ? `${homeownerProfile.firstName} ${homeownerProfile.lastName || ""}`
+            : "Homeowner"
+        }
+      />
+
+      <BomOneClickOrderingModal
+        isOpen={showBomModal}
+        onClose={() => setShowBomModal(false)}
+        job={job}
+        quote={quotes.find(q => q.status === "accepted") || quotes[0]}
+        propertyPassportSpecs={job.propertyPassportSpecs}
+        onOrderCreated={(order) => {
+          setJob((prev: any) => ({
+            ...prev,
+            hasBOMOrder: true,
+            bomOrderId: order.id,
+            bomMerchant: order.selectedMerchant,
+            bomStatus: order.status,
+            bomPickupRef: order.pickupReferenceCode,
+            materialsCost: order.subtotalCost
+          }));
+        }}
+      />
+    </div>
+  );
+}

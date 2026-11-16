@@ -1,0 +1,4539 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information for homeowners and tradespeople.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string",
+          "format": "email"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "homeowner",
+            "tradesperson",
+            "admin"
+          ]
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "postcode": {
+          "type": "string"
+        },
+        "avatarUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "bio": {
+          "type": "string"
+        },
+        "rating": {
+          "type": "number"
+        },
+        "totalReviews": {
+          "type": "integer"
+        },
+        "totalRecommendations": {
+          "type": "integer"
+        },
+        "totalJobsDone": {
+          "type": "integer"
+        },
+        "homeownerRating": {
+          "type": "number"
+        },
+        "totalHomeownerReviews": {
+          "type": "integer"
+        },
+        "responseRate": {
+          "type": "number"
+        },
+        "trustScore": {
+          "type": "number"
+        },
+        "trades": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "badges": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "searchFeedBadges": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "faqs": {
+          "type": "array",
+          "description": "Trader Frequently Asked Questions and answers for public profile display.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "question": { "type": "string" },
+              "answer": { "type": "string" }
+            }
+          }
+        },
+        "isTopTradesperson": {
+          "type": "boolean"
+        },
+        "isEstablishedTradesperson": {
+          "type": "boolean"
+        },
+        "isAcceptingRequests": {
+          "type": "boolean"
+        },
+        "isDisabled": {
+          "type": "boolean"
+        },
+        "isFoundingMember": {
+          "type": "boolean",
+          "description": "Tag for the first 100 verified traders."
+        },
+        "joinedDuringBeta": {
+          "type": "boolean",
+          "description": "Flag for users who joined during the early launch phase."
+        },
+        "stripeAccountId": {
+          "type": "string",
+          "description": "Connected Stripe Express/Custom account ID for payouts."
+        },
+        "stripeOnboardingComplete": {
+          "type": "boolean",
+          "description": "Whether the trader has completed the KYC onboarding flow."
+        },
+        "payoutsEnabled": {
+          "type": "boolean",
+          "description": "Whether the Stripe account is restricted or active."
+        },
+        "fairnessScore": {
+          "type": "number",
+          "description": "0-100 score tracking fairness in disputes (homeowners start at 100)."
+        },
+        "totalDisputesRaised": {
+          "type": "integer",
+          "description": "Historical count of disputes raised by this homeowner."
+        },
+        "phantomFeesSaved": {
+          "type": "number",
+          "description": "Running total of fees saved during free beta period for ROI tracking."
+        },
+        "memberId": {
+          "type": "string",
+          "description": "Human-readable ID with prefix (T-10001, H-10002, etc)."
+        },
+        "memberSequence": {
+          "type": "integer",
+          "description": "Numerical part of the member ID for easier searching."
+        },
+        "verificationStatus": {
+          "type": "string",
+          "enum": [
+            "unverified",
+            "pending",
+            "verified",
+            "vetted",
+            "auditioned",
+            "rejected"
+          ]
+        },
+        "insurance": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "policyNumber": {
+              "type": "string"
+            },
+            "expiryDate": {
+              "type": "string",
+              "format": "date"
+            },
+            "notifyRenew": {
+              "type": "boolean",
+              "description": "Consent to send renewal reminders"
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verifiedAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "verificationDocs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "approved",
+                  "rejected"
+                ]
+              },
+              "fileUrl": {
+                "type": "string"
+              },
+              "expiryDate": {
+                "type": "string",
+                "format": "date"
+              },
+              "rejectionReason": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "portfolio": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "referralCode": {
+          "type": "string"
+        },
+        "referredBy": {
+          "type": "string"
+        },
+        "referralBoostUntil": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "referralRewardProcessed": {
+          "type": "boolean"
+        },
+        "subscription": {
+          "type": "object",
+          "properties": {
+            "tierId": {
+              "type": "string"
+            },
+            "providerModel": {
+              "type": "string"
+            },
+            "nextRenewalDate": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "capacity": {
+              "type": "object",
+              "properties": {
+                "maxQuotes": {
+                  "type": "integer"
+                },
+                "usedQuotes": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "notificationSettings": {
+          "type": "object",
+          "properties": {
+            "quietHoursEnabled": {
+              "type": "boolean"
+            },
+            "quietHoursStart": {
+              "type": "string"
+            },
+            "quietHoursEnd": {
+              "type": "string"
+            },
+            "pushEnabled": {
+              "type": "boolean"
+            },
+            "emailEnabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "savedFilters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "searchTerm": {
+                "type": "string"
+              },
+              "categories": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "sortBy": {
+                "type": "string",
+                "enum": [
+                  "newest",
+                  "urgency",
+                  "completion"
+                ]
+              },
+              "showMatchedOnly": {
+                "type": "boolean"
+              },
+              "createdAt": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "id",
+              "name"
+            ]
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "deviceId": {
+          "type": "string"
+        },
+        "ipAddress": {
+          "type": "string"
+        },
+        "favoriteAddresses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "address": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "regularJourneys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              },
+              "comments": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "blockedDrivers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "UIDs of drivers this user has blocked."
+        },
+        "preferredDrivers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "UIDs of favorite drivers."
+        },
+        "appointmentSettings": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "subscriptionStatus": {
+              "type": "string",
+              "enum": [
+                "inactive",
+                "active",
+                "past_due",
+                "canceled"
+              ]
+            },
+            "services": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "durationMinutes": {
+                    "type": "integer"
+                  },
+                  "price": {
+                    "type": "number"
+                  }
+                }
+              }
+            },
+            "workingHours": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "start": {
+                    "type": "string"
+                  },
+                  "end": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "emergencyContacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "phone": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "uid",
+        "role",
+        "name"
+      ]
+    },
+    "DriverReview": {
+      "title": "DriverReview",
+      "description": "A review for a driver with a cooling-off period.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "rideId": {
+          "type": "string"
+        },
+        "driverId": {
+          "type": "string"
+        },
+        "passengerId": {
+          "type": "string"
+        },
+        "rating": {
+          "type": "integer"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "comment": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "visibilityDate": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this review becomes public"
+        },
+        "isAnonymous": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending_aggregation",
+            "aggregated",
+            "flagged"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "rideId",
+        "driverId",
+        "passengerId",
+        "rating",
+        "createdAt",
+        "visibilityDate"
+      ]
+    },
+    "Job": {
+      "title": "Job",
+      "description": "A job posted by a homeowner.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "linkedPropertyId": {
+          "type": "string",
+          "description": "ID of the property this job is linked to (if any)."
+        },
+        "jobNo": {
+          "type": "string",
+          "description": "Human-readable job number (e.g., AT-123456)."
+        },
+        "homeownerId": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "postcode": {
+          "type": "string"
+        },
+        "fullAddress": {
+          "type": "string"
+        },
+        "houseNumber": {
+          "type": "string"
+        },
+        "locationInstructions": {
+          "type": "string"
+        },
+        "urgency": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "posted",
+            "quoting",
+            "accepted",
+            "in_progress",
+            "completed",
+            "cancelled",
+            "disputed"
+          ]
+        },
+        "dispute": {
+          "type": "object",
+          "properties": {
+            "raisedBy": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "isPropertyDamage": {
+              "type": "boolean",
+              "description": "Whether the dispute involves physical damage to property."
+            },
+            "isHandshakeVerified": {
+              "type": "boolean",
+              "description": "True if the job was completed via QR handshake, restricting frivolous claims."
+            },
+            "mediationStakePaid": {
+              "type": "boolean",
+              "description": "Whether the £15 friction fee has been paid for this mediation."
+            },
+            "technicalFaultReport": {
+              "type": "string",
+              "description": "Mandatory technical explanation for non-cosmetic disputes."
+            },
+            "pliClaim": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "requested",
+                    "initiated",
+                    "rejected",
+                    "settled"
+                  ]
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "policyNumber": {
+                  "type": "string"
+                },
+                "initiatedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            },
+            "photos": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "open",
+                "resolved",
+                "mediated"
+              ]
+            },
+            "createdAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "estimateMin": {
+          "type": "number"
+        },
+        "estimateMax": {
+          "type": "number"
+        },
+        "photos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "videos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "documents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string",
+                "format": "uri"
+              }
+            }
+          }
+        },
+        "paymentPreference": {
+          "type": "string",
+          "enum": [
+            "fixed_price",
+            "hourly",
+            "negotiable"
+          ]
+        },
+        "quoteScope": {
+          "type": "string",
+          "enum": [
+            "labor_only",
+            "complete_package"
+          ]
+        },
+        "hasReview": {
+          "type": "boolean"
+        },
+        "hasTradespersonReview": {
+          "type": "boolean"
+        },
+        "scheduledDate": {
+          "type": "string",
+          "format": "date"
+        },
+        "isConfirmedByTradesperson": {
+          "type": "boolean"
+        },
+        "rescheduleProposal": {
+          "type": "object",
+          "properties": {
+            "proposedDate": {
+              "type": "string",
+              "format": "date"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "proposedBy": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "accepted",
+                "rejected"
+              ]
+            },
+            "createdAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "postedDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "clientDeleted": {
+          "type": "boolean",
+          "description": "Soft delete flag for the homeowner"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "instantMatchId": {
+          "type": "string"
+        },
+        "matchedViaInstantMatch": {
+          "type": "boolean"
+        },
+        "isInstantMatch": {
+          "type": "boolean"
+        },
+        "isEmergencyBoost": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "homeownerId",
+        "category",
+        "title",
+        "description",
+        "postcode",
+        "status",
+        "postedDate",
+        "createdAt"
+      ]
+    },
+    "PublicJobCard": {
+      "title": "PublicJobCard",
+      "description": "Sanitized public projection of a job for anonymous marketplace discovery without PII.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "jobNo": { "type": "string" },
+        "category": { "type": "string" },
+        "subCategory": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "postcodeArea": { "type": "string" },
+        "city": { "type": "string" },
+        "area": { "type": "string" },
+        "urgency": { "type": "string" },
+        "status": { "type": "string" },
+        "estimateMin": { "type": "number" },
+        "estimateMax": { "type": "number" },
+        "postedDate": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "quoteCount": { "type": "integer" },
+        "isBoosted": { "type": "boolean" },
+        "boostTier": { "type": "string" },
+        "isInstantMatch": { "type": "boolean" },
+        "targetTradespersonId": { "type": "string" },
+        "targetTradespersonName": { "type": "string" },
+        "photosCount": { "type": "integer" },
+        "videosCount": { "type": "integer" },
+        "documentsCount": { "type": "integer" },
+        "propertyId": { "type": "string" }
+      },
+      "required": [
+        "id",
+        "category",
+        "title",
+        "description",
+        "status"
+      ]
+    },
+    "Quote": {
+      "title": "Quote",
+      "description": "A quote submitted by a tradesperson for a job.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "tradespersonId": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "message": {
+          "type": "string"
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date"
+        },
+        "isImmediateStart": {
+          "type": "boolean"
+        },
+        "estimatedTimeline": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "accepted",
+            "rejected",
+            "requote_requested"
+          ]
+        },
+        "requoteMessage": {
+          "type": "string"
+        },
+        "pendingRevision": {
+          "type": "object",
+          "properties": {
+            "amount": {
+              "type": "number"
+            },
+            "message": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "approved",
+                "rejected"
+              ]
+            },
+            "createdAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number"
+              },
+              "message": {
+                "type": "string"
+              },
+              "quoteScope": {
+                "type": "string"
+              },
+              "paymentPreference": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "revisionCount": {
+          "type": "integer"
+        },
+        "paymentTrack": {
+          "type": "string",
+          "enum": [
+            "quick",
+            "project"
+          ]
+        },
+        "guaranteeExpiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "netPayoutValue": {
+          "type": "number",
+          "description": "The final amount the trader receives after all fees (estimated/actual)."
+        },
+        "stripeFeeAmount": {
+          "type": "number",
+          "description": "Processing fee (higher for cards, capped for bank transfers)."
+        },
+        "platformCommission": {
+          "type": "number",
+          "description": "The AnyTrader platform cut based on the user's tier and any commission caps."
+        },
+        "paymentRail": {
+          "type": "string",
+          "enum": [
+            "card",
+            "bank_transfer"
+          ],
+          "description": "The rail used (Bank used for jobs > £400)."
+        },
+        "milestones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "amount": {
+                "type": "number"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "pending_funding",
+                  "funded",
+                  "work_completed",
+                  "funds_released",
+                  "disputed"
+                ]
+              },
+              "releaseDate": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "fundedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "stripePaymentIntentId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "amount",
+              "status"
+            ]
+          }
+        }
+      },
+      "required": [
+        "id",
+        "jobId",
+        "tradespersonId",
+        "amount",
+        "status",
+        "createdAt"
+      ]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A message in a conversation.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "conversationId": {
+          "type": "string"
+        },
+        "senderId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "imageUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "audioUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "conversationId",
+        "senderId",
+        "createdAt"
+      ]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "A conversation between a homeowner and a tradesperson.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "participants": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "jobTitle": {
+          "type": "string"
+        },
+        "lastMessage": {
+          "type": "string"
+        },
+        "lastMessageAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "deletedBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "participants",
+        "jobId",
+        "jobTitle",
+        "updatedAt"
+      ]
+    },
+    "Review": {
+      "title": "Review",
+      "description": "A review left by a homeowner for a tradesperson.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "reviewerId": {
+          "type": "string"
+        },
+        "revieweeId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tradesperson_review",
+            "homeowner_review"
+          ]
+        },
+        "rating": {
+          "type": "integer"
+        },
+        "comment": {
+          "type": "string"
+        },
+        "recommended": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "jobId",
+        "reviewerId",
+        "revieweeId",
+        "rating",
+        "createdAt"
+      ]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app notification for users.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "quote",
+            "message",
+            "status",
+            "system"
+          ]
+        },
+        "link": {
+          "type": "string"
+        },
+        "read": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "title",
+        "message",
+        "type",
+        "read",
+        "createdAt"
+      ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Log of administrative actions for accountability.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "adminId": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "targetId": {
+          "type": "string"
+        },
+        "targetType": {
+          "type": "string",
+          "enum": [
+            "user",
+            "job",
+            "quote",
+            "review"
+          ]
+        },
+        "details": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "adminId",
+        "action",
+        "targetId",
+        "targetType",
+        "createdAt"
+      ]
+    },
+    "Invitation": {
+      "title": "Invitation",
+      "description": "An invitation for a new staff member or admin.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string",
+          "format": "email"
+        },
+        "role": {
+          "type": "string"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "accepted",
+            "expired"
+          ]
+        },
+        "invitedBy": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "email",
+        "role",
+        "permissions",
+        "status",
+        "invitedBy",
+        "createdAt"
+      ]
+    },
+    "Broadcast": {
+      "title": "Broadcast",
+      "description": "A mass message sent to platform users.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "announcement",
+            "offer",
+            "greeting",
+            "update"
+          ]
+        },
+        "targetSegments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "targetTrades": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sentBy": {
+          "type": "string"
+        },
+        "recipientCount": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "content",
+        "type",
+        "targetSegments",
+        "sentBy",
+        "createdAt"
+      ]
+    },
+    "SecurityAlert": {
+      "title": "SecurityAlert",
+      "description": "Alert for potential security threats like phishing or hacking attempts.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "targetId": {
+          "type": "string"
+        },
+        "targetType": {
+          "type": "string",
+          "enum": [
+            "message",
+            "job",
+            "user"
+          ]
+        },
+        "threatType": {
+          "type": "string",
+          "enum": [
+            "phishing",
+            "hacking",
+            "pii",
+            "other"
+          ]
+        },
+        "riskScore": {
+          "type": "number"
+        },
+        "details": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resolved": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "targetId",
+        "targetType",
+        "threatType",
+        "riskScore",
+        "createdAt",
+        "resolved"
+      ]
+    },
+    "RidesConfig": {
+      "title": "RidesConfig",
+      "description": "Configuration for the Rides/Taxi portal.",
+      "type": "object",
+      "properties": {
+        "baseFare": {
+          "type": "number"
+        },
+        "distanceRate": {
+          "type": "number"
+        },
+        "timeRate": {
+          "type": "number"
+        },
+        "minFare": {
+          "type": "number"
+        },
+        "commission": {
+          "type": "number"
+        },
+        "vehicleTypes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "multiplier": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "peakMultipliers": {
+          "type": "object",
+          "properties": {
+            "morning": {
+              "type": "number"
+            },
+            "evening": {
+              "type": "number"
+            },
+            "lateNight": {
+              "type": "number"
+            }
+          }
+        },
+        "surcharges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "amount": {
+                "type": "number"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "flat"
+                ]
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "RecurringSchedule": {
+      "title": "RecurringSchedule",
+      "description": "A recurring job arrangement between a homeowner and a tradesperson.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "originalJobId": {
+          "type": "string"
+        },
+        "homeownerId": {
+          "type": "string"
+        },
+        "tradespersonId": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "frequency": {
+          "type": "string",
+          "enum": [
+            "weekly",
+            "fortnightly",
+            "monthly"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending_approval",
+            "active",
+            "paused",
+            "cancelled"
+          ]
+        },
+        "proposedBy": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "lastJobGeneratedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "originalJobId",
+        "homeownerId",
+        "tradespersonId",
+        "category",
+        "title",
+        "frequency",
+        "status",
+        "proposedBy",
+        "amount",
+        "createdAt"
+      ]
+    },
+    "ShopOrder": {
+      "title": "ShopOrder",
+      "description": "Purchase record from the AI Smart Shop.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "totalAmount": {
+          "type": "number"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "totalAmount",
+        "createdAt"
+      ]
+    },
+    "Asset": {
+      "title": "Asset",
+      "description": "A property or asset managed by a business user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ownerId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string",
+          "description": "e.g. Building A, Flat 4"
+        },
+        "address": {
+          "type": "string"
+        },
+        "postcode": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "residential",
+            "commercial",
+            "industrial",
+            "retail"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        },
+        "photos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "transferStatus": {
+          "type": "string",
+          "enum": ["none", "pending", "completed", "cancelled"]
+        },
+        "transferCode": {
+          "type": "string"
+        },
+        "transferExpiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "transferTargetEmail": {
+          "type": "string"
+        },
+        "transferTargetName": {
+          "type": "string"
+        },
+        "previousOwnersCount": {
+          "type": "integer"
+        },
+        "transferHistory": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "componentRegistry": {
+          "type": "object"
+        },
+        "publicListingEnabled": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "name",
+        "address",
+        "postcode",
+        "type"
+      ]
+    },
+    "Appointment": {
+      "title": "Appointment",
+      "description": "An appointment requested by a customer for a tradesperson.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "customerId": {
+          "type": "string"
+        },
+        "traderId": {
+          "type": "string"
+        },
+        "serviceId": {
+          "type": "string"
+        },
+        "serviceName": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "startTime": {
+          "type": "string"
+        },
+        "durationMinutes": {
+          "type": "integer"
+        },
+        "price": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "confirmed",
+            "declined",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "customerId",
+        "traderId",
+        "serviceId",
+        "date",
+        "startTime",
+        "status",
+        "createdAt"
+      ]
+    },
+    "PlatformConfig": {
+      "title": "PlatformConfig",
+      "description": "Global platform settings and fee structures.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "maintenanceMode": {
+          "type": "boolean"
+        },
+        "providerModels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "tiers": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "price": {
+                      "type": "number"
+                    },
+                    "maxQuotes": {
+                      "type": "integer"
+                    },
+                    "maxAcceptedQuotes": {
+                      "type": "integer"
+                    },
+                    "commission": {
+                      "type": "number"
+                    },
+                    "leadFee": {
+                      "type": "number"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "features": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "color": {
+                      "type": "string",
+                      "description": "Hex or Tailwind color class for UI identification"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedBy": {
+          "type": "string"
+        }
+      }
+    },
+    "Partner": {
+      "title": "Partner",
+      "description": "Affiliate partners for monetization (Insurance, Finance, etc.)",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "Insurance",
+            "Finance",
+            "Vehicle",
+            "Health",
+            "Supplies",
+            "Other"
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "logoUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "trackingUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "commissionRate": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "inactive"
+          ]
+        },
+        "rating": {
+          "type": "number",
+          "description": "Average AnyRoller driver rating"
+        },
+        "totalDrivers": {
+          "type": "integer",
+          "description": "Number of AnyRoller drivers using this partner"
+        },
+        "startingPrice": {
+          "type": "string",
+          "description": "e.g., from £38/week"
+        },
+        "benefits": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "highlight": {
+          "type": "string",
+          "description": "e.g., Exclusive: 10% off for AnyRoller drivers"
+        },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "basic",
+            "featured",
+            "exclusive"
+          ],
+          "description": "Marketplace ranking tier"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "category",
+        "status",
+        "createdAt"
+      ]
+    },
+    "PromoCode": {
+      "title": "PromoCode",
+      "description": "Discount or priority promotion codes.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "Discount",
+            "Upgrade"
+          ]
+        },
+        "value": {
+          "type": "string"
+        },
+        "discountPercent": {
+          "type": "number"
+        },
+        "maxDiscount": {
+          "type": "number"
+        },
+        "maxUses": {
+          "type": "integer"
+        },
+        "currentUses": {
+          "type": "integer"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "expired"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "code",
+        "type",
+        "status",
+        "createdAt"
+      ]
+    },
+    "Campaign": {
+      "title": "Campaign",
+      "description": "Monetization campaigns and offers.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "partnerId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "targetRole": {
+          "type": "string",
+          "enum": [
+            "homeowner",
+            "tradesperson",
+            "both"
+          ]
+        },
+        "targetTrades": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "triggerType": {
+          "type": "string",
+          "enum": [
+            "expiry",
+            "behavior",
+            "seasonal",
+            "manual"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "active",
+            "paused"
+          ]
+        },
+        "clicks": {
+          "type": "integer"
+        },
+        "leads": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "partnerId",
+        "title",
+        "status",
+        "createdAt"
+      ]
+    },
+    "SupportTicket": {
+      "title": "SupportTicket",
+      "description": "A support ticket for rider/driver issues.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "preview": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "userRole": {
+          "type": "string",
+          "enum": [
+            "rider",
+            "driver"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "open",
+            "resolved"
+          ]
+        },
+        "priority": {
+          "type": "string",
+          "enum": [
+            "high",
+            "normal",
+            "low"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "subject",
+        "userId",
+        "userRole",
+        "status",
+        "priority",
+        "createdAt"
+      ]
+    },
+    "TaxiRide": {
+      "title": "TaxiRide",
+      "description": "A ride request and trip record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "riderId": {
+          "type": "string"
+        },
+        "driverId": {
+          "type": "string"
+        },
+        "pickup": {
+          "type": "string"
+        },
+        "dropoff": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "accepted",
+            "in_transit",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "totalFare": {
+          "type": "number"
+        },
+        "commissionAmount": {
+          "type": "number",
+          "description": "The platform's 12% cut of the total fare."
+        },
+        "driverEarnings": {
+          "type": "number",
+          "description": "The amount delivered directly to the driver."
+        },
+        "paymentStatus": {
+          "type": "string",
+          "enum": [
+            "unpaid",
+            "pending",
+            "paid",
+            "failed"
+          ]
+        },
+        "stripeCheckoutSessionId": {
+          "type": "string"
+        },
+        "stripePaymentIntentId": {
+          "type": "string",
+          "description": "Authoritative Stripe PaymentIntent ID."
+        },
+        "payoutTransferred": {
+          "type": "boolean",
+          "description": "Whether the driver payout transfer has been executed."
+        },
+        "payoutStatus": {
+          "type": "string",
+          "description": "Driver payout settlement lifecycle status."
+        },
+        "stripeTransferId": {
+          "type": "string",
+          "description": "Authoritative Stripe Transfer ID for driver payout."
+        },
+        "rideType": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "hourly"
+          ]
+        },
+        "duration": {
+          "type": "integer",
+          "description": "Duration in hours for hourly bookings."
+        },
+        "waitTolerance": {
+          "type": "integer",
+          "enum": [
+            10,
+            20,
+            30
+          ],
+          "description": "Max wait time in minutes for ASAP requests."
+        },
+        "comments": {
+          "type": "string"
+        },
+        "scheduledAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional future date for pre-booked rides."
+        },
+        "passengerDeleted": {
+          "type": "boolean",
+          "description": "Soft delete flag for the passenger"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "riderId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "DriverLocation": {
+      "title": "DriverLocation",
+      "description": "Real-time location and status of a driver for dispatching.",
+      "type": "object",
+      "properties": {
+        "driverId": {
+          "type": "string"
+        },
+        "lat": {
+          "type": "number"
+        },
+        "lng": {
+          "type": "number"
+        },
+        "geohash": {
+          "type": "string"
+        },
+        "isOnline": {
+          "type": "boolean",
+          "description": "Whether the driver is currently fetching jobs."
+        },
+        "sessionStartTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the driver last went online."
+        },
+        "vehicleClass": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "executive",
+            "xl",
+            "pro_van",
+            "luxury"
+          ]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "driverId",
+        "lat",
+        "lng",
+        "geohash",
+        "isOnline",
+        "updatedAt"
+      ]
+    },
+    "DriverMetrics": {
+      "title": "DriverMetrics",
+      "description": "Real-time daily performance metrics for driver fairness.",
+      "type": "object",
+      "properties": {
+        "driverId": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "dailyEarnings": {
+          "type": "number"
+        },
+        "jobsDoneToday": {
+          "type": "integer"
+        },
+        "lastAssignmentAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "driverId",
+        "date",
+        "dailyEarnings",
+        "jobsDoneToday",
+        "lastAssignmentAt"
+      ]
+    },
+    "Lead": {
+      "title": "Lead",
+      "description": "A lead generated for a partner.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "partnerId": {
+          "type": "string"
+        },
+        "campaignId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "userRole": {
+          "type": "string",
+          "enum": [
+            "homeowner",
+            "tradesperson"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "new",
+            "contacted",
+            "converted",
+            "rejected"
+          ]
+        },
+        "data": {
+          "type": "object"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "partnerId",
+        "userId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "DriverExpense": {
+      "title": "DriverExpense",
+      "description": "An expense logged by a driver.",
+      "type": "object",
+      "properties": {
+        "driverId": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "category": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "receiptImage": {
+          "type": "string",
+          "format": "uri"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "driverId",
+        "amount",
+        "category",
+        "date",
+        "createdAt"
+      ]
+    },
+    "InstantMatch": {
+      "title": "InstantMatch",
+      "description": "Represents an Instant Match session for a job.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "customerId": {
+          "type": "string"
+        },
+        "chargeAmountPence": {
+          "type": "integer"
+        },
+        "chargeTier": {
+          "type": "string",
+          "enum": [
+            "free",
+            "instant_match",
+            "emergency"
+          ]
+        },
+        "feeWaived": {
+          "type": "boolean"
+        },
+        "stripePaymentIntent": {
+          "type": "string"
+        },
+        "stripeRefundId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "searching",
+            "matched",
+            "accepted",
+            "expired",
+            "refunded",
+            "cancelled"
+          ]
+        },
+        "matchedTraderId": {
+          "type": "string"
+        },
+        "matchScore": {
+          "type": "number"
+        },
+        "currentAttempt": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "searchingAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "matchedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "refundedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cancelledAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "refundReason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "jobId",
+        "customerId",
+        "status",
+        "currentAttempt",
+        "createdAt"
+      ]
+    },
+    "InstantMatchAttempt": {
+      "title": "InstantMatchAttempt",
+      "description": "A notification attempt sent to a specific trader for an Instant Match.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "instantMatchId": {
+          "type": "string"
+        },
+        "attemptNumber": {
+          "type": "integer"
+        },
+        "traderId": {
+          "type": "string"
+        },
+        "traderCompositeScore": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "notified",
+            "accepted",
+            "declined",
+            "timeout"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "notifiedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "respondedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "responseTimeSeconds": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "instantMatchId",
+        "attemptNumber",
+        "traderId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "TraderMatchScore": {
+      "title": "TraderMatchScore",
+      "description": "Trader scores for Instant Match targeting based on category.",
+      "type": "object",
+      "properties": {
+        "traderId": {
+          "type": "string"
+        },
+        "categoryId": {
+          "type": "string"
+        },
+        "score": {
+          "type": "number"
+        },
+        "reliability": {
+          "type": "number"
+        },
+        "speed": {
+          "type": "number"
+        },
+        "quality": {
+          "type": "number"
+        },
+        "lastUpdated": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "traderId",
+        "categoryId",
+        "score",
+        "lastUpdated"
+      ]
+    },
+    "PlatformCategory": {
+      "title": "PlatformCategory",
+      "description": "Registered trade category with subcategories, required certifications, synonyms, and related search metadata.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "icon": { "type": "string" },
+        "description": { "type": "string" },
+        "subcategories": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "requiredCertifications": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "subcategoryCertifications": {
+          "type": "object"
+        },
+        "synonyms": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "related_terms": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "relatedTerms": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name"]
+    },
+    "Property": {
+      "title": "Property",
+      "description": "A property asset managed under the homeowner/business platform.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ownerId": {
+          "type": "string"
+        },
+        "usageType": {
+          "type": "string",
+          "enum": [
+            "long_term_rental",
+            "short_term_let",
+            "agency_managed",
+            "personal"
+          ]
+        },
+        "address": {
+          "type": "object",
+          "properties": {
+            "line1": {
+              "type": "string"
+            },
+            "line2": {
+              "type": "string"
+            },
+            "city": {
+              "type": "string"
+            },
+            "postcode": {
+              "type": "string"
+            },
+            "country": {
+              "type": "string"
+            }
+          }
+        },
+        "propertyType": {
+          "type": "string",
+          "enum": [
+            "apartment",
+            "house",
+            "commercial",
+            "warehouse",
+            "other"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "archived"
+          ]
+        },
+        "bedrooms": {
+          "type": "integer"
+        },
+        "bathrooms": {
+          "type": "integer"
+        },
+        "photos": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "transferStatus": {
+          "type": "string",
+          "enum": ["none", "pending", "completed", "cancelled"]
+        },
+        "transferCode": {
+          "type": "string"
+        },
+        "transferExpiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "transferTargetEmail": {
+          "type": "string"
+        },
+        "transferTargetName": {
+          "type": "string"
+        },
+        "previousOwnersCount": {
+          "type": "integer"
+        },
+        "transferHistory": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "componentRegistry": {
+          "type": "object"
+        },
+        "publicListingEnabled": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "usageType",
+        "address",
+        "propertyType",
+        "status",
+        "createdAt"
+      ]
+    },
+    "FieldAgent": {
+      "title": "FieldAgent",
+      "description": "An off-site worker/agent managed under the Field Services subcategory.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "businessId": {
+          "type": "string",
+          "description": "The UID of the business managing this agent"
+        },
+        "name": {
+          "type": "string"
+        },
+        "phone": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "available",
+            "en_route",
+            "on_site",
+            "offline"
+          ]
+        },
+        "currentLocation": {
+          "type": "object",
+          "properties": {
+            "lat": {
+              "type": "number"
+            },
+            "lng": {
+              "type": "number"
+            },
+            "updatedAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "businessId",
+        "name",
+        "status",
+        "createdAt"
+      ]
+    },
+    "DispatchRoute": {
+      "title": "DispatchRoute",
+      "description": "A scheduled route or task sequence assigned to a FieldAgent.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "businessId": {
+          "type": "string"
+        },
+        "agentId": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string",
+          "format": "date"
+        },
+        "stops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "jobId": {
+                "type": "string"
+              },
+              "address": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "completed",
+                  "skipped"
+                ]
+              },
+              "estimatedArrival": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "active",
+            "completed"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "businessId",
+        "agentId",
+        "date",
+        "status",
+        "createdAt"
+      ]
+    },
+    "RateCard": {
+      "title": "RateCard",
+      "description": "A rate card for a consultant.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "serviceType": {
+          "type": "string"
+        },
+        "hourlyRate": {
+          "type": "number"
+        },
+        "dailyRate": {
+          "type": "number"
+        },
+        "minimumHours": {
+          "type": "number"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "archived"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "serviceType",
+        "status",
+        "createdAt"
+      ]
+    },
+    "AvailabilityWindow": {
+      "title": "AvailabilityWindow",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "dayOfWeek": {
+          "type": "integer"
+        },
+        "startTime": {
+          "type": "string"
+        },
+        "endTime": {
+          "type": "string"
+        },
+        "isRecurring": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "available",
+            "blocked"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "dayOfWeek",
+        "startTime",
+        "endTime",
+        "isRecurring",
+        "status"
+      ]
+    },
+    "CalendarSync": {
+      "title": "CalendarSync",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "google",
+            "microsoft"
+          ]
+        },
+        "accountEmail": {
+          "type": "string"
+        },
+        "syncStatus": {
+          "type": "string",
+          "enum": [
+            "active",
+            "error"
+          ]
+        },
+        "lastSyncAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "provider",
+        "accountEmail",
+        "syncStatus"
+      ]
+    },
+    "Project": {
+      "title": "Project",
+      "description": "A consultancy project.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "clientId": {
+          "type": "string"
+        },
+        "managerId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "active",
+            "completed",
+            "cancelled",
+            "paused"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "budget": {
+          "type": "number"
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "clientId",
+        "status",
+        "title",
+        "createdAt"
+      ]
+    },
+    "Client": {
+      "title": "Client",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "company": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "phone": {
+          "type": "string"
+        },
+        "billingAddress": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "inactive"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "email",
+        "status",
+        "createdAt"
+      ]
+    },
+    "Proposal": {
+      "title": "Proposal",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "sent",
+            "accepted",
+            "rejected"
+          ]
+        },
+        "content": {
+          "type": "string"
+        },
+        "totalAmount": {
+          "type": "number"
+        },
+        "validUntil": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "consultantId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "ProposalTemplate": {
+      "title": "ProposalTemplate",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "authorId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "content",
+        "authorId",
+        "createdAt"
+      ]
+    },
+    "ProjectMilestone": {
+      "title": "ProjectMilestone",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "dueDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed"
+          ]
+        },
+        "amount": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "title",
+        "status",
+        "createdAt"
+      ]
+    },
+    "TeamMember": {
+      "title": "TeamMember",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "accessLevel": {
+          "type": "string",
+          "enum": [
+            "read",
+            "write",
+            "admin"
+          ]
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "consultantId",
+        "role",
+        "accessLevel",
+        "createdAt"
+      ]
+    },
+    "ProjectAssignment": {
+      "title": "ProjectAssignment",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "assignedHours": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "completed"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "consultantId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "ProjectRole": {
+      "title": "ProjectRole",
+      "description": "Specific functional role required within a project.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "projectId": { "type": "string" },
+        "roleName": { "type": "string", "description": "e.g. Caterer, DJ" },
+        "category": { "type": "string" },
+        "estimatedBudget": { "type": "number" },
+        "startDate": { "type": "string", "format": "date-time" },
+        "endDate": { "type": "string", "format": "date-time" },
+        "description": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["open", "bidding", "filled", "cancelled"]
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "projectId", "roleName", "status", "createdAt"]
+    },
+    "ProjectBid": {
+      "title": "ProjectBid",
+      "description": "A bid from a professional for a specific project role.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "projectId": { "type": "string" },
+        "projectRoleId": { "type": "string" },
+        "consultantId": { "type": "string" },
+        "amount": { "type": "number" },
+        "message": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "rejected", "withdrawn"]
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "projectId", "projectRoleId", "consultantId", "amount", "status", "createdAt"]
+    },
+    "ProjectShortlist": {
+      "title": "ProjectShortlist",
+      "description": "Shortlisted professionals for a project role",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "projectId": { "type": "string" },
+        "roleId": { "type": "string" },
+        "consultantId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "projectId", "roleId", "consultantId", "createdAt"]
+    },
+    "ProjectVenue": {
+      "title": "ProjectVenue",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "venueId": {
+          "type": "string"
+        },
+        "bookingStatus": {
+          "type": "string",
+          "enum": [
+            "requested",
+            "confirmed",
+            "cancelled"
+          ]
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "venueId",
+        "bookingStatus",
+        "createdAt"
+      ]
+    },
+    "Venue": {
+      "title": "Venue",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "capacity": {
+          "type": "integer"
+        },
+        "address": {
+          "type": "string"
+        },
+        "contactEmail": {
+          "type": "string"
+        },
+        "contactPhone": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "unavailable"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "address",
+        "status",
+        "createdAt"
+      ]
+    },
+    "ProjectSupplier": {
+      "title": "ProjectSupplier",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "supplierId": {
+          "type": "string"
+        },
+        "serviceProvided": {
+          "type": "string"
+        },
+        "cost": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "supplierId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "SupplierContact": {
+      "title": "SupplierContact",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "supplierId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "phone": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "supplierId",
+        "name",
+        "email",
+        "createdAt"
+      ]
+    },
+    "ProjectTimelineItem": {
+      "title": "ProjectTimelineItem",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "startTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "delayed"
+          ]
+        },
+        "assignedTo": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "title",
+        "status",
+        "createdAt"
+      ]
+    },
+    "Invoice": {
+      "title": "Invoice",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "clientId": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "sent",
+            "paid",
+            "overdue",
+            "cancelled"
+          ]
+        },
+        "dueDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "issueDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string"
+              },
+              "amount": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "clientId",
+        "amount",
+        "status",
+        "createdAt"
+      ]
+    },
+    "Expense": {
+      "title": "Expense",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "amount": {
+          "type": "number"
+        },
+        "category": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "receiptUrl": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "approved",
+            "rejected",
+            "reimbursed"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "projectId",
+        "consultantId",
+        "amount",
+        "category",
+        "status",
+        "createdAt"
+      ]
+    },
+    "PortfolioItem": {
+      "title": "PortfolioItem",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "imageUrls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "projectUrl": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "title",
+        "createdAt"
+      ]
+    },
+    "SessionNote": {
+      "title": "SessionNote",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "noteType": {
+          "type": "string",
+          "enum": [
+            "meeting",
+            "observation",
+            "internal"
+          ]
+        },
+        "content": {
+          "type": "string"
+        },
+        "isPrivate": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "projectId",
+        "noteType",
+        "content",
+        "createdAt"
+      ]
+    },
+    "CalendarEvent": {
+      "title": "CalendarEvent",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "startTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endTime": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "eventType": {
+          "type": "string",
+          "enum": [
+            "meeting",
+            "workshop",
+            "blocked"
+          ]
+        },
+        "location": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "title",
+        "startTime",
+        "endTime",
+        "eventType",
+        "createdAt"
+      ]
+    },
+    "MatchScore": {
+      "title": "MatchScore",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "consultantId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "score": {
+          "type": "number"
+        },
+        "criteriaBreakdown": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "criterion": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "consultantId",
+        "projectId",
+        "score",
+        "createdAt"
+      ]
+    },
+    "Enquiry": {
+      "title": "Enquiry",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "homeownerId": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        },
+        "details": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "new",
+            "reviewed",
+            "closed"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "homeownerId",
+        "status",
+        "createdAt"
+      ]
+    },
+    "ScheduledRepairTask": {
+      "title": "ScheduledRepairTask",
+      "description": "User planned and scheduled property repair task.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "targetDate": { "type": "string", "format": "date" },
+        "reminderOffset": { "type": "string" },
+        "estimatedBudget": { "type": "string" },
+        "urgency": { "type": "string" },
+        "notes": { "type": "string" },
+        "propertyId": { "type": "string" },
+        "propertyName": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "status": { "type": "string" }
+      },
+      "required": [
+        "id",
+        "userId",
+        "title",
+        "targetDate",
+        "createdAt"
+      ]
+    },
+    "DynamicSearchSynonym": {
+      "title": "DynamicSearchSynonym",
+      "description": "Dynamic search term and synonym mappings loaded at runtime without code deployment.",
+      "type": "object",
+      "properties": {
+        "term": { "type": "string" },
+        "categoryName": { "type": "string" },
+        "tradeTitle": { "type": "string" },
+        "keywords": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": { "type": "string", "enum": ["active", "paused", "rejected"] },
+        "addedBy": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["term", "categoryName", "keywords", "status"]
+    },
+    "UnmatchedSearchTelemetry": {
+      "title": "UnmatchedSearchTelemetry",
+      "description": "Logged customer searches with zero or low matching results for auto-synonym and profile optimization suggestions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "query": { "type": "string" },
+        "normalizedQuery": { "type": "string" },
+        "searchCount": { "type": "integer" },
+        "lastSearchedAt": { "type": "string" },
+        "postcodeArea": { "type": "string" },
+        "status": { "type": "string", "enum": ["unmatched", "synonym_added", "trader_notified", "ignored"] },
+        "suggestedCategory": { "type": "string" },
+        "suggestedTrade": { "type": "string" }
+      },
+      "required": ["query", "normalizedQuery", "searchCount", "status"]
+    },
+    "PublicProperty": {
+      "title": "PublicProperty",
+      "description": "Public sanitized property passport projection for external verification and discovery without exposing private addresses, homeowner IDs, or internal components.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "propertyType": { "type": "string" },
+        "postcodeArea": { "type": "string" },
+        "address": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "postcode": { "type": "string" },
+            "country": { "type": "string" }
+          }
+        },
+        "epcRating": { "type": "string" },
+        "bedrooms": { "type": "integer" },
+        "bathrooms": { "type": "integer" },
+        "photos": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "boilerInfo": { "type": "object" },
+        "roofCondition": { "type": "string" },
+        "gasSafetyExpiry": { "type": "string" },
+        "eicrExpiry": { "type": "string" },
+        "isPublicPassport": { "type": "boolean" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "postcodeArea", "isPublicPassport"]
+    },
+    "ProvenanceNode": {
+      "title": "ProvenanceNode",
+      "description": "Server-authoritative provenance graph node capturing data lineage across source, evidence, observation, extraction, intelligence, and projection.",
+      "type": "object",
+      "properties": {
+        "nodeId": { "type": "string" },
+        "tenantId": { "type": "string" },
+        "nodeType": { "type": "string" },
+        "sourceType": { "type": "string" },
+        "sourceId": { "type": "string" },
+        "sourceVersion": { "type": "string" },
+        "contentHash": { "type": "string" },
+        "schemaVersion": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "status": { "type": "string" },
+        "rightsReference": { "type": "object" },
+        "metadata": { "type": "object" }
+      },
+      "required": ["nodeId", "tenantId", "nodeType", "sourceType", "sourceId", "contentHash", "schemaVersion", "createdAt", "status"]
+    },
+    "ProvenanceEdge": {
+      "title": "ProvenanceEdge",
+      "description": "Server-authoritative directed edge linking provenance nodes within the same tenant partition.",
+      "type": "object",
+      "properties": {
+        "edgeId": { "type": "string" },
+        "tenantId": { "type": "string" },
+        "fromNodeId": { "type": "string" },
+        "toNodeId": { "type": "string" },
+        "relationType": { "type": "string" },
+        "sourceVersion": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "metadata": { "type": "object" }
+      },
+      "required": ["edgeId", "tenantId", "fromNodeId", "toNodeId", "relationType", "createdAt"]
+    },
+    "ProvenanceEvent": {
+      "title": "ProvenanceEvent",
+      "description": "Append-only immutable provenance audit event capturing graph operations.",
+      "type": "object",
+      "properties": {
+        "eventId": { "type": "string" },
+        "tenantId": { "type": "string" },
+        "eventType": { "type": "string" },
+        "nodeId": { "type": "string" },
+        "edgeId": { "type": "string" },
+        "payload": { "type": "object" },
+        "eventHash": { "type": "string" },
+        "recordedAt": { "type": "string" }
+      },
+      "required": ["eventId", "tenantId", "eventType", "payload", "eventHash", "recordedAt"]
+    },
+    "DataRightsRecord": {
+      "title": "DataRightsRecord",
+      "description": "Server-authoritative data rights record establishing purpose permissions, restrictions, and tenant boundaries.",
+      "type": "object",
+      "properties": {
+        "rightsId": { "type": "string" },
+        "tenantId": { "type": "string" },
+        "owner": { "type": "object" },
+        "subject": { "type": "object" },
+        "source": { "type": "object" },
+        "purposes": { "type": "object" },
+        "restrictions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": { "type": "string" },
+        "schemaVersion": { "type": "string" },
+        "contentHash": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "version": { "type": "integer" }
+      },
+      "required": ["rightsId", "tenantId", "owner", "subject", "source", "purposes", "status", "schemaVersion", "contentHash", "createdAt", "updatedAt", "version"]
+    },
+    "DataRightsHistory": {
+      "title": "DataRightsHistory",
+      "description": "Append-only immutable audit history for data rights records.",
+      "type": "object",
+      "properties": {
+        "historyId": { "type": "string" },
+        "rightsId": { "type": "string" },
+        "tenantId": { "type": "string" },
+        "action": { "type": "string" },
+        "snapshot": { "type": "object" },
+        "timestamp": { "type": "string" },
+        "actor": { "type": "string" }
+      },
+      "required": ["historyId", "rightsId", "tenantId", "action", "snapshot", "timestamp", "actor"]
+    }
+  },
+  "firestore": {
+    "/scheduledRepairs/{taskId}": {
+      "schema": "ScheduledRepairTask",
+      "description": "User planned and scheduled property repair tasks."
+    },
+    "/appointments/{appointmentId}": {
+      "schema": "Appointment",
+      "description": "Appointment requests and bookings."
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile documents."
+    },
+    "/jobs/{jobId}": {
+      "schema": "Job",
+      "description": "Job posting documents."
+    },
+    "/jobs/{jobId}/quotes/{quoteId}": {
+      "schema": "Quote",
+      "description": "Quotes for a specific job."
+    },
+    "/conversations/{conversationId}": {
+      "schema": "Conversation",
+      "description": "Conversation metadata."
+    },
+    "/conversations/{conversationId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Messages within a conversation."
+    },
+    "/reviews/{reviewId}": {
+      "schema": "Review",
+      "description": "Reviews for tradespeople."
+    },
+    "/notifications/{notificationId}": {
+      "schema": "Notification",
+      "description": "User notifications."
+    },
+    "/audit_logs/{logId}": {
+      "schema": "AuditLog",
+      "description": "Administrative audit logs."
+    },
+    "/invitations/{invitationId}": {
+      "schema": "Invitation",
+      "description": "Staff and admin invitations."
+    },
+    "/broadcasts/{broadcastId}": {
+      "schema": "Broadcast",
+      "description": "Platform-wide broadcasts."
+    },
+    "/recurring_schedules/{scheduleId}": {
+      "schema": "RecurringSchedule",
+      "description": "Recurring job schedules."
+    },
+    "/security_alerts/{alertId}": {
+      "schema": "SecurityAlert",
+      "description": "Security alerts for phishing or hacking attempts."
+    },
+    "/shop_orders/{orderId}": {
+      "schema": "ShopOrder",
+      "description": "Purchase record from the AI Smart Shop."
+    },
+    "/assets/{assetId}": {
+      "schema": {
+        "$ref": "#/entities/Asset"
+      },
+      "description": "Properties and assets managed by business users."
+    },
+    "/platform_config/{configId}": {
+      "schema": "PlatformConfig",
+      "description": "Global platform settings."
+    },
+    "/platform_counters/{counterId}": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "currentValue": {
+            "type": "integer"
+          }
+        }
+      },
+      "description": "Atomic counters for member IDs and job numbers."
+    },
+    "/promo_codes/{promoId}": {
+      "schema": "PromoCode",
+      "description": "Promotional codes for discounts and upgrades."
+    },
+    "/partners/{partnerId}": {
+      "schema": "Partner",
+      "description": "Affiliate partner documents."
+    },
+    "/campaigns/{campaignId}": {
+      "schema": "Campaign",
+      "description": "Monetization campaign documents."
+    },
+    "/support_tickets/{ticketId}": {
+      "schema": "SupportTicket",
+      "description": "Support tickets for riders and drivers."
+    },
+    "/leads/{leadId}": {
+      "schema": "Lead",
+      "description": "Lead documents for partners."
+    },
+    "/ride_requests/{rideId}": {
+      "schema": "TaxiRide",
+      "description": "Ride request and trip records."
+    },
+    "/live_tracking/{rideId}": {
+      "schema": "DriverLocation",
+      "description": "Real-time location index for drivers."
+    },
+    "/dispatches/{dispatchId}": {
+      "schema": {
+        "type": "object"
+      },
+      "description": "Dispatch jobs."
+    },
+    "/admins/{adminId}": {
+      "schema": {
+        "type": "object"
+      },
+      "description": "Trusted admin UIDs for RBAC."
+    },
+    "/driver_status/{driverId}": {
+      "schema": {
+        "type": "object"
+      },
+      "description": "Driver status."
+    },
+    "/driver_reviews/{reviewId}": {
+      "schema": "DriverReview",
+      "description": "Reviews for drivers with a cooling-off period."
+    },
+    "/driver_metrics/{driverId}": {
+      "schema": "DriverMetrics",
+      "description": "Driver performance metrics for fairness."
+    },
+    "/driver_expenses/{expenseId}": {
+      "schema": "DriverExpense",
+      "description": "Expenses tracked by the driver."
+    },
+    "/instant_matches/{matchId}": {
+      "schema": "InstantMatch",
+      "description": "Instant Match sessions"
+    },
+    "/instant_matches/{matchId}/attempts/{attemptId}": {
+      "schema": "InstantMatchAttempt",
+      "description": "Notification attempts for an Instant Match"
+    },
+    "/users/{userId}/trader_match_scores/{categoryId}": {
+      "schema": "TraderMatchScore",
+      "description": "Trader match scores per category"
+    },
+    "/instant_match_attempts/{attemptId}": {
+      "schema": "InstantMatchAttempt",
+      "description": "Notification attempts for an Instant Match"
+    },
+    "/properties/{propertyId}": {
+      "schema": "Property",
+      "description": "Properties registered by landlords, Airbnb hosts, or estate agents"
+    },
+    "/field_agents/{agentId}": {
+      "schema": "FieldAgent",
+      "description": "Agents managed by a business"
+    },
+    "/dispatch_routes/{routeId}": {
+      "schema": "DispatchRoute",
+      "description": "Dispatch routes for Field Agents"
+    },
+    "/rateCards/{id}": {
+      "schema": {
+        "$ref": "#/entities/RateCard"
+      },
+      "description": "Consultant rate cards"
+    },
+    "/availabilityWindows/{id}": {
+      "schema": {
+        "$ref": "#/entities/AvailabilityWindow"
+      },
+      "description": "Consultant availability windows"
+    },
+    "/calendarSyncs/{id}": {
+      "schema": {
+        "$ref": "#/entities/CalendarSync"
+      },
+      "description": "Consultant calendar synchronization profiles"
+    },
+    "/projectRoles/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectRole"
+      },
+      "description": "Functional roles requested within a project"
+    },
+    "/projectBids/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectBid"
+      },
+      "description": "Bids placed by professionals to fulfill project roles"
+    },
+    "/projectShortlists/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectShortlist"
+      },
+      "description": "Professionals shortlisted for a project role"
+    },
+    "/projects/{id}": {
+      "schema": {
+        "$ref": "#/entities/Project"
+      },
+      "description": "Consultancy projects"
+    },
+    "/clients/{id}": {
+      "schema": {
+        "$ref": "#/entities/Client"
+      },
+      "description": "Client details"
+    },
+    "/proposals/{id}": {
+      "schema": {
+        "$ref": "#/entities/Proposal"
+      },
+      "description": "Project proposals"
+    },
+    "/proposalTemplates/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProposalTemplate"
+      },
+      "description": "Reusable proposal templates"
+    },
+    "/projectMilestones/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectMilestone"
+      },
+      "description": "Milestones within a project"
+    },
+    "/teamMembers/{id}": {
+      "schema": {
+        "$ref": "#/entities/TeamMember"
+      },
+      "description": "Members of project teams"
+    },
+    "/projectAssignments/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectAssignment"
+      },
+      "description": "Consultant assignment to a project"
+    },
+    "/projectVenues/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectVenue"
+      },
+      "description": "Venues assigned for a project"
+    },
+    "/venues/{id}": {
+      "schema": {
+        "$ref": "#/entities/Venue"
+      },
+      "description": "Global venue directory"
+    },
+    "/projectSuppliers/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectSupplier"
+      },
+      "description": "Suppliers assigned to a project"
+    },
+    "/supplierContacts/{id}": {
+      "schema": {
+        "$ref": "#/entities/SupplierContact"
+      },
+      "description": "Contacts for suppliers"
+    },
+    "/projectTimelineItems/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProjectTimelineItem"
+      },
+      "description": "Timeline events for a project"
+    },
+    "/invoices/{id}": {
+      "schema": {
+        "$ref": "#/entities/Invoice"
+      },
+      "description": "Invoices for projects"
+    },
+    "/expenses/{id}": {
+      "schema": {
+        "$ref": "#/entities/Expense"
+      },
+      "description": "Expenses incurred for projects"
+    },
+    "/portfolioItems/{id}": {
+      "schema": {
+        "$ref": "#/entities/PortfolioItem"
+      },
+      "description": "Consultant portfolio items"
+    },
+    "/sessionNotes/{id}": {
+      "schema": {
+        "$ref": "#/entities/SessionNote"
+      },
+      "description": "Session notes from meetings/workshops"
+    },
+    "/calendarEvents/{id}": {
+      "schema": {
+        "$ref": "#/entities/CalendarEvent"
+      },
+      "description": "Calendar events"
+    },
+    "/matchScores/{id}": {
+      "schema": {
+        "$ref": "#/entities/MatchScore"
+      },
+      "description": "Algorithmic match scores between projects and consultants"
+    },
+    "/enquiries/{id}": {
+      "schema": {
+        "$ref": "#/entities/Enquiry"
+      },
+      "description": "Client enquiries"
+    },
+    "/flash_deals/{id}": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "traderId": { "type": "string" },
+          "traderName": { "type": "string" },
+          "traderAvatarUrl": { "type": "string" },
+          "service": { "type": "string" },
+          "discountPercentage": { "type": "integer" },
+          "originalPrice": { "type": "number" },
+          "discountedPrice": { "type": "number" },
+          "dayOfWeek": { "type": "string" },
+          "description": { "type": "string" },
+          "status": { "type": "string" },
+          "maxClaims": { "type": "integer", "description": "Maximum number of bookings or claims allowed for this deal (null for unlimited)" },
+          "claimedCount": { "type": "integer", "description": "Number of times this deal has been claimed" },
+          "createdAt": { "type": "string" },
+          "expiresAt": { "type": "string" },
+          "city": { "type": "string" },
+          "postcode": { "type": "string" }
+        }
+      },
+      "description": "Quiet Period Off-Peak Trades Flash Deals"
+    },
+    "/dynamic_search_synonyms/{id}": {
+      "schema": {
+        "$ref": "#/entities/DynamicSearchSynonym"
+      },
+      "description": "Dynamic search term and synonym registry loaded at runtime without code changes."
+    },
+    "/unmatched_search_telemetry/{id}": {
+      "schema": {
+        "$ref": "#/entities/UnmatchedSearchTelemetry"
+      },
+      "description": "Telemetry collection for customer search terms with zero or low matching results."
+    },
+    "/platform_categories/{id}": {
+      "schema": {
+        "$ref": "#/entities/PlatformCategory"
+      },
+      "description": "Dynamic searchable platform categories registry with synonyms and related terms."
+    },
+    "/public_job_cards/{id}": {
+      "schema": {
+        "$ref": "#/entities/PublicJobCard"
+      },
+      "description": "Public sanitized job projections for marketplace discovery without PII."
+    },
+    "/public_properties/{id}": {
+      "schema": {
+        "$ref": "#/entities/PublicProperty"
+      },
+      "description": "Public sanitized property passport projections for external verification without PII or internal components."
+    },
+    "/intelligence_events/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Immutable derived intelligence events with evidence IDs, multi-dimensional confidence, and provenance."
+    },
+    "/intelligence_evidence/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Cryptographically hashed evidence records supporting derived intelligence assertions."
+    },
+    "/intelligence_extractions/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Model extractions with storage manifest references and candidate structured outputs."
+    },
+    "/intelligence_tasks/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Asynchronous intelligence tasks with idempotency keys and retry lifecycle."
+    },
+    "/intelligence_jobs/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Compact derived job intelligence records strictly conforming to 100 KiB safety budget."
+    },
+    "/intelligence_properties/{id}": {
+      "schema": {
+        "$ref": "#/entities/Property"
+      },
+      "description": "Derived property roll-up records aggregating building components and observed conditions."
+    },
+    "/intelligence_quality/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Admin quality review and human correction records with cryptographic audit provenance."
+    },
+    "/intelligence_processing_runs/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Durable intelligence task execution observability and processing run records."
+    },
+    "/property_passports/{id}": {
+      "schema": {
+        "$ref": "#/entities/Property"
+      },
+      "description": "Authoritative evidence-backed Property Passport projections aggregating condition, risk, and predictive maintenance."
+    },
+    "/property_passport_history/{id}": {
+      "schema": {
+        "$ref": "#/entities/Property"
+      },
+      "description": "Append-only immutable historical Property Passport snapshots with cryptographic content hashes."
+    },
+    "/buyer_intelligence/{id}": {
+      "schema": {
+        "$ref": "#/entities/Property"
+      },
+      "description": "Authoritative evidence-backed Buyer / Conveyancing Intelligence assessments."
+    },
+    "/buyer_intelligence_history/{id}": {
+      "schema": {
+        "$ref": "#/entities/Property"
+      },
+      "description": "Append-only immutable historical Buyer / Conveyancing Intelligence snapshots with cryptographic content hashes."
+    },
+    "/provenance_nodes/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProvenanceNode"
+      },
+      "description": "Server-authoritative provenance graph nodes capturing data lineage across source, evidence, observation, extraction, intelligence, and projection."
+    },
+    "/provenance_edges/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProvenanceEdge"
+      },
+      "description": "Server-authoritative directed edges linking provenance nodes within the same tenant partition."
+    },
+    "/provenance_events/{id}": {
+      "schema": {
+        "$ref": "#/entities/ProvenanceEvent"
+      },
+      "description": "Append-only immutable provenance audit events capturing graph mutations."
+    },
+    "/data_rights/{id}": {
+      "schema": {
+        "$ref": "#/entities/DataRightsRecord"
+      },
+      "description": "Server-authoritative data rights records enforcing tenant boundaries, purpose permissions, and restrictions."
+    },
+    "/data_rights_history/{id}": {
+      "schema": {
+        "$ref": "#/entities/DataRightsHistory"
+      },
+      "description": "Append-only immutable historical data rights audit records with cryptographic snapshots."
+    },
+    "/data_classifications/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative controlled data classifications enforcing tenant isolation, category taxonomy, and sensitivity levels."
+    },
+    "/data_classifications_history/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Append-only immutable historical data classification snapshots with cryptographic SHA-256 hashes."
+    },
+    "/data_eligibility_decisions/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative immutable data eligibility decision audit records with deterministic hashes."
+    },
+    "/ai_usage_controls/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative AI training and usage control policies enforcing strict purpose isolation and opt-in consent."
+    },
+    "/ai_usage_controls_history/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Append-only immutable historical AI usage control policy snapshots with cryptographic SHA-256 content hashes."
+    },
+    "/ai_usage_decisions/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative immutable AI usage eligibility evaluation decision audit trail records."
+    },
+    "/data_retention_policies/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative data retention policies enforcing tenant boundaries, statutory retention periods, and legal holds."
+    },
+    "/data_deletion_requests/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative data deletion and erasure lifecycle requests enforcing state machines and dependency gates."
+    },
+    "/data_lifecycle_events/{id}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Append-only immutable data lifecycle audit events recording policy mutations, legal holds, revocations, and erasures."
+    }
+  }
+}

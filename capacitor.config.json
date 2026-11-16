@@ -1,0 +1,50 @@
+{
+  "appId": "com.anytrader.app",
+  "appName": "AnyTrader",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https",
+    "hostname": "localhost",
+    "allowNavigation": [
+      "anytrader.app",
+      "*.anytrader.app",
+      "identitytoolkit.googleapis.com",
+      "securetoken.googleapis.com",
+      "*.firebaseio.com"
+    ]
+  },
+  "plugins": {
+    "Keyboard": {
+      "resize": "body",
+      "style": "DARK",
+      "resizeOnFullScreen": true
+    },
+    "FirebaseAuthentication": {
+      "skipNativeAuth": false,
+      "providers": ["google.com"]
+    },
+    "App": {
+      "appUrlOpen": {
+        "domains": [
+          "anytrader.app",
+          "*.anytrader.app"
+        ]
+      }
+    }
+  },
+  "deepLinking": {
+    "scheme": "anytrader",
+    "hostname": "anytrader.app",
+    "domains": [
+      "anytrader.app",
+      "*.anytrader.app"
+    ],
+    "routes": [
+      { "path": "/job/:id", "component": "JobDetails" },
+      { "path": "/chat/:id", "component": "Chat" },
+      { "path": "/profile/:id", "component": "PublicProfile" },
+      { "path": "/messages", "component": "Conversations" }
+    ]
+  }
+}

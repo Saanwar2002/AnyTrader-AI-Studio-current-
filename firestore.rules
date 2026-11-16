@@ -1,0 +1,1649 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // --- Global Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isAnonymousAuth() { return isSignedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous'; }
+    function isRegistered() { return isSignedIn() && !isAnonymousAuth(); }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function isAdmin() { 
+      return isSignedIn() && (
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        ('isAdmin' in request.auth.token && request.auth.token.isAdmin == true) ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      ); 
+    }
+
+    function isJobOwner(jobData) {
+      return isSignedIn() && (
+        jobData.get('homeownerId', '') == request.auth.uid || 
+        jobData.get('userId', '') == request.auth.uid || 
+        jobData.get('ownerId', '') == request.auth.uid || 
+        jobData.get('posterId', '') == request.auth.uid || 
+        jobData.get('customerId', '') == request.auth.uid
+      );
+    }
+
+    function isJobTradesperson(jobData) {
+      return isSignedIn() && (
+        jobData.get('acceptedTradespersonId', '') == request.auth.uid ||
+        jobData.get('acceptedTraderId', '') == request.auth.uid ||
+        jobData.get('assignedTraderId', '') == request.auth.uid ||
+        jobData.get('tradespersonId', '') == request.auth.uid ||
+        jobData.get('traderId', '') == request.auth.uid ||
+        jobData.get('targetTradespersonId', '') == request.auth.uid
+      );
+    }
+
+    function isJobParticipant(jobData) {
+      return isJobOwner(jobData) || isJobTradesperson(jobData);
+    }
+
+    function isFieldEmptyOrMissing(map, key) {
+      return map.get(key, null) == null || map.get(key, '') == '';
+    }
+
+    // Prevents deletion of jobs that are funded, hold escrow balances, have an assigned/accepted tradesperson,
+    // are in progress or completed, or have active/pending disputes. Deleting in these states orphans escrow and destroys evidence.
+    function isJobDeletableByOwner(jobData) {
+      return isJobOwner(jobData) &&
+        // Strict Escrow & Funding Protection: Cannot delete if funded, paid, or holding escrow balances
+        jobData.get('funded', false) == false &&
+        jobData.get('isPaid', false) == false &&
+        jobData.get('amountPaid', 0) == 0 &&
+        jobData.get('escrowBalance', 0) == 0 &&
+        jobData.get('escrowStatus', 'none') in ['none', 'unfunded'] &&
+        jobData.get('paymentStatus', 'unpaid') in ['unpaid', 'none', 'unfunded', 'cancelled'] &&
+        // Assigned / Accepted Tradesperson Protection: Cannot delete if a tradesperson is engaged or quote accepted
+        isFieldEmptyOrMissing(jobData, 'acceptedTradespersonId') &&
+        isFieldEmptyOrMissing(jobData, 'acceptedTraderId') &&
+        isFieldEmptyOrMissing(jobData, 'assignedTraderId') &&
+        isFieldEmptyOrMissing(jobData, 'tradespersonId') &&
+        isFieldEmptyOrMissing(jobData, 'traderId') &&
+        isFieldEmptyOrMissing(jobData, 'acceptedQuoteId') &&
+        // Lifecycle & Dispute Evidence Protection: Cannot delete if in progress, completed, or in dispute
+        jobData.get('status', 'open') in ['draft', 'open', 'cancelled'] &&
+        jobData.get('disputeStatus', 'none') in ['none', ''] &&
+        !jobData.keys().hasAny(['disputedAt', 'disputeId', 'escrowPaymentIntentId', 'stripePaymentIntentId']);
+    }
+
+    function isPropertyOwner(propData) {
+      return isSignedIn() && (
+        propData.get('ownerId', '') == request.auth.uid || 
+        propData.get('userId', '') == request.auth.uid || 
+        propData.get('landlordId', '') == request.auth.uid
+      );
+    }
+
+    function isPropertyOwnerOrLandlord(propertyId) {
+      return isSignedIn() &&
+        propertyId != '' &&
+        exists(/databases/$(database)/documents/properties/$(propertyId)) &&
+        isPropertyOwner(get(/databases/$(database)/documents/properties/$(propertyId)).data);
+    }
+
+    function isAssignedPropertyManager(propertyId) {
+      return isSignedIn() &&
+        propertyId != '' &&
+        exists(/databases/$(database)/documents/properties/$(propertyId)) &&
+        (
+          get(/databases/$(database)/documents/properties/$(propertyId)).data.get('managerId', '') == request.auth.uid ||
+          get(/databases/$(database)/documents/properties/$(propertyId)).data.get('propertyManagerId', '') == request.auth.uid
+        );
+    }
+    
+    // --- Default Deny ---
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /admins/{adminId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /test/{subPath=**} {
+      allow read, write: if false;
+    }
+
+    // Collection group rule for quotes (strictly scoped to quoting trader, homeowner, or admin)
+    match /{path=**}/quotes/{quoteId} {
+      allow read, list: if isSignedIn() && (
+        resource.data.get('tradespersonId', '') == request.auth.uid || 
+        resource.data.get('traderId', '') == request.auth.uid || 
+        resource.data.get('proId', '') == request.auth.uid ||
+        resource.data.get('homeownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid ||
+        isAdmin()
+      );
+    }
+
+    // --- Platform Config (Strictly forbidding secrets and sub-paths) ---
+    match /platform_config/secrets/{subPath=**} {
+      allow read, write: if false; // Deny all client SDK access to API keys & secrets subtree
+    }
+    match /platform_config/secrets {
+      allow read, write: if false;
+    }
+    match /platform_config/{doc} {
+      allow read: if doc != 'secrets';
+      allow write: if isAdmin() && doc != 'secrets';
+    }
+    match /platform_categories/{document=**} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /dynamic_search_synonyms/{synonymId} {
+      allow read: if isSignedIn() || isAdmin();
+      allow write: if isAdmin();
+    }
+    match /unmatched_search_telemetry/{telemetryId} {
+      allow read: if isSignedIn() || isAdmin();
+      allow create: if isSignedIn() && request.resource.data.query is string && request.resource.data.query.size() <= 200;
+      allow update: if isAdmin() || (isSignedIn() && request.resource.data.query is string && request.resource.data.query.size() <= 200 && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'suggestedCategory', 'suggestedTrade']));
+      allow delete: if isAdmin();
+    }
+
+    // --- Advertisements ---
+    match /advertisements/{adId} {
+      allow get, list: if
+        (resource.data.get('isActive', false) == true && resource.data.get('approvalStatus', '') == 'approved') ||
+        (isSignedIn() && (
+          resource.data.get('advertiserUid', '') == request.auth.uid ||
+          resource.data.get('advertiserId', '') == request.auth.uid
+        )) ||
+        isAdmin();
+      allow create: if isRegistered() && (
+        isAdmin() || (
+          request.resource.data.advertiserUid == request.auth.uid &&
+          request.resource.data.get('advertiserId', request.auth.uid) == request.auth.uid &&
+          request.resource.data.get('isActive', false) == false &&
+          request.resource.data.get('approvalStatus', 'pending') == 'pending' &&
+          request.resource.data.get('prepaidBalance', 0) == 0 &&
+          request.resource.data.get('clicks', 0) == 0 &&
+          request.resource.data.get('bannerClicks', 0) == 0 &&
+          request.resource.data.get('searchFeedClicks', 0) == 0 &&
+          request.resource.data.get('impressions', 0) == 0
+        )
+      );
+      allow update: if isAdmin() || (
+        isSignedIn() && (
+          // 1. Controlled Engagement Tracking (Monotonic Increment +1 Only, No Financial/State Modification)
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'clicks', 'bannerClicks', 'searchFeedClicks', 'impressions'
+            ]) &&
+            (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['clicks']) || (
+              request.resource.data.clicks is int &&
+              request.resource.data.clicks >= resource.data.get('clicks', 0) &&
+              request.resource.data.clicks <= resource.data.get('clicks', 0) + 1
+            )) &&
+            (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['bannerClicks']) || (
+              request.resource.data.bannerClicks is int &&
+              request.resource.data.bannerClicks >= resource.data.get('bannerClicks', 0) &&
+              request.resource.data.bannerClicks <= resource.data.get('bannerClicks', 0) + 1
+            )) &&
+            (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['searchFeedClicks']) || (
+              request.resource.data.searchFeedClicks is int &&
+              request.resource.data.searchFeedClicks >= resource.data.get('searchFeedClicks', 0) &&
+              request.resource.data.searchFeedClicks <= resource.data.get('searchFeedClicks', 0) + 1
+            )) &&
+            (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['impressions']) || (
+              request.resource.data.impressions is int &&
+              request.resource.data.impressions >= resource.data.get('impressions', 0) &&
+              request.resource.data.impressions <= resource.data.get('impressions', 0) + 1
+            ))
+          ) ||
+          // 2. Ad Owner Creative/Metadata Updates (Strictly Prohibiting Financial, Schedule, State & Attribution Tampering)
+          (
+            (resource.data.advertiserUid == request.auth.uid || resource.data.get('advertiserId', '') == request.auth.uid) &&
+            request.resource.data.advertiserUid == resource.data.advertiserUid &&
+            request.resource.data.get('advertiserId', resource.data.advertiserUid) == resource.data.get('advertiserId', resource.data.advertiserUid) &&
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              'prepaidBalance', 'isActive', 'lastAutoTopUpAt', 'approvalStatus',
+              'totalBudget', 'totalCost', 'dailyRate', 'recurringPrice',
+              'advertiserUid', 'advertiserId',
+              'startDate', 'endDate', 'durationDays', 'status', 'type', 'targetRole',
+              'isTraderAd', 'badgeLabel', 'perkText',
+              'clicks', 'bannerClicks', 'searchFeedClicks', 'impressions'
+            ])
+          )
+        )
+      );
+      allow delete: if isAdmin() || (
+        isSignedIn() && (resource.data.advertiserUid == request.auth.uid || resource.data.get('advertiserId', '') == request.auth.uid)
+      );
+    }
+
+    // --- Public Profiles (Sanitized Non-PII Metadata) ---
+    match /public_profiles/{userId} {
+      allow read: if true;
+      allow create: if isOwner(userId) && (
+        isAdmin() || (
+          request.resource.data.get('rating', 0) == 0 &&
+          request.resource.data.get('totalReviews', 0) == 0 &&
+          request.resource.data.get('trustScore', 0) == 0 &&
+          request.resource.data.get('verifiedTrader', false) == false &&
+          request.resource.data.get('isVerified', false) == false &&
+          request.resource.data.get('videoVerified', false) == false &&
+          request.resource.data.get('verificationStatus', 'unverified') == 'unverified'
+        )
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          isOwner(userId) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'rating', 'trustScore', 'totalReviews', 'verified', 'isVerified',
+            'verifiedTrader', 'badges', 'videoVerificationStatus', 'videoVerified',
+            'verificationStatus', 'tierId', 'responseRate', 'recommendedCategories'
+          ])
+        )
+      );
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    // --- User Profiles (Private PII & Full Profile) ---
+    match /users/{userId} {
+      // Strictly restricted to document owner or administrators to protect private PII (email, phone, address)
+      allow read: if isOwner(userId) || isAdmin();
+
+      // Task 35-A: Explicit allowlist on create — clients can only initialize non-privileged profile fields
+      allow create: if isOwner(userId) && (
+        isAdmin() ||
+        request.resource.data.keys().hasOnly([
+          'id', 'uid', 'name', 'displayName', 'email', 'phone', 'phoneNumber',
+          'photoURL', 'avatarUrl', 'profileImage', 'avatar',
+          'bio', 'about', 'description',
+          'trade', 'trades', 'categories', 'services', 'skills', 'subcategories', 'specializations',
+          'businessName', 'companyName', 'company',
+          'address', 'homeAddress', 'businessAddress', 'street', 'line1', 'line2',
+          'city', 'county', 'postcode', 'postcodeArea', 'location', 'area',
+          'coordinates', 'lat', 'lng', 'latitude', 'longitude',
+          'website', 'portfolio', 'socialLinks',
+          'hourlyRate', 'dayRate', 'calloutFee', 'pricingNotes',
+          'qualifications', 'certifications', 'insurancePolicyNumber', 'insuranceExpiry',
+          'insuranceProvider', 'experienceYears', 'yearsInBusiness', 'tradeBodyMemberships',
+          'availability', 'schedule', 'workingHours', 'workingDays', 'serviceRadius', 'coverageRadiusMiles',
+          'emergencyCallout', 'emergencyAvailable',
+          'emergencyContact', 'emergencyContactName', 'emergencyContactPhone',
+          'preferences', 'notificationPreferences', 'settings', 'theme', 'language',
+          'soundEnabled', 'hapticsEnabled', 'emailNotifications', 'smsNotifications', 'pushNotifications',
+          'fcmToken', 'pushToken', 'notificationToken',
+          'updatedAt', 'createdAt', 'lastLoginAt', 'lastActiveAt',
+          'completedOnboarding', 'onboardingStep'
+        ])
+      );
+      
+      allow delete: if isOwner(userId) || isAdmin();
+      
+      // Task 35-A: Explicit allowlist on update — clients can ONLY modify approved non-privileged fields
+      // Prevents self-elevation of role, driver, verification, tier, balance, credits, or unexpected fields
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          isOwner(userId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'id', 'uid', 'name', 'displayName', 'email', 'phone', 'phoneNumber',
+            'photoURL', 'avatarUrl', 'profileImage', 'avatar',
+            'bio', 'about', 'description',
+            'trade', 'trades', 'categories', 'services', 'skills', 'subcategories', 'specializations',
+            'businessName', 'companyName', 'company',
+            'address', 'homeAddress', 'businessAddress', 'street', 'line1', 'line2',
+            'city', 'county', 'postcode', 'postcodeArea', 'location', 'area',
+            'coordinates', 'lat', 'lng', 'latitude', 'longitude',
+            'website', 'portfolio', 'socialLinks',
+            'hourlyRate', 'dayRate', 'calloutFee', 'pricingNotes',
+            'qualifications', 'certifications', 'insurancePolicyNumber', 'insuranceExpiry',
+            'insuranceProvider', 'experienceYears', 'yearsInBusiness', 'tradeBodyMemberships',
+            'availability', 'schedule', 'workingHours', 'workingDays', 'serviceRadius', 'coverageRadiusMiles',
+            'emergencyCallout', 'emergencyAvailable',
+            'emergencyContact', 'emergencyContactName', 'emergencyContactPhone',
+            'preferences', 'notificationPreferences', 'settings', 'theme', 'language',
+            'soundEnabled', 'hapticsEnabled', 'emailNotifications', 'smsNotifications', 'pushNotifications',
+            'fcmToken', 'pushToken', 'notificationToken',
+            'updatedAt', 'createdAt', 'lastLoginAt', 'lastActiveAt',
+            'completedOnboarding', 'onboardingStep'
+          ])
+        )
+      );
+    }
+
+    // --- Rides Portal ---
+    match /driver_reviews/{reviewId} {
+      allow create: if isSignedIn() && (request.resource.data.get('passengerId', '') == request.auth.uid || request.resource.data.get('riderId', '') == request.auth.uid);
+      allow read, list: if isAdmin() || (
+        isSignedIn() && 
+        (resource == null || (resource.data.driverId == request.auth.uid && resource.data.visibilityDate <= request.time))
+      );
+      allow update: if false; // immutable by users
+      allow delete: if isAdmin();
+    }
+
+    function isAnyRollerDriver() {
+      return isSignedIn() && (
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'driver' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isDriver', false) == true
+      );
+    }
+
+    match /ride_requests/{rideId} {
+      allow create: if isSignedIn() && (
+        isAdmin() || (
+          (request.resource.data.get('passengerId', '') == request.auth.uid || request.resource.data.get('riderId', '') == request.auth.uid) &&
+          request.resource.data.get('status', 'pending') in ['pending', 'searching', 'offered', 'draft'] &&
+          request.resource.data.get('paymentStatus', 'unpaid') in ['unpaid', 'pending'] &&
+          request.resource.data.get('paid', false) == false &&
+          request.resource.data.get('isPaid', false) == false &&
+          request.resource.data.get('payoutTransferred', false) == false &&
+          request.resource.data.get('payoutStatus', 'unpaid') in ['unpaid', 'pending', 'none', 'draft'] &&
+          !request.resource.data.keys().hasAny([
+            'driverId', 'assignedDriverId',
+            'finalFare', 'driverEarnings', 'calculatedDriverEarnings', 'commissionAmount', 'stripeTransferId', 
+            'paymentIntentId', 'stripePaymentIntentId', 'stripeSessionId', 'stripeCheckoutSessionId', 
+            'payoutTransferredAt', 'settlementId', 'settlementStatus', 'platformFee', 'calculatedPlatformFee',
+            'payoutLockedAt', 'payoutFailedAt', 'payoutRetryCount', 'payoutLastError', 'payoutError', 'paidAt',
+            'payoutClaimToken'
+          ])
+        )
+      );
+      allow read: if isSignedIn() && (
+        resource == null || 
+        resource.data.get('passengerId', '') == request.auth.uid || 
+        resource.data.get('riderId', '') == request.auth.uid || 
+        resource.data.get('driverId', '') == request.auth.uid || 
+        resource.data.get('assignedDriverId', '') == request.auth.uid || 
+        isAdmin() || 
+        (isAnyRollerDriver() && resource.data.status in ["pending", "searching", "offered"])
+      );
+      allow update: if isAdmin() || (
+        isSignedIn() && (
+          // Passenger updates:
+          (
+            (resource.data.get('passengerId', '') == request.auth.uid || resource.data.get('riderId', '') == request.auth.uid) &&
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              'paymentStatus', 'paid', 'isPaid', 'payoutTransferred', 'payoutTransferredAt', 'stripeTransferId', 
+              'stripePaymentIntentId', 'stripeSessionId', 'stripeCheckoutSessionId', 'finalFare', 
+              'driverEarnings', 'calculatedDriverEarnings', 'commissionAmount', 'assignedDriverId', 'driverId', 'settlementId', 
+              'settlementStatus', 'platformFee', 'calculatedPlatformFee', 'baseFare', 'payoutStatus',
+              'payoutLockedAt', 'payoutFailedAt', 'payoutRetryCount', 'payoutLastError', 'payoutError', 'paidAt',
+              'payoutClaimToken'
+            ]) &&
+            (
+              !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status']) ||
+              (request.resource.data.status in ['cancelled', 'draft'] && resource.data.status in ['pending', 'searching', 'offered', 'draft'])
+            )
+          ) ||
+          // Assigned driver updates:
+          (
+            (resource.data.get('driverId', '') == request.auth.uid || resource.data.get('assignedDriverId', '') == request.auth.uid) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'location', 'updatedAt']) &&
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              'paymentStatus', 'paid', 'isPaid', 'payoutTransferred', 'payoutTransferredAt', 'stripeTransferId', 
+              'stripePaymentIntentId', 'stripeSessionId', 'stripeCheckoutSessionId', 'finalFare', 
+              'driverEarnings', 'calculatedDriverEarnings', 'commissionAmount', 'assignedDriverId', 'driverId', 'settlementId', 
+              'settlementStatus', 'platformFee', 'calculatedPlatformFee', 'baseFare', 'payoutStatus',
+              'payoutLockedAt', 'payoutFailedAt', 'payoutRetryCount', 'payoutLastError', 'payoutError', 'paidAt'
+            ])
+          ) ||
+          // Driver accepting a pending ride:
+          (
+            isAnyRollerDriver() &&
+            resource.data.status in ["pending", "searching", "offered"] &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'driverId', 'assignedDriverId', 'updatedAt']) &&
+            (request.resource.data.get('driverId', '') == request.auth.uid || request.resource.data.get('assignedDriverId', '') == request.auth.uid)
+          )
+        )
+      );
+      allow delete: if isAdmin();
+
+      match /chat/{messageId} {
+        allow read, write: if isSignedIn() && (
+          get(/databases/$(database)/documents/ride_requests/$(rideId)).data.get('passengerId', '') == request.auth.uid || 
+          get(/databases/$(database)/documents/ride_requests/$(rideId)).data.get('riderId', '') == request.auth.uid || 
+          get(/databases/$(database)/documents/ride_requests/$(rideId)).data.get('driverId', '') == request.auth.uid || 
+          get(/databases/$(database)/documents/ride_requests/$(rideId)).data.get('assignedDriverId', '') == request.auth.uid || 
+          isAdmin()
+        );
+      }
+    }
+
+    match /reported_hazards/{hazardId} {
+      allow read, list: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
+      allow update, delete: if isSignedIn() && (resource == null || resource.data.reporterId == request.auth.uid || isAdmin());
+    }
+    
+    match /live_tracking/{rideId} {
+      allow get, list: if isRegistered() && (
+        resource.data.get('driverId', '') == request.auth.uid || 
+        resource.data.get('passengerId', '') == request.auth.uid || 
+        resource.data.get('riderId', '') == request.auth.uid || 
+        rideId == request.auth.uid || 
+        isAdmin()
+      );
+      allow create: if isRegistered() && (
+        rideId == request.auth.uid || 
+        request.resource.data.get('driverId', '') == request.auth.uid || 
+        request.resource.data.get('passengerId', '') == request.auth.uid ||
+        isAdmin()
+      );
+      allow update: if isRegistered() && (
+        isAdmin() || 
+        (
+          rideId == request.auth.uid &&
+          (!request.resource.data.keys().hasAny(['driverId']) || request.resource.data.get('driverId', request.auth.uid) == request.auth.uid)
+        ) || 
+        (
+          resource.data.get('driverId', '') == request.auth.uid &&
+          request.resource.data.get('driverId', '') == request.auth.uid
+        ) || 
+        (
+          resource.data.get('passengerId', '') == request.auth.uid &&
+          request.resource.data.get('passengerId', '') == request.auth.uid
+        )
+      );
+      allow delete: if isRegistered() && (
+        rideId == request.auth.uid || 
+        resource.data.get('driverId', '') == request.auth.uid || 
+        resource.data.get('passengerId', '') == request.auth.uid || 
+        isAdmin()
+      );
+    }
+
+    match /driver_status/{driverId} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(driverId) || isAdmin();
+    }
+
+    // --- Notifications (User-scoped read/update; strictly server/admin created to prevent spoofing/spam) ---
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && (
+        resource == null || 
+        resource.data.userId == request.auth.uid || 
+        resource.data.get('recipientId', '') == request.auth.uid || 
+        resource.data.get('traderId', '') == request.auth.uid || 
+        resource.data.get('homeownerId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      // H3 Remediated: Normal authenticated clients CANNOT directly create notifications
+      // All client-triggered notifications MUST flow through authenticated server endpoints (/api/notifications)
+      allow create: if isAdmin();
+      allow update: if isAdmin() || (
+        isSignedIn() && 
+        resource != null && 
+        (resource.data.userId == request.auth.uid || resource.data.get('recipientId', '') == request.auth.uid || resource.data.get('traderId', '') == request.auth.uid) && 
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'isRead', 'readAt', 'updatedAt'])
+      );
+      allow delete: if isAdmin() || (isSignedIn() && resource != null && (resource.data.userId == request.auth.uid || resource.data.get('recipientId', '') == request.auth.uid));
+    }
+
+    // --- Server-Only Queues (Locked down from all direct client writes - H3 Remediated) ---
+    match /sms_queue/{queueId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /email_queue/{queueId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /email_alerts_queue/{queueId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /audit_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /admin_login_audits/{auditId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /security_alerts/{alertId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /ai_agent_audit_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /materials_arbitrage_alerts/{alertId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /demand_surge_forecasts/{forecastId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /platform_counters/{counterId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // --- Messaging & Conversations (PL-14 Hardened) ---
+    match /conversations/{conversationId} {
+      allow read, list: if isSignedIn() && (resource == null || request.auth.uid in resource.data.participants || isAdmin());
+      allow create: if isRegistered() && (
+        isAdmin() || (
+          request.auth.uid in request.resource.data.participants &&
+          request.resource.data.participants.size() >= 2 &&
+          request.resource.data.participants.size() <= 10
+        )
+      );
+      allow update: if isRegistered() && (
+        isAdmin() || (
+          request.auth.uid in resource.data.participants &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['participants'])
+        )
+      );
+      
+      match /messages/{messageId} {
+        allow read, list: if isSignedIn() && (
+          isAdmin() ||
+          (exists(/databases/$(database)/documents/conversations/$(conversationId)) && 
+           request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants)
+        );
+        allow create: if isSignedIn() && (
+          isAdmin() ||
+          (request.auth.uid == request.resource.data.senderId &&
+           exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+           request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants)
+        );
+      }
+    }
+
+    match /{path=**}/messages/{messageId} {
+      allow read, list: if isSignedIn() && (
+        resource.data.senderId == request.auth.uid || 
+        resource.data.get('recipientId', '') == request.auth.uid || 
+        resource.data.get('receiverId', '') == request.auth.uid || 
+        isAdmin()
+      );
+    }
+
+    // --- Reviews (Server-Authoritative Only, PL-05 & PL-01 Hardened) ---
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if false; // All reviews must be submitted via /api/reviews/submit with authoritative counterparty validation
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /driver_metrics/{driverId} {
+      allow read, list: if isSignedIn() && (driverId == request.auth.uid || isAdmin());
+      allow write: if isOwner(driverId) || isAdmin();
+    }
+
+    match /driver_expenses/{expenseId} {
+      allow read, list: if isSignedIn() && (resource == null || resource.data.driverId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.driverId == request.auth.uid;
+      allow update, delete: if isSignedIn() && (resource == null || resource.data.driverId == request.auth.uid || isAdmin());
+    }
+
+    match /invitations/{invitationId} {
+      function isVerifiedInvitationRecipient() {
+        return isSignedIn() &&
+          ('email' in request.auth.token) &&
+          (request.auth.token.email is string) &&
+          ('email_verified' in request.auth.token) &&
+          request.auth.token.email_verified == true &&
+          (resource.data.get('email', '') is string) &&
+          resource.data.get('email', '').lower() == request.auth.token.email.lower();
+      }
+
+      function isVerifiedInvitationRecipientForAcceptance() {
+        return isSignedIn() &&
+          ('email' in request.auth.token) &&
+          (request.auth.token.email is string) &&
+          ('email_verified' in request.auth.token) &&
+          request.auth.token.email_verified == true &&
+          resource.data.get('email', '') == request.auth.token.email;
+      }
+
+      // List queries must use exact equality so Firestore can prove the query is
+      // constrained to the authenticated recipient.
+      function isVerifiedInvitationRecipientForList() {
+        return isSignedIn() &&
+          ('email' in request.auth.token) &&
+          (request.auth.token.email is string) &&
+          ('email_verified' in request.auth.token) &&
+          request.auth.token.email_verified == true &&
+          resource.data.get('email', '') == request.auth.token.email;
+      }
+
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        (resource != null && (
+          isVerifiedInvitationRecipient() ||
+          resource.data.get('invitedBy', '') == request.auth.uid
+        ))
+      );
+      allow list: if isSignedIn() && (
+        isAdmin() ||
+        (resource != null && (
+          isVerifiedInvitationRecipientForList() ||
+          resource.data.get('invitedBy', '') == request.auth.uid
+        ))
+      );
+      allow create: if isRegistered() && (
+        isAdmin() ||
+        request.resource.data.get('invitedBy', '') == request.auth.uid
+      );
+      // A verified recipient may perform only the pending -> accepted transition.
+      // Keep the authorization checks inline so each evaluated field is explicit.
+      allow update: if (
+        isSignedIn() &&
+        ('email' in request.auth.token) &&
+        request.auth.token.email is string &&
+        ('email_verified' in request.auth.token) &&
+        request.auth.token.email_verified == true &&
+        resource.data.email == request.auth.token.email &&
+        resource.data.get('status', '') == 'pending' &&
+        request.resource.data.get('status', '') == 'accepted' &&
+        request.resource.data.acceptedAt == request.time &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedAt'])
+      ) || (
+        isSignedIn() &&
+        resource.data.get('invitedBy', '') == request.auth.uid
+      ) || isAdmin();
+      allow delete: if isRegistered() && (
+        isAdmin() ||
+        resource.data.get('invitedBy', '') == request.auth.uid
+      );
+    }
+
+    match /emergency_broadcasts/{broadcastId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /broadcasts/{broadcastId} {
+      allow read: if isSignedIn() || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /search_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+
+    // --- Promo Codes (No public enumeration) ---
+    match /promo_codes/{promoId} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /partners/{partnerId} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner() || isAdmin() || resource.data.get('status', '') == 'active');
+      allow write: if isAdmin();
+    }
+
+    match /campaigns/{campaignId} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner() || isAdmin() || resource.data.get('status', '') == 'active');
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        isSignedIn() && 
+        resource.data.get('status', '') == 'active' && 
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['clicks', 'leads']) &&
+        (
+          (!request.resource.data.keys().hasAll(['clicks']) || request.resource.data.clicks == resource.data.get('clicks', 0) + 1) &&
+          (!request.resource.data.keys().hasAll(['leads']) || request.resource.data.leads == resource.data.get('leads', 0) + 1)
+        )
+      );
+    }
+
+    match /leads/{leadId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update: if isAdmin();
+    }
+
+    match /admin_alert_rules/{ruleId} {
+      allow read: if isAdmin() || isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /shop_orders/{orderId} {
+      allow read: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid && !request.resource.data.keys().hasAny(['paid', 'status', 'total', 'fulfilled']);
+      allow update: if isAdmin();
+    }
+
+    match /assets/{assetId} {
+      allow read: if isSignedIn() && (resource == null || resource.data.ownerId == request.auth.uid || isAdmin());
+      allow create: if isRegistered() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isRegistered() && (
+        isAdmin() || (
+          resource.data.ownerId == request.auth.uid &&
+          request.resource.data.ownerId == request.auth.uid
+        )
+      );
+      allow delete: if isRegistered() && (
+        isAdmin() ||
+        resource.data.ownerId == request.auth.uid
+      );
+    }
+
+    match /scheduledRepairs/{taskId} {
+      allow get, list: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow update, delete: if isSignedIn() && (resource == null || resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // --- Properties & Passports: Private Operational Source of Truth ---
+    match /properties/{propertyId} {
+      allow get: if isSignedIn() && (
+        resource.data.get('ownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        resource.data.get('landlordId', '') == request.auth.uid ||
+        (resource.data.get('transferStatus', '') == 'pending' && resource.data.get('pendingTransferToUid', '') == request.auth.uid) ||
+        (
+          'email' in request.auth.token &&
+          'email_verified' in request.auth.token &&
+          request.auth.token.email_verified == true &&
+          resource.data.get('tenantEmail', '') != '' &&
+          resource.data.get('tenantEmail', '').lower() == request.auth.token.email.lower()
+        ) ||
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.get('ownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        resource.data.get('landlordId', '') == request.auth.uid ||
+        isAdmin()
+      );
+      // Property creation is server-only; the authenticated API command enforces Gotham door limits.
+      allow create: if false;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          (resource.data.get('ownerId', '') == request.auth.uid || resource.data.get('userId', '') == request.auth.uid) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'ownerId', 'userId', 'landlordId', 'homeownerId',
+            'pendingTransferToUid', 'transferStatus', 'transferCode',
+            'transferExpiresAt', 'transferTargetEmail', 'transferHistory',
+            'transferClaimedAt', 'transferClaimedByUid', 'previousOwnersCount',
+            'transferTargetName', 'transferInitiatedAt', 'transferInitiatorUid',
+            'verifiedByAdmin'
+          ])
+        )
+      );
+      // Property deletion is server-only so the Gotham usage counter is decremented atomically.
+      allow delete: if false;
+    }
+
+    // --- Public Properties: Sanitized projection for Anonymous & Public Property Discovery / Verification ---
+    match /public_properties/{propertyId} {
+      allow get, list: if true;
+      allow create, update: if isAdmin() && (
+        !request.resource.data.keys().hasAny([
+          'ownerId', 'userId', 'landlordId', 'tenantId', 'tenantEmail', 'tenantName', 'tenantPhone',
+          'fullAddress', 'line1', 'houseNumber', 'street', 'contactPhone', 'contactEmail',
+          'componentRegistry', 'transferHistory', 'transferCode', 'pendingTransferToUid', 'transferClaimedByUid',
+          'insuranceProvider', 'policyNumber', 'privateNotes', 'financialInfo'
+        ])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // --- Tenant Issues (Hardened: Protected from public data extraction, PL-08) ---
+    match /tenant_issues/{issueId} {
+      allow create: if isRegistered() && request.resource.data.get('tenantName', '') is string && 
+                       request.resource.data.get('title', '') is string;
+      allow get, list: if isSignedIn() && (
+        resource.data.get('landlordOwnerId', '') == request.auth.uid || 
+        (
+          'email' in request.auth.token &&
+          request.auth.token.get('email_verified', false) == true &&
+          resource.data.get('tenantEmail', '') != '' &&
+          resource.data.get('tenantEmail', '').lower() == request.auth.token.email.lower()
+        ) ||
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        resource.data.get('landlordOwnerId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow delete: if isAdmin() || (isSignedIn() && resource.data.get('landlordOwnerId', '') == request.auth.uid);
+    }
+
+    match /field_agents/{agentId} {
+      allow get: if isSignedIn() && (resource.data.businessId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.businessId == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.businessId == request.auth.uid;
+      allow update: if isSignedIn() && (resource.data.businessId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (resource.data.businessId == request.auth.uid || isAdmin());
+    }
+
+    match /dispatch_routes/{routeId} {
+      allow get: if isSignedIn() && (resource.data.businessId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.businessId == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.businessId == request.auth.uid;
+      allow update: if isSignedIn() && (resource.data.businessId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (resource.data.businessId == request.auth.uid || isAdmin());
+    }
+
+    match /dispatches/{dispatchId} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isAdmin();
+    }
+
+    match /recurring_schedules/{scheduleId} {
+      allow get: if isSignedIn() && (
+        resource.data.get('homeownerId', '') == request.auth.uid || 
+        resource.data.get('tradespersonId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        (resource.data.get('participants', null) != null && request.auth.uid in resource.data.participants) ||
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.get('homeownerId', '') == request.auth.uid || 
+        resource.data.get('tradespersonId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        (resource.data.get('participants', null) != null && request.auth.uid in resource.data.participants) ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.get('homeownerId', '') == request.auth.uid || 
+        request.resource.data.get('tradespersonId', '') == request.auth.uid || 
+        request.resource.data.get('userId', '') == request.auth.uid || 
+        (request.resource.data.get('participants', null) != null && request.auth.uid in request.resource.data.participants) ||
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          (
+            resource.data.get('homeownerId', '') == request.auth.uid || 
+            resource.data.get('tradespersonId', '') == request.auth.uid || 
+            resource.data.get('userId', '') == request.auth.uid ||
+            (resource.data.get('participants', null) != null && request.auth.uid in resource.data.participants)
+          ) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'homeownerId', 'tradespersonId', 'userId', 'payoutStatus', 'payoutTransferred', 'funded'
+          ])
+        )
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.get('homeownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+    }
+
+    // --- Instant Match and Scores ---
+    match /instant_matches/{matchId} {
+      allow get: if isSignedIn() && (
+        resource.data.get('customerId', '') == request.auth.uid || 
+        resource.data.get('matchedTraderId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.get('customerId', '') == request.auth.uid || 
+        resource.data.get('matchedTraderId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.get('customerId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        resource.data.get('customerId', '') == request.auth.uid || 
+        resource.data.get('matchedTraderId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /instant_match_attempts/{attemptId} {
+      allow get: if isSignedIn() && (resource.data.get('traderId', '') == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.traderId == request.auth.uid || isAdmin());
+      allow create: if isAdmin() || (isSignedIn() && (request.auth.uid == get(/databases/$(database)/documents/instant_matches/$(request.resource.data.instantMatchId)).data.customerId || request.auth.uid == getAfter(/databases/$(database)/documents/instant_matches/$(request.resource.data.instantMatchId)).data.customerId));
+      allow update: if isSignedIn() && (resource.data.get('traderId', '') == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /users/{userId}/trader_match_scores/{categoryId} {
+      allow read: if isSignedIn() && (userId == request.auth.uid || isAdmin());
+      allow write: if isAdmin() || (isSignedIn() && userId == request.auth.uid);
+    }
+
+    // --- Home Portal: Jobs & Quotes (Hardened Ownership & Privacy) ---
+    match /jobs/{jobId} {
+      allow get: if isSignedIn() && (
+        isJobOwner(resource.data) || 
+        isJobTradesperson(resource.data) || 
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        isAdmin() || 
+        isJobOwner(resource.data) || 
+        isJobTradesperson(resource.data)
+      );
+      // Authoritative job creation is server-only. Clients must use /api/jobs/create,
+      // which binds ownership to verified Firebase Auth, enforces schema/protected-field
+      // rejection, atomic quota, idempotency, lifecycle validation and projection.
+      allow create: if false;
+      // Owner has update rights (without changing ownerId or forging financial payout status); accepted trader can only update operational fields; admin has full rights
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          isJobOwner(resource.data) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'status', 'startedAt', 'completedAt', 'cancelledAt', 'disputedAt',
+            'payoutTransferred', 'payoutStatus', 'paymentStatus', 'funded', 'isPaid',
+            'escrowStatus', 'escrowBalance', 'amountPaid', 'amount', 'platformFee',
+            'assignedTraderId', 'acceptedTradespersonId', 'acceptedTraderId', 'tradespersonId', 'traderId',
+            'targetTradespersonId', 'targetTradespersonName', 'targetTraderId', 'directTraderId', 'acceptedQuoteId',
+            'hasReview', 'hasTradespersonReview',
+            'ownerId', 'homeownerId', 'userId', 'customerId', 'posterId',
+            'stripeCustomerId', 'stripeAccountId', 'rating', 'trustScore', 'isVerified', 'verified',
+            'isBoosted', 'boostTier', 'boostExpiresAt', 'exclusiveUntil', 'isInstantMatch', 'isEmergencyBoost'
+          ])
+        ) ||
+        (
+          isJobTradesperson(resource.data) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'status', 'startedAt', 'completedAt', 'cancelledAt', 'disputedAt',
+            'payoutTransferred', 'payoutStatus', 'paymentStatus', 'funded', 'isPaid',
+            'escrowStatus', 'escrowBalance', 'amountPaid', 'amount', 'platformFee',
+            'assignedTraderId', 'acceptedTradespersonId', 'acceptedTraderId',
+            'ownerId', 'homeownerId', 'userId', 'customerId', 'posterId',
+            'stripeCustomerId', 'stripeAccountId'
+          ]) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'stage', 'timelineNotes', 'updatedAt', 'workStatus',
+            'estimatedCompletion', 'notes', 'traderNotes', 'completionNotes',
+            'photosBefore', 'photosAfter', 'checkInTime',
+            'isEmergencyResolved', 'trackingStatus', 'trackingLocation'
+          ])
+        )
+      );
+      allow delete: if isSignedIn() && (
+        isAdmin() ||
+        isJobDeletableByOwner(resource.data)
+      );
+    }
+
+    // --- Public Job Cards: Sanitized projection for Anonymous & Public Marketplace Discovery ---
+    match /public_job_cards/{cardId} {
+      allow get, list: if true;
+      allow create, update: if isAdmin() && (
+        !request.resource.data.keys().hasAny([
+          'homeownerId', 'userId', 'customerId', 'ownerId', 'posterId',
+          'fullAddress', 'houseNumber', 'locationInstructions', 'accessInstructions',
+          'postcode', 'photos', 'videos', 'documents', 'drawings', 'voiceNotes',
+          'quotes', 'dispute', 'payoutStatus', 'payoutTransferred',
+          'stripeCustomerId', 'stripeAccountId',
+          'targetTradespersonId', 'targetTradespersonName', 'targetTraderId', 'directTraderId', 'propertyId'
+        ])
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /jobs/{jobId}/quotes/{quoteId} {
+      // Quote Privacy: only quoting trader, job owner, or admin can read quotes
+      allow read, list: if isSignedIn() && (
+        resource.data.get('tradespersonId', '') == request.auth.uid || 
+        resource.data.get('traderId', '') == request.auth.uid || 
+        resource.data.get('proId', '') == request.auth.uid || 
+        resource.data.get('homeownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        (exists(/databases/$(database)/documents/jobs/$(jobId)) && (
+          get(/databases/$(database)/documents/jobs/$(jobId)).data.get('homeownerId', '') == request.auth.uid ||
+          get(/databases/$(database)/documents/jobs/$(jobId)).data.get('userId', '') == request.auth.uid
+        )) ||
+        isAdmin()
+      );
+      // Canonical Quote Commands: all mutations must execute through the authoritative server command endpoint
+      allow create, update, delete: if false;
+    }
+
+    // --- Consultancy System ---
+    match /rateCards/{id} {
+      allow read: if isSignedIn() && (resource == null || resource.data.consultantId == request.auth.uid || resource.data.get('isPublic', false) == true || isAdmin());
+      allow write: if isSignedIn() && (request.resource.data.consultantId == request.auth.uid || isAdmin());
+    }
+    match /availabilityWindows/{id} {
+      allow read: if isSignedIn() && (resource == null || resource.data.consultantId == request.auth.uid || resource.data.get('isPublic', false) == true || isAdmin());
+      allow write: if isSignedIn() && (request.resource.data.consultantId == request.auth.uid || isAdmin());
+    }
+    match /calendarSyncs/{id} {
+      allow read: if isSignedIn() && (resource == null || resource.data.consultantId == request.auth.uid || isAdmin());
+      allow write: if isSignedIn() && (request.resource.data.consultantId == request.auth.uid || isAdmin());
+    }
+    
+    function isConsultancyOwner() {
+      return isSignedIn() && (
+        (resource != null && (
+          resource.data.get('businessId', '') == request.auth.uid || 
+          resource.data.get('consultantId', '') == request.auth.uid || 
+          resource.data.get('userId', '') == request.auth.uid ||
+          resource.data.get('traderId', '') == request.auth.uid ||
+          resource.data.get('creatorId', '') == request.auth.uid
+        )) ||
+        (request.resource != null && (
+          request.resource.data.get('businessId', '') == request.auth.uid || 
+          request.resource.data.get('consultantId', '') == request.auth.uid || 
+          request.resource.data.get('userId', '') == request.auth.uid ||
+          request.resource.data.get('traderId', '') == request.auth.uid ||
+          request.resource.data.get('creatorId', '') == request.auth.uid
+        )) ||
+        isAdmin()
+      );
+    }
+
+    match /projectRoles/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /projectBids/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner() || request.resource.data.bidderId == request.auth.uid);
+    }
+    match /projectShortlists/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /projects/{id} {
+      allow read, list: if isSignedIn() && (resource == null || isConsultancyOwner() || resource.data.get('clientId', '') == request.auth.uid);
+      allow create: if isSignedIn() && (isConsultancyOwner() || isAdmin());
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        isConsultancyOwner() || 
+        (resource.data.get('clientId', '') == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['clientNotes', 'feedback', 'updatedAt']))
+      );
+      allow delete: if isAdmin() || isConsultancyOwner();
+    }
+    match /clients/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /proposals/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /proposalTemplates/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /projectMilestones/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /teamMembers/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /projectAssignments/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /projectVenues/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /venues/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isAdmin();
+    }
+    match /projectSuppliers/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /supplierContacts/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /projectTimelineItems/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /invoices/{id} {
+      allow get, list: if isSignedIn() && (
+        isConsultancyOwner() || 
+        resource.data.get('traderId', '') == request.auth.uid || 
+        resource.data.get('consultantId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        resource.data.get('businessId', '') == request.auth.uid || 
+        resource.data.get('clientId', '') == request.auth.uid || 
+        resource.data.get('homeownerId', '') == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        isAdmin() || (
+          (
+            request.resource.data.get('traderId', '') == request.auth.uid || 
+            request.resource.data.get('consultantId', '') == request.auth.uid || 
+            request.resource.data.get('userId', '') == request.auth.uid || 
+            request.resource.data.get('businessId', '') == request.auth.uid
+          ) &&
+          request.resource.data.get('paid', false) == false &&
+          request.resource.data.get('isPaid', false) == false &&
+          request.resource.data.get('payoutTransferred', false) == false &&
+          request.resource.data.get('payoutStatus', 'unpaid') in ['unpaid', 'pending', 'draft'] &&
+          request.resource.data.get('status', 'draft') in ['draft', 'pending', 'sent', 'unpaid']
+        )
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          (
+            isConsultancyOwner() || 
+            resource.data.get('traderId', '') == request.auth.uid || 
+            resource.data.get('consultantId', '') == request.auth.uid || 
+            resource.data.get('userId', '') == request.auth.uid || 
+            resource.data.get('businessId', '') == request.auth.uid
+          ) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'paid', 'isPaid', 'status', 'stripePaymentIntentId', 'stripeSessionId', 'payoutStatus', 'payoutTransferred', 'platformFee', 'amountPaid'
+          ])
+        )
+      );
+      allow delete: if isSignedIn() && (
+        isAdmin() || 
+        (
+          (
+            isConsultancyOwner() || 
+            resource.data.get('traderId', '') == request.auth.uid || 
+            resource.data.get('consultantId', '') == request.auth.uid || 
+            resource.data.get('userId', '') == request.auth.uid || 
+            resource.data.get('businessId', '') == request.auth.uid
+          ) && 
+          resource.data.get('paid', false) == false
+        )
+      );
+    }
+    match /expenses/{id} {
+      allow get, list: if isSignedIn() && (
+        isConsultancyOwner() || 
+        resource.data.get('consultantId', '') == request.auth.uid || 
+        resource.data.get('traderId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.get('consultantId', '') == request.auth.uid || 
+        request.resource.data.get('traderId', '') == request.auth.uid || 
+        request.resource.data.get('userId', '') == request.auth.uid ||
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          (
+            isConsultancyOwner() || 
+            resource.data.get('consultantId', '') == request.auth.uid || 
+            resource.data.get('traderId', '') == request.auth.uid || 
+            resource.data.get('userId', '') == request.auth.uid
+          ) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'consultantId', 'traderId', 'userId', 'isReimbursed', 'reimbursementStatus'
+          ])
+        )
+      );
+      allow delete: if isSignedIn() && (
+        isAdmin() || 
+        isConsultancyOwner() || 
+        resource.data.get('consultantId', '') == request.auth.uid || 
+        resource.data.get('traderId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid
+      );
+    }
+    match /portfolioItems/{id} {
+      allow read: if true;
+      allow create: if isSignedIn() && (request.resource.data.consultantId == request.auth.uid || isAdmin());
+      allow update: if isSignedIn() && (resource.data.consultantId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && (resource.data.consultantId == request.auth.uid || isAdmin());
+    }
+    match /sessionNotes/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /calendarEvents/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /matchScores/{id} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isSignedIn() && (resource == null || isConsultancyOwner());
+    }
+    match /enquiries/{id} {
+      allow get, list: if isSignedIn() && (
+        isConsultancyOwner() || 
+        resource.data.get('senderId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.get('senderId', '') == request.auth.uid || 
+        request.resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        isConsultancyOwner() || 
+        (resource.data.get('senderId', '') == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']))
+      );
+      allow delete: if isAdmin() || isConsultancyOwner();
+    }
+    match /support_tickets/{ticketId} {
+      allow get, list: if isSignedIn() && (
+        resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (
+          resource.data.get('userId', '') == request.auth.uid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'userId', 'adminAssigned', 'priority', 'internalNotes'
+          ])
+        )
+      );
+      allow delete: if isAdmin();
+    }
+    match /bidding_jobs/{jobId} {
+      allow get, list: if isSignedIn() && (
+        resource.data.get('creatorId', '') == request.auth.uid || 
+        resource.data.get('ownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        resource.data.get('assignedTo', '') == request.auth.uid ||
+        resource.data.get('tradespersonId', '') == request.auth.uid ||
+        resource.data.get('status', '') == 'open' || 
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.get('creatorId', '') == request.auth.uid || 
+        request.resource.data.get('ownerId', '') == request.auth.uid || 
+        request.resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (
+          (
+            resource.data.get('creatorId', '') == request.auth.uid || 
+            resource.data.get('ownerId', '') == request.auth.uid || 
+            resource.data.get('userId', '') == request.auth.uid
+          ) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'creatorId', 'ownerId', 'userId', 'payoutStatus', 'payoutTransferred', 'funded', 'amount', 'balance'
+          ])
+        )
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.get('creatorId', '') == request.auth.uid || 
+        resource.data.get('ownerId', '') == request.auth.uid || 
+        resource.data.get('userId', '') == request.auth.uid || 
+        isAdmin()
+      );
+    }
+    match /affiliates/{affiliateId} {
+      allow read: if isSignedIn() && (resource == null || isConsultancyOwner());
+      allow write: if isAdmin();
+    }
+    match /appointments/{appointmentId} {
+      allow get: if isSignedIn() && (resource.data.get('customerId', '') == request.auth.uid || resource.data.get('traderId', '') == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.customerId == request.auth.uid || resource.data.traderId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && (request.resource.data.get('customerId', '') == request.auth.uid || isAdmin());
+      allow update: if isSignedIn() && (resource.data.get('customerId', '') == request.auth.uid || resource.data.get('traderId', '') == request.auth.uid || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /flash_deals/{dealId} {
+      allow read: if true;
+      allow create: if isSignedIn() && (
+        request.resource.data.traderId == request.auth.uid || 
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        resource.data.traderId == request.auth.uid || 
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedCount', 'status', 'updatedAt']) &&
+          request.resource.data.claimedCount == resource.data.get('claimedCount', 0) + 1
+        ) ||
+        isAdmin()
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.traderId == request.auth.uid || 
+        isAdmin()
+      );
+    }
+
+    match /system_settings/{settingId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /platform_settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ==========================================
+    // V8.1 STRUCTURED INTELLIGENCE SECURITY BOUNDARY
+    // Server-Authoritative / Admin Only
+    // Public and ordinary client reads/writes strictly DENIED
+    // Historical immutability enforced for events, evidence, extractions, and quality reviews
+    // ==========================================
+    match /intelligence_events/{eventId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Append-only immutable event store; server Admin SDK writes only
+    }
+    match /intelligence_evidence/{evidenceId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Append-only immutable evidence registry; server Admin SDK writes only
+    }
+    match /intelligence_extractions/{extractionId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Append-only raw extraction manifests; server Admin SDK writes only
+    }
+    match /intelligence_tasks/{taskId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Server-authoritative task queue; only trusted server Admin SDK writes
+    }
+    match /intelligence_jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(jobId);
+      allow delete: if false;
+    }
+    match /intelligence_properties/{propertyId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(propertyId);
+      allow delete: if false;
+    }
+    match /intelligence_contractors/{contractorId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(contractorId);
+      allow delete: if false;
+    }
+    match /intelligence_quotes/{quoteId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(quoteId);
+      allow delete: if false;
+    }
+    match /intelligence_reviews/{reviewId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(reviewId);
+      allow delete: if false;
+    }
+    match /intelligence_materials/{materialId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(materialId);
+      allow delete: if false;
+    }
+    match /intelligence_projects/{projectId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(projectId);
+      allow delete: if false;
+    }
+    match /intelligence_customer_requests/{requestId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(requestId);
+      allow delete: if false;
+    }
+    match /intelligence_quality/{qualityId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Immutable audit log of human quality corrections; server Admin SDK writes only
+    }
+    match /intelligence_backfill_runs/{runId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Operational state: only trusted server Admin SDK writes
+    }
+    match /intelligence_backfill_scopes/{scopeId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Operational state: only trusted server Admin SDK writes
+    }
+    match /intelligence_processing_runs/{runId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Execution records are immutable audit trails; clients cannot create, update, or delete processing runs
+    }
+    match /property_condition_history/{conditionId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable condition history; server Admin SDK writes only
+    }
+    match /property_risk_history/{riskId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Immutable risk history; server Admin SDK writes only
+    }
+    match /property_risk_retractions/{retractionId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable retractions; server Admin SDK writes only
+    }
+    match /property_maintenance_history/{maintenanceId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Immutable predictive maintenance history; server Admin SDK writes only
+    }
+    match /property_maintenance_supersessions/{supersessionId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable supersessions; server Admin SDK writes only
+    }
+    match /property_passports/{propertyId} {
+      allow read: if isSignedIn() &&
+        (
+          isPropertyOwnerOrLandlord(propertyId) ||
+          isAssignedPropertyManager(propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Authoritative passport projection; server Admin SDK writes only
+    }
+    match /property_passport_history/{snapshotId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable passport snapshot history; server Admin SDK writes only
+    }
+    match /buyer_intelligence/{propertyId} {
+      allow read: if isSignedIn() &&
+        (
+          isPropertyOwnerOrLandlord(propertyId) ||
+          isAssignedPropertyManager(propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Authoritative buyer intelligence projection; server Admin SDK writes only
+    }
+    match /buyer_intelligence_history/{snapshotId} {
+      allow read: if isSignedIn() &&
+        resource.data.get('propertyId', '') != '' &&
+        (
+          isPropertyOwnerOrLandlord(resource.data.propertyId) ||
+          isAssignedPropertyManager(resource.data.propertyId) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable buyer intelligence snapshot history; server Admin SDK writes only
+    }
+    match /data_rights/{rightsId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+    match /data_rights_history/{historyId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable data rights history; server Admin SDK writes only
+    }
+
+    // ==========================================
+    // V8.3 TASK 28 — EVIDENCE & DATA PROVENANCE GRAPH
+    // Strict Tenant-Bound Security & Append-Only Immutability
+    // Client writes strictly DENIED; Server Admin SDK writes only
+    // ==========================================
+    match /provenance_nodes/{nodeId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+
+    match /provenance_edges/{edgeId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+
+    match /provenance_events/{eventId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable provenance event history; server Admin SDK writes only
+    }
+
+    // =========================================================================
+    // V8.3 Task 30: Server-Authoritative Data Classification & Eligibility Rules
+    // Strict tenant boundary (tenantId === request.auth.uid) or platform admin.
+    // Client writes are strictly forbidden (allow create, update, delete: if false;).
+    // All classifications and decisions are server-authoritative.
+    // =========================================================================
+    match /data_classifications/{classificationId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+
+    match /data_classifications_history/{historyId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable history; client writes denied
+    }
+
+    match /data_classification_history/{historyId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable history; client writes denied
+    }
+
+    match /data_eligibility_decisions/{decisionId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Immutable decision audit trail; server writes only
+    }
+
+    // =========================================================================
+    // V8.3 Task 31: AI Training & Usage Controls Security Rules
+    // Strict tenant boundary (tenantId === request.auth.uid) or platform admin.
+    // Client writes are strictly forbidden (allow create, update, delete: if false;).
+    // All controls, history, and decisions are server-authoritative.
+    // =========================================================================
+    match /ai_usage_controls/{controlId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+
+    match /ai_usage_controls_history/{historyId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable history; client writes denied
+    }
+
+    match /ai_usage_decisions/{decisionId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Immutable evaluation decision audit trail; server writes only
+    }
+
+    // =========================================================================
+    // V8.3 Task 32: Revocation, Retention & Deletion Security Rules
+    // Strict tenant boundary (tenantId === request.auth.uid) or platform admin.
+    // Client writes are strictly forbidden (allow create, update, delete: if false;).
+    // All policies, deletion requests, and lifecycle events are server-authoritative.
+    // =========================================================================
+    match /data_retention_policies/{policyId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+
+    match /data_deletion_requests/{requestId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Server Admin SDK writes only; client writes denied
+    }
+
+    match /data_lifecycle_events/{eventId} {
+      allow read: if isSignedIn() &&
+        (
+          (resource.data.get('tenantId', '') != '' && resource.data.tenantId == request.auth.uid) ||
+          isAdmin()
+        );
+      allow create, update, delete: if false; // Append-only immutable lifecycle events; client writes denied
+    }
+  }
+}

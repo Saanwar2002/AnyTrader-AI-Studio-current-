@@ -1,0 +1,241 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Outfit", "Inter", sans-serif;
+  
+  --color-primary: var(--primary-color, #2563eb);
+  --color-primary-hover: var(--primary-hover, #1d4ed8);
+  --color-trust: var(--trust-color, #10b981);
+  --color-warning: var(--warning-color, #f59e0b);
+  --color-danger: var(--danger-color, #ef4444);
+  --color-surface: var(--surface-color, #f8fafc);
+  --color-header: var(--header-color, #0f172a);
+  --color-brand-blue: #2d5a88;
+
+  --color-card: var(--card-bg, #ffffff);
+  --color-text-main: var(--text-color, #0f172a);
+  --color-text-muted: var(--text-muted-color, #64748b);
+  --color-border-main: var(--border-color, #f1f5f9);
+}
+
+/* Light Theme (Default) */
+:root {
+  --primary-color: #2563eb;
+  --primary-hover: #1d4ed8;
+  --surface-color: #f8fafc;
+  --card-bg: #ffffff;
+  --text-color: #0f172a;
+  --text-muted-color: #64748b;
+  --border-color: #f1f5f9;
+  --header-color: #0f172a;
+
+  /* Capacitor Safe Area Inset Support */
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+}
+
+/* Dark Theme */
+.theme-dark {
+  --primary-color: #3b82f6;
+  --primary-hover: #60a5fa;
+  --surface-color: #0f172a;
+  --card-bg: #1e293b;
+  --text-color: #f8fafc;
+  --text-muted-color: #94a3b8;
+  --border-color: #334155;
+  --header-color: #1e293b;
+}
+
+/* AnyRoller Brand Theme */
+.theme-anyroller {
+  --primary-color: #000000;
+  --primary-hover: #333333;
+  --surface-color: #fffbeb;
+  --card-bg: #ffffff;
+  --text-color: #000000;
+  --text-muted-color: #71717a;
+  --border-color: #e4e4e7;
+  --header-color: #000000;
+}
+
+/* Global Print Styles */
+@media print {
+  #mobile-bottom-nav,
+  header,
+  footer,
+  .print\:hidden {
+    display: none !important;
+  }
+
+  body {
+    background: white !important;
+    color: black !important;
+    overflow: visible !important;
+  }
+
+  .overflow-y-auto,
+  .overflow-y-scroll,
+  .overflow-hidden {
+    overflow: visible !important;
+    max-height: none !important;
+    height: auto !important;
+  }
+}
+
+@keyframes pulseGreenBorder {
+  0%, 100% {
+    border-color: #10b981;
+    box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.35);
+  }
+  50% {
+    border-color: #34d399;
+    box-shadow: 0 0 0 0px rgba(16, 185, 129, 0);
+  }
+}
+
+.pulse-green-border {
+  animation: pulseGreenBorder 1.5s infinite ease-in-out;
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  
+  .glass {
+    @apply bg-card/80 backdrop-blur-md border border-white/20;
+  }
+  
+  .card-premium {
+    @apply bg-card rounded-3xl border border-border-main shadow-sm hover:shadow-md transition-all duration-300;
+  }
+  
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-text-main to-text-muted;
+  }
+}
+
+@layer base {
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    min-height: 100%;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-overflow-scrolling: touch;
+    cursor: default;
+    overflow-x: hidden;
+  }
+
+  body {
+    @apply bg-surface text-text-main font-sans antialiased;
+    overflow-x: hidden;
+    touch-action: pan-y;
+  }
+
+  /* Hide scrollbar globally */
+  ::-webkit-scrollbar {
+    display: none;
+  }
+  * {
+    scrollbar-width: none;
+  }
+
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+
+  /* Enforce minimum 44x44px touch target area for interactive elements */
+  button,
+  select,
+  input[type="button"],
+  input[type="submit"],
+  input[type="reset"],
+  input[type="checkbox"],
+  input[type="radio"],
+  [role="button"] {
+    min-width: 44px;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Ensure standalone link buttons meet 44px height requirement */
+  a[class*="button"],
+  a[class*="btn"],
+  a[class*="p-"],
+  a[class*="py-"],
+  a[class*="rounded"] {
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  h1, h2, h3, .font-display {
+    @apply font-display tracking-tight;
+  }
+}
+
+body.hide-driver-bottom-nav #mobile-bottom-nav {
+  transform: translateY(100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Capacitor Virtual Keyboard Layout Adjustments */
+body.keyboard-is-open #mobile-bottom-nav,
+body.keyboard-is-open .hide-on-keyboard {
+  display: none !important;
+}
+
+body.keyboard-is-open {
+  /* Prevent background scrolling locking while maintaining form focus */
+  overflow-y: auto !important;
+}
+
+@keyframes slowScrollMarquee {
+  0% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-slow-scroll {
+  display: flex;
+  width: max-content;
+  animation: slowScrollMarquee 45s linear infinite;
+}
+
+.animate-slow-scroll:hover,
+.animate-slow-scroll:active,
+.animate-slow-scroll:focus-within {
+  animation-play-state: paused;
+}
+
+/* Dedicated relaxed, slow reading pace for Illustrated Ad Ticker */
+.animate-ticker-slow {
+  display: flex;
+  width: max-content;
+  animation: slowScrollMarquee 200s linear infinite;
+}
+
+.animate-ticker-slow:hover,
+.animate-ticker-slow:active,
+.animate-ticker-slow:focus-within {
+  animation-play-state: paused;
+}
+

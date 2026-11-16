@@ -1,0 +1,836 @@
+import React, { useEffect, useState } from "react";
+import { db, collection, query, where, orderBy, onSnapshot, updateDoc, doc, serverTimestamp, handleFirestoreError, OperationType, deleteDoc, addDoc } from "@/src/firebase";
+import { useAuth } from "./AuthProvider";
+import { usePortal } from "@/src/lib/PortalContext";
+import { motion, AnimatePresence } from "motion/react";
+import { Briefcase, Clock, MapPin, ChevronRight, AlertCircle, AlertTriangle, Settings, Edit2, RotateCcw, XCircle, Loader2, Plus, Image as ImageIcon, Video as VideoIcon, Trash2, History, Zap, Building2, MessageSquare } from "lucide-react";
+import { toast } from "sonner";
+import { Link, useNavigate, useLocation } from "react-router-dom";
+import { cn, getOutwardPostcode, formatJobLocation } from "@/src/lib/utils";
+import { EmergencyTimer } from "./EmergencyTimer";
+import MediaGalleryModal from "./MediaGalleryModal";
+import { createJobViaCommand, cancelJobViaCommand } from "../services/jobCommandService";
+
+export default function MyJobs() {
+  const { user, profile, isAuthReady, loading: authLoading } = useAuth();
+  const { activeRole } = usePortal();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const isBusiness = profile?.subscriptionType === "business";
+  const [jobs, setJobs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [actionId, setActionId] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState<string | null>(null);
+  
+  const isHistoryView = new URLSearchParams(location.search).get("history") === "true";
+  const propertyId = new URLSearchParams(location.search).get("propertyId");
+
+  const [filter, setFilter] = useState<"all" | "active" | "cancelled" | "completed">(propertyId ? "all" : "active");
+  const [selectedJobMedia, setSelectedJobMedia] = useState<any | null>(null);
+  const [jobToDelete, setJobToDelete] = useState<string | null>(null);
+  const [confirmCancelId, setConfirmCancelId] = useState<string | null>(null);
+  const [confirmRepostId, setConfirmRepostId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  useEffect(() => {
+    // If auth is still resolving, wait
+    if (authLoading && !isAuthReady) return;
+
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+
+    // Query without compound orderBy to avoid requiring a composite Firestore index
+    const q = query(
+      collection(db, "jobs"),
+      where("homeownerId", "==", user.uid)
+    );
+
+    // Timeout safety fallback so spinner never hangs indefinitely (max 2.5 seconds)
+    const timeoutId = setTimeout(() => {
+      setLoading(false);
+    }, 2500);
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      clearTimeout(timeoutId);
+      const jobsData = snapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() }))
+        .filter((job: any) => !job.clientDeleted)
+        .sort((a: any, b: any) => {
+          const timeA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : new Date(a.createdAt || 0).getTime();
+          const timeB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : new Date(b.createdAt || 0).getTime();
+          return timeB - timeA;
+        });
+      setJobs(jobsData);
+      setLoading(false);
+    }, (error) => {
+      clearTimeout(timeoutId);
+      console.error("Error fetching jobs:", error);
+      handleFirestoreError(error, OperationType.LIST, "jobs");
+      setLoading(false);
+    });
+
+    return () => {
+      clearTimeout(timeoutId);
+      unsubscribe();
+    };
+  }, [user, authLoading, isAuthReady]);
+
+  const displayJobs = jobs.filter(job => {
+    if (propertyId && job.assetId !== propertyId) return false;
+
+    const jobDate = job.createdAt?.seconds ? job.createdAt.seconds * 1000 : new Date(job.createdAt).getTime();
+    const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const isRecent = jobDate > fourteenDaysAgo;
+    const isArchivableStatus = job.status === "completed" || job.status === "cancelled";
+
+    // If filtering by a specific property, show all its jobs (unless a specific tab is selected)
+    if (propertyId) {
+      if (filter === "all") return true;
+      if (filter === "active") return job.status !== "completed" && job.status !== "cancelled";
+      if (filter === "cancelled") return job.status === "cancelled";
+      if (filter === "completed") return job.status === "completed";
+      return true;
+    }
+
+    if (isHistoryView) {
+      // History view shows archived jobs (completed/cancelled > 14 days)
+      return isArchivableStatus && !isRecent;
+    }
+
+    // Main view shows pending jobs OR recent completed/cancelled jobs
+    const isVisibleInMain = !isArchivableStatus || isRecent;
+    if (!isVisibleInMain) return false;
+
+    // Apply UI filters on top of visibility logic
+    if (filter === "all") return true;
+    if (filter === "active") return job.status !== "completed" && job.status !== "cancelled";
+    if (filter === "cancelled") return job.status === "cancelled";
+    if (filter === "completed") return job.status === "completed";
+    return true;
+  });
+
+  const handleSimulateJob = async () => {
+    setIsProcessing("simulating");
+    try {
+      if (!user) return;
+      
+      let tempJobId = "";
+      try {
+        const result = await createJobViaCommand({
+          user,
+          payload: {
+            title: "Fix leaking washing machine",
+            description: "My Bosch washing machine is leaking from the bottom front door when running a hot wash. Need someone to fix it ASAP.",
+            category: "Appliance Repair",
+            subCategory: "Washing Machine Repair",
+            urgency: "standard",
+            postcode: "HD5 9BW",
+            city: "Huddersfield",
+          },
+        });
+        tempJobId = result.jobId;
+      } catch (e: any) {
+        throw new Error(`Job creation failed: ${e.message}`);
+      }
+      
+      const quotesRef = collection(db, "jobs", tempJobId, "quotes");
+      
+      const mockPros = [
+        { id: "pro1", name: "Bob's Repairs", price: 65, rating: 4.8, reviews: 142, message: "Can do this tomorrow morning. Includes standard replacement seal." },
+        { id: "pro2", name: "QuickFix Appliances", price: 85, rating: 4.9, reviews: 310, message: "We can come today. fully insured and guaranteed." },
+        { id: "pro3", name: "Huddersfield Handyman", price: 45, rating: 4.5, reviews: 89, message: "I've fixed many of these. Labour only, parts extra if needed." },
+        { id: "pro4", name: "Elite Appliance Care", price: 110, rating: 5.0, reviews: 45, message: "Premium service with official Bosch parts. 1 year warranty." },
+        { id: "pro5", name: "Dave The Plumber", price: 70, rating: 4.7, reviews: 215, message: "Available next week. Sounds like a simple door seal issue." }
+      ];
+      
+      for (const pro of mockPros) {
+        try {
+          await addDoc(quotesRef, {
+            tradespersonId: pro.id,
+            homeownerId: user.uid,
+            proId: pro.id,
+            jobId: tempJobId,
+            businessName: pro.name,
+            price: pro.price,
+            projectTotal: pro.price,
+            estimatedHours: 1,
+            message: pro.message,
+            status: "pending",
+            createdAt: serverTimestamp(),
+            materialsFinalized: true,
+            averageRating: pro.rating,
+            totalReviews: pro.reviews,
+          });
+        } catch (e: any) {
+           throw new Error(`Quote creation failed for ${pro.id}: ${e.message}`);
+        }
+      }
+      
+      navigate(`/job/${tempJobId}`);
+    } catch (e: any) {
+      console.error("Simulation error", e);
+      alert(`Simulation error: ${e.message}`);
+    } finally {
+      setIsProcessing(null);
+    }
+  };
+
+  const handleCancel = async (jobId: string) => {
+    if (!user) return;
+    setIsProcessing(jobId);
+    try {
+      await cancelJobViaCommand({
+        user,
+        jobId,
+      });
+      setActionId(null);
+    } catch (error) {
+      console.error("Error cancelling job:", error);
+    } finally {
+      setIsProcessing(null);
+    }
+  };
+
+  const handleRepost = async (job: any) => {
+    if (!user) return;
+    setIsProcessing(job.id);
+    try {
+      await createJobViaCommand({
+        user,
+        payload: {
+          title: job.title || "Untitled Job",
+          description: job.description || "No description provided",
+          category: job.category || "General Maintenance",
+          subCategory: job.subCategory || job.subcategory || null,
+          postcode: job.postcode || "SW1A 1AA",
+          city: job.city || null,
+          area: job.area || null,
+          urgency: job.urgency === "emergency" ? "emergency" : "standard",
+          budget: job.budget || null,
+          photos: Array.isArray(job.photos) ? job.photos : [],
+          propertyId: job.propertyId || null,
+        },
+      });
+      setActionId(null);
+      toast.success("Job reposted successfully!");
+    } catch (error: any) {
+      console.error("Error reposting job:", error);
+      toast.error(error.message || "Failed to repost job");
+    } finally {
+      setIsProcessing(null);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!jobToDelete) return;
+    await executeDelete(jobToDelete);
+    setJobToDelete(null);
+  };
+
+  const executeDelete = async (jobId: string) => {
+    setIsProcessing(jobId);
+    try {
+      await updateDoc(doc(db, "jobs", jobId), { clientDeleted: true });
+      setActionId(null);
+    } catch (error) {
+      console.error("Error deleting job:", error);
+    } finally {
+      setIsProcessing(null);
+    }
+  };
+
+  const handleDelete = (jobId: string) => {
+    setJobToDelete(jobId);
+  };
+
+  const formatRelativeTime = (date: any) => {
+    if (!date) return "Just now";
+    const now = new Date();
+    const jobDate = date.seconds ? new Date(date.seconds * 1000) : new Date(date);
+    const diffInMs = now.getTime() - jobDate.getTime();
+    const diffInMins = Math.floor(diffInMs / (1000 * 60));
+    
+    if (diffInMins < 1) return "Just now";
+    if (diffInMins < 60) return `${diffInMins}m ago`;
+    
+    const diffInHours = Math.floor(diffInMins / 60);
+    if (diffInHours < 24) return `${diffInHours}h ago`;
+    
+    const diffInDays = Math.floor(diffInHours / 24);
+    if (diffInDays < 7) return `${diffInDays}d ago`;
+    
+    return jobDate.toLocaleDateString('en-GB');
+  };
+
+  const [quoteCounts, setQuoteCounts] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    if (jobs.length === 0) return;
+
+    const unsubscribes = jobs.map(job => {
+      return onSnapshot(collection(db, "jobs", job.id, "quotes"), (snapshot) => {
+        setQuoteCounts(prev => ({
+          ...prev,
+          [job.id]: snapshot.size
+        }));
+      }, (error) => {
+        console.error(`Error fetching quotes for job ${job.id}:`, error);
+        handleFirestoreError(error, OperationType.LIST, `jobs/${job.id}/quotes`);
+      });
+    });
+
+    return () => unsubscribes.forEach(unsub => unsub());
+  }, [jobs]);
+
+  if (loading) {
+    return (
+      <div className="py-12 flex justify-center">
+        <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="space-y-6 pb-24">
+        <div className="flex items-center justify-between">
+          <h1 className="text-3xl font-black text-slate-900">
+            {isHistoryView ? 
+              (isBusiness ? "Project History" : "Job History") : 
+              (isBusiness ? "My Hiring Projects" : "My Hiring Jobs")}
+          </h1>
+          {!isHistoryView && filter !== "completed" && filter !== "cancelled" && (
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={handleSimulateJob}
+                disabled={isProcessing === "simulating"}
+                className="text-purple-600 font-bold hover:underline flex items-center gap-1 disabled:opacity-50"
+              >
+                {isProcessing === "simulating" ? <Loader2 className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5" />}
+                Simulate Demo Job
+              </button>
+              <Link 
+                to="/post-job"
+                className="text-orange-500 font-bold hover:underline flex items-center gap-1"
+              >
+                <Plus className="w-5 h-5" />
+                {isBusiness ? "Post Project" : "Post new"}
+              </Link>
+            </div>
+          )}
+        </div>
+
+        {/* Filter Tabs - Only show in main view */}
+        {!isHistoryView && (
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-2">
+            {[
+              { id: "all", label: "All" },
+              { id: "active", label: "Active" },
+              { id: "completed", label: "Completed" },
+              { id: "cancelled", label: "Cancelled" }
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setFilter(tab.id as any)}
+                className={cn(
+                  "px-6 py-2.5 rounded-2xl text-sm font-bold transition-all shrink-0 border",
+                  filter === tab.id 
+                    ? "bg-slate-900 text-white border-slate-900 shadow-lg shadow-slate-200" 
+                    : "bg-white text-slate-500 border-black hover:border-black"
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {displayJobs.length === 0 ? (
+          <div className="bg-white p-12 rounded-3xl border border-black text-center space-y-6 shadow-sm">
+            <div className="w-20 h-20 bg-slate-50 rounded-full flex items-center justify-center mx-auto text-slate-300">
+              {isHistoryView ? <History className="w-10 h-10" /> : <Briefcase className="w-10 h-10" />}
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-xl font-bold text-slate-900">
+                {isHistoryView 
+                  ? (isBusiness ? "No archived projects" : "No archived jobs")
+                  : (filter === "completed" || filter === "cancelled")
+                    ? `No recent ${filter} ${isBusiness ? "projects" : "jobs"}`
+                    : (isBusiness ? "No projects posted yet" : "No jobs posted yet")}
+              </h3>
+              <p className="text-slate-500 max-w-xs mx-auto">
+                {isHistoryView 
+                  ? (isBusiness ? "Completed or cancelled projects older than 14 days will appear here." : "Completed or cancelled jobs older than 14 days will appear here.")
+                  : (filter === "completed" || filter === "cancelled")
+                    ? (isBusiness ? "Projects older than 14 days are automatically moved to your history to keep things tidy." : "Jobs older than 14 days are automatically moved to your history to keep things tidy.")
+                    : (isBusiness ? "Post your first project to get AI estimates and quotes from local tradespeople." : "Post your first job to get AI estimates and quotes from local tradespeople.")}
+              </p>
+            </div>
+            {!isHistoryView && (
+              filter === "completed" || filter === "cancelled" ? (
+                <Link 
+                  to="/my-jobs?history=true"
+                  className="inline-flex items-center gap-2 text-blue-600 font-bold hover:underline"
+                >
+                  Go to your {isBusiness ? "project" : "job"} history in profile to see old {isBusiness ? "projects" : "jobs"} <ChevronRight className="w-4 h-4" />
+                </Link>
+              ) : (
+                <Link 
+                  to="/post-job"
+                  className="inline-block bg-[#1e3a5f] text-white px-8 py-3 rounded-2xl font-bold hover:bg-blue-900 transition-all active:scale-95 shadow-lg shadow-blue-100"
+                >
+                  {isBusiness ? "Post a Project" : "Post a Job"}
+                </Link>
+              )
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-6">
+            {displayJobs.map((job) => (
+              <div
+                key={job.id}
+                className="bg-white rounded-[2.5rem] border border-black shadow-sm hover:shadow-md transition-all overflow-hidden relative group"
+              >
+                {job.claimedDeal ? (
+                  <div className="bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 text-slate-950 font-black text-xs sm:text-sm tracking-wide uppercase py-2.5 px-4 sm:px-6 flex items-center justify-between border-b border-amber-600 shadow-sm">
+                    <div className="flex items-center gap-2">
+                      <span className="bg-slate-950 text-amber-400 p-1 rounded-md">
+                        <Zap className="w-3.5 h-3.5 fill-current" />
+                      </span>
+                      <span>Flash Deal • Quote Request</span>
+                    </div>
+                    <span className="bg-slate-950 text-amber-300 text-[10px] sm:text-xs font-black px-3 py-1 rounded-full uppercase tracking-wider">
+                      Targeted: {job.targetTradespersonName || job.claimedDeal.traderName || "Individual Trader"}
+                    </span>
+                  </div>
+                ) : (job.targetTradespersonName || job.targetTradespersonId) ? (
+                  <div className="bg-gradient-to-r from-indigo-900 via-blue-900 to-indigo-950 text-white font-black text-xs sm:text-sm tracking-wide uppercase py-2.5 px-4 sm:px-6 flex items-center justify-between border-b border-indigo-950 shadow-sm gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm shrink-0">🎯</span>
+                      <span className="truncate">Direct Trader Quote Request</span>
+                    </div>
+                    <div className="bg-amber-400 text-slate-950 text-[10px] sm:text-xs font-extrabold px-3 py-1 rounded-full uppercase tracking-wider shadow-sm flex items-center gap-1.5 shrink-0 border border-amber-300">
+                      <span className="text-slate-800 font-bold opacity-90 hidden xs:inline">Sent to:</span>
+                      <span className="text-amber-950 font-black tracking-tight underline decoration-amber-600 decoration-1 underline-offset-2">{job.targetTradespersonName || "Individual Trader"}</span>
+                    </div>
+                  </div>
+                ) : (job.boostTier === 'instant_match' || job.isInstantMatch) ? (
+                  <div className="bg-[#E6A020] text-center py-2 text-slate-900 font-black text-3xl tracking-wide uppercase border-b border-[#D4921E]">
+                    Instant Match
+                  </div>
+                ) : job.urgency === 'emergency' ? (
+                  <div className="bg-gradient-to-r from-red-600 to-rose-600 text-center py-2 text-white font-black text-xs tracking-widest uppercase border-b border-red-700 flex items-center justify-center gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5" />
+                    Emergency Job
+                  </div>
+                ) : (
+                  <div className="bg-slate-900 text-center py-1.5 text-white font-black text-[11px] tracking-widest uppercase border-b border-slate-800">
+                    Standard Job
+                  </div>
+                )}
+                <div className={cn(
+                  "p-3.5 sm:p-5 space-y-2.5",
+                  job.urgency === "emergency" ? "bg-red-50/20" : ""
+                )}>
+                  {/* Header: Category and Badges */}
+                  <div className="space-y-1.5">
+                    {/* Category & Subcategory in a single line row */}
+                    <div className="flex items-center gap-2 min-w-0 w-full overflow-hidden">
+                      <div className={cn(
+                        "w-5 h-5 rounded-lg flex items-center justify-center shrink-0",
+                        job.urgency === "emergency" ? "bg-red-100" : "bg-orange-100"
+                      )}>
+                        <Briefcase className={cn(
+                          "w-3 h-3",
+                          job.urgency === "emergency" ? "text-red-600" : "text-orange-600"
+                        )} />
+                      </div>
+                      <p className={cn(
+                        "text-[10px] sm:text-[11px] font-black uppercase tracking-wider truncate whitespace-nowrap min-w-0 flex-1",
+                        job.urgency === "emergency" ? "text-red-600" : "text-orange-600"
+                      )}>
+                        {job.category} {job.subcategory ? `• ${job.subcategory}` : ''}
+                      </p>
+                    </div>
+
+                    {/* Status Badges & Quotes Received Tab in 1 Row */}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="bg-slate-900 text-white px-2 py-0.5 rounded-md text-[9px] sm:text-[10px] font-black shadow-2xs uppercase tracking-wider shrink-0">
+                        #{job.jobNo || (job.id ? `AT-${job.id.substring(0, 6).toUpperCase()}` : "AT-JOB")}
+                      </span>
+                      {job.urgency === 'emergency' && (
+                        <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-black shadow-2xs uppercase tracking-wider flex items-center gap-1 border border-red-200">
+                          <AlertCircle className="w-2.5 h-2.5" />
+                          Emergency
+                        </span>
+                      )}
+                      {job.status === 'completed' ? (
+                        <span className="text-[10px] font-black tracking-widest uppercase text-emerald-600 border-[2px] border-emerald-600 px-2 py-0.5 rounded-md shadow-sm bg-white/90">
+                          COMPLETED
+                        </span>
+                      ) : (
+                        <>
+                          {/* Seeking Quotes Badge with Pulsing Green or Solid Red Border */}
+                          {(() => {
+                            const qCount = quoteCounts[job.id] || job.quoteCount || 0;
+                            const isFull = qCount >= 5;
+                            return (
+                              <span className={cn(
+                                "px-2.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-black shadow-2xs uppercase tracking-wider transition-all",
+                                job.status === "posted"
+                                  ? isFull
+                                    ? "border-2 border-red-500 text-red-700 bg-red-50"
+                                    : "border-2 border-emerald-500 text-emerald-800 bg-emerald-50 pulse-green-border"
+                                  : job.status === "accepted"
+                                  ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
+                                  : "bg-red-100 text-red-800 border border-red-200"
+                              )}>
+                                {job.status === 'posted' ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : job.status.replace(/_/g, " ")}
+                              </span>
+                            );
+                          })()}
+
+                          {/* Quotes Received Tab directly next to Seeking Quotes */}
+                          <Link 
+                            to={`/job/${job.id}#quote-form-section`}
+                            onClick={(e) => e.stopPropagation()}
+                            className="hover:opacity-90 transition-opacity"
+                          >
+                            <span className={cn(
+                              "px-2.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-black flex items-center gap-1 border transition-all",
+                              (quoteCounts[job.id] || job.quoteCount || 0) >= 5
+                                ? "bg-amber-100 text-amber-900 border-amber-300"
+                                : (quoteCounts[job.id] || job.quoteCount || 0) > 0
+                                ? "bg-blue-100 text-blue-800 border-blue-300"
+                                : "bg-slate-100 text-slate-700 border-slate-300"
+                            )}>
+                              <span>{(quoteCounts[job.id] || job.quoteCount || 0)} Quotes</span>
+                              {(quoteCounts[job.id] || job.quoteCount || 0) > 0 && <ChevronRight className="w-2.5 h-2.5" />}
+                            </span>
+                          </Link>
+                        </>
+                      )}
+                      {job.status === "posted" && job.boostTier === "instant_match" && (
+                        <span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-black shadow-2xs uppercase tracking-wider flex items-center gap-1 animate-pulse border border-amber-300">
+                          <Zap className="w-2.5 h-2.5" />
+                          Finding Pro
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Title & Description */}
+                  <div className="space-y-1 cursor-pointer" onClick={() => navigate(`/job/${job.id}`)}>
+                    {job.assetName && (
+                      <div className="flex items-center gap-1.5 mb-0.5">
+                        <Building2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                        <span className="text-[11px] font-bold text-emerald-700 uppercase tracking-wider">{job.assetName}</span>
+                      </div>
+                    )}
+                    <h3 className="text-lg sm:text-xl font-black text-slate-950 leading-snug group-hover:text-blue-600 transition-colors">
+                      {job.title}
+                    </h3>
+                    <p className="text-slate-900 font-semibold line-clamp-2 text-xs sm:text-sm leading-relaxed">
+                      {job.description}
+                    </p>
+                  </div>
+
+                  {/* Flash Deal / Direct Quote Request Information Box */}
+                  {job.claimedDeal ? (
+                    <div className="bg-gradient-to-r from-amber-50 to-orange-50/60 border-2 border-amber-300 rounded-2xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-xs">
+                      <div className="flex items-start sm:items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-sm">
+                          <Zap className="w-4 h-4 fill-current" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-[11px] font-black text-amber-950 uppercase tracking-wider">
+                              Pre-Agreed Flash Deal
+                            </span>
+                            <span className="bg-amber-200 text-amber-950 text-[9px] font-black px-1.5 py-0.5 rounded-md uppercase border border-amber-300">
+                              {job.claimedDeal.discountPercentage || 0}% OFF
+                            </span>
+                          </div>
+                          <p className="text-xs font-bold text-slate-800 mt-0.5">
+                            Individual Trader: <span className="text-amber-900 font-black">{job.targetTradespersonName || job.claimedDeal.traderName || "Selected Specialist"}</span>
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (job.targetTradespersonName || job.targetTradespersonId) ? (
+                    <div className="bg-gradient-to-r from-blue-50 to-indigo-50/60 border-2 border-blue-200 rounded-2xl p-3 flex items-center justify-between gap-2 shadow-xs">
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="w-8 h-8 rounded-xl bg-blue-600 text-white flex items-center justify-center shrink-0 shadow-sm font-black text-xs">
+                          🎯
+                        </div>
+                        <div className="min-w-0">
+                          <span className="text-[11px] font-black text-blue-950 uppercase tracking-wider block">
+                            Direct 1-on-1 Quote Request
+                          </span>
+                          <p className="text-xs font-bold text-slate-700 mt-0.5 flex items-center gap-1.5 flex-wrap">
+                            <span>Exclusively To:</span>
+                            <span className="text-blue-700 bg-blue-100/90 px-2 py-0.5 rounded-md border border-blue-200/90 font-black text-xs shadow-2xs inline-flex items-center gap-1">
+                              👤 {job.targetTradespersonName || "Individual Trader"}
+                            </span>
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {/* Combined Location, Time & Action Icons Row */}
+                  <div className="flex items-center justify-between gap-2 pt-1 text-slate-900 font-extrabold text-xs">
+                    {/* Left: Location, Time & Badges */}
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <div className="flex items-center gap-1 text-slate-900 font-extrabold text-xs">
+                        <MapPin className="w-3.5 h-3.5 text-slate-800 shrink-0" />
+                        <span className="uppercase tracking-wide text-slate-900 font-black">
+                          {formatJobLocation(job)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1 text-slate-900 font-extrabold text-xs">
+                        <Clock className="w-3.5 h-3.5 text-slate-800 shrink-0" />
+                        <span className="uppercase tracking-wide text-slate-900 font-black">
+                          {formatRelativeTime(job.createdAt)}
+                        </span>
+                      </div>
+
+                      {job.urgency === "emergency" && (
+                        <div className="text-[10px]">
+                          <EmergencyTimer postedDate={job.createdAt?.seconds ? new Date(job.createdAt.seconds * 1000) : job.createdAt} />
+                        </div>
+                      )}
+
+                      {job.estimatedCompletionTime && (
+                        <span className="bg-emerald-50 text-emerald-800 text-[10px] font-black px-2 py-0.5 rounded-lg uppercase tracking-wider flex items-center gap-1 border border-emerald-200">
+                          <Clock className="w-3 h-3 text-emerald-600" />
+                          {job.estimatedCompletionTime} {job.estimatedCompletionTimeUnit}
+                        </span>
+                      )}
+
+                      {(job.photos?.length > 0 || job.videos?.length > 0) && (
+                        <button
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setSelectedJobMedia(job);
+                          }}
+                          className="bg-orange-50 text-orange-700 text-[10px] font-black px-2 py-0.5 rounded-lg uppercase tracking-wider flex items-center gap-1 hover:bg-orange-100 transition-colors border border-orange-200"
+                        >
+                          {job.photos?.length > 0 ? <ImageIcon className="w-3 h-3" /> : <VideoIcon className="w-3 h-3" />}
+                          { (job.photos?.length || 0) + (job.videos?.length || 0) } Media
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Right: Trash & Gear Action Buttons */}
+                    <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+                      <div className="flex items-center gap-0.5 bg-slate-100 p-0.5 rounded-xl border border-slate-200">
+                        {/* Quick Delete button */}
+                        <div className="relative">
+                          <AnimatePresence>
+                            {confirmDeleteId === job.id && (
+                              <motion.div
+                                initial={{ opacity: 0, y: 5 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: 5 }}
+                                className="absolute bottom-full right-0 mb-2 px-2 py-1 bg-slate-800 text-white text-[10px] font-medium rounded-lg shadow-lg whitespace-nowrap pointer-events-none z-30"
+                              >
+                                Click again to Delete
+                                <div className="absolute top-full right-3 -mt-1 w-2 h-2 bg-slate-800 transform rotate-45" />
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (confirmDeleteId === job.id) {
+                                executeDelete(job.id);
+                                setConfirmDeleteId(null);
+                              } else {
+                                setConfirmDeleteId(job.id);
+                                setConfirmRepostId(null);
+                                setTimeout(() => setConfirmDeleteId(null), 3000);
+                              }
+                            }}
+                            disabled={isProcessing === job.id}
+                            className={cn(
+                              "p-1 rounded-lg transition-colors",
+                              confirmDeleteId === job.id ? "bg-red-100 text-red-600" : "hover:bg-red-50 text-slate-500 hover:text-red-500"
+                            )}
+                            title={confirmDeleteId === job.id ? "Confirm Delete" : "Delete Job"}
+                          >
+                            {isProcessing === job.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                          </button>
+                        </div>
+
+                        {/* Settings Gear button with Action Menu */}
+                        <div className="relative">
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActionId(actionId === job.id ? null : job.id);
+                            }}
+                            className="p-1 hover:bg-white rounded-lg text-slate-500 hover:text-slate-700 transition-colors"
+                            title="Job Settings & Options"
+                          >
+                            <Settings className="w-4 h-4" />
+                          </button>
+                          
+                          <AnimatePresence>
+                            {actionId === job.id && (
+                              <>
+                                <div className="fixed inset-0 z-10" onClick={() => setActionId(null)} />
+                                <motion.div
+                                  initial={{ opacity: 0, scale: 0.95, y: -10 }}
+                                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                                  exit={{ opacity: 0, scale: 0.95, y: -10 }}
+                                  className="absolute right-0 bottom-full mb-2 w-48 bg-white rounded-2xl shadow-xl border border-black z-20 py-2 overflow-hidden"
+                                >
+                                  {job.status !== "completed" && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        navigate(`/post-job`, { state: { editJob: job } });
+                                      }}
+                                      className="w-full px-4 py-2.5 text-left text-sm font-bold text-slate-700 hover:bg-slate-50 flex items-center gap-3"
+                                    >
+                                      <Edit2 className="w-4 h-4 text-slate-400" />
+                                      Edit Job
+                                    </button>
+                                  )}
+                                  
+                                  {(job.status === "posted" || job.status === "open" || job.status === "accepted" || job.status === "pending_admin_review" || job.status === "quoting") && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        if (confirmCancelId === job.id) {
+                                          handleCancel(job.id);
+                                          setConfirmCancelId(null);
+                                        } else {
+                                          setConfirmCancelId(job.id);
+                                          setTimeout(() => setConfirmCancelId(null), 3000);
+                                        }
+                                      }}
+                                      className="w-full px-4 py-2.5 text-left text-sm font-bold text-red-600 hover:bg-red-50 flex items-center gap-3"
+                                    >
+                                      <XCircle className="w-4 h-4 text-red-500" />
+                                      {confirmCancelId === job.id ? "Confirm Cancel" : "Cancel Job"}
+                                    </button>
+                                  )}
+                                </motion.div>
+                              </>
+                            )}
+                          </AnimatePresence>
+                        </div>
+
+                        {/* Quick Repost button for cancelled/completed */}
+                        {(job.status === "cancelled" || job.status === "completed") && (
+                          <div className="relative">
+                            <AnimatePresence>
+                              {confirmRepostId === job.id && (
+                                <motion.div
+                                  initial={{ opacity: 0, y: 5 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, y: 5 }}
+                                  className="absolute bottom-full right-0 mb-2 px-2 py-1 bg-slate-800 text-white text-[10px] font-medium rounded-lg shadow-lg whitespace-nowrap pointer-events-none z-30"
+                                >
+                                  Click again to Repost
+                                  <div className="absolute top-full right-3 -mt-1 w-2 h-2 bg-slate-800 transform rotate-45" />
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (confirmRepostId === job.id) {
+                                  handleRepost(job);
+                                  setConfirmRepostId(null);
+                                } else {
+                                  setConfirmRepostId(job.id);
+                                  setConfirmDeleteId(null);
+                                  setTimeout(() => setConfirmRepostId(null), 3000);
+                                }
+                              }}
+                              disabled={isProcessing === job.id}
+                              className={cn(
+                                "p-1.5 rounded-lg transition-colors",
+                                confirmRepostId === job.id ? "bg-blue-100 text-blue-600" : "hover:bg-blue-50 text-slate-500 hover:text-blue-500"
+                              )}
+                              title={confirmRepostId === job.id ? "Confirm Repost" : "Repost Job"}
+                            >
+                              {isProcessing === job.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {job.status === "accepted" && job.acceptedTradespersonId && (
+                        <Link
+                          to={`/chat/${job.id}_${job.acceptedTradespersonId}`}
+                          state={{ jobTitle: job.title }}
+                          onClick={(e) => e.stopPropagation()}
+                          className="p-1.5 bg-blue-50 text-blue-600 rounded-xl hover:bg-blue-100 transition-colors shrink-0"
+                          title="Chat with Tradesperson"
+                        >
+                          <MessageSquare className="w-4 h-4" />
+                        </Link>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+            </div>
+          )}
+        </div>
+
+        <MediaGalleryModal
+          isOpen={!!selectedJobMedia}
+          onClose={() => setSelectedJobMedia(null)}
+          photos={selectedJobMedia?.photos}
+          videos={selectedJobMedia?.videos}
+          title={selectedJobMedia?.title || "Job Media"}
+        />
+
+        {/* Delete Confirmation Modal */}
+        <AnimatePresence>
+          {jobToDelete && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl"
+              >
+                <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center mb-4 mx-auto">
+                  <Trash2 className="w-6 h-6 text-red-600" />
+                </div>
+                <h3 className="text-xl font-bold text-center text-slate-900 mb-2">Delete Job?</h3>
+                <p className="text-center text-slate-500 mb-6">
+                  Are you sure you want to delete this job? This action cannot be undone.
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setJobToDelete(null)}
+                    className="flex-1 py-3 px-4 rounded-xl font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={confirmDelete}
+                    disabled={isProcessing === jobToDelete}
+                    className="flex-1 py-3 px-4 rounded-xl font-bold text-white bg-red-600 hover:bg-red-700 transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {isProcessing === jobToDelete ? <Loader2 className="w-5 h-5 animate-spin" /> : "Delete"}
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+      </>
+    );
+  }
