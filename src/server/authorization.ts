@@ -299,6 +299,21 @@ export function assertCanDeleteJob(user: AuthenticatedUser, jobData: Record<stri
  */
 export function assertCanSubmitQuote(user: AuthenticatedUser, jobData: Record<string, any>): void {
   assertIsAuthenticated(user);
+  const isAdmin = isUserAdminClaim(user);
+  if (!isAdmin) {
+    const accountType = String((user as any).accountType || "").toLowerCase();
+    const role = String((user as any).role || "").toLowerCase();
+    const capabilities: string[] | undefined = Array.isArray((user as any).capabilities)
+      ? (user as any).capabilities
+      : undefined;
+    if (
+      accountType === "consumer" ||
+      (["homeowner", "customer", "passenger", "driver"].includes(role) && !capabilities?.includes("tradesperson")) ||
+      (capabilities && !capabilities.includes("tradesperson"))
+    ) {
+      throw new ForbiddenError("Only verified tradespeople can submit quotes on jobs.");
+    }
+  }
   const ownerId = jobData.homeownerId || jobData.userId || jobData.ownerId;
   if (user.uid === ownerId) {
     throw new BadRequestError("Homeowners cannot submit quotes on their own jobs.");

@@ -3,8 +3,11 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X, Sparkles, UserCircle, Star, Calendar, MessageSquare, CheckCircle } from "lucide-react";
 import { db, collection, query, where, getDocs, addDoc, serverTimestamp, sendNotification } from "@/src/firebase";
 import { getProMatches } from "@/src/services/gemini";
+import { useAuth } from "../AuthProvider";
+import { toast } from "sonner";
 
 export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, projectId: string, onClose: () => void }) {
+  const { user } = useAuth();
   const [loading, setLoading] = useState(true);
   const [matches, setMatches] = useState<any[]>([]);
 
@@ -23,18 +26,21 @@ export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, pr
         })) as any[];
 
         // Filter out those lacking meaningful data to avoid wasting tokens
-        candidatePros = candidatePros.filter(p => p.businessName || p.fullName);
+        candidatePros = candidatePros.filter(p => p.businessName || p.fullName || p.name);
 
-        // Schedule Availability Check (Phase D2)
-        if (role.requiredDate) {
-          const reqDateStr = role.requiredDate; // e.g. "2026-05-20"
-          const eventsSnapshot = await getDocs(collection(db, "calendarEvents"));
-          const events = eventsSnapshot.docs.map(d => d.data());
-          // Map of consultantId to number of events on that day
-          const busyPros = events.filter(e => e.startTime && e.startTime.startsWith(reqDateStr)).map(e => e.consultantId);
-          // Filter candidate pros heavily booked (e.g. > 1 event, or any event)
-          // For simplicity, if they have an event on that exact date, they are "busy"
-          candidatePros = candidatePros.filter(p => !busyPros.includes(p.id));
+        // Schedule Availability Check (scoped to caller's own calendar events to satisfy zero-trust rules)
+        if (role.requiredDate && user) {
+          try {
+            const reqDateStr = role.requiredDate;
+            const eventsSnapshot = await getDocs(
+              query(collection(db, "calendarEvents"), where("consultantId", "==", user.uid))
+            );
+            const events = eventsSnapshot.docs.map(d => d.data());
+            const busyPros = events.filter(e => e.startTime && e.startTime.startsWith(reqDateStr)).map(e => e.consultantId);
+            candidatePros = candidatePros.filter(p => !busyPros.includes(p.id));
+          } catch (calErr) {
+            console.warn("Calendar availability pre-filter skipped:", calErr);
+          }
         }
 
         if (candidatePros.length === 0) {
@@ -46,9 +52,9 @@ export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, pr
         // Prepare context for Gemini
         const candidatesContext = candidatePros.map(p => ({
           id: p.id,
-          name: p.businessName || p.fullName,
-          category: p.businessCategory || "General",
-          rating: p.averageRating || 4.5,
+          name: p.businessName || p.fullName || p.name,
+          category: p.businessCategory || p.category || "General",
+          rating: p.averageRating || p.rating || 4.5,
           location: p.city || p.location || "Unknown"
         }));
 
@@ -74,27 +80,31 @@ export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, pr
     }
 
     findMatches();
-  }, [role]);
+  }, [role, user]);
 
   const handleShortlist = async (matchId: string) => {
+    if (!user) return;
     try {
       await addDoc(collection(db, "projectShortlists"), {
         projectId,
+        managerId: user.uid,
         roleId: role.id,
         consultantId: matchId,
         createdAt: serverTimestamp()
       });
-      alert("Pro added to project shortlist!");
+      toast.success("Pro added to project shortlist!");
     } catch (err) {
       console.error(err);
-      alert("Failed to shortlist.");
+      toast.error("Failed to shortlist.");
     }
   };
 
   const handleBroadcast = async (matchId: string) => {
+    if (!user) return;
     try {
       await addDoc(collection(db, "projectBids"), {
         projectId: projectId,
+        managerId: user.uid,
         projectRoleId: role.id,
         consultantId: matchId,
         amount: role.estimatedBudget, // Initial budget offer
@@ -112,10 +122,10 @@ export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, pr
         { projectId }
       );
 
-      alert("Invitation to bid sent successfully!");
+      toast.success("Invitation to bid sent successfully!");
     } catch (err) {
       console.error(err);
-      alert("Failed to send invitation.");
+      toast.error("Failed to send invitation.");
     }
   };
 

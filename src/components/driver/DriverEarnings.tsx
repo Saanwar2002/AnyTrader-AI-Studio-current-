@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   AreaChart,
@@ -54,6 +54,8 @@ import { cn } from "@/src/lib/utils";
 import { toast } from "sonner";
 import DriverExpenses from "./DriverExpenses";
 import DriverFullTripHistory from "./DriverFullTripHistory";
+import { resolveRideFinancialSummary } from "@/src/lib/rideEarningsDisplay";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 
 export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
   const { user, profile } = useAuth();
@@ -67,9 +69,9 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
   }>({ baseFare: 3.5, distanceRate: 1.3, minFare: 5.0, commissionRate: 0.12, fixedTripFee: 0 });
   const [period, setPeriod] = useState<"today" | "week" | "month">("today");
   const [metrics, setMetrics] = useState({
-    today: { earnings: 0, jobs: 0, goal: 200 },
-    week: { earnings: 0, jobs: 0, goal: 1000 },
-    month: { earnings: 0, jobs: 0, goal: 4000 },
+    today: { earnings: 0, gross: 0, jobs: 0, goal: 200 },
+    week: { earnings: 0, gross: 0, jobs: 0, goal: 1000 },
+    month: { earnings: 0, gross: 0, jobs: 0, goal: 4000 },
   });
   const [stripeBalance, setStripeBalance] = useState({
     available: 0,
@@ -105,6 +107,26 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
   const [isExportingSheets, setIsExportingSheets] = useState(false);
   const [sheetsUrl, setSheetsUrl] = useState<string | null>(null);
 
+  const statementsDialogRef = useDialogA11y(
+    showEarningStatements && !showPaymentPortal && !showFullTripHistory,
+    () => setShowEarningStatements(false),
+  );
+  const paymentPortalDialogRef = useDialogA11y(
+    showPaymentPortal,
+    () => setShowPaymentPortal(false),
+    isProcessingPayment,
+  );
+
+  const withdrawalAttemptKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    withdrawalAttemptKeyRef.current = null;
+  }, [user?.uid, stripeBalance.available]);
+
+  const resolveRideNetEarnings = (job: any) => {
+    return resolveRideFinancialSummary(job, fareConfig).driverEarnings;
+  };
+
   const handleExportGoogleSheets = async () => {
     const listToExport = customReportJobs.length > 0 ? customReportJobs : recentTrips;
     if (listToExport.length === 0) {
@@ -114,9 +136,7 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
 
     setIsExportingSheets(true);
     const formatted = listToExport.map(job => {
-      const grossFare = job.price || job.quotedPrice || job.finalFare || job.fareEstimate || 0;
-      const tip = job.tipAmount || 0;
-      const driverEarned = job.driverEarnings || (job.finalFare ? (job.finalFare - tip) * 0.88 + tip : grossFare * 0.88 + tip);
+      const summary = resolveRideFinancialSummary(job, fareConfig);
       const pickupStr = typeof job.pickupAddress === 'string' ? job.pickupAddress : (job.pickup?.address || job.pickup || 'Unknown');
       const dropoffStr = typeof job.dropoffAddress === 'string' ? job.dropoffAddress : (job.dropoff?.address || job.dropoff || 'Unknown');
 
@@ -125,9 +145,9 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
         rideRef: job.id || 'RIDE-REF',
         pickup: pickupStr,
         dropoff: dropoffStr,
-        fare: driverEarned,
-        tip,
-        total: driverEarned + tip,
+        fare: summary.driverBaseShare,
+        tip: summary.tipAmount,
+        total: summary.driverEarnings,
         driverOrPassenger: "Driver Earnings",
       };
     });
@@ -197,8 +217,10 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
   };
 
   const handleDownloadCSV = () => {
-     // Check for subscription - £10 a year feature
-     if (!profile?.subscriptions?.earningsReportExport) {
+     const hasExportSub =
+       profile?.subscriptionType === "driver_gold" ||
+       profile?.subscriptions?.earningsReportExport === true;
+     if (!hasExportSub) {
         setShowReportSubPrompt(true);
         return;
      }
@@ -217,13 +239,9 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
         const dateStr = dt.toLocaleDateString();
         const timeStr = dt.toLocaleTimeString();
 
-        const grossFare = job.price || job.quotedPrice || job.finalFare || 0;
-        const isAbandoned = job.status === 'rider_abandoned';
-        const tip = job.tipAmount || 0;
-        const driverEarned = job.driverEarnings || (job.finalFare ? (job.finalFare - tip) * 0.88 + tip : (isAbandoned ? 5 : grossFare * 0.88 + tip));
-        
-        const earnings = driverEarned.toFixed(2);
-        const gross = grossFare.toFixed(2);
+        const summary = resolveRideFinancialSummary(job, fareConfig);
+        const earnings = summary.driverEarnings.toFixed(2);
+        const gross = summary.totalFarePaid.toFixed(2);
         const distance = job.distanceMiles?.toFixed(1) || (job.distanceInfo?.value ? (job.distanceInfo.value / 1609.34).toFixed(1) : "0.0");
         
         const pickupStr = job.pickupAddress || job.pickup || '';
@@ -372,10 +390,13 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
         const snapshot = await getDocs(hq);
 
         let todayEarnings = 0;
+        let todayGross = 0;
         let todayJobs = 0;
         let monthEarnings = 0;
+        let monthGross = 0;
         let monthJobs = 0;
         let weekEarnings = 0;
+        let weekGross = 0;
         let weekJobs = 0;
 
         const yearGroups: Record<string, { total: number; jobs: number; rank: number }> = {};
@@ -389,26 +410,24 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
             data.completedAt?.toDate() || data.createdAt?.toDate();
           if (!createdAt) return;
 
-          // Compute exact Net Earnings matching DriverJobs
-          const grossFare = data.fareEstimate || data.finalFare || 0;
-          const tip = data.tipAmount || 0;
-          let netFare = 0;
-          if (data.finalFare) {
-             netFare = (data.finalFare - tip) * (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0) + tip;
-          } else {
-             netFare = data.driverEarnings || (grossFare * (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0)) + tip;
-          }
+          // Compute canonical Net Earnings & Gross Paid from server summary
+          const summary = resolveRideFinancialSummary(data, fareConfig);
+          const netFare = summary.driverEarnings;
+          const grossFare = summary.totalFarePaid;
 
           if (createdAt >= todayStart) {
             todayEarnings += netFare;
+            todayGross += grossFare;
             todayJobs++;
           }
           if (createdAt >= monthStart) {
             monthEarnings += netFare;
+            monthGross += grossFare;
             monthJobs++;
           }
           if (createdAt >= weekStart) {
             weekEarnings += netFare;
+            weekGross += grossFare;
             weekJobs++;
           }
 
@@ -486,9 +505,9 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
 
         setMetrics((prev) => ({
           ...prev,
-          today: { ...prev.today, earnings: todayEarnings, jobs: todayJobs },
-          month: { ...prev.month, earnings: monthEarnings, jobs: monthJobs },
-          week: { ...prev.week, earnings: weekEarnings, jobs: weekJobs },
+          today: { ...prev.today, earnings: todayEarnings, gross: todayGross, jobs: todayJobs },
+          month: { ...prev.month, earnings: monthEarnings, gross: monthGross, jobs: monthJobs },
+          week: { ...prev.week, earnings: weekEarnings, gross: weekGross, jobs: weekJobs },
         }));
       } catch (err) {
         console.error("Failed to fetch historical metrics:", err);
@@ -518,10 +537,15 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
     // 3. Fetch Stripe Balance
     const fetchBalance = async () => {
       try {
-        const res = await fetch(`/api/driver/stripe-balance/${user.uid}`);
+        const token = await user.getIdToken();
+        const res = await fetch(`/api/driver/stripe-balance/${user.uid}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
         if (res.ok) {
           const data = await res.json();
           setStripeBalance({ ...data, loading: false });
+        } else {
+          setStripeBalance((prev) => ({ ...prev, loading: false }));
         }
       } catch (err) {
         console.error("Error fetching balance:", err);
@@ -542,7 +566,10 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
     setIsRefreshing(true);
 
     try {
-      const res = await fetch(`/api/driver/stripe-balance/${user.uid}`);
+      const token = await user.getIdToken();
+      const res = await fetch(`/api/driver/stripe-balance/${user.uid}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       if (res.ok) {
         const data = await res.json();
         setStripeBalance({ ...data, loading: false });
@@ -560,16 +587,36 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
       return;
     }
 
+    if (!withdrawalAttemptKeyRef.current) {
+      const randomSuffix =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      withdrawalAttemptKeyRef.current = `drv-payout-${user.uid}-${randomSuffix}`;
+    }
+    const idempotencyKey = withdrawalAttemptKeyRef.current;
+
     setIsWithdrawing(true);
     try {
+      const token = await user.getIdToken();
       const res = await fetch(`/api/driver/stripe-payout/${user.uid}`, {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({ idempotencyKey }),
       });
       const data = await res.json();
       if (res.ok && data.success) {
+        withdrawalAttemptKeyRef.current = null;
         toast.success(`Withdrawal of £${stripeBalance.available.toFixed(2)} initiated.`);
         handleRefresh();
       } else {
+        if (res.status >= 400 && res.status < 500 && res.status !== 409 && res.status !== 429) {
+          withdrawalAttemptKeyRef.current = null;
+        }
         toast.error(data.error || "Withdrawal failed.");
       }
     } catch (e: any) {
@@ -615,6 +662,8 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
         
         {onClose && (
           <button
+            type="button"
+            aria-label="Close driver earnings"
             onClick={onClose}
             className="w-8 h-8 flex items-center justify-center bg-[#1A1A1E] rounded-full border border-[#2C2C30] text-[#A1A1AA] hover:text-white transition-colors shrink-0"
           >
@@ -649,6 +698,8 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
                 Stripe Balance
               </p>
               <button
+                type="button"
+                aria-label="Refresh Stripe balance"
                 onClick={handleRefresh}
                 className={cn(
                   "opacity-70 hover:opacity-100 transition-opacity",
@@ -724,7 +775,7 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
                   Goal
                 </p>
                 {!isEditingGoal && (
-                  <button onClick={handleEditGoal} className="text-[#A1A1AA] hover:text-[#00D26A] transition-colors p-0.5">
+                  <button type="button" aria-label="Edit earnings goal" onClick={handleEditGoal} className="text-[#A1A1AA] hover:text-[#00D26A] transition-colors p-0.5">
                     <Edit2 className="w-2.5 h-2.5" />
                   </button>
                 )}
@@ -746,14 +797,15 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
                 <span className="text-[10px] font-black text-white mr-0.5">£</span>
                 <input 
                   type="number"
+                  aria-label="Earnings goal amount in GBP"
                   value={editingGoalValue}
                   onChange={(e) => setEditingGoalValue(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') handleSaveGoal(); }}
                   className="w-12 bg-transparent border-b border-[#00D26A] text-[10px] font-black text-white outline-none px-0.5 mr-1"
                   autoFocus
                 />
-                <button onClick={handleSaveGoal} className="text-[#00D26A] hover:bg-[#00D26A]/20 rounded p-0.5 mr-1"><Check className="w-3 h-3" /></button>
-                <button onClick={() => setIsEditingGoal(false)} className="text-[#FF3B30] hover:bg-[#FF3B30]/20 rounded p-0.5"><X className="w-3 h-3" /></button>
+                <button type="button" aria-label="Save earnings goal" onClick={handleSaveGoal} className="text-[#00D26A] hover:bg-[#00D26A]/20 rounded p-0.5 mr-1"><Check className="w-3 h-3" /></button>
+                <button type="button" aria-label="Cancel editing earnings goal" onClick={() => setIsEditingGoal(false)} className="text-[#FF3B30] hover:bg-[#FF3B30]/20 rounded p-0.5"><X className="w-3 h-3" /></button>
               </div>
             ) : (
               <p className="text-[9px] font-black text-white px-0.5 leading-none">
@@ -792,7 +844,7 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
         <div className="bg-[#1A1A1E] border border-[#2C2C30] rounded-3xl p-5">
           <ArrowUpRight className="w-5 h-5 text-[#E4E4E7] mb-3" />
           <p className="text-2xl font-black text-white -mt-1 leading-none">
-            £{((displayEarnings + displayJobs * (fareConfig.fixedTripFee || 0)) / (1 - fareConfig.commissionRate)).toFixed(2)}
+            £{(metrics[period]?.gross || 0).toFixed(2)}
           </p>
           <p className="text-[10px] font-bold text-[#A1A1AA] uppercase tracking-wider mt-2">
             Gross Fares
@@ -810,19 +862,21 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
           {profile?.pendingPlatformFees > 0 && (
             <button
               onClick={async () => {
+                if (!user) return;
                 const toastId = toast.loading("Preparing settlement...");
                 try {
+                  const token = await user.getIdToken();
                   const res = await fetch("/api/driver/settle-fees", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ 
-                      driverId: user?.uid,
-                      amount: profile?.pendingPlatformFees || 0
-                    }),
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({}),
                   });
                   const data = await res.json();
                   toast.dismiss(toastId);
-                  if (data.url) {
+                  if (res.ok && data.url) {
                     window.location.href = data.url;
                   } else {
                     toast.error(data.error || "Failed to initiate settlement");
@@ -872,12 +926,12 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
               </div>
               <div className="text-right">
                 <p className="text-sm font-black text-[#00D26A]">
-                  £{(trip.fareEstimate || 0).toFixed(2)}
+                  £{resolveRideNetEarnings(trip).toFixed(2)}
                 </p>
                 <div className="flex items-center gap-1 justify-end mt-0.5">
                   <ShieldCheck className="w-2.5 h-2.5 text-[#00D26A]" />
                   <span className="text-[9px] font-black text-[#00D26A] uppercase">
-                    Paid
+                    Earned
                   </span>
                 </div>
               </div>
@@ -931,19 +985,26 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
       <AnimatePresence>
         {showEarningStatements && (
           <motion.div
+            ref={statementsDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="driver-earnings-analytics-title"
+            tabIndex={-1}
             initial={{ opacity: 0, y: "100%" }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: "100%" }}
             transition={{ type: "spring", bounce: 0, duration: 0.4 }}
-            className="fixed inset-0 z-50 bg-[#0A0A0B] flex flex-col pt-16"
+            className="fixed inset-0 z-50 bg-[#0A0A0B] flex flex-col pt-16 outline-none"
           >
             <div className="flex-1 overflow-y-auto px-4 pb-24">
               <div className="flex items-center justify-between mb-8">
                 <div>
-                  <h2 className="text-2xl font-black text-white tracking-tight">Earning Analytics Hub</h2>
+                  <h2 id="driver-earnings-analytics-title" className="text-2xl font-black text-white tracking-tight">Earning Analytics Hub</h2>
                   <p className="text-[#A1A1AA] text-xs font-bold uppercase tracking-wider mt-1">Daily, Weekly, Monthly, Yearly Overview</p>
                 </div>
                 <button
+                  type="button"
+                  aria-label="Close earning analytics hub"
                   onClick={() => setShowEarningStatements(false)}
                   className="w-10 h-10 bg-[#1A1A1E] rounded-full flex items-center justify-center border border-[#2C2C30] active:scale-95 transition-all text-white"
                 >
@@ -971,23 +1032,23 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
               <div className="bg-[#1A1A1E] p-4 rounded-2xl border border-[#2C2C30] mb-6 space-y-3">
                  <div className="flex items-center gap-2 mb-2"><Search className="w-4 h-4 text-[#A1A1AA]"/> <h3 className="text-xs font-black uppercase tracking-wider text-[#E4E4E7]">Search By Date</h3></div>
                  <div className="flex items-center gap-2 text-xs flex-wrap">
-                    <select className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportStartDate.day} onChange={e => setReportStartDate(p => ({...p, day: e.target.value}))}>
+                    <select aria-label="Report start day" className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportStartDate.day} onChange={e => setReportStartDate(p => ({...p, day: e.target.value}))}>
                        {daysList.map(d => <option key={`start-day-${d}`}>{d === '--' ? 'Day' : d}</option>)}
                     </select>
-                    <select className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportStartDate.month} onChange={e => setReportStartDate(p => ({...p, month: e.target.value}))}>
+                    <select aria-label="Report start month" className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportStartDate.month} onChange={e => setReportStartDate(p => ({...p, month: e.target.value}))}>
                        {monthsList.map(m => <option key={`start-month-${m}`}>{m === '--' ? 'Month' : m}</option>)}
                     </select>
-                    <select className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportStartDate.year} onChange={e => setReportStartDate(p => ({...p, year: e.target.value}))}>
+                    <select aria-label="Report start year" className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportStartDate.year} onChange={e => setReportStartDate(p => ({...p, year: e.target.value}))}>
                        {yearsList.map(y => <option key={`start-year-${y}`}>{y === '----' ? 'Year' : y}</option>)}
                     </select>
                     <span className="text-[#A1A1AA] font-black uppercase text-xs mx-1">To</span>
-                    <select className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportEndDate.day} onChange={e => setReportEndDate(p => ({...p, day: e.target.value}))}>
+                    <select aria-label="Report end day" className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportEndDate.day} onChange={e => setReportEndDate(p => ({...p, day: e.target.value}))}>
                        {daysList.map(d => <option key={`end-day-${d}`}>{d === '--' ? 'Day' : d}</option>)}
                     </select>
-                    <select className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportEndDate.month} onChange={e => setReportEndDate(p => ({...p, month: e.target.value}))}>
+                    <select aria-label="Report end month" className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportEndDate.month} onChange={e => setReportEndDate(p => ({...p, month: e.target.value}))}>
                        {monthsList.map(m => <option key={`end-month-${m}`}>{m === '--' ? 'Month' : m}</option>)}
                     </select>
-                    <select className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportEndDate.year} onChange={e => setReportEndDate(p => ({...p, year: e.target.value}))}>
+                    <select aria-label="Report end year" className="bg-[#0D0D0F] border border-[#2C2C30] rounded-xl px-2 py-1.5 text-[#A1A1AA] focus:outline-none focus:border-[#00D26A]" value={reportEndDate.year} onChange={e => setReportEndDate(p => ({...p, year: e.target.value}))}>
                        {yearsList.map(y => <option key={`end-year-${y}`}>{y === '----' ? 'Year' : y}</option>)}
                     </select>
                  </div>
@@ -1014,9 +1075,9 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
                     <div className="bg-[#FF3B30]/10 border border-[#FF3B30]/20 rounded-xl p-3 flex items-start gap-3 mt-2">
                        <AlertCircle className="w-5 h-5 text-[#FF3B30] shrink-0 mt-0.5" />
                        <div className="flex-1">
-                          <p className="text-xs font-bold text-[#FF3B30] mb-1">AnyRoller Pro</p>
-                          <p className="text-[12px] text-white leading-relaxed mb-3">CSV Export is part of our Unified Premium Subscription (£10/year). Pay once to unlock this and ALL other premium tools across your AnyRoller driver profile.</p>
-                          <button onClick={() => { setShowReportSubPrompt(false); setShowPaymentPortal(true); }} className="w-full bg-[#FF3B30] hover:bg-[#FF453A] active:scale-95 text-white text-[12px] uppercase font-black tracking-widest py-3 rounded-lg transition-transform">Unlock Premium (£10/yr)</button>
+                          <p className="text-xs font-bold text-[#FF3B30] mb-1">Gold Driver Subscription</p>
+                          <p className="text-[12px] text-white leading-relaxed mb-3">CSV Earnings Export, 10% reduced platform commission, and Priority Dispatch are unlocked with Gold Driver (£49.99/mo via verified Stripe Checkout).</p>
+                          <button onClick={() => { setShowReportSubPrompt(false); setShowPaymentPortal(true); }} className="w-full bg-[#FF3B30] hover:bg-[#FF453A] active:scale-95 text-white text-[12px] uppercase font-black tracking-widest py-3 rounded-lg transition-transform">Upgrade via Stripe Checkout</button>
                        </div>
                     </div>
                  )}
@@ -1028,10 +1089,7 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
                         </div>
                         <div className="max-h-64 overflow-y-auto pr-1 space-y-2">
                            {(isReportListExpanded ? customReportJobs : customReportJobs.slice(0, 5)).map((job, idx) => {
-                              const grossFare = job.price || job.quotedPrice || job.finalFare || 0;
-                              const isAbandoned = job.status === 'rider_abandoned';
-                              const tip = job.tipAmount || 0;
-                              const driverEarned = job.driverEarnings || (job.finalFare ? (job.finalFare - tip) * 0.88 + tip : (isAbandoned ? 5 : grossFare * 0.88 + tip));
+                              const driverEarned = resolveRideNetEarnings(job);
                               const pickupStr = job.pickupAddress || job.pickup || 'Unknown';
                               const dropoffStr = job.dropoffAddress || job.dropoff || 'Unknown';
                               return (
@@ -1173,91 +1231,80 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
         {showPaymentPortal && (
           <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center p-4">
               <div className="absolute inset-0 bg-black/60 backdrop-blur-md" onClick={() => !isProcessingPayment && setShowPaymentPortal(false)}></div>
-              <div className="relative bg-[#1A1A1E] border border-[#2C2C30] rounded-3xl w-full max-w-sm overflow-hidden z-10 p-6 flex flex-col pt-12 text-center animate-in fade-in zoom-in-95 duration-200">
-                  <button onClick={() => !isProcessingPayment && setShowPaymentPortal(false)} className="absolute top-4 right-4 text-[#A1A1AA] hover:text-white bg-[#252529] p-2 rounded-full border border-[#2C2C30]"><X className="w-4 h-4"/></button>
+              <div
+                ref={paymentPortalDialogRef}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="driver-gold-payment-modal-title"
+                tabIndex={-1}
+                className="relative bg-[#1A1A1E] border border-[#2C2C30] rounded-3xl w-full max-w-sm overflow-hidden z-10 p-6 flex flex-col pt-12 text-center animate-in fade-in zoom-in-95 duration-200 outline-none"
+              >
+                  <button type="button" aria-label="Close Gold Driver subscription dialog" onClick={() => !isProcessingPayment && setShowPaymentPortal(false)} className="absolute top-4 right-4 text-[#A1A1AA] hover:text-white bg-[#252529] p-2 rounded-full border border-[#2C2C30]"><X className="w-4 h-4"/></button>
                   <CreditCard className="w-12 h-12 text-[#00D26A] mx-auto mb-4" />
-                  <h3 className="text-xl font-black text-white mb-2">AnyRoller Pro</h3>
-                  <p className="text-sm font-medium text-[#A1A1AA] mb-4">One single £10 subscription unlocks ALL premium tools across your entire AnyRoller driver profile.</p>
+                  <h3 id="driver-gold-payment-modal-title" className="text-xl font-black text-white mb-2">Gold Driver Pro</h3>
+                  <p className="text-sm font-medium text-[#A1A1AA] mb-4">Upgrade securely through Stripe Checkout to unlock Gold Driver commission rates, CSV exports, and priority tools.</p>
                   
                   <div className="bg-[#252529] rounded-2xl p-4 border border-[#2C2C30] mb-6 text-left">
                      <p className="text-[10px] font-black uppercase text-[#E4E4E7] tracking-widest border-b border-[#333338] pb-2 mb-3">Included Features</p>
                      <ul className="space-y-2 mb-4">
                         <li className="flex items-center gap-2 text-xs text-[#A1A1AA]"><Check className="w-3.5 h-3.5 text-[#00D26A]"/> Unlimited CSV Earnings Reports</li>
-                        <li className="flex items-center gap-2 text-xs text-[#A1A1AA]"><Check className="w-3.5 h-3.5 text-[#00D26A]"/> Advanced Analytics Hub</li>
-                        <li className="flex items-center gap-2 text-xs text-[#A1A1AA]"><Check className="w-3.5 h-3.5 text-[#00D26A]"/> Tax & Accounting Tools</li>
-                        <li className="flex items-center gap-2 text-xs text-[#A1A1AA]"><Check className="w-3.5 h-3.5 text-[#00D26A]"/> All future premium additions</li>
+                        <li className="flex items-center gap-2 text-xs text-[#A1A1AA]"><Check className="w-3.5 h-3.5 text-[#00D26A]"/> 10% Reduced Platform Commission</li>
+                        <li className="flex items-center gap-2 text-xs text-[#A1A1AA]"><Check className="w-3.5 h-3.5 text-[#00D26A]"/> Advanced Analytics & Priority Dispatch</li>
                      </ul>
                      <p className="text-[10px] font-black uppercase text-[#E4E4E7] tracking-widest border-b border-[#333338] pb-2 mb-3">Order Summary</p>
                      <div className="flex justify-between items-center mb-2">
-                        <span className="text-sm font-medium text-[#A1A1AA]">Yearly Subscription</span>
-                        <span className="text-lg font-black text-white">£10.00</span>
+                        <span className="text-sm font-medium text-[#A1A1AA]">Monthly Subscription</span>
+                        <span className="text-lg font-black text-white">£49.99/mo</span>
                      </div>
                   </div>
 
-                  {stripeBalance.available >= 10 ? (
-                     <>
-                        <button 
-                           onClick={async () => {
-                               setIsProcessingPayment(true);
-                               try {
-                                  // Update subscription flag on the driver profile
-                                  await setDoc(doc(db, "driver_profiles", user?.uid || ""), {
-                                      subscriptions: {
-                                          earningsReportExport: true,
-                                          expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString()
-                                      }
-                                  }, { merge: true });
-                                  toast.success("Subscription Activated! £10 deducted from earnings.");
-                                  setTimeout(() => {
-                                    setShowPaymentPortal(false);
-                                    handleRefresh(); // Refresh balance
-                                  }, 1500);
-                               } catch (e) {
-                                  toast.error("Payment failed. Please try again.");
-                               } finally {
-                                  setIsProcessingPayment(false);
-                               }
-                           }}
-                           disabled={isProcessingPayment} 
-                           className="w-full bg-[#00D26A] hover:bg-[#00E575] active:scale-95 text-black font-black uppercase tracking-widest text-sm py-4 rounded-2xl transition-all disabled:opacity-50 disabled:scale-100 flex items-center justify-center gap-2 mb-2"
-                        >
-                           {isProcessingPayment ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Pay from Earnings (£10.00)'}
-                        </button>
-                        <p className="text-[9px] text-[#A1A1AA] text-center mt-2 px-2 leading-relaxed">
-                           You authorize AnyRoller to securely deduct £10.00 from your connected Stripe account balance.
-                        </p>
-                     </>
-                  ) : (
-                     <div className="space-y-3">
-                        <button disabled className="w-full bg-[#00D26A]/20 text-[#00D26A]/50 font-black uppercase tracking-widest text-sm py-4 rounded-2xl cursor-not-allowed">
-                           Insufficient Earnings (£{stripeBalance.available.toFixed(2)})
-                        </button>
-                        <button 
-                           onClick={async () => {
-                               setIsProcessingPayment(true);
-                               try {
-                                  // Update subscription flag on the driver profile
-                                  await setDoc(doc(db, "driver_profiles", user?.uid || ""), {
-                                      subscriptions: {
-                                          earningsReportExport: true,
-                                          expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString()
-                                      }
-                                  }, { merge: true });
-                                  toast.success("Paid via AnyTrader saved card!");
-                                  setTimeout(() => setShowPaymentPortal(false), 1500);
-                               } catch (e) {
-                                  toast.error("Payment failed. Please try again.");
-                               } finally {
-                                  setIsProcessingPayment(false);
-                               }
-                           }}
-                           disabled={isProcessingPayment} 
-                           className="w-full bg-[#252529] hover:bg-[#333338] active:scale-95 text-white border border-[#2C2C30] font-black uppercase tracking-widest text-sm py-4 rounded-2xl transition-all disabled:opacity-50 disabled:scale-100 flex items-center justify-center gap-2"
-                        >
-                           {isProcessingPayment ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Pay with Saved Card'}
-                        </button>
-                     </div>
-                  )}
+                  <button
+                    onClick={async () => {
+                      if (!user) return;
+                      setIsProcessingPayment(true);
+                      try {
+                        const token = await user.getIdToken();
+                        const response = await fetch("/api/create-checkout-session", {
+                          method: "POST",
+                          headers: {
+                            "Content-Type": "application/json",
+                            Authorization: `Bearer ${token}`,
+                            "Idempotency-Key":
+                              typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+                                ? crypto.randomUUID()
+                                : `gold-chk-${user.uid}-${Date.now()}`,
+                          },
+                          body: JSON.stringify({
+                            userId: user.uid,
+                            priceId: "price_driver_gold",
+                            tierName: "Gold Driver Subscription",
+                            mode: "subscription",
+                            successUrl: `${window.location.origin}/billing?driver_gold=success`,
+                            cancelUrl: `${window.location.origin}/billing`,
+                            metadata: {
+                              subscriptionType: "driver_gold",
+                              type: "driver_gold",
+                              userId: user.uid,
+                            },
+                          }),
+                        });
+                        const data = await response.json().catch(() => ({}));
+                        if (response.ok && data.url) {
+                          window.location.href = data.url;
+                        } else {
+                          toast.error(data.error || "Unable to open Stripe Checkout. Subscription was not activated.");
+                        }
+                      } catch {
+                        toast.error("Failed to start Stripe Checkout. Please try again.");
+                      } finally {
+                        setIsProcessingPayment(false);
+                      }
+                    }}
+                    disabled={isProcessingPayment}
+                    className="w-full bg-[#00D26A] hover:bg-[#00E575] active:scale-95 text-black font-black uppercase tracking-widest text-sm py-4 rounded-2xl transition-all disabled:opacity-50 disabled:scale-100 flex items-center justify-center gap-2"
+                  >
+                    {isProcessingPayment ? <Loader2 className="w-5 h-5 animate-spin" /> : "Continue to Stripe Checkout"}
+                  </button>
               </div>
           </div>
         )}

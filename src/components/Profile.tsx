@@ -29,6 +29,7 @@ import { HomeownerIdentityCard } from "./profile/HomeownerIdentityCard";
 import { SafetyEmergencyCard } from "./profile/SafetyEmergencyCard";
 import TraderNotificationPreferencesModal from "./TraderNotificationPreferencesModal";
 import { cn } from "@/src/lib/utils";
+import { sanitizePublicProfilePayload } from "@/src/lib/publicProfileProjection";
 import { 
   DndContext, 
   closestCenter,
@@ -795,21 +796,36 @@ export default function Profile() {
     if (!user) return;
     setIsProcessingSetup(true);
     try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) {
+        toast.error("Please sign in again to add a payment method.");
+        return;
+      }
       const response = await fetch("/api/create-setup-session", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({
           userId: user.uid,
           successUrl: `${window.location.origin}/profile?setup=success`,
           cancelUrl: `${window.location.origin}/profile`
         })
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        toast.error(data.error || "Unable to open card setup right now.");
+        return;
+      }
       if (data.url) {
         window.location.href = data.url;
+      } else {
+        toast.error("Card setup URL was not returned by payment provider.");
       }
     } catch (err) {
       console.error("Setup Error:", err);
+      toast.error("Failed to start payment method setup.");
     } finally {
       setIsProcessingSetup(false);
     }
@@ -835,30 +851,36 @@ export default function Profile() {
     if (!user) return;
     setIsProcessingSetup(true);
     try {
-      // Simulate Stripe checkout or backend logic
-      await new Promise(r => setTimeout(r, 1500));
-      await updateDoc(doc(db, "users", user.uid), {
-        "appointmentSettings.enabled": true,
-        "appointmentSettings.subscriptionStatus": "active"
-      });
-      alert("Successfully enabled Appointment Add-on! (Simulated)");
-    } catch(err) {
-      handleFirestoreError(err, OperationType.UPDATE, "users");
+      toast.info("Manage booking subscriptions securely in Billing.");
+      window.location.assign("/billing");
     } finally {
       setIsProcessingSetup(false);
     }
   };
 
   const handleCancelAppointments = async () => {
-    if (!user || !confirm("Are you sure you want to cancel the Appointment Add-on? Customers will no longer be able to book slots.")) return;
+    if (!user) return;
     setIsProcessingSetup(true);
     try {
-      await updateDoc(doc(db, "users", user.uid), {
-        "appointmentSettings.enabled": false,
-        "appointmentSettings.subscriptionStatus": "canceled"
+      const token = await auth.currentUser?.getIdToken();
+      const res = await fetch("/api/create-customer-portal-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "Authorization": `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ returnUrl: `${window.location.origin}/profile` })
       });
-    } catch(err) {
-      handleFirestoreError(err, OperationType.UPDATE, "users");
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.url) {
+        window.location.href = data.url;
+        return;
+      }
+      toast.info("Manage or cancel add-ons from your Billing settings.");
+      window.location.assign("/billing");
+    } catch (err) {
+      console.error("Billing Portal Error:", err);
+      toast.error("Unable to open subscription portal right now.");
     } finally {
       setIsProcessingSetup(false);
     }
@@ -1212,11 +1234,10 @@ export default function Profile() {
         tags: tagsArray,
         services: editData.services,
         productsAndServices: editData.services,
-        badges: editData.badges?.includes('local_business') 
-          ? editData.badges 
-          : [...(editData.badges || []), 'local_business'],
         searchFeedBadges: editData.searchFeedBadges || []
       };
+      // `badges` is server-owned in firestore.rules; never send it from client profile saves
+      delete finalData.badges;
 
       if ((editData as any).miniProfileSettings) {
         finalData.miniProfilePricing = (editData as any).miniProfileSettings;
@@ -1237,25 +1258,10 @@ export default function Profile() {
       
       await updateDoc(doc(db, "users", user.uid), finalData);
 
-      // If user is a trader, sync non-PII fields to public_profiles
+      // If user is a trader, sync strictly sanitized non-PII fields to public_profiles
       if (profile?.role === "tradesperson" || (profile?.role as any) === "trader" || profile?.role === "business") {
         try {
-          const publicFields: Record<string, any> = {};
-          if (finalData.name !== undefined) publicFields.name = finalData.name;
-          if (finalData.bio !== undefined) publicFields.bio = finalData.bio;
-          if (finalData.avatarUrl !== undefined) publicFields.avatarUrl = finalData.avatarUrl;
-          if (finalData.trades !== undefined) publicFields.trades = finalData.trades;
-          if (finalData.category !== undefined) publicFields.category = finalData.category;
-          if (finalData.categories !== undefined) publicFields.categories = finalData.categories;
-          if (finalData.subcategories !== undefined) publicFields.subcategories = finalData.subcategories;
-          if (finalData.services !== undefined) publicFields.services = finalData.services;
-          if (finalData.skills !== undefined) publicFields.skills = finalData.skills;
-          if (finalData.city !== undefined) publicFields.city = finalData.city;
-          if (finalData.callOutFee !== undefined) publicFields.callOutFee = finalData.callOutFee;
-          if (finalData.hourlyRate !== undefined) publicFields.hourlyRate = finalData.hourlyRate;
-          if (finalData.extraInfo !== undefined) publicFields.extraInfo = finalData.extraInfo;
-          if (finalData.isAvailableForEmergency !== undefined) publicFields.isAvailableForEmergency = finalData.isAvailableForEmergency;
-          
+          const publicFields = sanitizePublicProfilePayload(finalData);
           if (Object.keys(publicFields).length > 0) {
             await setDoc(doc(db, "public_profiles", user.uid), publicFields, { merge: true });
           }
@@ -1277,6 +1283,34 @@ export default function Profile() {
     }
   };
 
+  const handleToggleAcceptingNewWork = async (nextValue: boolean) => {
+    if (!user) return;
+    setIsSaving(true);
+    try {
+      await updateDoc(doc(db, "users", user.uid), {
+        acceptingNewWork: nextValue,
+      });
+      if (isBusinessProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload({ acceptingNewWork: nextValue }),
+          { merge: true }
+        ).catch((pubSyncErr) => console.warn("Public profile availability sync skipped:", pubSyncErr));
+      }
+      setProfile((prev: any) => ({ ...prev, acceptingNewWork: nextValue }));
+      toast.success(
+        nextValue
+          ? "Your profile is now active and accepting new work in public search."
+          : "New work paused — your profile is hidden from new job discovery and TradeBot matches."
+      );
+    } catch (err) {
+      console.error("Error updating acceptingNewWork:", err);
+      toast.error("Failed to update availability status.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleSaveServices = async () => {
     if (!user) return;
     setIsSaving(true);
@@ -1286,12 +1320,21 @@ export default function Profile() {
         .filter((s: string) => s.length > 0)
         .slice(0, 15);
 
-      await updateDoc(doc(db, "users", user.uid), {
+      const serviceUpdates = {
         services: cleaned,
         productsAndServices: cleaned
-      });
-      setProfile((prev: any) => ({ ...prev, services: cleaned, productsAndServices: cleaned }));
+      };
+      await updateDoc(doc(db, "users", user.uid), serviceUpdates);
+      if (isBusinessProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload(serviceUpdates),
+          { merge: true }
+        ).catch((pubSyncErr) => console.warn("Public profile services sync skipped:", pubSyncErr));
+      }
+      setProfile((prev: any) => ({ ...prev, ...serviceUpdates }));
       setIsEditingServices(false);
+      toast.success("Services updated and synced to your public listing.");
     } catch (err) {
       console.error("Error saving services:", err);
       try {
@@ -1343,6 +1386,13 @@ export default function Profile() {
       }
 
       await updateDoc(doc(db, "users", user.uid), updates);
+      if (isBusinessProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload(updates),
+          { merge: true }
+        ).catch((pubSyncErr) => console.warn("Public profile trade removal sync skipped:", pubSyncErr));
+      }
       setProfile((prev: any) => ({ ...prev, ...updates }));
     } catch (err) {
       console.error("Error removing trade/skill:", err);
@@ -1368,6 +1418,13 @@ export default function Profile() {
       };
 
       await updateDoc(doc(db, "users", user.uid), updates);
+      if (isBusinessProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload(updates),
+          { merge: true }
+        ).catch((pubSyncErr) => console.warn("Public profile tag removal sync skipped:", pubSyncErr));
+      }
       setProfile((prev: any) => ({ ...prev, ...updates }));
     } catch (err) {
       console.error("Error removing tag:", err);
@@ -1577,11 +1634,11 @@ export default function Profile() {
     try {
       await updateDoc(doc(db, "users", user.uid), {
         professionalBadges: updatedBadgesnest,
-        badges: updatedBadgesnest,
       });
       toast.success("Guarantees updated successfully!");
     } catch (err) {
       console.error("Error updating badges:", err);
+      toast.error("Failed to update guarantees.");
     }
   };
 
@@ -2374,12 +2431,36 @@ export default function Profile() {
       )}
 
       {isBusinessProfile ? (
-        <TraderIdentityCard
-          profile={profile}
-          onEditClick={() => setIsEditing(true)}
-          onPhotoUpload={handlePhotoUpload}
-          isUploading={isUploading}
-        />
+        <>
+          <TraderIdentityCard
+            profile={profile}
+            onEditClick={() => setIsEditing(true)}
+            onPhotoUpload={handlePhotoUpload}
+            isUploading={isUploading}
+          />
+          <div className="mb-6 bg-white rounded-2xl border border-black p-4 flex items-center justify-between gap-4 shadow-sm">
+            <div>
+              <h3 className="text-sm font-black text-black">Accepting New Work</h3>
+              <p className="text-xs text-slate-700">
+                {profile?.acceptingNewWork === false
+                  ? "Paused — your profile is currently hidden from public directory search and TradeBot matches."
+                  : "Active — homeowners can discover your profile and send direct quote requests."}
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={isSaving}
+              onClick={() => handleToggleAcceptingNewWork(profile?.acceptingNewWork === false)}
+              className={`px-4 py-2 rounded-xl text-xs font-black border border-black transition shrink-0 ${
+                profile?.acceptingNewWork === false
+                  ? "bg-slate-100 text-black hover:bg-slate-200"
+                  : "bg-emerald-600 text-white hover:bg-emerald-700"
+              }`}
+            >
+              {profile?.acceptingNewWork === false ? "Paused — Resume Work" : "Accepting Work"}
+            </button>
+          </div>
+        </>
       ) : (
         <HomeownerIdentityCard
           profile={profile}

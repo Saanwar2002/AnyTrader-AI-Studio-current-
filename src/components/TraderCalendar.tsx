@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from "react";
 import { useAuth } from "./AuthProvider";
-import { db, collection, query, where, onSnapshot, updateDoc, doc, handleFirestoreError, OperationType } from "@/src/firebase";
+import { db, collection, query, where, limit, onSnapshot, updateDoc, doc, handleFirestoreError, OperationType } from "@/src/firebase";
 import { differenceInDays, format, addDays, subDays, isSameDay, startOfWeek, endOfWeek, startOfMonth, endOfMonth, addMonths, getDaysInMonth, isWithinInterval } from "date-fns";
 import { Calendar as CalendarIcon, Clock, MapPin, Search, Sparkles, BrainCircuit, ArrowRight, Zap, X, CalendarClock, CalendarDays, Check, XCircle, ChevronLeft, ChevronRight, ChevronDown, CalendarCheck, RefreshCw } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 import { isGoogleCalendarConnected, requestCalendarAccessToken, disconnectGoogleCalendar, syncJobToGoogleCalendar, openGoogleCalendarUrl } from "@/src/services/googleCalendarService";
+import { toast } from "sonner";
 
 export default function TraderCalendar() {
   const { user } = useAuth();
@@ -117,16 +118,17 @@ export default function TraderCalendar() {
       }));
     });
 
-    // In the future this should query `accepted_jobs` or `calendar_events`
-    // For now, let's just create a basic fetching structure
+    // AT-CJ-SCHED-03: Query canonical `jobs` collection for this tradesperson's active/scheduled jobs
     const q = query(
-      collection(db, "bidding_jobs"),
-      where("status", "==", "accepted"),
-      where("assignedTo", "==", user.uid) // mock condition for now, we usually have quote accepted
+      collection(db, "jobs"),
+      where("assignedTradespersonId", "==", user.uid),
+      limit(100)
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const data = snapshot.docs
+        .map(docSnap => ({ id: docSnap.id, ...(docSnap.data() as Record<string, any>) }))
+        .filter((j: any) => !["cancelled", "deleted", "draft"].includes(String(j.status || "").toLowerCase()));
       setEvents(data);
     });
 
@@ -186,10 +188,10 @@ export default function TraderCalendar() {
       await updateDoc(doc(db, "appointments", appointmentId), {
         status: action
       });
-      alert(`Appointment ${action} successfully!`);
+      toast.success(`Appointment ${action} successfully.`);
     } catch(err) {
       handleFirestoreError(err, OperationType.UPDATE, `appointments/${appointmentId}`);
-      alert("Action failed.");
+      toast.error("Failed to update appointment status.");
     }
   };
 

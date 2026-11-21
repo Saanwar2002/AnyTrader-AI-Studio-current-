@@ -135,22 +135,7 @@ export default function MyQuotes() {
         };
       });
 
-      const fortyEightHoursAgo = Date.now() - 48 * 60 * 60 * 1000;
-      const validQuotes: any[] = [];
-
-      for (const quote of quotesData) {
-        if (quote.status === "rejected") {
-           const rejectedTime = quote.rejectedAt?.seconds ? quote.rejectedAt.seconds * 1000 : 
-                              (quote.updatedAt?.seconds ? quote.updatedAt.seconds * 1000 : quote.createdAt?.seconds * 1000);
-           
-           if (rejectedTime && rejectedTime < fortyEightHoursAgo) {
-             continue; // Skip adding to state
-           }
-        }
-        validQuotes.push(quote);
-      }
-
-      setQuotes(validQuotes);
+      setQuotes(quotesData);
       setLoading(false);
     }, (error) => {
       console.error("Error fetching quotes:", error);
@@ -164,36 +149,38 @@ export default function MyQuotes() {
     };
   }, [user]);
 
-  // Fetch job data for each quote to check status
+  // Subscribe live to parent job documents so job status updates stay current (AT-CJ-QUOTE-UI-05)
+  const jobIdsKey = [...new Set(quotes.map((q) => q.jobId as string).filter(Boolean))].sort().join(",");
   useEffect(() => {
-    const fetchJobs = async () => {
-      const jobIds = [...new Set(quotes.map(q => q.jobId as string).filter(Boolean))];
-      const missingJobIds = jobIds.filter(id => !jobs[id]);
-      
-      if (missingJobIds.length === 0) return;
+    const jobIds = jobIdsKey ? jobIdsKey.split(",") : [];
+    if (jobIds.length === 0) return;
 
-      setJobsLoading(true);
-      const newJobs = { ...jobs };
-      
-      try {
-        await Promise.all(missingJobIds.map(async (jobId: string) => {
-          const jobDoc = await getDoc(doc(db, "jobs", jobId));
+    setJobsLoading(true);
+    const unsubscribers = jobIds.map((jobId) =>
+      onSnapshot(
+        doc(db, "jobs", jobId),
+        (jobDoc) => {
           if (jobDoc.exists()) {
-            newJobs[jobId] = jobDoc.data();
+            setJobs((prev) => ({
+              ...prev,
+              [jobId]: { id: jobDoc.id, ...jobDoc.data() },
+            }));
           }
-        }));
-        setJobs(newJobs);
-      } catch (error) {
-        console.error("Error fetching jobs for quotes:", error);
-      } finally {
-        setJobsLoading(false);
-      }
-    };
+          setJobsLoading(false);
+        },
+        (error) => {
+          console.error(`Error listening to parent job ${jobId}:`, error);
+          setJobsLoading(false);
+        }
+      )
+    );
 
-    if (quotes.length > 0) {
-      fetchJobs();
-    }
-  }, [quotes]);
+    return () => {
+      unsubscribers.forEach((unsub) => {
+        try { unsub(); } catch {}
+      });
+    };
+  }, [jobIdsKey]);
 
   const filteredQuotes = quotes.filter(q => {
     // Just filter by status
@@ -392,26 +379,33 @@ export default function MyQuotes() {
                 </div>
               )}
               <div className="flex-1 min-w-0 space-y-1 w-full sm:w-auto">
-                <div className="flex items-center justify-between">
-                  <span className={cn(
-                    "text-[10px] font-bold uppercase px-2 py-0.5 rounded-full",
-                    quote.status === "accepted" ? "bg-green-100 text-green-700" :
-                    quote.status === "rejected" ? "bg-red-100 text-red-700" :
-                    quote.status === "withdrawn" ? "bg-slate-100 text-slate-600" :
-                    "bg-amber-100 text-amber-700"
-                  )}>
-                    {quote.status}
-                  </span>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={cn(
+                      "text-[10px] font-bold uppercase px-2 py-0.5 rounded-full",
+                      quote.status === "accepted" ? "bg-green-100 text-green-700" :
+                      quote.status === "rejected" ? "bg-red-100 text-red-700" :
+                      quote.status === "withdrawn" ? "bg-slate-100 text-slate-600" :
+                      "bg-amber-100 text-amber-700"
+                    )}>
+                      {quote.status}
+                    </span>
+                    {jobs[quote.jobId]?.status && (
+                      <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-slate-100 text-black border border-black/20">
+                        Job: {String(jobs[quote.jobId].status).replace(/_/g, " ")}
+                      </span>
+                    )}
+                  </div>
                   <span className="text-xs text-slate-400">
                     {new Date(quote.createdAt?.toDate?.() || quote.createdAt).toLocaleDateString()}
                   </span>
                 </div>
                 <h4 className="font-bold text-lg text-slate-900 truncate">
-                  {quote.jobTitle || `Quote for Job #${quote.jobId.slice(-4)}`}
+                  {jobs[quote.jobId]?.title || quote.jobTitle || `Quote for Job #${quote.jobId.slice(-4)}`}
                 </h4>
-                {quote.jobNo && (
+                {(jobs[quote.jobId]?.jobNo || quote.jobNo) && (
                   <p className="text-[10px] font-bold text-blue-600 bg-blue-50 px-2 py-0.5 rounded w-fit uppercase tracking-wider">
-                    {quote.jobNo}
+                    {jobs[quote.jobId]?.jobNo || quote.jobNo}
                   </p>
                 )}
                 <p className="text-sm text-slate-500 line-clamp-1">{quote.message || "No message provided."}</p>

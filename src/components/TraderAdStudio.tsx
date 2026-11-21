@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { collection, query, where, onSnapshot, doc, setDoc, updateDoc, serverTimestamp } from "firebase/firestore";
+import { collection, query, where, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
 import { useAuth } from "./AuthProvider";
+import { toast } from "sonner";
 import { Zap, Plus, ArrowLeft, Loader2, CreditCard, LayoutGrid, AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Sparkles, Target, Flame, HelpCircle } from "lucide-react";
 
 export default function TraderAdStudio() {
@@ -15,12 +16,18 @@ export default function TraderAdStudio() {
 
   // Determine click cost based on tier
   const tierCost = profile?.subscriptionType === "premium" ? 0.50 : profile?.subscriptionType === "pro" ? 0.70 : 1.00;
+  const hasSavedOffSessionCard = Boolean(profile?.stripeCustomerId && profile?.defaultPaymentMethodId);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setIsLoading(false);
+      return;
+    }
     const q = query(collection(db, "advertisements"), where("advertiserUid", "==", user.uid));
     const unsub = onSnapshot(q, (snap) => {
       setAdverts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      setIsLoading(false);
+    }, () => {
       setIsLoading(false);
     });
     return unsub;
@@ -34,77 +41,91 @@ export default function TraderAdStudio() {
     );
   }
 
+  if (!user) {
+    return (
+      <div className="max-w-lg mx-auto my-12 bg-white border border-black rounded-2xl p-8 text-center space-y-3">
+        <AlertCircle className="w-8 h-8 text-black mx-auto" />
+        <h2 className="text-lg font-black text-black">Sign In Required</h2>
+        <p className="text-sm text-black/70">Please sign in with a tradesperson or business account to manage ad campaigns.</p>
+      </div>
+    );
+  }
+
   const handleRequestAd = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!user) return;
     const formData = new FormData(e.currentTarget);
     const budget = Number(formData.get("budget"));
-    const placement = formData.get("placement") || "both";
-    const selectedCat = formData.get("targetCategory") || "all";
-    const promotionRadius = formData.get("promotionRadius") || "20";
-    
+    const placement = String(formData.get("placement") || "both");
+    const selectedCat = String(formData.get("targetCategory") || "all");
+    const promotionRadius = String(formData.get("promotionRadius") || "20");
+    const wantsAutoTopUp = formData.get("autoTopUpEnabled") === "on";
+
+    if (wantsAutoTopUp && !hasSavedOffSessionCard) {
+      toast.error("Smart Auto Top-Up requires a saved off-session payment method in Billing settings.");
+      return;
+    }
+
     try {
-      await setDoc(doc(collection(db, "advertisements")), {
-        advertiserUid: user.uid,
-        advertiserId: user.uid,
-        advertiserName: profile?.name || "Trader",
-        title: formData.get("title"),
-        description: formData.get("description"),
-        url: `${window.location.origin}/profile/${user.uid}`,
-        bgColor: "bg-blue-600",
-        iconName: "Zap",
-        placement: placement, // "search_feed", "banner_ad", or "both"
-        promotionRadius: promotionRadius, // "5", "10", "15", "20", "50", or "nationwide"
-        autoTopUpEnabled: formData.get("autoTopUpEnabled") === "on",
-        autoTopUpThreshold: 10,
-        autoTopUpAmount: 50,
-        lowBalanceAlertsEnabled: formData.get("lowBalanceAlertsEnabled") === "on",
-        targetRole: formData.get("targetRole"),
-        targetCategories: selectedCat === "all" ? [] : [selectedCat],
-        costPerDisplay: tierCost,
-        dailyDisplayLimit: 100,
-        durationDays: 30,
-        isActive: false,
-        approvalStatus: "pending",
-        billingCycle: "prepaid",
-        totalBudget: budget,
-        prepaidBalance: 0,
-        clicks: 0,
-        searchFeedClicks: 0,
-        bannerClicks: 0,
-        impressions: 0,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
+      const token = await user.getIdToken();
+      const response = await fetch("/api/ads/create-cpc", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: String(formData.get("title") || ""),
+          description: String(formData.get("description") || ""),
+          placement,
+          promotionRadius,
+          targetRole: String(formData.get("targetRole") || "all"),
+          targetCategories: selectedCat === "all" ? [] : [selectedCat],
+          budget,
+          autoTopUpEnabled: wantsAutoTopUp && hasSavedOffSessionCard,
+          autoTopUpThreshold: 10,
+          autoTopUpAmount: 50,
+          autoTopUpMaxMonthlyCapGbp: 250,
+          lowBalanceAlertsEnabled: formData.get("lowBalanceAlertsEnabled") === "on",
+        }),
       });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to submit campaign request.");
+      }
       setShowRequestModal(false);
-    } catch (e) {
-      console.error(e);
-      alert("Error requesting ad");
+      toast.success("Campaign request submitted for admin approval.");
+    } catch (err: any) {
+      console.error(err);
+      toast.error(err?.message || "Error requesting ad campaign.");
     }
   };
 
-  const handleTopup = async (adId: string, currentBalance: number, amount: number) => {
+  const handleTopup = async (adId: string, _currentBalance: number, amount: number, isCurrentlyActive?: boolean) => {
     if (!user) return;
-    if (confirm(`Top up £${amount} from your ad wallet to this campaign balance?`)) {
-      try {
-        const token = await user.getIdToken();
-        const response = await fetch(`/api/ads/${adId}/topup`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`
-          },
-          body: JSON.stringify({ amount })
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || "Failed to top up ad balance");
-        }
-        alert(`Successfully topped up £${amount} to campaign!`);
-      } catch (err: any) {
-        console.error(err);
-        alert(err.message || "Failed to top up ad balance");
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch(`/api/ads/${adId}/topup`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        // Keep paused campaigns paused on top-up; advertiser explicitly resumes via Resume button
+        body: JSON.stringify({ amount, resumeAfterTopup: false })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to top up ad balance");
       }
+      toast.success(
+        isCurrentlyActive
+          ? `Successfully topped up £${amount} to active campaign.`
+          : `Successfully topped up £${amount}. Campaign stays paused until you click Resume.`
+      );
+    } catch (err: any) {
+      console.error(err);
+      toast.error(err.message || "Failed to top up ad balance");
     }
   };
 
@@ -228,9 +249,13 @@ export default function TraderAdStudio() {
                       <h3 className="font-bold text-lg text-slate-900 leading-tight">{ad.title}</h3>
                       <p className="text-sm text-slate-500">{ad.description}</p>
                     </div>
-                    {ad.approvalStatus === "pending" ? (
+                    {(ad.approvalStatus === "pending" || ad.approvalStatus === "pending_review") ? (
                       <span className="bg-amber-100 text-amber-800 text-xs font-bold px-3 py-1 rounded-full flex items-center gap-1">
                         <Loader2 className="w-3 h-3 animate-spin" /> Pending Review
+                      </span>
+                    ) : ad.approvalStatus === "rejected" ? (
+                      <span className="bg-red-100 text-red-800 text-xs font-bold px-3 py-1 rounded-full flex items-center gap-1">
+                        Rejected
                       </span>
                     ) : ad.isActive ? (
                       <span className="bg-green-100 text-green-800 text-xs font-bold px-3 py-1 rounded-full flex items-center gap-1">
@@ -285,20 +310,45 @@ export default function TraderAdStudio() {
                         ) : null}
                         <span>
                           {ad.autoTopUpEnabled 
-                            ? "⚡ Auto Top-Up Active: Automatically reloads £50.00 if balance drops below £10.00." 
-                            : "Auto Top-Up Disabled: Campaign will pause when balance reaches £0.00."}
+                            ? `⚡ Auto Top-Up Active: Reloads £${ad.autoTopUpAmount || 50}.00 below £${ad.autoTopUpThreshold || 10}.00 (monthly cap £${ad.autoTopUpMaxMonthlyCapGbp || 250}).`
+                            : hasSavedOffSessionCard
+                              ? "Auto Top-Up Disabled: Campaign will pause when balance reaches £0.00."
+                              : "Auto Top-Up Unavailable: Save a default payment card in Billing to enable off-session reloads."}
                         </span>
                       </div>
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
-                      <label className="flex items-center gap-1.5 cursor-pointer text-[11px] font-bold text-slate-700">
+                      <label className={`flex items-center gap-1.5 text-[11px] font-bold text-slate-700 ${!hasSavedOffSessionCard && !ad.autoTopUpEnabled ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}`}>
                         <input 
                           type="checkbox" 
-                          checked={ad.autoTopUpEnabled || false} 
+                          checked={ad.autoTopUpEnabled || false}
+                          disabled={!hasSavedOffSessionCard && !ad.autoTopUpEnabled}
                           onChange={async (e) => {
-                            await updateDoc(doc(db, "advertisements", ad.id), {
-                              autoTopUpEnabled: e.target.checked
-                            });
+                            if (!user) return;
+                            try {
+                              const token = await user.getIdToken();
+                              const res = await fetch(`/api/ads/${encodeURIComponent(ad.id)}/auto-topup-settings`, {
+                                method: "POST",
+                                headers: {
+                                  "Content-Type": "application/json",
+                                  Authorization: `Bearer ${token}`,
+                                },
+                                body: JSON.stringify({
+                                  autoTopUpEnabled: e.target.checked,
+                                  autoTopUpThreshold: ad.autoTopUpThreshold || 10,
+                                  autoTopUpAmount: ad.autoTopUpAmount || 50,
+                                  autoTopUpMaxMonthlyCapGbp: ad.autoTopUpMaxMonthlyCapGbp || 250,
+                                  lowBalanceAlertsEnabled: ad.lowBalanceAlertsEnabled !== false,
+                                }),
+                              });
+                              const result = await res.json().catch(() => ({}));
+                              if (!res.ok) {
+                                throw new Error(result.error || "Failed to update Auto Top-Up settings.");
+                              }
+                              toast.success(e.target.checked ? "Smart Auto Top-Up enabled." : "Smart Auto Top-Up disabled.");
+                            } catch (err: any) {
+                              toast.error(err?.message || "Could not update Auto Top-Up settings.");
+                            }
                           }}
                           className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
                         />
@@ -309,17 +359,17 @@ export default function TraderAdStudio() {
 
                   <div className="flex justify-between items-center pt-4 border-t border-black gap-2">
                     <div className="flex gap-2 w-full md:w-auto">
-                        <button onClick={() => handleTopup(ad.id, ad.prepaidBalance, 50)} className="flex-1 md:flex-none border border-black bg-white text-slate-700 hover:bg-slate-50 px-4 py-2 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition">
+                        <button onClick={() => handleTopup(ad.id, ad.prepaidBalance, 50, ad.isActive)} className="flex-1 md:flex-none border border-black bg-white text-slate-700 hover:bg-slate-50 px-4 py-2 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition">
                         <CreditCard className="w-4 h-4" /> Top up £50
                         </button>
                         <button onClick={() => {
                             navigator.clipboard.writeText(`${window.location.origin}/ad-report/${ad.id}`);
-                            alert("Report link copied!");
+                            toast.success("Report link copied!");
                         }} className="border border-black bg-white text-slate-700 hover:bg-slate-50 px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 transition">
                         <LayoutGrid className="w-4 h-4" /> Report
                         </button>
                     </div>
-                    {ad.approvalStatus !== "pending" && (
+                    {ad.approvalStatus === "approved" && (
                         <button 
                          onClick={async () => {
                            if (!user) return;
@@ -335,7 +385,7 @@ export default function TraderAdStudio() {
                              }
                            } catch (err: any) {
                              console.error(err);
-                             alert(err.message || "Failed to update campaign status");
+                             toast.error(err.message || "Failed to update campaign status");
                            }
                          }}
                          className={`px-4 py-2 rounded-xl text-sm font-bold ${ad.isActive ? "bg-slate-100 text-slate-700 hover:bg-slate-200" : "bg-green-100 text-green-700 hover:bg-green-200"}`}
@@ -516,11 +566,21 @@ export default function TraderAdStudio() {
               </div>
 
               <div className="bg-slate-50 border border-black rounded-xl p-4 space-y-3">
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input type="checkbox" name="autoTopUpEnabled" defaultChecked className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4" />
+                <label className={`flex items-center gap-3 ${hasSavedOffSessionCard ? "cursor-pointer" : "opacity-60 cursor-not-allowed"}`}>
+                  <input
+                    type="checkbox"
+                    name="autoTopUpEnabled"
+                    defaultChecked={hasSavedOffSessionCard}
+                    disabled={!hasSavedOffSessionCard}
+                    className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
+                  />
                   <div>
                     <span className="text-xs font-bold text-slate-900 block">⚡ Enable Smart Auto Top-Up</span>
-                    <span className="text-[11px] text-slate-500 block">Automatically reloads £50.00 when balance falls below £10.00 to keep campaign active during peak search hours.</span>
+                    <span className="text-[11px] text-slate-600 block">
+                      {hasSavedOffSessionCard
+                        ? "Reloads £50.00 when balance falls below £10.00 (capped at £250/month) using your saved Stripe card."
+                        : "Requires a saved default payment method on file in Billing settings before enabling off-session charging."}
+                    </span>
                   </div>
                 </label>
                 <label className="flex items-center gap-3 cursor-pointer pt-2 border-t border-slate-200">

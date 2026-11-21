@@ -1,4 +1,4 @@
-import { db, doc, getDoc, setDoc, onSnapshot, collection, addDoc, serverTimestamp, query, orderBy, limit, sendNotification } from "@/src/firebase";
+import { auth, db, doc, getDoc, setDoc, onSnapshot, collection, serverTimestamp, query, orderBy, limit, sendNotification } from "@/src/firebase";
 
 export interface MasterAdminAuthConfig {
   primaryAdminEmail: string;
@@ -149,12 +149,18 @@ export async function dispatchAdminLoginAlert(params: {
       </div>
     `;
 
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : "";
+
     // 1. Dispatch Email to all configured recipients
     for (const recipient of recipients) {
       try {
-        await fetch("/api/admin/send-email-alert", {
+        if (!idToken) continue;
+        const emailRes = await fetch("/api/admin/send-email-alert", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+          },
           body: JSON.stringify({
             to: recipient,
             subject: emailSubject,
@@ -162,29 +168,37 @@ export async function dispatchAdminLoginAlert(params: {
             breachType: "admin_login_alert",
             severity: "HIGH"
           })
-        }).catch(e => console.debug("Email alert POST notice:", e));
+        });
+        if (!emailRes.ok) {
+          console.warn("Admin login email alert dispatch returned:", emailRes.status);
+        }
       } catch (err) {
         console.debug("Email alert error:", err);
       }
     }
 
-    // 2. Log in Firestore admin_login_audits collection
+    // 2. Record immutable login audit server-side via Admin SDK
     try {
-      await addDoc(collection(db, "admin_login_audits"), {
-        adminEmail,
-        timestamp: nowIso,
-        timeZone,
-        userAgent,
-        platform,
-        ipAddress: clientIp,
-        pinVerified,
-        status,
-        recipients,
-        emailAlertSent: true,
-        createdAt: serverTimestamp()
-      });
+      if (idToken) {
+        await fetch("/api/admin/login-audit", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            adminEmail,
+            timeZone,
+            userAgent,
+            platform,
+            clientIp,
+            pinVerified,
+            status,
+          }),
+        });
+      }
     } catch (err) {
-      console.debug("Could not record admin login audit in Firestore:", err);
+      console.debug("Could not record admin login audit via server:", err);
     }
 
     // 3. Create an in-app security notification

@@ -23,6 +23,8 @@ import {
   PurposePermission,
   DataRightsSecurityError,
   DataRightsService,
+  computeDataRightsHash,
+  validateDataRightsRecord,
   dataRightsService,
 } from './dataRights';
 import {
@@ -221,6 +223,15 @@ export class ContractorArchiveRightsService {
     this.provService.setFirestoreDb(db);
   }
 
+  private getDb(): admin.firestore.Firestore | any {
+    if (this.db) return this.db;
+    if (admin?.apps && admin.apps.length > 0) {
+      this.db = admin.firestore();
+      return this.db;
+    }
+    throw new ContractorArchiveValidationError('[ContractorArchiveRightsService] Firestore not initialized');
+  }
+
   /**
    * Registers a contractor archive and establishes its server-authoritative rights boundary.
    * Enforces:
@@ -273,35 +284,232 @@ export class ContractorArchiveRightsService {
       restrictions.push('restrict_internal_ai_use');
     }
 
-    // Register archive rights record via authoritative DataRightsService
     const archiveSourceVersion = input.sourceVersion !== undefined && input.sourceVersion !== null && String(input.sourceVersion).trim() !== ''
       ? String(input.sourceVersion)
       : '1';
 
-    const rightsRecord = await this.rightsService.createDataRightsRecord({
-      tenantId: input.tenantId,
-      subject: {
-        type: 'contractor_archive',
-        id: archiveId,
-      },
-      owner: {
-        type: 'contractor',
-        id: input.contractorUid,
-      },
-      source: {
-        type: 'contractor_archive',
-        id: archiveId,
+    const components = Array.isArray(input.components) ? input.components : [];
+
+    // AT-INTEL-ARCHIVE-01: Pre-validate all component specifications BEFORE mutating any database state
+    for (const comp of components) {
+      if (!ARCHIVE_ORIGIN_TYPES.includes(comp.originType)) {
+        throw new ContractorArchiveValidationError(
+          `Invalid originType '${comp.originType}'. Must be one of: ${ARCHIVE_ORIGIN_TYPES.join(', ')}`
+        );
+      }
+      if (!ARCHIVE_COMPONENT_CATEGORIES.includes(comp.category)) {
+        throw new ContractorArchiveValidationError(
+          `Invalid category '${comp.category}'. Must be one of: ${ARCHIVE_COMPONENT_CATEGORIES.join(', ')}`
+        );
+      }
+      // Deterministic component ID validation (throws on empty componentKey)
+      computeArchiveComponentId(input.tenantId, archiveId, comp.componentKey);
+    }
+
+    // Conservative fail-closed permission intersection helper:
+    // Child component permissions can NEVER exceed parent archive permissions.
+    const intersectConservativePermission = (
+      parentPerm: PurposePermission,
+      childRequested: PurposePermission | undefined
+    ): PurposePermission => {
+      if (parentPerm === 'denied' || childRequested === 'denied') return 'denied';
+      if (parentPerm === 'unknown') return 'unknown';
+      return childRequested ?? parentPerm;
+    };
+
+    const db = this.getDb();
+    const nowIso = new Date().toISOString();
+    const recordedBy = input.recordedBy || 'contractor_archive_boundary';
+
+    const buildValidatedRightsRecord = (params: {
+      subjectType: 'contractor_archive' | 'contractor_archive_component';
+      subjectId: string;
+      ownerType: 'contractor' | 'mixed_subject';
+      recordPurposes: Record<RightsPurpose, PurposePermission>;
+      recordRestrictions: string[];
+      sourceType: string;
+      sourceId: string;
+      sourceVersion: string;
+      recordedByActor: string;
+    }): DataRightsRecord => {
+      const rightsId = this.rightsService.generateRightsId(input.tenantId, params.subjectType, params.subjectId);
+      const record: DataRightsRecord = {
+        rightsId,
         tenantId: input.tenantId,
-      },
-      purposes,
-      restrictions,
-      provenance: {
-        sourceType: 'contractor_archive',
-        sourceId: archiveId,
-        tenantId: input.tenantId,
+        subject: { type: params.subjectType, id: params.subjectId },
+        owner: { type: params.ownerType, id: input.contractorUid },
+        source: { type: 'contractor_archive', id: archiveId, tenantId: input.tenantId },
+        purposes: params.recordPurposes,
+        restrictions: Array.from(new Set(params.recordRestrictions)),
+        status: 'active',
+        version: 1,
+        provenance: {
+          sourceType: params.sourceType,
+          sourceId: params.sourceId,
+          tenantId: input.tenantId,
+          sourceVersion: params.sourceVersion,
+          recordedBy: params.recordedByActor,
+        },
+        effectiveAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      record.provenance.rightsHash = computeDataRightsHash({
+        rightsId: record.rightsId,
+        tenantId: record.tenantId,
+        subject: record.subject,
+        owner: record.owner,
+        purposes: record.purposes,
+        restrictions: record.restrictions,
+        version: record.version,
+        source: record.source,
+        provenance: {
+          sourceType: record.provenance.sourceType,
+          sourceId: record.provenance.sourceId,
+          tenantId: record.provenance.tenantId,
+          sourceVersion: record.provenance.sourceVersion,
+          recordedBy: record.provenance.recordedBy,
+        },
+        status: record.status,
+        effectiveAt: record.effectiveAt,
+      });
+      validateDataRightsRecord(record);
+      return record;
+    };
+
+    const rightsRecord = buildValidatedRightsRecord({
+      subjectType: 'contractor_archive',
+      subjectId: archiveId,
+      ownerType: 'contractor',
+      recordPurposes: purposes,
+      recordRestrictions: restrictions,
+      sourceType: 'contractor_archive',
+      sourceId: archiveId,
+      sourceVersion: archiveSourceVersion,
+      recordedByActor: recordedBy,
+    });
+
+    const preparedComponents = components.map((comp) => {
+      const componentId = computeArchiveComponentId(input.tenantId, archiveId, comp.componentKey);
+
+      // Conservative fail-closed inheritance: child cannot exceed parent archive permissions
+      // and external purposes are never manufactured as 'allowed'.
+      const compPurposes: Record<RightsPurpose, PurposePermission> = {
+        internal_platform_operation: intersectConservativePermission(
+          purposes.internal_platform_operation,
+          comp.purposes?.internal_platform_operation
+        ),
+        internal_ai_use: intersectConservativePermission(
+          purposes.internal_ai_use,
+          comp.purposes?.internal_ai_use
+        ),
+        external_ai_training:
+          purposes.external_ai_training === 'denied' || comp.purposes?.external_ai_training === 'denied'
+            ? 'denied'
+            : 'unknown',
+        third_party_sharing:
+          purposes.third_party_sharing === 'denied' || comp.purposes?.third_party_sharing === 'denied'
+            ? 'denied'
+            : 'unknown',
+        commercial_licensing:
+          purposes.commercial_licensing === 'denied' || comp.purposes?.commercial_licensing === 'denied'
+            ? 'denied'
+            : 'unknown',
+        export:
+          purposes.export === 'denied' || comp.purposes?.export === 'denied'
+            ? 'denied'
+            : 'unknown',
+      };
+
+      const compRestrictions = [...restrictions, ...(comp.restrictions || [])];
+      if (comp.originType === 'customer_or_subject_data') {
+        compRestrictions.push('subject_privacy_protected');
+      } else if (comp.originType === 'third_party_data') {
+        compRestrictions.push('third_party_copyright_protected');
+      }
+
+      const compRecord = buildValidatedRightsRecord({
+        subjectType: 'contractor_archive_component',
+        subjectId: componentId,
+        ownerType: comp.originType === 'contractor_owned' ? 'contractor' : 'mixed_subject',
+        recordPurposes: compPurposes,
+        recordRestrictions: compRestrictions,
+        sourceType: 'contractor_archive_component',
+        sourceId: componentId,
         sourceVersion: archiveSourceVersion,
-        recordedBy: input.recordedBy || 'contractor_archive_boundary',
-      },
+        recordedByActor: input.recordedBy || 'contractor_archive_component_boundary',
+      });
+
+      return { componentId, component: comp, rightsRecord: compRecord };
+    });
+
+    // AT-INTEL-ARCHIVE-01: Persist parent archive rights, all component rights, immutable histories,
+    // and deterministic child component index ATOMICALLY in a single Firestore transaction.
+    await db.runTransaction(async (tx: any) => {
+      const parentRef = db.collection('data_rights').doc(rightsRecord.rightsId);
+      const parentSnap = await tx.get(parentRef);
+      if (parentSnap.exists) {
+        throw new ContractorArchiveSecurityError(
+          `Data rights record '${rightsRecord.rightsId}' already exists. Use updateDataRightsRecord for revisions.`
+        );
+      }
+
+      const compRefs = preparedComponents.map((c) => db.collection('data_rights').doc(c.rightsRecord.rightsId));
+      for (const compRef of compRefs) {
+        const compSnap = await tx.get(compRef);
+        if (compSnap.exists) {
+          throw new ContractorArchiveSecurityError(
+            `Component data rights record '${compRef.id}' already exists.`
+          );
+        }
+      }
+
+      const indexRef = db.collection('contractor_archive_component_index').doc(archiveId);
+      const idxSnap = await tx.get(indexRef);
+      const existingIdx = idxSnap.exists ? idxSnap.data() : null;
+      if (existingIdx?.tenantId && existingIdx.tenantId !== input.tenantId) {
+        throw new ContractorArchiveSecurityError(
+          `Archive index tenant mismatch for archive '${archiveId}'`
+        );
+      }
+
+      const tsSeed = Date.now();
+      await tx.set(parentRef, rightsRecord);
+      await tx.set(db.collection('data_rights_history').doc(`${rightsRecord.rightsId}_v1_${tsSeed}`), {
+        historyId: `${rightsRecord.rightsId}_v1_${tsSeed}`,
+        rightsId: rightsRecord.rightsId,
+        tenantId: input.tenantId,
+        version: 1,
+        action: 'created',
+        snapshot: rightsRecord,
+        recordedAt: nowIso,
+      });
+
+      for (let i = 0; i < preparedComponents.length; i++) {
+        const c = preparedComponents[i];
+        await tx.set(compRefs[i], c.rightsRecord);
+        const hId = `${c.rightsRecord.rightsId}_v1_${tsSeed}_${i}`;
+        await tx.set(db.collection('data_rights_history').doc(hId), {
+          historyId: hId,
+          rightsId: c.rightsRecord.rightsId,
+          tenantId: input.tenantId,
+          version: 1,
+          action: 'created',
+          snapshot: c.rightsRecord,
+          recordedAt: nowIso,
+        });
+      }
+
+      if (preparedComponents.length > 0) {
+        const existingIds: string[] = Array.isArray(existingIdx?.componentIds) ? existingIdx.componentIds : [];
+        const nextIds = Array.from(new Set([...existingIds, ...preparedComponents.map((c) => c.componentId)]));
+        await tx.set(indexRef, {
+          archiveId,
+          tenantId: input.tenantId,
+          componentIds: nextIds,
+          updatedAt: nowIso,
+        });
+      }
     });
 
     let provenanceNode: ProvenanceNode | undefined;
@@ -321,29 +529,45 @@ export class ContractorArchiveRightsService {
         metadata: {
           archiveReference: input.archiveReference,
           contractorUid: input.contractorUid,
-          componentCount: input.components?.length || 0,
-          hasMixedOrigins: (input.components || []).some(
-            (c) => c.originType !== 'contractor_owned'
-          ),
+          componentCount: preparedComponents.length,
+          hasMixedOrigins: preparedComponents.some((c) => c.component.originType !== 'contractor_owned'),
         },
-        createdBy: input.recordedBy || 'contractor_archive_boundary',
+        createdBy: recordedBy,
       });
-    }
 
-    // Register component rights if mixed-origin components were provided
-    const componentRights: DataRightsRecord[] = [];
-    if (input.components && input.components.length > 0) {
-      for (const comp of input.components) {
-        const compRes = await this.registerComponentRights({
+      for (const c of preparedComponents) {
+        const compNode = await this.provService.createNode({
           tenantId: input.tenantId,
-          archiveId,
-          component: comp,
-          linkProvenance: input.linkProvenance,
-          recordedBy: input.recordedBy,
+          nodeType: 'observation',
+          sourceType: 'contractor_archive_component',
+          sourceId: c.componentId,
+          sourceVersion: Number(archiveSourceVersion) || 1,
+          rightsReference: {
+            rightsId: c.rightsRecord.rightsId,
+            tenantId: input.tenantId,
+            status: c.rightsRecord.status,
+          },
+          metadata: {
+            archiveId,
+            componentKey: c.component.componentKey,
+            originType: c.component.originType,
+            category: c.component.category,
+            ...(c.component.contentHash ? { contentHash: c.component.contentHash } : {}),
+          },
+          createdBy: input.recordedBy || 'contractor_archive_component_boundary',
         });
-        componentRights.push(compRes.rightsRecord);
+
+        await this.provService.createEdge({
+          tenantId: input.tenantId,
+          fromNodeId: provenanceNode.nodeId,
+          toNodeId: compNode.nodeId,
+          relationType: 'OBSERVED_FROM',
+          createdBy: input.recordedBy || 'contractor_archive_component_boundary',
+        });
       }
     }
+
+    const componentRights = preparedComponents.map((c) => c.rightsRecord);
 
     return {
       archiveId,
@@ -476,6 +700,27 @@ export class ContractorArchiveRightsService {
         createdBy: input.recordedBy || 'contractor_archive_component_boundary',
       });
     }
+
+    // Persist deterministic archive -> child component index for atomic revocation cascades
+    const db = this.getDb();
+    const indexRef = db.collection('contractor_archive_component_index').doc(archiveId);
+    await db.runTransaction(async (tx: any) => {
+      const idxSnap = await tx.get(indexRef);
+      const existingData = idxSnap.exists ? idxSnap.data() : null;
+      if (existingData?.tenantId && existingData.tenantId !== tenantId) {
+        throw new ContractorArchiveSecurityError(
+          `Archive index tenant mismatch for archive '${archiveId}'`
+        );
+      }
+      const existingIds: string[] = Array.isArray(existingData?.componentIds) ? existingData.componentIds : [];
+      const nextIds = existingIds.includes(componentId) ? existingIds : [...existingIds, componentId];
+      await tx.set(indexRef, {
+        archiveId,
+        tenantId,
+        componentIds: nextIds,
+        updatedAt: new Date().toISOString(),
+      });
+    });
 
     return {
       componentId,
@@ -651,6 +896,38 @@ export class ContractorArchiveRightsService {
       };
     }
 
+    // Parent archive status invariant: revoked/non-active parent archive ALWAYS blocks child components
+    const parentRightsId = this.rightsService.generateRightsId(tenantId, 'contractor_archive', archiveId);
+    const parentRights = await this.rightsService.getDataRightsRecord(parentRightsId);
+    if (parentRights) {
+      if (parentRights.tenantId !== tenantId) {
+        return {
+          eligible: false,
+          reason: 'blocked_by_tenant',
+          purpose,
+          tenantId,
+          archiveId,
+          componentId,
+          rightsId: parentRights.rightsId,
+          originType,
+          details: 'Tenant mismatch on parent archive rights record',
+        };
+      }
+      if (parentRights.status !== 'active') {
+        return {
+          eligible: false,
+          reason: 'blocked_by_status',
+          purpose,
+          tenantId,
+          archiveId,
+          componentId,
+          rightsId: parentRights.rightsId,
+          originType,
+          details: `Parent archive rights status is '${parentRights.status}' (must be 'active')`,
+        };
+      }
+    }
+
     const rightsId = this.rightsService.generateRightsId(
       tenantId,
       'contractor_archive_component',
@@ -817,8 +1094,8 @@ export class ContractorArchiveRightsService {
   }
 
   /**
-   * Revokes rights for a contractor archive.
-   * Ensures status is updated to 'revoked' and append-only history snapshot is persisted.
+   * Revokes rights for a contractor archive and cascades revocation transactionally
+   * to all child component data_rights records with append-only history snapshots.
    */
   public async revokeArchiveRights(
     tenantId: string,
@@ -829,13 +1106,149 @@ export class ContractorArchiveRightsService {
     if (!tenantId || !tenantId.trim()) {
       throw new ContractorArchiveSecurityError('Invalid tenantId: tenant context is mandatory');
     }
-    const rightsId = this.rightsService.generateRightsId(tenantId, 'contractor_archive', archiveId);
-    return this.rightsService.updateDataRightsRecord({
-      rightsId,
-      tenantId,
-      status: 'revoked',
-      revocationReason,
-      updatedBy: revokedBy || 'contractor_archive_revocation',
+    if (!archiveId || !archiveId.trim()) {
+      throw new ContractorArchiveValidationError('Invalid archiveId: archiveId is mandatory');
+    }
+
+    const db = this.getDb();
+    const parentRightsId = this.rightsService.generateRightsId(tenantId, 'contractor_archive', archiveId);
+    const candidateRightsIds = new Set<string>([parentRightsId]);
+
+    // Gather registered child components from index
+    try {
+      const idxSnap = await db.collection('contractor_archive_component_index').doc(archiveId).get();
+      if (idxSnap.exists) {
+        const idxData = idxSnap.data();
+        if (idxData?.tenantId === tenantId && Array.isArray(idxData.componentIds)) {
+          for (const compId of idxData.componentIds) {
+            if (typeof compId === 'string' && compId.trim()) {
+              candidateRightsIds.add(
+                this.rightsService.generateRightsId(tenantId, 'contractor_archive_component', compId)
+              );
+            }
+          }
+        }
+      }
+    } catch {
+      // Index optional for archives without components
+    }
+
+    // Also query data_rights directly if collection supports .where() (real Firestore / emulator)
+    const dataRightsCol = db.collection('data_rights');
+    if (typeof dataRightsCol.where === 'function') {
+      try {
+        const qSnap = await dataRightsCol
+          .where('tenantId', '==', tenantId)
+          .where('source.id', '==', archiveId)
+          .get();
+        if (qSnap?.docs) {
+          for (const doc of qSnap.docs) {
+            candidateRightsIds.add(doc.id);
+          }
+        }
+      } catch {
+        // Fallback silently to index-gathered candidates if composite index absent in test env
+      }
+    }
+
+    const orderedIds = [parentRightsId, ...Array.from(candidateRightsIds).filter((id) => id !== parentRightsId)];
+    const nowIso = new Date().toISOString();
+    const actor = revokedBy || 'contractor_archive_revocation';
+    const tsMs = Date.now();
+
+    return db.runTransaction(async (tx: any) => {
+      // 1. Read parent and all child rights documents strictly before any writes
+      const refs = orderedIds.map((id) => db.collection('data_rights').doc(id));
+      const snaps = await Promise.all(refs.map((ref) => tx.get(ref)));
+
+      const parentSnap = snaps[0];
+      if (!parentSnap.exists) {
+        throw new DataRightsSecurityError(`Data rights record '${parentRightsId}' not found`);
+      }
+
+      const parentCurrent = parentSnap.data() as DataRightsRecord;
+      if (parentCurrent.tenantId !== tenantId) {
+        throw new DataRightsSecurityError(
+          `Tenant mismatch: cannot revoke archive rights for tenant '${parentCurrent.tenantId}' with tenant '${tenantId}'`
+        );
+      }
+
+      const writes: Array<{
+        ref: any;
+        record: DataRightsRecord;
+        historyRef: any;
+        historyEntry: Record<string, any>;
+      }> = [];
+
+      for (let i = 0; i < snaps.length; i++) {
+        const snap = snaps[i];
+        if (!snap.exists) continue;
+        const current = snap.data() as DataRightsRecord;
+        if (current.tenantId !== tenantId) continue;
+        if (i > 0 && current.status === 'revoked') continue;
+
+        const nextVersion = current.version + 1;
+        const updatedRecord: DataRightsRecord = {
+          ...current,
+          status: 'revoked',
+          version: nextVersion,
+          updatedAt: nowIso,
+          revokedAt: current.revokedAt || nowIso,
+          revocationReason:
+            i === 0
+              ? revocationReason || current.revocationReason
+              : `Cascade revocation from parent archive '${archiveId}': ${revocationReason}`,
+          provenance: {
+            ...current.provenance,
+            tenantId: current.tenantId,
+            recordedBy: actor,
+          },
+        };
+
+        updatedRecord.provenance.rightsHash = computeDataRightsHash({
+          rightsId: updatedRecord.rightsId,
+          tenantId: updatedRecord.tenantId,
+          subject: updatedRecord.subject,
+          owner: updatedRecord.owner,
+          purposes: updatedRecord.purposes,
+          restrictions: updatedRecord.restrictions,
+          version: updatedRecord.version,
+          source: updatedRecord.source,
+          provenance: {
+            sourceType: updatedRecord.provenance.sourceType,
+            sourceId: updatedRecord.provenance.sourceId,
+            tenantId: updatedRecord.provenance.tenantId,
+            sourceVersion: updatedRecord.provenance.sourceVersion,
+            recordedBy: updatedRecord.provenance.recordedBy,
+          },
+          status: updatedRecord.status,
+          effectiveAt: updatedRecord.effectiveAt,
+        });
+
+        validateDataRightsRecord(updatedRecord);
+
+        const historyId = `${updatedRecord.rightsId}_v${nextVersion}_${tsMs}_${i}`;
+        const historyRef = db.collection('data_rights_history').doc(historyId);
+        writes.push({
+          ref: refs[i],
+          record: updatedRecord,
+          historyRef,
+          historyEntry: {
+            ...updatedRecord,
+            historyId,
+            historyRecordedAt: nowIso,
+            historyEventType: 'REVOKED',
+          },
+        });
+      }
+
+      // 2. Execute all writes atomically
+      for (const w of writes) {
+        await tx.set(w.ref, w.record);
+        await tx.set(w.historyRef, w.historyEntry);
+      }
+
+      return writes[0].record;
     });
   }
 }

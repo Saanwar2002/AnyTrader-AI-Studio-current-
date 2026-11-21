@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, setDoc } from "firebase/firestore";
+import { collection, onSnapshot, doc, setDoc, query, limit } from "firebase/firestore";
 import { db } from "../firebase";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "motion/react";
@@ -129,7 +129,7 @@ export default function AnyRollerAdmin() {
   }, [searchQuery]);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "users"), (snapshot) => {
+    const unsub = onSnapshot(query(collection(db, "users"), limit(100)), (snapshot) => {
       const allUsers = snapshot.docs.map(doc => doc.data());
       const drivers = allUsers.filter((u: any) => 
         u.role === "driver" || 

@@ -1,4 +1,5 @@
 import { textContainsTokenMatch, tokenize, tokenMatches, categoryMatchesSearch, getMatchingCategoriesForTrader } from "@/src/lib/fuzzyMatch";
+import { openSafeExternalUrl } from "@/src/lib/safeExternalUrl";
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
@@ -53,7 +54,7 @@ import { db, doc, setDoc, updateDoc, collection, serverTimestamp, handleFirestor
 import { distributeJobNotifications } from "@/src/services/notificationService";
 import { useAuth } from "./AuthProvider";
 import { useNavigate, useLocation } from "react-router-dom";
-import { createJobViaCommand } from "../services/jobCommandService";
+import { createJobViaCommand, updateJobViaCommand } from "../services/jobCommandService";
 import { useJsApiLoader } from "@react-google-maps/api";
 import { Capacitor } from '@capacitor/core';
 import { SpeechRecognition } from '@capacitor-community/speech-recognition';
@@ -733,15 +734,22 @@ export default function PostJobWizard() {
   
   useEffect(() => {
     const handler = setTimeout(() => {
-      if (searchQuery && searchQuery.length >= 3) {
-        addDoc(collection(db, "search_logs"), {
-          query: searchQuery.toLowerCase(),
-          timestamp: serverTimestamp()
-        }).catch(err => console.error("Error logging search:", err));
+      const cleaned = (searchQuery || "").trim().toLowerCase().slice(0, 120);
+      if (cleaned.length >= 3 && user) {
+        user.getIdToken().then((token) =>
+          fetch("/api/telemetry/search-log", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ query: cleaned }),
+          })
+        ).catch((err) => console.error("Error logging search telemetry:", err));
       }
     }, 1000);
     return () => clearTimeout(handler);
-  }, [searchQuery]);
+  }, [searchQuery, user]);
 
   const [recordingTime, setRecordingTime] = useState(0);
   const recordingTimerRef = useRef<any>(null);
@@ -2005,45 +2013,29 @@ export default function PostJobWizard() {
           if (!firstJobId) {
             firstJobId = currentJobId;
           }
-          const jobData = {
-            id: currentJobId,
-            jobNo: editJob.jobNo || jobNo,
-            ...formData,
-            city: asset?.city || finalCity,
-            area: asset?.area || finalArea,
-            fullAddress: asset?.fullAddress || formData.fullAddress,
-            postcode: (asset?.postcode || finalPostcode).toUpperCase(),
+          const editPayload: Record<string, any> = {
+            title: formData.title,
             description: finalDescription,
-            status: editJob.status || "open",
-            updatedAt: serverTimestamp(),
+            category: formData.category,
+            subCategory: (formData as any).subCategory || formData.subcategory || null,
+            subcategory: formData.subcategory || null,
+            city: asset?.city || finalCity || null,
+            area: asset?.area || finalArea || null,
+            fullAddress: asset?.fullAddress || formData.fullAddress || null,
+            postcode: (asset?.postcode || finalPostcode).toUpperCase(),
+            urgency: formData.urgency,
+            budget: formData.selectedBudget || null,
+            estimateMin: estimate?.min ?? editJob.estimateMin ?? null,
+            estimateMax: estimate?.max ?? editJob.estimateMax ?? null,
             assetId: asset?.id || null,
             assetName: asset?.name || null,
             linkedPropertyId: asset?.id || (location.state as any)?.linkedPropertyId || null,
           };
-          const { selectedAssets, isEmergencyBoost, isInstantMatch, ...cleanData } = jobData as any;
-          await updateDoc(jobRef, cleanData);
-
-          try {
-            const publicRef = doc(db, "public_job_cards", currentJobId);
-            await setDoc(publicRef, {
-              id: currentJobId,
-              jobNo: cleanData.jobNo || undefined,
-              category: cleanData.category || "General",
-              subCategory: cleanData.subCategory || undefined,
-              title: cleanData.title || "Trade Job",
-              description: cleanData.description || "",
-              postcodeArea: cleanData.postcode?.trim().split(/\s+/)[0] || cleanData.area || "Local Area",
-              city: cleanData.city || undefined,
-              area: cleanData.area || undefined,
-              urgency: cleanData.urgency || "standard",
-              status: cleanData.status || "open",
-              estimateMin: cleanData.estimateMin || undefined,
-              estimateMax: cleanData.estimateMax || undefined,
-              updatedAt: new Date().toISOString()
-            }, { merge: true });
-          } catch (projErr) {
-            console.warn("Public job projection update note:", projErr);
-          }
+          await updateJobViaCommand({
+            user,
+            jobId: currentJobId,
+            payload: editPayload,
+          });
         } else {
           // Authoritative server-command job creation (Task 2)
           const commandPayload: Record<string, any> = {
@@ -2623,8 +2615,10 @@ export default function PostJobWizard() {
               </div>
 
               <div className="relative">
+                <label htmlFor="post-job-category-search" className="sr-only">Search trade category</label>
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
                 <input 
+                  id="post-job-category-search"
                   type="text"
                   placeholder="Search or describe (e.g. leaky)"
                   className="w-full pl-12 pr-4 py-3 rounded-2xl border border-black shadow-sm focus:outline-none focus:ring-4 focus:ring-blue-600/20 focus:border-blue-600 bg-white transition-all font-medium placeholder:font-normal"
@@ -2698,7 +2692,9 @@ export default function PostJobWizard() {
                 ))}
                 
                 <div className="col-span-2 pt-2 space-y-2">
+                  <label htmlFor="post-job-custom-subcategory" className="sr-only">Custom requirement</label>
                   <input
+                    id="post-job-custom-subcategory"
                     type="text"
                     placeholder="Or enter custom requirement..."
                     className="w-full text-center p-3.5 rounded-xl border border-black shadow-sm focus:outline-none focus:ring-4 focus:ring-[#0084a5]/20 focus:border-black bg-white font-bold placeholder:font-medium placeholder:text-slate-400 text-base sm:text-lg text-slate-800"
@@ -2782,8 +2778,9 @@ export default function PostJobWizard() {
                   </div>
                 )}
                 <div className="space-y-1">
-                  <label className="text-sm font-bold text-slate-700">Job Title <span className="text-red-500">*</span></label>
+                  <label htmlFor="post-job-title-input" className="text-sm font-bold text-slate-700 block">Job Title <span className="text-red-500">*</span></label>
                   <input 
+                    id="post-job-title-input"
                     type="text" 
                     placeholder="e.g. Fix leaking kitchen tap"
                     className={cn(
@@ -2804,9 +2801,10 @@ export default function PostJobWizard() {
                   {titleError && <p className="text-red-500 text-xs mt-1 font-medium">{titleError}</p>}
                 </div>
                 <div className="space-y-1">
-                  <label className="text-sm font-bold text-slate-700">Description <span className="text-red-500">*</span></label>
+                  <label htmlFor="post-job-description-input" className="text-sm font-bold text-slate-700 block">Description <span className="text-red-500">*</span></label>
                   <div className="relative">
                     <textarea 
+                      id="post-job-description-input"
                       rows={7}
                       placeholder="Describe the issue, any specific parts needed, and the current state..."
                       className={cn(
@@ -2944,7 +2942,7 @@ export default function PostJobWizard() {
                           <span className="text-[9px] text-slate-700 truncate w-full text-center font-medium">{doc.name}</span>
                           {doc.name === 'Audio Note' && (
                             <div className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-                              <Play className="w-5 h-5 text-white cursor-pointer" onClick={() => window.open(doc.url, '_blank')} />
+                              <Play className="w-5 h-5 text-white cursor-pointer" onClick={() => openSafeExternalUrl(doc.url, { allowBlob: true })} />
                             </div>
                           )}
                           <button 
@@ -3037,9 +3035,10 @@ export default function PostJobWizard() {
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-sm font-bold text-slate-700">Estimated Completion Time (Optional)</label>
+                  <label htmlFor="post-job-est-time-input" className="text-sm font-bold text-slate-700 block">Estimated Completion Time (Optional)</label>
                   <div className="flex gap-2">
                     <input 
+                      id="post-job-est-time-input"
                       type="number" 
                       placeholder="e.g. 4"
                       className="w-24 p-4 rounded-2xl border border-black shadow-sm focus:outline-none focus:ring-4 focus:ring-blue-600/20 focus:border-blue-600 bg-white transition-all font-medium placeholder:font-normal"
@@ -3047,6 +3046,8 @@ export default function PostJobWizard() {
                       onChange={(e) => setFormData({ ...formData, estimatedCompletionTime: e.target.value })}
                     />
                     <select 
+                      id="post-job-est-time-unit"
+                      aria-label="Estimated completion time unit"
                       className="w-32 p-4 rounded-2xl border border-black shadow-sm focus:outline-none focus:ring-4 focus:ring-blue-600/20 focus:border-blue-600 bg-white font-bold text-slate-700 transition-all font-medium"
                       value={formData.estimatedCompletionTimeUnit}
                       onChange={(e) => setFormData({ ...formData, estimatedCompletionTimeUnit: e.target.value })}
@@ -3061,8 +3062,9 @@ export default function PostJobWizard() {
 
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
-                    <label className="text-sm font-bold text-slate-700">Payment Preference</label>
+                    <label htmlFor="post-job-payment-pref" className="text-sm font-bold text-slate-700 block">Payment Preference</label>
                     <select 
+                      id="post-job-payment-pref"
                       className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 bg-white font-bold text-slate-700"
                       value={formData.paymentPreference}
                       onChange={(e) => setFormData({ ...formData, paymentPreference: e.target.value })}
@@ -3073,8 +3075,9 @@ export default function PostJobWizard() {
                     </select>
                   </div>
                   <div className="space-y-1">
-                    <label className="text-sm font-bold text-slate-700">Quote Scope</label>
+                    <label htmlFor="post-job-quote-scope" className="text-sm font-bold text-slate-700 block">Quote Scope</label>
                     <select 
+                      id="post-job-quote-scope"
                       className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 bg-white font-bold text-slate-700"
                       value={formData.quoteScope}
                       onChange={(e) => setFormData({ ...formData, quoteScope: e.target.value })}
@@ -3125,8 +3128,9 @@ export default function PostJobWizard() {
                 ) : (
                   clarifyingQuestions.map((question, idx) => (
                     <div key={idx} className="space-y-2">
-                      <label className="text-sm font-bold text-slate-700">{question}</label>
+                      <label htmlFor={`post-job-clarifying-${idx}`} className="text-sm font-bold text-slate-700 block">{question}</label>
                       <textarea 
+                        id={`post-job-clarifying-${idx}`}
                         rows={2}
                         placeholder="Your answer..."
                         className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 resize-none bg-white"
@@ -3155,14 +3159,17 @@ export default function PostJobWizard() {
               <div className="space-y-4 bg-white p-5 rounded-3xl border border-black shadow-[0_2px_12px_-4px_rgba(0,0,0,0.05)] relative overflow-hidden">
                 <div className="absolute top-0 left-0 w-1.5 h-full bg-blue-500 rounded-l-3xl"></div>
                 
-                <h2 className="text-lg font-black text-slate-800 flex items-center gap-3">
+                <h2 id="post-job-location-heading" className="text-lg font-black text-slate-800 flex items-center gap-3">
                   <span className="w-7 h-7 rounded-full bg-blue-50 flex items-center justify-center text-sm font-black text-blue-600">1</span>
                   Where is the job?
                 </h2>
                 
                  <div className="relative">
+                   <label htmlFor="post-job-address-input" className="sr-only">Job address or postcode</label>
                    <MapPin className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
                    <input 
+                     id="post-job-address-input"
+                     aria-labelledby="post-job-location-heading"
                      className="w-full p-4 pl-12 pr-12 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 bg-white transition-all text-sm font-medium placeholder:font-normal placeholder:text-slate-400"
                      placeholder="Enter job address..."
                      value={addressInput}
@@ -3354,8 +3361,9 @@ export default function PostJobWizard() {
 
                 <div className="grid grid-cols-2 gap-3 pt-2 border-t border-black mt-2">
                   <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1">House / Flat</label>
+                    <label htmlFor="post-job-house-flat" className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1 block">House / Flat</label>
                     <input 
+                      id="post-job-house-flat"
                       type="text" 
                       placeholder="e.g. 42 or Flat 3B"
                       className="w-full p-3.5 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 bg-white text-sm font-medium placeholder:text-slate-300"
@@ -3364,8 +3372,9 @@ export default function PostJobWizard() {
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1">City</label>
+                    <label htmlFor="post-job-city" className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1 block">City</label>
                     <input 
+                      id="post-job-city"
                       type="text" 
                       placeholder="Auto-filled"
                       className="w-full p-3.5 rounded-2xl border-none bg-slate-50 text-sm font-medium focus:outline-none cursor-not-allowed text-slate-500"
@@ -3404,6 +3413,8 @@ export default function PostJobWizard() {
                   {URGENCY_LEVELS.filter(level => !targetTradespersonId || level.id !== "emergency").map((level) => (
                     <button
                       key={level.id}
+                      type="button"
+                      aria-pressed={formData.urgency === level.id}
                       onClick={() => setFormData({ ...formData, urgency: level.id })}
                       className={cn(
                         "px-5 py-3 text-sm rounded-2xl border transition-all font-bold",
@@ -3421,9 +3432,11 @@ export default function PostJobWizard() {
                   <motion.div 
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
-                    className="pt-2"
+                    className="pt-2 space-y-1.5"
                   >
+                    <label htmlFor="post-job-specific-date" className="text-xs font-bold text-slate-600 block">Preferred Job Date</label>
                     <input 
+                      id="post-job-specific-date"
                       type="date" 
                       className="w-full p-4 rounded-2xl border border-black shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 bg-white transition-all font-medium text-slate-700"
                       value={formData.jobDate}
@@ -3703,7 +3716,7 @@ export default function PostJobWizard() {
                       )}
 
                       <div className="space-y-3 pt-6 border-t border-black">
-                        <h3 className="font-extrabold text-black flex items-center justify-center -mt-2 bg-white px-4 mx-auto w-max text-sm relative -top-6">Custom budget</h3>
+                        <label htmlFor="custom-budget-input" className="font-extrabold text-black flex items-center justify-center -mt-2 bg-white px-4 mx-auto w-max text-sm relative -top-6">Custom budget</label>
                         <div className="relative">
                           <span className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-500 text-xl font-bold">£</span>
                           <button 
@@ -3856,10 +3869,11 @@ export default function PostJobWizard() {
                       </div>
                       
                       <div className="space-y-4 bg-slate-100/50 p-6 rounded-3xl border border-black">
-                        <h3 className="text-xl font-black text-slate-900">Enter custom amount</h3>
+                        <label htmlFor="fallback-custom-budget-input" className="text-xl font-black text-slate-900 block">Enter custom amount</label>
                         <div className="relative">
                           <span className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-900 font-black text-xl">£</span>
                           <input
+                            id="fallback-custom-budget-input"
                             type="number"
                             placeholder="0.00"
                             className="w-full p-5 pl-12 rounded-2xl border border-black bg-white font-black text-xl focus:outline-none focus:ring-4 focus:ring-[#0084a5]/10 focus:border-[#0084a5] transition-all"
@@ -3968,11 +3982,20 @@ export default function PostJobWizard() {
                 <button 
                   onClick={() => {
                     const category = categories.find(c => c.name === formData.category);
-                    if (category && formData.subcategory && !category.subcategories.includes(formData.subcategory)) {
-                      addDoc(collection(db, "search_logs"), {
-                        query: formData.subcategory.toLowerCase(),
-                        timestamp: serverTimestamp()
-                      }).catch(err => console.error("Error logging custom subcategory:", err));
+                    if (category && formData.subcategory && !category.subcategories.includes(formData.subcategory) && user) {
+                      const cleanedSub = formData.subcategory.trim().toLowerCase().slice(0, 120);
+                      if (cleanedSub.length >= 2) {
+                        user.getIdToken().then((token) =>
+                          fetch("/api/telemetry/search-log", {
+                            method: "POST",
+                            headers: {
+                              "Content-Type": "application/json",
+                              Authorization: `Bearer ${token}`,
+                            },
+                            body: JSON.stringify({ query: cleanedSub, category: formData.category }),
+                          })
+                        ).catch(err => console.error("Error logging custom subcategory:", err));
+                      }
                     }
                     nextStep();
                   }}

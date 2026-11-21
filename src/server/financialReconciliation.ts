@@ -25,7 +25,9 @@ export type ReconciliationFindingCode =
   | "PAYOUT_TRANSFER_ID_MISSING"
   | "ESCROW_RELEASE_LEDGER_MISSING"
   | "ESCROW_RELEASE_TRANSFER_MISSING"
-  | "PAYOUT_ALLOCATION_EXCEEDED";
+  | "PAYOUT_ALLOCATION_EXCEEDED"
+  | "TRANSFER_REVERSED"
+  | "CONNECT_PAYOUT_FAILED";
 
 export interface ReconciliationLedgerSnapshot {
   entryId: string;
@@ -61,6 +63,19 @@ export interface ReconciliationTransferSnapshot {
   currency: string;
   destination?: string;
   metadata?: Record<string, string | undefined>;
+  reversed?: boolean;
+  amountReversed?: number;
+  reversalIds?: string[];
+}
+export interface ReconciliationConnectPayoutSnapshot {
+  payoutId: string;
+  stripeAccountId: string;
+  amount: number;
+  currency: string;
+  status: string;
+  failureCode?: string;
+  failureMessage?: string;
+  arrivalDate?: number;
 }
 export interface ReconciliationPayoutSnapshot {
   operationId: string;
@@ -92,6 +107,7 @@ export interface FinancialReconciliationSnapshot {
   refunds?: readonly ReconciliationRefundSnapshot[];
   transfers?: readonly ReconciliationTransferSnapshot[];
   payouts?: readonly ReconciliationPayoutSnapshot[];
+  connectPayouts?: readonly ReconciliationConnectPayoutSnapshot[];
   escrows?: readonly ReconciliationEscrowSnapshot[];
   refundedTotals?: readonly { paymentIntentId: string; amount: number }[];
   /** Explicit business-authorized caps; evaluator never infers a cap. */
@@ -126,6 +142,7 @@ export function evaluateFinancialReconciliation(
   const refunds = snapshot.refunds || [];
   const transfers = snapshot.transfers || [];
   const payouts = snapshot.payouts || [];
+  const connectPayouts = snapshot.connectPayouts || [];
   const escrows = snapshot.escrows || [];
   const totals = snapshot.refundedTotals || [];
 
@@ -260,9 +277,30 @@ export function evaluateFinancialReconciliation(
     }
   }
   for(const transfer of transfers) {
+    if (transfer.reversed === true || (typeof transfer.amountReversed === "number" && transfer.amountReversed > 0)) {
+      add(
+        "TRANSFER_REVERSED",
+        "critical",
+        transfer.transferId,
+        `Stripe transfer has been reversed (amountReversed=${Number(transfer.amountReversed || 0)}p).`,
+        [transfer.transferId, ...(transfer.reversalIds || [])]
+      );
+    }
     if(linkedTransferIds.has(transfer.transferId)) continue;
     const hasLedger=ledger.some(x=>x.stripeTransferId===transfer.transferId && (x.type==="ESCROW_RELEASE" || x.type==="PLATFORM_COMMISSION"));
     if(!hasLedger) add("TRANSFER_ORPHANED","warning",transfer.transferId,"Stripe transfer has no matching payout, escrow or transfer ledger reference.",[transfer.transferId]);
+  }
+  for (const cp of connectPayouts) {
+    const normalizedStatus = String(cp.status || "").trim().toLowerCase();
+    if (normalizedStatus === "failed" || normalizedStatus === "canceled") {
+      add(
+        "CONNECT_PAYOUT_FAILED",
+        "critical",
+        cp.payoutId,
+        `Downstream Connect bank payout ${cp.payoutId} on ${cp.stripeAccountId} ${normalizedStatus}${cp.failureCode ? ` (${cp.failureCode})` : ""}.`,
+        [cp.payoutId, cp.stripeAccountId]
+      );
+    }
   }
 
   const allocationByKey=new Map<string,number>();

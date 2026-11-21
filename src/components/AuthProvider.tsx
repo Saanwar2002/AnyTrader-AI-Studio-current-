@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
 import { Capacitor } from "@capacitor/core";
 import { auth, db, onAuthStateChanged, type FirebaseUser, doc, onSnapshot, handleFirestoreError, OperationType, logout, updateDoc, setDoc, addDoc, collection, serverTimestamp, signInWithGoogle, sendNotification } from "@/src/firebase";
 import { Loader2, ShieldAlert, LogOut } from "lucide-react";
@@ -8,6 +8,7 @@ import { UserProfile } from "../types";
 import { SessionReauthModal } from "./SessionReauthModal";
 import { isAuthorizedAdminEmail } from "../services/adminAuthSecurityService";
 import { checkAndNotifyTraderMatches } from "../services/traderNotificationEngine";
+import { purgeClientSessionOnUidTransition } from "../lib/sessionIsolation";
 
 export type SessionStatus = "active" | "expiring_soon" | "expired" | "invalid";
 
@@ -61,6 +62,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("active");
   const [lastHeartbeatAt, setLastHeartbeatAt] = useState<number | null>(null);
   const [showReauthModal, setShowReauthModal] = useState(false);
+  const activeUidRef = useRef<string | null>(null);
 
   // Lightweight, non-blocking token check
   const performHeartbeatCheck = useCallback(async (forceRefresh = false): Promise<boolean> => {
@@ -238,6 +240,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const authUnsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       clearTimeout(initFallbackTimer);
+
+      const nextUid = firebaseUser?.uid ?? null;
+      const prevUid = activeUidRef.current;
+      if (nextUid !== prevUid) {
+        activeUidRef.current = nextUid;
+        setProfile(null);
+        setShowReauthModal(false);
+        setSessionStatus("active");
+        setLastHeartbeatAt(null);
+        setIsTradeBotOpen(false);
+        purgeClientSessionOnUidTransition(prevUid, nextUid);
+        if (nextUid !== null) {
+          setLoading(true);
+        }
+      }
 
       // Security: Validate admin email
       let cachedConfig = null;

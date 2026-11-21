@@ -37,6 +37,8 @@ describe("Production Invariant Checks", () => {
       STRIPE_WEBHOOK_SECRET: "whsec_verylongsecurekey123456789",
       GEMINI_API_KEY: "AIzaSy_verylongsecurekey123456789",
       JWT_SECRET: "very_long_secure_jwt_secret_key_123456789",
+      CRON_SECRET: "very_long_secure_cron_secret_key_123456789",
+      FIRESTORE_DATABASE_ID: "ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a",
       ALLOW_MOCK_PAYMENTS: "false",
       APP_URL: "https://anytrader.com",
       ALLOWED_ORIGINS: "https://anytrader.com"
@@ -46,5 +48,24 @@ describe("Production Invariant Checks", () => {
     expect(report.overallStatus).toBe("GO");
     const failedChecks = report.checks.filter((c) => c.status === "FAIL");
     expect(failedChecks.length).toBe(0);
+  });
+
+  it("AT-CJ-AUTH-05: fails production gate when ALLOW_DEGRADED_AUTH=true in production", () => {
+    const fakeEnv = {
+      NODE_ENV: "production",
+      STRIPE_SECRET_KEY: "sk_live_verylongsecurekey123456789",
+      STRIPE_WEBHOOK_SECRET: "whsec_verylongsecurekey123456789",
+      GEMINI_API_KEY: "AIzaSy_verylongsecurekey123456789",
+      JWT_SECRET: "very_long_secure_jwt_secret_key_123456789",
+      ALLOW_MOCK_PAYMENTS: "false",
+      ALLOW_DEGRADED_AUTH: "true",
+      APP_URL: "https://anytrader.com",
+      ALLOWED_ORIGINS: "https://anytrader.com",
+    };
+
+    const report = runProductionChecks(fakeEnv as any, { collection: () => {} });
+    expect(report.overallStatus).toBe("NO_GO");
+    const degradedCheck = report.checks.find((c) => c.name === "Degraded Auth Gate");
+    expect(degradedCheck?.status).toBe("FAIL");
   });
 });

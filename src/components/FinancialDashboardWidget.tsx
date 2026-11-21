@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from "react";
-import { db, collection, query, where, onSnapshot, addDoc, handleFirestoreError, OperationType } from "@/src/firebase";
+import { db, collection, query, where, onSnapshot, handleFirestoreError, OperationType } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
-import { shareToWhatsApp, copyPrivacyShareLink } from "@/src/utils/shareUtils";
-import { PoundSterling, TrendingUp, FileText, Plus, Share2, CheckCircle2, Clock, Calculator, ShieldCheck, Download, AlertCircle, Award } from "lucide-react";
+import { shareToWhatsApp } from "@/src/utils/shareUtils";
+import { evaluateVatEligibility } from "@/src/lib/vatValidation";
+import { estimateUkSoleTraderTaxReserve } from "@/src/lib/ukTaxEstimator";
+import { PoundSterling, FileText, Plus, Share2, Clock, Calculator, AlertCircle, SlidersHorizontal } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { toast } from "sonner";
 
@@ -23,6 +25,8 @@ export function FinancialDashboardWidget() {
   const [vatRate, setVatRate] = useState<number>(20); // 20% UK VAT rate or 0% for non-VAT registered
   const [isVatRegistered, setIsVatRegistered] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [expenseRatioPct, setExpenseRatioPct] = useState<number>(25);
+  const [showTaxConfig, setShowTaxConfig] = useState<boolean>(false);
 
   useEffect(() => {
     if (!user) return;
@@ -56,9 +60,20 @@ export function FinancialDashboardWidget() {
     setItems(items.filter((_, i) => i !== index));
   };
 
+  // VAT eligibility validation (AT-CJ-INVOICE-06)
+  const vatEligibility = evaluateVatEligibility(profile as any);
+  const canChargeVat = vatEligibility.eligible;
+
+  useEffect(() => {
+    if (!canChargeVat && isVatRegistered) {
+      setIsVatRegistered(false);
+    }
+  }, [canChargeVat, isVatRegistered]);
+
   // Subtotal & VAT Calculations
   const subtotal = items.reduce((sum, item) => sum + item.amount, 0);
-  const vatAmount = isVatRegistered ? (subtotal * vatRate) / 100 : 0;
+  const effectiveVatRegistered = canChargeVat && isVatRegistered;
+  const vatAmount = effectiveVatRegistered ? (subtotal * vatRate) / 100 : 0;
   const totalAmount = subtotal + vatAmount;
 
   const handleCreateInvoice = async (e: React.FormEvent) => {
@@ -68,25 +83,39 @@ export function FinancialDashboardWidget() {
       toast.error("Please fill in client details and invoice amount");
       return;
     }
+    if (isVatRegistered && !canChargeVat) {
+      toast.error(vatEligibility.reason || "Verified UK VAT registration is required to issue VAT-itemized invoices.");
+      return;
+    }
 
     setIsSubmitting(true);
     try {
-      const docRef = await addDoc(collection(db, "invoices"), {
-        traderId: user.uid,
-        traderName: profile?.displayName || "TradeOS Specialist",
-        clientName: clientName.trim(),
-        clientAddress: clientAddress.trim(),
-        title: jobTitle.trim(),
-        items,
-        subtotal,
-        vatAmount,
-        vatRate: isVatRegistered ? vatRate : 0,
-        amount: totalAmount,
-        status: "unpaid", // 'paid' | 'unpaid' | 'overdue'
-        dueDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // 14-day payment term
-        createdAt: new Date().toISOString()
+      const token = await user.getIdToken();
+      const response = await fetch("/api/invoices/create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          clientName: clientName.trim(),
+          clientAddress: clientAddress.trim(),
+          title: jobTitle.trim(),
+          items: items.map((item) => ({
+            description: item.description.trim() || "Trade Service",
+            amount: Number(item.amount) || 0,
+          })),
+          includeVat: effectiveVatRegistered,
+          vatRate: effectiveVatRegistered ? vatRate : 0,
+        }),
       });
 
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.error || "Failed to create invoice");
+      }
+
+      const createdId = payload?.invoice?.id || payload?.id || "";
       toast.success("Invoice created successfully!");
       setShowCreateInvoice(false);
       setClientName("");
@@ -96,13 +125,13 @@ export function FinancialDashboardWidget() {
       // Trigger WhatsApp share offer
       shareToWhatsApp({
         type: "invoice",
-        id: docRef.id,
+        id: createdId,
         title: jobTitle.trim(),
-        amount: totalAmount
+        amount: payload?.invoice?.amount ?? totalAmount,
       });
-    } catch (err) {
+    } catch (err: any) {
       handleFirestoreError(err, OperationType.CREATE, "invoices");
-      toast.error("Failed to create invoice");
+      toast.error(err?.message || "Failed to create invoice");
     } finally {
       setIsSubmitting(false);
     }
@@ -112,11 +141,11 @@ export function FinancialDashboardWidget() {
   const totalEarned = invoices.filter(i => i.status === "paid").reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
   const pendingInvoices = invoices.filter(i => i.status === "unpaid").reduce((sum, i) => sum + (Number(i.amount) || 0), 0);
 
-  // UK Self-Assessment Tax Estimation (Rough guide for UK Sole Traders)
-  const estimatedTaxableProfit = Math.max(0, totalEarned * 0.75); // Assume 25% average allowable trade expense deduction
-  const personalAllowance = 12570;
-  const taxableAboveAllowance = Math.max(0, estimatedTaxableProfit - personalAllowance);
-  const estimatedTaxAndNI = Math.round(taxableAboveAllowance * 0.28); // 20% Income Tax + Class 4 NI approx
+  // Banded UK Self-Assessment Tax & Class 4 NI Estimation (AT-CJ-FIN-01)
+  const taxEstimate = estimateUkSoleTraderTaxReserve({
+    grossPaidGbp: totalEarned,
+    expenseRatioPct,
+  });
 
   return (
     <div className="space-y-4">
@@ -132,26 +161,97 @@ export function FinancialDashboardWidget() {
           </div>
         </div>
 
-        <div className="p-4 bg-white text-slate-900 rounded-3xl border border-black shadow-sm flex items-center justify-between">
+        <div className="p-4 bg-white text-black rounded-3xl border border-black shadow-sm flex items-center justify-between">
           <div>
-            <p className="text-[10px] font-extrabold uppercase text-slate-500">Outstanding Invoices</p>
+            <p className="text-[10px] font-extrabold uppercase text-black">Outstanding Invoices</p>
             <p className="text-2xl font-black text-amber-600 mt-1">£{pendingInvoices.toLocaleString('en-GB')}</p>
           </div>
-          <div className="p-3 bg-amber-50 text-amber-600 rounded-2xl border border-amber-200">
+          <div className="p-3 bg-amber-50 text-amber-600 rounded-2xl border border-black">
             <Clock className="w-6 h-6" />
           </div>
         </div>
 
-        <div className="p-4 bg-purple-50 text-purple-950 rounded-3xl border border-purple-200 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-[10px] font-extrabold uppercase text-purple-700">Est. Tax & NI Reserve</p>
-            <p className="text-2xl font-black text-purple-900 mt-1">£{estimatedTaxAndNI.toLocaleString('en-GB')}</p>
+        <div className="p-4 bg-purple-50 text-black rounded-3xl border border-black shadow-sm flex flex-col justify-between gap-2">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-[10px] font-extrabold uppercase text-black">Est. Tax & NI Reserve (Guide)</p>
+              <p className="text-2xl font-black text-black mt-1">
+                £{taxEstimate.totalEstimatedReserveGbp.toLocaleString('en-GB')}
+              </p>
+            </div>
+            <div className="p-3 bg-purple-200/60 text-black rounded-2xl border border-black">
+              <Calculator className="w-6 h-6" />
+            </div>
           </div>
-          <div className="p-3 bg-purple-200/60 text-purple-800 rounded-2xl">
-            <Calculator className="w-6 h-6" />
+          <div className="flex items-center justify-between text-[10px] font-bold text-black pt-1 border-t border-black/15">
+            <span>
+              IT: £{taxEstimate.incomeTaxGbp.toLocaleString('en-GB')} • NI4: £{taxEstimate.class4NiGbp.toLocaleString('en-GB')}
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowTaxConfig((v) => !v)}
+              className="inline-flex items-center gap-1 underline font-extrabold text-black cursor-pointer"
+            >
+              <SlidersHorizontal className="w-3 h-3" />
+              {showTaxConfig ? "Hide" : `${taxEstimate.expenseRatioPct}% exp`}
+            </button>
           </div>
         </div>
       </div>
+
+      {/* Configurable UK Sole-Trader Tax Estimator & Disclaimer */}
+      {showTaxConfig && (
+        <div className="p-4 bg-purple-50 text-black rounded-3xl border border-black shadow-sm space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h4 className="text-xs font-black uppercase text-black">
+                UK Sole-Trader Tax & Class 4 NI Estimate
+              </h4>
+              <p className="text-[11px] font-bold text-black mt-0.5">
+                {taxEstimate.taxBandLabel} • Effective reserve: {taxEstimate.effectiveReserveRatePct}% of gross paid
+              </p>
+            </div>
+            <label className="flex items-center gap-2 text-xs font-extrabold text-black">
+              <span>Est. Trade Expenses (%):</span>
+              <input
+                type="number"
+                min={0}
+                max={85}
+                step={1}
+                value={expenseRatioPct}
+                onChange={(e) => {
+                  const val = Math.max(0, Math.min(85, Number(e.target.value) || 0));
+                  setExpenseRatioPct(val);
+                }}
+                className="w-16 p-1.5 rounded-xl border border-black bg-white text-black text-xs font-black text-right"
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+            <div className="p-2.5 bg-white rounded-2xl border border-black">
+              <p className="text-[10px] font-bold uppercase text-black">Est. Expenses</p>
+              <p className="font-black text-black">£{taxEstimate.estimatedExpensesGbp.toLocaleString('en-GB')}</p>
+            </div>
+            <div className="p-2.5 bg-white rounded-2xl border border-black">
+              <p className="text-[10px] font-bold uppercase text-black">Est. Taxable Profit</p>
+              <p className="font-black text-black">£{taxEstimate.estimatedTaxableProfitGbp.toLocaleString('en-GB')}</p>
+            </div>
+            <div className="p-2.5 bg-white rounded-2xl border border-black">
+              <p className="text-[10px] font-bold uppercase text-black">Income Tax (20–45%)</p>
+              <p className="font-black text-black">£{taxEstimate.incomeTaxGbp.toLocaleString('en-GB')}</p>
+            </div>
+            <div className="p-2.5 bg-white rounded-2xl border border-black">
+              <p className="text-[10px] font-bold uppercase text-black">Class 4 NI (6% / 2%)</p>
+              <p className="font-black text-black">£{taxEstimate.class4NiGbp.toLocaleString('en-GB')}</p>
+            </div>
+          </div>
+
+          <p className="text-[11px] font-medium text-black leading-relaxed">
+            {taxEstimate.disclaimer}
+          </p>
+        </div>
+      )}
 
       {/* Invoice Management Header & Action */}
       <div className="p-5 bg-white rounded-3xl border border-black shadow-sm space-y-4">
@@ -334,33 +434,48 @@ export function FinancialDashboardWidget() {
                     </div>
                   </div>
 
-                  {/* VAT Toggle */}
-                  <div className="p-3 bg-slate-50 border border-black rounded-2xl flex items-center justify-between gap-3">
-                    <label className="text-xs font-extrabold text-slate-900 flex items-center gap-2 cursor-pointer select-none">
-                      <input
-                        type="checkbox"
-                        checked={isVatRegistered}
-                        onChange={(e) => setIsVatRegistered(e.target.checked)}
-                        className="w-4 h-4 text-blue-600 rounded border-black focus:ring-blue-500"
-                      />
-                      <span>Include UK VAT (20%)</span>
-                    </label>
-                    {isVatRegistered && (
-                      <span className="text-xs font-black text-blue-600 whitespace-nowrap">
-                        +£{vatAmount.toFixed(2)} VAT
-                      </span>
+                  {/* VAT Toggle (Locked unless verified UK VAT registration is on profile) */}
+                  <div className="p-3 bg-slate-50 border border-black rounded-2xl space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <label className={`text-xs font-extrabold text-black flex items-center gap-2 select-none ${canChargeVat ? "cursor-pointer" : "opacity-60 cursor-not-allowed"}`}>
+                        <input
+                          type="checkbox"
+                          checked={effectiveVatRegistered}
+                          disabled={!canChargeVat}
+                          onChange={(e) => {
+                            if (!canChargeVat) {
+                              toast.error(vatEligibility.reason || "Verified UK VAT registration is required.");
+                              return;
+                            }
+                            setIsVatRegistered(e.target.checked);
+                          }}
+                          className="w-4 h-4 text-blue-600 rounded border-black focus:ring-blue-500 disabled:opacity-50"
+                        />
+                        <span>Include UK VAT (20%)</span>
+                      </label>
+                      {effectiveVatRegistered && (
+                        <span className="text-xs font-black text-blue-700 whitespace-nowrap">
+                          +£{vatAmount.toFixed(2)} VAT ({vatEligibility.vatNumber})
+                        </span>
+                      )}
+                    </div>
+                    {!canChargeVat && (
+                      <div className="p-2 bg-amber-50 border border-black rounded-xl flex items-start gap-2 text-[11px] font-bold text-black">
+                        <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                        <span>{vatEligibility.reason || "Add a verified UK VAT number in Profile settings before issuing VAT-itemized invoices."}</span>
+                      </div>
                     )}
                   </div>
 
                   {/* Total Amount Summary */}
-                  <div className="p-3.5 bg-blue-50/80 border border-blue-200 rounded-2xl flex items-center justify-between">
+                  <div className="p-3.5 bg-blue-50/80 border border-black rounded-2xl flex items-center justify-between">
                     <div className="min-w-0">
-                      <span className="text-xs font-black text-blue-950 block">Total Invoice Amount</span>
-                      <span className="text-[10px] text-blue-700 font-bold">
-                        Subtotal: £{subtotal.toFixed(2)} {isVatRegistered ? `+ £${vatAmount.toFixed(2)} VAT` : '(No VAT)'}
+                      <span className="text-xs font-black text-black block">Total Invoice Amount</span>
+                      <span className="text-[10px] text-black font-bold">
+                        Subtotal: £{subtotal.toFixed(2)} {effectiveVatRegistered ? `+ £${vatAmount.toFixed(2)} VAT` : '(No VAT)'}
                       </span>
                     </div>
-                    <span className="text-xl sm:text-2xl font-black text-blue-950 shrink-0 ml-2">£{totalAmount.toFixed(2)}</span>
+                    <span className="text-xl sm:text-2xl font-black text-black shrink-0 ml-2">£{totalAmount.toFixed(2)}</span>
                   </div>
                 </div>
 

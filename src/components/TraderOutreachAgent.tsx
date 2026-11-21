@@ -15,6 +15,7 @@ import {
   HomeownerOutreachCampaign
 } from "../services/aiAgentEcosystemService";
 import { cn } from "@/src/lib/utils";
+import { useAuth } from "./AuthProvider";
 
 const SAMPLE_PROSPECT_LEADS: TraderProspectLead[] = [
   {
@@ -65,36 +66,66 @@ const SAMPLE_PROSPECT_LEADS: TraderProspectLead[] = [
 ];
 
 export default function TraderOutreachAgent() {
-  const [leads, setLeads] = useState<TraderProspectLead[]>(() => {
-    const saved = localStorage.getItem("anytrader_outreach_leads");
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.warn("Failed to parse saved outreach leads:", e);
-      }
+  const { user } = useAuth();
+  const activeAdminUid = user?.uid || null;
+
+  // AT-OUTREACH-01: Scope all prospect outreach state strictly to active authenticated admin UID in sessionStorage
+  const buildScopedKey = (suffix: string, uid: string | null) =>
+    uid ? `anytrader_outreach_${uid}_${suffix}` : null;
+
+  const readScopedSession = <T,>(suffix: string, uid: string | null, fallback: T): T => {
+    const key = buildScopedKey(suffix, uid);
+    if (!key || typeof sessionStorage === "undefined") return fallback;
+    try {
+      const saved = sessionStorage.getItem(key);
+      if (saved !== null) return JSON.parse(saved) as T;
+    } catch (e) {
+      console.warn(`Failed to parse scoped outreach ${suffix}:`, e);
     }
-    return SAMPLE_PROSPECT_LEADS;
-  });
+    return fallback;
+  };
+
+  const defaultTargetedSchedule = () => {
+    const defaultEnd = new Date();
+    defaultEnd.setDate(defaultEnd.getDate() + 14);
+    return {
+      enabled: true,
+      postcodes: ["M1", "M2", "M3", "M14", "M20", "SE1", "EC1", "B1"],
+      startDate: new Date().toISOString().split("T")[0],
+      endDate: defaultEnd.toISOString().split("T")[0],
+      targetAudience: "all" as const,
+      campaignName: "Greater Manchester & London Sector Blitz"
+    };
+  };
+
+  const defaultAutopilotLogs = () => ([
+    { id: "log-1", timestamp: new Date().toLocaleTimeString(), message: "🤖 Autopilot Engine initialized. Scoped to authenticated admin session.", type: "info" as const },
+    { id: "log-2", timestamp: new Date().toLocaleTimeString(), message: "⚡ Server-backed outbound queue ready for audited dispatch.", type: "success" as const }
+  ]);
+
+  const [leads, setLeads] = useState<TraderProspectLead[]>(() =>
+    readScopedSession("leads", activeAdminUid, SAMPLE_PROSPECT_LEADS)
+  );
 
   // Autopilot Engine State
-  const [isAutopilotEnabled, setIsAutopilotEnabled] = useState<boolean>(() => {
-    const saved = localStorage.getItem("anytrader_outreach_autopilot_enabled");
-    return saved !== null ? JSON.parse(saved) : true;
-  });
+  const [isAutopilotEnabled, setIsAutopilotEnabled] = useState<boolean>(() =>
+    readScopedSession("autopilot_enabled", activeAdminUid, false)
+  );
 
-  const [autopilotLogs, setAutopilotLogs] = useState<Array<{ id: string; timestamp: string; message: string; type: "info" | "success" | "action" }>>(() => {
-    const saved = localStorage.getItem("anytrader_outreach_autopilot_logs");
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {}
-    }
-    return [
-      { id: "log-1", timestamp: new Date().toLocaleTimeString(), message: "🤖 Autopilot Engine initialized. Scanning local directories...", type: "info" },
-      { id: "log-2", timestamp: new Date().toLocaleTimeString(), message: "⚡ Independent campaign generator standby for Yellow Pages & Yell listings.", type: "success" }
-    ];
-  });
+  const [autopilotLogs, setAutopilotLogs] = useState<Array<{ id: string; timestamp: string; message: string; type: "info" | "success" | "action" }>>(() =>
+    readScopedSession("autopilot_logs", activeAdminUid, defaultAutopilotLogs())
+  );
+
+  const [serverQueueItems, setServerQueueItems] = useState<Array<{
+    id: string;
+    leadId: string;
+    businessName: string;
+    channel: string;
+    recipient: string;
+    deliveryStatus: string;
+    providerNotice: string;
+    createdAt: string;
+  }>>([]);
 
   const [autopilotSettings, setAutopilotSettings] = useState({
     autoGeneratePacks: true,
@@ -111,24 +142,7 @@ export default function TraderOutreachAgent() {
     endDate: string;
     targetAudience: "all" | "traders_b2b" | "homeowners_b2c";
     campaignName: string;
-  }>(() => {
-    const saved = localStorage.getItem("anytrader_outreach_targeted_schedule");
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {}
-    }
-    const defaultEnd = new Date();
-    defaultEnd.setDate(defaultEnd.getDate() + 14);
-    return {
-      enabled: true,
-      postcodes: ["M1", "M2", "M3", "M14", "M20", "SE1", "EC1", "B1"],
-      startDate: new Date().toISOString().split("T")[0],
-      endDate: defaultEnd.toISOString().split("T")[0],
-      targetAudience: "all",
-      campaignName: "Greater Manchester & London Sector Blitz"
-    };
-  });
+  }>(() => readScopedSession("targeted_schedule", activeAdminUid, defaultTargetedSchedule()));
 
   const [newPostcodeInput, setNewPostcodeInput] = useState("");
 
@@ -139,9 +153,43 @@ export default function TraderOutreachAgent() {
   const [adminTestType, setAdminTestType] = useState<"trader" | "homeowner" | "both">("both");
   const [testDispatchSuccessNotice, setTestDispatchSuccessNotice] = useState<string | null>(null);
 
+  // AT-OUTREACH-01: Reload/reset outreach state cleanly whenever the authenticated admin UID changes or signs out
   useEffect(() => {
-    localStorage.setItem("anytrader_outreach_targeted_schedule", JSON.stringify(targetedSchedule));
-  }, [targetedSchedule]);
+    if (!activeAdminUid) {
+      setLeads([]);
+      setIsAutopilotEnabled(false);
+      setAutopilotLogs([]);
+      setServerQueueItems([]);
+      setTargetedSchedule(defaultTargetedSchedule());
+      return;
+    }
+    setLeads(readScopedSession("leads", activeAdminUid, SAMPLE_PROSPECT_LEADS));
+    setIsAutopilotEnabled(readScopedSession("autopilot_enabled", activeAdminUid, false));
+    setAutopilotLogs(readScopedSession("autopilot_logs", activeAdminUid, defaultAutopilotLogs()));
+    setTargetedSchedule(readScopedSession("targeted_schedule", activeAdminUid, defaultTargetedSchedule()));
+
+    // Load durable server outbound queue items
+    user?.getIdToken().then(async (token) => {
+      try {
+        const res = await fetch("/api/admin/outreach/queue?limit=30", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && Array.isArray(data?.items)) {
+          setServerQueueItems(data.items);
+        }
+      } catch {
+        // Non-blocking initial queue fetch
+      }
+    }).catch(() => {});
+  }, [activeAdminUid]);
+
+  useEffect(() => {
+    const key = buildScopedKey("targeted_schedule", activeAdminUid);
+    if (key && typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(key, JSON.stringify(targetedSchedule));
+    }
+  }, [targetedSchedule, activeAdminUid]);
 
   const addTargetPostcode = () => {
     if (!newPostcodeInput.trim()) return;
@@ -246,19 +294,27 @@ export default function TraderOutreachAgent() {
     }
   };
 
-  // Sync leads to localStorage
+  // AT-OUTREACH-01: Sync outreach state strictly to UID-scoped sessionStorage (never global localStorage)
   useEffect(() => {
-    localStorage.setItem("anytrader_outreach_leads", JSON.stringify(leads));
-  }, [leads]);
-
-  // Sync autopilot state to localStorage
-  useEffect(() => {
-    localStorage.setItem("anytrader_outreach_autopilot_enabled", JSON.stringify(isAutopilotEnabled));
-  }, [isAutopilotEnabled]);
+    const key = buildScopedKey("leads", activeAdminUid);
+    if (key && typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(key, JSON.stringify(leads));
+    }
+  }, [leads, activeAdminUid]);
 
   useEffect(() => {
-    localStorage.setItem("anytrader_outreach_autopilot_logs", JSON.stringify(autopilotLogs.slice(0, 30)));
-  }, [autopilotLogs]);
+    const key = buildScopedKey("autopilot_enabled", activeAdminUid);
+    if (key && typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(key, JSON.stringify(isAutopilotEnabled));
+    }
+  }, [isAutopilotEnabled, activeAdminUid]);
+
+  useEffect(() => {
+    const key = buildScopedKey("autopilot_logs", activeAdminUid);
+    if (key && typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(key, JSON.stringify(autopilotLogs.slice(0, 30)));
+    }
+  }, [autopilotLogs, activeAdminUid]);
 
   const addAutopilotLog = (message: string, type: "info" | "success" | "action" = "info") => {
     setAutopilotLogs(prev => [
@@ -319,11 +375,46 @@ export default function TraderOutreachAgent() {
         if (allUnprocessed.length > 0 && targetedSchedule.enabled) {
           addAutopilotLog(`📍 Autopilot Target Filter: ${allUnprocessed.length} pending lead(s) fall outside active target postcodes [${targetedSchedule.postcodes.join(", ")}].`, "info");
         } else if (autopilotSettings.autoFollowUpAlerts) {
-          // 2. Auto-check sequences & queue reminders
+          // AT-OUTREACH-02: Persist outbound dispatch into durable server queue with honest delivery status
           const draftedLeads = leads.filter(l => l.status === "campaign_drafted");
-          if (draftedLeads.length > 0 && Math.random() > 0.6) {
-            const sample = draftedLeads[Math.floor(Math.random() * draftedLeads.length)];
-            addAutopilotLog(`📩 Autopilot: Enqueued Strategy 1 WhatsApp & Email pitch for "${sample.businessName}" (${sample.phone}).`, "info");
+          if (draftedLeads.length > 0 && user) {
+            const sample = draftedLeads[0];
+            const idToken = await user.getIdToken();
+            const channel = sample.email ? "email" : "whatsapp";
+            const recipient = sample.email || sample.phone;
+            const body =
+              sample.aiOutreachPack?.emailBody ||
+              sample.aiOutreachPack?.whatsappMessage ||
+              `Outreach draft for ${sample.businessName}`;
+            const queueRes = await fetch("/api/admin/outreach/enqueue", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${idToken}`,
+              },
+              body: JSON.stringify({
+                leadId: sample.id,
+                businessName: sample.businessName,
+                channel,
+                recipient,
+                subject: sample.aiOutreachPack?.emailSubject || `AnyTrader Invite — ${sample.businessName}`,
+                body,
+                campaignName: targetedSchedule.campaignName,
+              }),
+            });
+            const queueData = await queueRes.json().catch(() => ({}));
+            if (queueRes.ok && queueData?.record) {
+              setServerQueueItems((prev) => [queueData.record, ...prev].slice(0, 50));
+              addAutopilotLog(
+                `📩 Server Queue [${queueData.record.deliveryStatus}]: "${sample.businessName}" (${channel}) — ${queueData.record.providerNotice}`,
+                queueData.record.deliveryStatus === "queued" ? "success" : "info"
+              );
+            } else {
+              addAutopilotLog(
+                `⚠️ Outbound queue rejected dispatch for "${sample.businessName}": ${queueData?.error || "Server unavailable"}`,
+                "info"
+              );
+            }
           }
         }
       }

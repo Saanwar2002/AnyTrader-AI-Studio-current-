@@ -20,30 +20,31 @@ export const bootstrapProfileSchema = z.object({
   county: z.string().trim().max(80).optional(),
   trades: z.array(z.string().max(80)).max(20).default([]),
   subcategories: z.array(z.string().max(80)).max(50).default([]),
-  businessLayer: z.enum(["trades", "properties", "consultancy"]).nullish(),
+  businessLayer: z.enum(["trades", "field_services", "properties", "consultancy"]).nullish(),
   businessCategory: z.string().max(80).nullish(),
   vehicleCategories: z.array(z.string().max(40)).max(10).nullish(),
   isPetFriendly: z.boolean().optional(),
   referrerUid: z.string().max(128).nullish(),
+  referralCode: z.string().trim().max(64).nullish(),
   affiliateCode: z.string().max(64).nullish(),
 }).strict();
 
 export function capabilitiesFor(
   role: SelfServiceRole,
-  businessLayer?: "trades" | "properties" | "consultancy" | null
+  businessLayer?: "trades" | "field_services" | "properties" | "consultancy" | null
 ): string[] {
   switch (role) {
     case "business":
-      return [
-        "contractor",
-        "tradesperson",
-        "homeowner",
-        ...(businessLayer === "properties"
-          ? ["landlord", "property_manager", "estate_agent"]
-          : businessLayer === "consultancy"
-          ? ["consultant"]
-          : []),
-      ];
+      if (businessLayer === "trades" || businessLayer === "field_services") {
+        return ["contractor", "tradesperson", "homeowner"];
+      }
+      if (businessLayer === "properties") {
+        return ["homeowner", "landlord", "property_manager", "estate_agent"];
+      }
+      if (businessLayer === "consultancy") {
+        return ["homeowner", "consultant"];
+      }
+      return ["homeowner"];
     case "fleet_driver":
       return ["fleet_driver", "homeowner"];
     case "tradesperson":
@@ -101,6 +102,70 @@ export async function executeBootstrapProfileCommand(
       ? "Business Professional"
       : "Standard Driver";
 
+  // AT-REF-02: Server-authoritative referral & affiliate attribution lookup.
+  // Never trust arbitrary client-supplied referrerUid; resolve and verify against active DB records.
+  let verifiedReferredBy: string | null = null;
+  let verifiedAffiliateId: string | null = null;
+  const rawAttributionCode = (input.referralCode || input.affiliateCode || "").trim();
+
+  if (rawAttributionCode.length >= 3) {
+    try {
+      const affSnap = await firestoreDb
+        .collection("affiliates")
+        .where("code", "==", rawAttributionCode.toLowerCase())
+        .limit(1)
+        .get();
+      if (affSnap && !affSnap.empty) {
+        const affDoc = affSnap.docs[0];
+        const affData = typeof affDoc.data === "function" ? affDoc.data() : affDoc.data;
+        if (!affData?.status || affData.status === "active") {
+          verifiedAffiliateId = affDoc.id;
+        }
+      }
+
+      if (!verifiedAffiliateId) {
+        const refSnap = await firestoreDb
+          .collection("users")
+          .where("referralCode", "==", rawAttributionCode.toUpperCase())
+          .limit(1)
+          .get();
+        if (refSnap && !refSnap.empty) {
+          const refDoc = refSnap.docs[0];
+          const refData = typeof refDoc.data === "function" ? refDoc.data() : refDoc.data;
+          const isSelfReferral = refDoc.id === caller.uid;
+          const isInactiveReferrer =
+            refData?.isSuspended === true ||
+            refData?.isFrozen === true ||
+            refData?.banned === true ||
+            refData?.isDisabled === true;
+          if (!isSelfReferral && !isInactiveReferrer) {
+            verifiedReferredBy = refDoc.id;
+          }
+        }
+      }
+    } catch (refErr: any) {
+      console.warn("[executeBootstrapProfileCommand] Referral attribution verification skipped:", refErr?.message);
+    }
+  } else if (input.referrerUid && input.referrerUid !== caller.uid) {
+    // Legacy client compatibility: only accept if the referenced user exists, is active, and is not self
+    try {
+      const refDoc = await firestoreDb.collection("users").doc(input.referrerUid).get();
+      if (refDoc && refDoc.exists) {
+        const refData = typeof refDoc.data === "function" ? refDoc.data() : refDoc.data;
+        const isInactiveReferrer =
+          refData?.isSuspended === true ||
+          refData?.isFrozen === true ||
+          refData?.banned === true ||
+          refData?.isDisabled === true;
+        if (!isInactiveReferrer) {
+          verifiedReferredBy = refDoc.id;
+        }
+      }
+    } catch {
+      // Fail closed to null attribution if lookup cannot be verified
+    }
+  }
+
   const userProfileData: Record<string, any> = {
     uid: caller.uid,
     id: caller.uid,
@@ -132,8 +197,8 @@ export async function executeBootstrapProfileCommand(
     joinedDuringBeta: true,
     phantomFeesSaved: 0,
     referralCode: caller.uid.slice(0, 8).toUpperCase(),
-    referredBy: input.referrerUid ?? null,
-    affiliateId: input.affiliateCode ?? null,
+    referredBy: verifiedReferredBy,
+    affiliateId: verifiedAffiliateId,
     vehicleCategories: isDriver ? (input.vehicleCategories ?? null) : null,
     isPetFriendly: isDriver ? (input.isPetFriendly ?? false) : false,
     ipAddress: clientIp || "unknown",
@@ -150,8 +215,8 @@ export async function executeBootstrapProfileCommand(
 
       transaction.set(userRef, userProfileData);
 
-      // Sync sanitized non-PII public profile projection for tradesperson / business
-      if (input.role === "tradesperson" || input.role === "business") {
+      // Sync sanitized non-PII public profile projection only for verified-eligible trade execution roles
+      if (canonicalCapabilities.includes("tradesperson")) {
         transaction.set(
           publicProfileRef,
           {

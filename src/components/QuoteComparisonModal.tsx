@@ -9,6 +9,7 @@ import { cn } from "@/src/lib/utils";
 import { getTraderBadges, BadgeOverlay } from "@/src/lib/badges";
 import { calculateTraderMatchScore } from "@/src/services/matchingEngine";
 import BnplFinancingModal from "./BnplFinancingModal";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 
 interface QuoteComparisonModalProps {
   isOpen: boolean;
@@ -44,6 +45,11 @@ export default function QuoteComparisonModal({
 
   // Video preview state
   const [activeVideoUrl, setActiveVideoUrl] = React.useState<string | null>(null);
+  const [confirmAcceptId, setConfirmAcceptId] = React.useState<string | null>(null);
+
+  // AT-A11Y-03: Escape-to-close and focus restoration
+  const mainDialogRef = useDialogA11y<HTMLDivElement>(isOpen && !showBnplModal && !activeVideoUrl, onClose);
+  const videoDialogRef = useDialogA11y<HTMLDivElement>(Boolean(activeVideoUrl), () => setActiveVideoUrl(null));
 
   if (!isOpen) return null;
 
@@ -129,10 +135,15 @@ export default function QuoteComparisonModal({
             onClick={onClose}
           />
           <motion.div
+            ref={mainDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="quote-comparison-modal-title"
+            tabIndex={-1}
             initial={{ opacity: 0, scale: 0.96, y: 15 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.96, y: 15 }}
-            className="fixed inset-2 sm:inset-6 md:inset-10 z-50 bg-slate-100 rounded-[2rem] sm:rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col border border-white/30"
+            className="fixed inset-2 sm:inset-6 md:inset-10 z-50 bg-slate-100 rounded-[2rem] sm:rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col border border-white/30 focus:outline-none"
           >
             {/* Header with View Mode Switcher */}
             <div className="py-3 px-4 md:px-6 bg-white border-b border-black flex flex-wrap items-center justify-between gap-3 shrink-0 shadow-2xs">
@@ -141,7 +152,7 @@ export default function QuoteComparisonModal({
                   {sortedQuotes.length}
                 </div>
                 <div>
-                  <h2 className="text-base sm:text-lg font-black text-slate-900 leading-tight">Compare Received Quotes</h2>
+                  <h2 id="quote-comparison-modal-title" className="text-base sm:text-lg font-black text-slate-900 leading-tight">Compare Received Quotes</h2>
                   <p className="text-[11px] font-bold text-slate-500">
                     {job?.title || "Homeowner Job Quotes"}
                   </p>
@@ -150,8 +161,10 @@ export default function QuoteComparisonModal({
 
               {/* Controls: Mode Switcher & Close */}
               <div className="flex items-center gap-2">
-                <div className="bg-slate-100 p-1 rounded-2xl border border-black flex items-center gap-1">
+                <div className="bg-slate-100 p-1 rounded-2xl border border-black flex items-center gap-1" role="group" aria-label="Quote view mode">
                   <button
+                    type="button"
+                    aria-pressed={viewMode === "cards"}
                     onClick={() => setViewMode("cards")}
                     className={cn(
                       "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5",
@@ -164,6 +177,8 @@ export default function QuoteComparisonModal({
                     <span className="hidden sm:inline">Cards</span>
                   </button>
                   <button
+                    type="button"
+                    aria-pressed={viewMode === "matrix"}
                     onClick={() => setViewMode("matrix")}
                     className={cn(
                       "px-3 py-1.5 rounded-xl text-xs font-black transition-all flex items-center gap-1.5",
@@ -178,7 +193,9 @@ export default function QuoteComparisonModal({
                 </div>
 
                 <button 
-                  onClick={onClose} 
+                  type="button"
+                  onClick={onClose}
+                  aria-label="Close quote comparison modal"
                   className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-600 hover:text-slate-900 border border-black"
                 >
                   <X className="w-5 h-5" />
@@ -506,7 +523,11 @@ export default function QuoteComparisonModal({
                                 ))}
                               </div>
 
+                              <label htmlFor={`quote-revision-${quote.id}`} className="sr-only">
+                                Re-quote revision message
+                              </label>
                               <textarea
+                                id={`quote-revision-${quote.id}`}
                                 value={revisionMessage}
                                 onChange={(e) => setRevisionMessage(e.target.value)}
                                 placeholder="State specific modifications needed..."
@@ -514,12 +535,14 @@ export default function QuoteComparisonModal({
                               />
                               <div className="flex gap-2">
                                 <button
+                                  type="button"
                                   onClick={() => setRequestingRevisionId(null)}
                                   className="flex-1 py-2 text-[10px] font-black text-slate-600 bg-white border border-slate-300 rounded-xl hover:bg-slate-100"
                                 >
                                   CANCEL
                                 </button>
                                 <button
+                                  type="button"
                                   onClick={() => handleRequestRevision(quote)}
                                   disabled={isSubmitting || !revisionMessage.trim()}
                                   className="flex-[2] py-2 text-[10px] font-black text-white bg-amber-600 rounded-xl hover:bg-amber-700 disabled:opacity-50"
@@ -538,21 +561,29 @@ export default function QuoteComparisonModal({
                               ) : (
                                 <div className="flex flex-col gap-2">
                                   <button 
+                                    type="button"
                                     disabled={isSubmitting || isAcceptingId === quote.id}
                                     onClick={async () => {
-                                      if (window.confirm(`Are you sure you want to accept the quote from ${tpProfile?.name || 'this trader'} for £${quote.amount}?`)) {
-                                        try {
-                                          setIsAcceptingId(quote.id);
-                                          await onAccept(quote);
-                                          onClose();
-                                        } catch (err) {
-                                          setIsAcceptingId(null);
-                                        }
+                                      if (confirmAcceptId !== quote.id) {
+                                        setConfirmAcceptId(quote.id);
+                                        return;
+                                      }
+                                      try {
+                                        setIsAcceptingId(quote.id);
+                                        setConfirmAcceptId(null);
+                                        await onAccept(quote);
+                                        onClose();
+                                      } catch (err) {
+                                        setIsAcceptingId(null);
                                       }
                                     }}
                                     className="w-full bg-[#1e3a5f] text-white p-3.5 rounded-2xl font-black hover:bg-blue-900 transition-all shadow-md active:scale-95 disabled:opacity-50 text-xs tracking-wider"
                                   >
-                                    {isAcceptingId === quote.id ? "ACCEPTING..." : "ACCEPT QUOTE"}
+                                    {isAcceptingId === quote.id
+                                      ? "ACCEPTING..."
+                                      : confirmAcceptId === quote.id
+                                      ? `CONFIRM ACCEPT £${quote.amount}`
+                                      : "ACCEPT QUOTE"}
                                   </button>
                                   {quote.status === "pending" && (
                                     <button 
@@ -750,15 +781,19 @@ export default function QuoteComparisonModal({
                                 </span>
                               ) : (
                                 <button
+                                  type="button"
                                   onClick={async () => {
-                                    if (window.confirm(`Accept quote from ${tpProfile?.name || 'trader'} for £${quote.amount}?`)) {
-                                      await onAccept(quote);
-                                      onClose();
+                                    if (confirmAcceptId !== quote.id) {
+                                      setConfirmAcceptId(quote.id);
+                                      return;
                                     }
+                                    setConfirmAcceptId(null);
+                                    await onAccept(quote);
+                                    onClose();
                                   }}
                                   className="bg-[#1e3a5f] hover:bg-blue-900 text-white font-black px-4 py-2 rounded-xl text-xs shadow-2xs"
                                 >
-                                  ACCEPT
+                                  {confirmAcceptId === quote.id ? `CONFIRM £${quote.amount}` : "ACCEPT"}
                                 </button>
                               )}
                             </td>
@@ -777,13 +812,25 @@ export default function QuoteComparisonModal({
       {/* Video Credential Modal */}
       {activeVideoUrl && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[60] flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-3xl p-4 w-full max-w-md space-y-3 relative text-white">
+          <div
+            ref={videoDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="video-credential-modal-title"
+            tabIndex={-1}
+            className="bg-slate-900 border border-white/20 rounded-3xl p-4 w-full max-w-md space-y-3 relative text-white focus:outline-none"
+          >
             <div className="flex items-center justify-between">
-              <h3 className="font-black text-sm flex items-center gap-2">
+              <h3 id="video-credential-modal-title" className="font-black text-sm flex items-center gap-2">
                 <Video className="w-4 h-4 text-purple-400" />
                 Trader Video Credential Selfie
               </h3>
-              <button onClick={() => setActiveVideoUrl(null)} className="p-1 text-slate-400 hover:text-white">
+              <button
+                type="button"
+                aria-label="Close trader video credential modal"
+                onClick={() => setActiveVideoUrl(null)}
+                className="p-1 text-slate-400 hover:text-white"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>

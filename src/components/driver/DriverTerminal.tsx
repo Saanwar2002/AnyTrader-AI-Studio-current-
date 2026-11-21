@@ -2030,19 +2030,8 @@ export default function DriverTerminal() {
 
             if (data.cancellationFee > 0 && user) {
               toast.success("Cancellation Fee Applied", {
-                description: `You have been credited £${data.cancellationFee.toFixed(1)} for the cancellation.`,
+                description: `You have been credited £${Number(data.cancellationFee).toFixed(2)} for the cancellation.`,
               });
-              // Credit the driver metric
-              const today = new Date().toISOString().split("T")[0];
-              await setDoc(
-                doc(db, "driver_metrics", user.uid),
-                {
-                  date: today,
-                  dailyEarnings: increment(data.cancellationFee),
-                  updatedAt: serverTimestamp(),
-                },
-                { merge: true },
-              );
             }
 
             if (user) {
@@ -2070,6 +2059,21 @@ export default function DriverTerminal() {
             data.status === "completed" &&
             rideState === "completed"
           ) {
+            setActiveRide((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    status: data.status,
+                    paymentMethod: data.paymentMethod ?? prev.paymentMethod,
+                    finalFare: data.finalFare ?? prev.finalFare,
+                    tipAmount: data.tipAmount ?? prev.tipAmount,
+                    totalFarePaid: data.totalFarePaid ?? prev.totalFarePaid,
+                    fareContractVersion: data.fareContractVersion ?? prev.fareContractVersion,
+                    driverEarnings: data.driverEarnings ?? prev.driverEarnings,
+                    platformFee: data.platformFee ?? prev.platformFee,
+                  }
+                : prev
+            );
             toast.success("Trip Finalized", {
               description: "The trip payment has been confirmed.",
             });
@@ -2370,11 +2374,17 @@ export default function DriverTerminal() {
   };
 
   // Update session duration timer
+  const lastMetricsHeartbeatRef = useRef<number>(0);
+
   useEffect(() => {
-    if (!isOnline || !onlineStartTime) return;
+    if (!isOnline || !onlineStartTime) {
+      lastMetricsHeartbeatRef.current = 0;
+      return;
+    }
 
     const interval = setInterval(() => {
-      const diffMs = new Date().getTime() - onlineStartTime.getTime();
+      const nowMs = Date.now();
+      const diffMs = nowMs - onlineStartTime.getTime();
       const diffMin = Math.floor(diffMs / 60000);
 
       if (diffMin < 60) {
@@ -2385,49 +2395,45 @@ export default function DriverTerminal() {
         setOnlineDurationText(`${hrs}h ${mins}m`);
       }
 
-      // Sync online time to Firestore every 60 seconds (6 ticks)
-      if (Math.floor(diffMs / 1000) % 60 < 10) {
-        const today = new Date().toISOString().split("T")[0];
-        if (user) {
-          updateDoc(doc(db, "driver_metrics", user.uid), {
-            date: today,
-            onlineSecondsToday: increment(60),
-          })
-            .then(() => {
-              // Verify limits
-              getDoc(doc(db, "driver_metrics", user.uid)).then((metricsDoc) => {
-                if (metricsDoc.exists()) {
-                  const secs = metricsDoc.data().onlineSecondsToday || 0;
-                  if (secs / 3600 >= (fareConfig.maxDailyDriverHours || 24)) {
-                    toast.error("Safety Limit Reached", {
-                      description: `You have reached the maximum allowed driving time of ${fareConfig.maxDailyDriverHours || 24} hours.`,
-                    });
-                    setIsOnline(false);
-                    updateDoc(doc(db, "live_tracking", user.uid), {
-                      isOnline: false,
-                    }).catch(console.error);
-                  }
-                }
-              });
+      // Sync online time via server-authoritative heartbeat every 60 seconds
+      if (user && nowMs - lastMetricsHeartbeatRef.current >= 60000) {
+        lastMetricsHeartbeatRef.current = nowMs;
+        user
+          .getIdToken()
+          .then((token) =>
+            fetch("/api/driver/metrics/heartbeat", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({}),
             })
-            .catch(() => {
-              // Fallback: create if not exists
-              setDoc(
-                doc(db, "driver_metrics", user.uid),
-                {
-                  date: today,
-                  onlineSecondsToday: 60,
-                  dailyEarnings: 0,
-                },
-                { merge: true },
-              );
-            });
-        }
+          )
+          .then(async (res) => {
+            if (!res.ok) return;
+            const metricsData = await res.json().catch(() => null);
+            if (metricsData?.limitReached) {
+              toast.error("Safety Limit Reached", {
+                description: `You have reached the maximum allowed driving time of ${metricsData.maxDailyDriverHours || fareConfig.maxDailyDriverHours || 24} hours.`,
+              });
+              setIsOnline(false);
+              updateDoc(doc(db, "live_tracking", user.uid), {
+                isOnline: false,
+              }).catch(console.error);
+              updateDoc(doc(db, "driver_status", user.uid), {
+                online: false,
+              }).catch(console.error);
+            }
+          })
+          .catch((err) => {
+            console.error("Failed to record driver heartbeat:", err);
+          });
       }
     }, 10000); // Check every 10 seconds
 
     return () => clearInterval(interval);
-  }, [isOnline, onlineStartTime]);
+  }, [isOnline, onlineStartTime, user, fareConfig.maxDailyDriverHours]);
 
   // Real-time GPS Tracking & Status Sync
   const lastStateUpdateRef = useRef<number>(0);
@@ -3531,66 +3537,83 @@ export default function DriverTerminal() {
     setRideState("completed");
 
     const waitFare = (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
-    // Base estimate logic normally computes full journey. For abandonment we should
-    // ideally calculate partial distance. Using fareEstimate as approximation for UI.
     const partialFareEstimate = activeRide?.fareEstimate
       ? activeRide.fareEstimate * 0.5
       : 12.0;
-    const finalFare = partialFareEstimate + waitFare + 5.0; // Add the £5 abandonment fee!
+    const computedBaseFare = partialFareEstimate + waitFare + 5.0;
 
     try {
-      await updateDoc(doc(db, "ride_requests", activeRide.id), {
-        status: "rider_abandoned",
-        paymentMethod: "stripe_qr",
-        finalFare: finalFare,
-        paidWaitSeconds: totalPaidWaitSeconds,
-        abandonmentFee: 5.0,
-        completedAt: serverTimestamp(),
-      });
+      if (activeRide.isReal) {
+        const token = await user.getIdToken();
+        const payRes = await fetch("/api/rides/create-trip-payment", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            isAbandonment: true,
+            paidWaitSeconds: totalPaidWaitSeconds,
+          }),
+        });
+        const payData = await payRes.json();
+        if (!payRes.ok) {
+          throw new Error(payData?.error || "Failed to generate abandonment payment link");
+        }
+        if (payData.url) {
+          setPaymentUrl(payData.url);
+        }
 
-      if (
-        activeRide.riderId &&
-        typeof activeRide.riderId === "string" &&
-        activeRide.riderId.length > 0
-      ) {
-        // Apply strike
-        await updateDoc(doc(db, "users", activeRide.riderId), {
-          pendingCharges: increment(finalFare),
-          abandonmentStrikes: increment(1),
-        } as any).catch((err) => console.error("Failed to add strike:", err));
+        const completeRes = await fetch("/api/rides/complete", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "abandonment",
+            paidWaitSeconds: totalPaidWaitSeconds,
+            paymentUrl: payData.url,
+          }),
+        });
+        const completeData = await completeRes.json();
+        if (!completeRes.ok) {
+          throw new Error(completeData?.error || "Failed to record rider abandonment");
+        }
+        setActiveRide((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: completeData.status || "rider_abandoned",
+                paymentMethod: "stripe_qr",
+                finalFare: completeData.finalFare ?? payData.effectiveBaseFare ?? computedBaseFare,
+                tipAmount: completeData.tipAmount ?? payData.sanitizedTip ?? prev.tipAmount ?? 0,
+                totalFarePaid: completeData.totalFarePaid ?? payData.totalAmount ?? computedBaseFare,
+                driverEarnings: completeData.driverEarnings,
+                platformFee: completeData.platformFee,
+                fareContractVersion: "v2_excl_tip",
+              }
+            : null
+        );
+      } else {
+        setActiveRide((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "rider_abandoned",
+                paymentMethod: "stripe_qr",
+                finalFare: computedBaseFare,
+                totalFarePaid: computedBaseFare + (prev.tipAmount || 0),
+                fareContractVersion: "v2_excl_tip",
+              }
+            : null
+        );
       }
-
-      const today = new Date().toISOString().split("T")[0];
-      await setDoc(
-        doc(db, "driver_metrics", user.uid),
-        {
-          date: today,
-          dailyEarnings: increment(finalFare), // Usually minus commission handled in backend
-          jobsDoneToday: increment(1),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
-
-      // Generate the payment link
-      const response = await fetch("/api/rides/create-trip-payment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rideId: activeRide.id,
-          driverId: user.uid,
-          amount: finalFare,
-          isAbandonment: true,
-        }),
-      });
-
-      const data = await response.json();
-      if (data.url) {
-        setPaymentUrl(data.url);
-      }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Abandonment process failed:", err);
-      toast.error("Failed to process abandonment. Please reload.");
+      toast.error(err?.message || "Failed to process abandonment. Please reload.");
     } finally {
       setIsGeneratingPayment(false);
     }
@@ -3636,11 +3659,27 @@ export default function DriverTerminal() {
       mapInstance.panTo({ lat: rideToUpdate.pickupLat, lng: rideToUpdate.pickupLng });
     }
 
-    if (rideToUpdate?.id && rideToUpdate?.isReal) {
-      await updateDoc(doc(db, "ride_requests", rideToUpdate.id), {
-        status: "arrived",
-        arrivedAt: serverTimestamp(),
-      });
+    if (rideToUpdate?.id && rideToUpdate?.isReal && user) {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch("/api/rides/transition", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: rideToUpdate.id,
+            action: "arrived",
+          }),
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          console.error("Arrival sync error:", errData);
+        }
+      } catch (err) {
+        console.error("Failed to sync arrival:", err);
+      }
       
       if (rideToUpdate.userId) {
         fetch("/api/chat-push", {
@@ -3698,12 +3737,28 @@ export default function DriverTerminal() {
     const pickupPaidWait = Math.max(0, elapsedWaitSeconds - freeWaitSeconds);
     setAccumulatedPaidWaitSeconds(pickupPaidWait);
 
-    if (activeRide?.id && activeRide?.isReal) {
-      await updateDoc(doc(db, "ride_requests", activeRide.id), {
-        status: "in_progress",
-        startedAt: serverTimestamp(),
-        paidWaitSeconds: pickupPaidWait,
-      });
+    if (activeRide?.id && activeRide?.isReal && user) {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch("/api/rides/transition", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "in_progress",
+            paidWaitSeconds: pickupPaidWait,
+          }),
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          console.error("Failed to start ride on server:", errData);
+        }
+      } catch (err) {
+        console.error("Failed to start ride:", err);
+      }
     }
     if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
   };
@@ -3738,10 +3793,20 @@ export default function DriverTerminal() {
     setHasReachedCurrentStop(false);
     setShowLeaveStopReminder(false);
     
-    if (activeRide?.id && activeRide?.isReal) {
+    if (activeRide?.id && activeRide?.isReal && user) {
       try {
-        await updateDoc(doc(db, "ride_requests", activeRide.id), {
-          currentStopIndex: currentLegIndex + 1
+        const token = await user.getIdToken();
+        await fetch("/api/rides/transition", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "stop_progress",
+            currentStopIndex: currentLegIndex + 1,
+          }),
         });
       } catch (err) {
         console.error("Failed to sync leg index", err);
@@ -3762,11 +3827,22 @@ export default function DriverTerminal() {
       isEarlyCompletion &&
       earlyCompletionReason &&
       activeRide?.id &&
-      activeRide?.isReal
+      activeRide?.isReal &&
+      user
     ) {
       try {
-        await updateDoc(doc(db, "ride_requests", activeRide.id), {
-          earlyCompletionReason: earlyCompletionReason,
+        const token = await user.getIdToken();
+        await fetch("/api/rides/transition", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "early_completion_reason",
+            earlyCompletionReason,
+          }),
         });
       } catch (e) {
         console.error("Failed to save early completion reason", e);
@@ -3784,10 +3860,6 @@ export default function DriverTerminal() {
     setIsGeneratingPayment(true);
     setRideState("completed");
 
-    const waitFare = (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
-    const baseFinalFare = (activeRide?.fareEstimate || 38.5) + waitFare;
-    const finalFare = baseFinalFare + (activeRide?.tipAmount || 0);
-
     if (activeRide?.hasCardOnFile) {
       toast("Processing Auto-Payment...", { duration: 1500 });
       setTimeout(async () => {
@@ -3804,32 +3876,68 @@ export default function DriverTerminal() {
       return;
     }
 
-    // Generate the Direct-to-Driver QR Payment Link
-    try {
-      const response = await fetch("/api/rides/create-trip-payment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          rideId: activeRide?.id || "sim_123",
-          driverId: user?.uid,
-          baseFare: baseFinalFare,
-          tipAmount: activeRide?.tipAmount || 0,
-        }),
-      });
+    // Generate the Direct-to-Driver QR Payment Link via authenticated server endpoint
+    if (activeRide?.id && activeRide?.isReal && user) {
+      try {
+        const token = await user.getIdToken();
+        const response = await fetch("/api/rides/create-trip-payment", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            paidWaitSeconds: totalPaidWaitSeconds,
+            tipAmount: activeRide?.tipAmount || 0,
+          }),
+        });
 
-      const data = await response.json();
-      if (data.url) {
-        setPaymentUrl(data.url);
-        if (activeRide?.id && activeRide?.isReal) {
-          await updateDoc(doc(db, "ride_requests", activeRide.id), {
-            status: "awaiting_payment",
-            paymentUrl: data.url,
-          });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data?.error || "Failed to generate trip payment session");
         }
+        if (data.url) {
+          setPaymentUrl(data.url);
+        }
+
+        const completeRes = await fetch("/api/rides/complete", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "qr_pending",
+            paidWaitSeconds: totalPaidWaitSeconds,
+            earlyCompletionReason: isEarlyCompletion ? earlyCompletionReason : undefined,
+            paymentUrl: data.url,
+          }),
+        });
+        const completeData = await completeRes.json();
+        if (completeRes.ok) {
+          setActiveRide((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  finalFare: completeData.finalFare ?? data.effectiveBaseFare ?? prev.finalFare,
+                  tipAmount: completeData.tipAmount ?? data.sanitizedTip ?? prev.tipAmount,
+                  totalFarePaid: completeData.totalFarePaid ?? data.totalAmount,
+                  driverEarnings: completeData.driverEarnings,
+                  platformFee: completeData.platformFee,
+                  fareContractVersion: "v2_excl_tip",
+                }
+              : null
+          );
+        }
+      } catch (err: any) {
+        console.error("Payment generation failed:", err);
+        toast.error(err?.message || "Payment link generation failed.");
+      } finally {
+        setIsGeneratingPayment(false);
       }
-    } catch (err) {
-      console.error("Payment generation failed:", err);
-    } finally {
+    } else {
       setIsGeneratingPayment(false);
     }
 
@@ -3839,58 +3947,47 @@ export default function DriverTerminal() {
   const handleAutoPaymentCompletion = async () => {
     if (activeRide?.id && activeRide?.isReal && user) {
       try {
-        const waitFare =
-          (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
-        const baseFare = (activeRide.fareEstimate || 0) + waitFare;
-        const totalFare = baseFare + (activeRide.tipAmount || 0);
-
-        await updateDoc(doc(db, "ride_requests", activeRide.id), {
-          status: "completed",
-          paymentMethod: "stripe_auto",
-          finalFare: totalFare,
-          paidWaitSeconds: totalPaidWaitSeconds,
-          completedAt: serverTimestamp(),
-        });
-
-        if (
-          activeRide.riderId &&
-          typeof activeRide.riderId === "string" &&
-          activeRide.riderId.length > 0
-        ) {
-          await updateDoc(doc(db, "users", activeRide.riderId), {
-            pendingCharges: 0,
-            cancellationCount: 0,
-          } as any).catch((err) =>
-            console.error("Failed to clear passenger fees:", err),
-          );
-        }
-
-        // We can update the daily driver_metrics as well
-        const today = new Date().toISOString().split("T")[0];
-        await setDoc(
-          doc(db, "driver_metrics", user.uid),
-          {
-            date: today,
-            dailyEarnings: increment(totalFare),
-            jobsDoneToday: increment(1),
-            updatedAt: serverTimestamp(),
+        const token = await user.getIdToken();
+        const res = await fetch("/api/rides/complete", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
           },
-          { merge: true },
-        );
-
-        // Update driver earnings in auth profile
-        await updateDoc(doc(db, "users", user.uid), {
-          totalEarnings: increment(totalFare),
-          jobsCompleted: increment(1),
-          totalBusinessMileage: increment(
-            (activeRide?.distanceToPickupMiles || 0) +
-              (activeRide?.distanceMiles || 0),
-          ),
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "auto_card",
+            paidWaitSeconds: totalPaidWaitSeconds,
+            earlyCompletionReason: isEarlyCompletion ? earlyCompletionReason : undefined,
+          }),
         });
-      } catch (err) {
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || "Failed to process auto payment");
+        }
+        setActiveRide((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "completed",
+                paymentMethod: "stripe_auto",
+                finalFare: data.finalFare,
+                tipAmount: data.tipAmount,
+                totalFarePaid: data.totalFarePaid,
+                driverEarnings: data.driverEarnings,
+                platformFee: data.platformFee,
+                fareContractVersion: "v2_excl_tip",
+              }
+            : null
+        );
+      } catch (err: any) {
         console.error("Failed to process auto payment:", err);
+        toast.error(err?.message || "Failed to finalize auto payment.");
+        setIsGeneratingPayment(false);
+        return;
       }
     }
+    setIsGeneratingPayment(false);
     setRideState("review");
     toast.success("Payment Received", {
       description: "Passenger's card was charged automatically.",
@@ -3900,46 +3997,43 @@ export default function DriverTerminal() {
   const handleClosePayment = async () => {
     if (activeRide?.id && activeRide?.isReal && user) {
       try {
-        const waitFare =
-          (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
-        const baseFare = (activeRide.fareEstimate || 0) + waitFare;
-        const totalFare = baseFare + (activeRide.tipAmount || 0);
-
-        await updateDoc(doc(db, "ride_requests", activeRide.id), {
-          status: "completed",
-          paymentMethod: "stripe_qr",
-          finalFare: totalFare,
-          paidWaitSeconds: totalPaidWaitSeconds,
-          completedAt: serverTimestamp(),
-        });
-
-        if (
-          activeRide.riderId &&
-          typeof activeRide.riderId === "string" &&
-          activeRide.riderId.length > 0
-        ) {
-          await updateDoc(doc(db, "users", activeRide.riderId), {
-            pendingCharges: 0,
-            cancellationCount: 0,
-          } as any).catch((err) =>
-            console.error("Failed to clear passenger fees:", err),
-          );
-        }
-
-        // We can update the daily driver_metrics as well
-        const today = new Date().toISOString().split("T")[0];
-        await setDoc(
-          doc(db, "driver_metrics", user.uid),
-          {
-            date: today,
-            dailyEarnings: increment(totalFare),
-            jobsDoneToday: increment(1),
-            updatedAt: serverTimestamp(),
+        const token = await user.getIdToken();
+        const res = await fetch("/api/rides/complete", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
           },
-          { merge: true },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: "qr_manual_close",
+            paidWaitSeconds: totalPaidWaitSeconds,
+            earlyCompletionReason: isEarlyCompletion ? earlyCompletionReason : undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || "Failed to close QR payment");
+        }
+        setActiveRide((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "completed",
+                paymentMethod: "stripe_qr",
+                finalFare: data.finalFare,
+                tipAmount: data.tipAmount,
+                totalFarePaid: data.totalFarePaid,
+                driverEarnings: data.driverEarnings,
+                platformFee: data.platformFee,
+                fareContractVersion: "v2_excl_tip",
+              }
+            : null
         );
-      } catch (err) {
+      } catch (err: any) {
         console.error("Failed to complete ride via QR:", err);
+        toast.error(err?.message || "Failed to finalize ride payment.");
+        return;
       }
     }
     setRideState("review");
@@ -3949,150 +4043,94 @@ export default function DriverTerminal() {
   const handleCashPayment = async (forceComplete: boolean = false) => {
     if (activeRide?.id && activeRide?.isReal && user) {
       try {
-        let parsedReportedCash: number | null = null;
-        let isAlreadyApplied = false;
-        try {
-          const docSnap = await getDoc(doc(db, "ride_requests", activeRide.id));
-          if (docSnap.exists()) {
-            const rData = docSnap.data();
-            if (rData.reportedCashCollected !== undefined && rData.reportedCashCollected !== null) {
-              parsedReportedCash = Number(rData.reportedCashCollected);
-            }
-            if (rData.pendingChargesApplied === true) {
-              isAlreadyApplied = true;
-            }
-          }
-        } catch (e) {
-          console.error("Failed to fetch ride request for cash verification", e);
-        }
-
-        const waitFare = (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
-        const distMiles = activeRide?.distanceMiles || 22;
-        const durationMins = activeRide?.durationMinutes || 0;
-        const vehicleSubtotal = Math.max(
-           fareConfig.minFare, 
-           fareConfig.baseFare + (distMiles * fareConfig.distanceRate) + (durationMins * fareConfig.timeRate)
-        );
-        const baseFare = (activeRide.fareEstimate || vehicleSubtotal) + waitFare;
-        const totalFare = baseFare + (activeRide.tipAmount || 0);
-        const platformFee = (baseFare * fareConfig.commissionRate) + (fareConfig.fixedTripFee || 0);
-        
-        let enteredAmount = totalFare;
         const currentCashInput = cashCollectedInputRef.current || cashCollectedInput;
-        if (parsedReportedCash !== null) {
-           enteredAmount = parsedReportedCash;
-        } else if (currentCashInput.trim() !== "") {
-           enteredAmount = parseFloat(currentCashInput);
-        }
-        
-        if (isNaN(enteredAmount) || enteredAmount < 0) {
-           toast.error("Please enter a valid cash amount");
-           return;
-        }
-
-        if (enteredAmount < totalFare && !forceComplete) {
-            await updateDoc(doc(db, "ride_requests", activeRide.id), {
-               status: "awaiting_cash_confirm",
-               reportedCashCollected: enteredAmount,
-               reportedCashDiscrepancy: totalFare - enteredAmount,
-            });
-            setShowCashConfirm(false);
-            setIsAwaitingCashConfirm(true);
-            setCashConfirmTimer(45); // start 45 seconds passenger wait
-            toast.info("Awaiting Passenger...", {
-               description: "Waiting for passenger to confirm unpaid balance on their device.",
-               duration: 8000,
-            });
-            
-            // Start a local timer just for the UI
-            const timerInterval = setInterval(() => {
-              setCashConfirmTimer((prev) => {
-                if (prev <= 1) {
-                  clearInterval(timerInterval);
-                  return 0;
-                }
-                return prev - 1;
-              });
-            }, 1000);
-            
-            // Save interval to the scope or just let state handle it safely.
-            // When passenger confirms, it triggers the onSnapshot completed logic above.
+        let cashValue: number | undefined;
+        if (!forceComplete && currentCashInput.trim() !== "") {
+          cashValue = parseFloat(currentCashInput);
+          if (isNaN(cashValue) || cashValue < 0) {
+            toast.error("Please enter a valid cash amount");
             return;
-        }
-
-        const discrepancyAmount = Math.max(0, totalFare - enteredAmount);
-
-        await updateDoc(doc(db, "ride_requests", activeRide.id), {
-          status: "completed",
-          paymentMethod: "cash",
-          finalFare: totalFare,
-          paidWaitSeconds: totalPaidWaitSeconds,
-          platformFeeOwed: platformFee,
-          reportedCashCollected: enteredAmount,
-          reportedCashDiscrepancy: discrepancyAmount,
-          pendingChargesApplied: true,
-          forceCompleteReason: forceCompleteReasonRef.current || forceCompleteReason || null,
-          completedAt: serverTimestamp(),
-        });
-
-        if (
-          activeRide.riderId &&
-          typeof activeRide.riderId === "string" &&
-          activeRide.riderId.length > 0
-        ) {
-          if (discrepancyAmount > 0 && !isAlreadyApplied) {
-             await updateDoc(doc(db, "users", activeRide.riderId), {
-                pendingCharges: increment(discrepancyAmount),
-                pendingChargesReason: forceCompleteReasonRef.current || forceCompleteReason || "Unpaid trip balance",
-             }).catch((err) => console.error("Failed to update partial payment on rider", err));
-          } else {
-             await updateDoc(doc(db, "users", activeRide.riderId), {
-               pendingCharges: 0,
-               cancellationCount: 0,
-             } as any).catch((err) =>
-               console.error("Failed to clear passenger fees:", err),
-             );
           }
         }
 
-        await updateDoc(doc(db, "users", user.uid), {
-          pendingPlatformFees: increment(platformFee),
-          totalBusinessMileage: increment(
-            (activeRide?.distanceToPickupMiles || 0) +
-              (activeRide?.distanceMiles || 0),
-          ),
-        });
-
-        // Update driver metrics
-        const today = new Date().toISOString().split("T")[0];
-        await setDoc(
-          doc(db, "driver_metrics", user.uid),
-          {
-            date: today,
-            dailyEarnings: increment(totalFare),
-            jobsDoneToday: increment(1),
-            updatedAt: serverTimestamp(),
+        const token = await user.getIdToken();
+        const res = await fetch("/api/rides/complete", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
           },
-          { merge: true },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+            action: forceComplete ? "cash_finalize" : "cash_report",
+            paidWaitSeconds: totalPaidWaitSeconds,
+            cashCollected: cashValue,
+            forceComplete,
+            forceCompleteReason: forceCompleteReasonRef.current || forceCompleteReason || null,
+            earlyCompletionReason: isEarlyCompletion ? earlyCompletionReason : undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || "Failed to record cash payment");
+        }
+
+        if (data.awaitingCashConfirm) {
+          setShowCashConfirm(false);
+          setIsAwaitingCashConfirm(true);
+          setCashConfirmTimer(45);
+          toast.info("Awaiting Passenger...", {
+            description: "Waiting for passenger to confirm unpaid balance on their device.",
+            duration: 8000,
+          });
+          const timerInterval = setInterval(() => {
+            setCashConfirmTimer((prev) => {
+              if (prev <= 1) {
+                clearInterval(timerInterval);
+                return 0;
+              }
+              return prev - 1;
+            });
+          }, 1000);
+          return;
+        }
+
+        const platformFee = Number(data.platformFee || 0);
+        setActiveRide((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "completed",
+                paymentMethod: "cash",
+                finalFare: data.finalFare,
+                tipAmount: data.tipAmount,
+                totalFarePaid: data.totalFarePaid,
+                driverEarnings: data.driverEarnings,
+                platformFee,
+                fareContractVersion: "v2_excl_tip",
+              }
+            : null
         );
 
         toast.warning("Cash Trip Recorded", {
           description: `£${platformFee.toFixed(2)} (${(fareConfig.commissionRate * 100).toFixed(0)}%${fareConfig.fixedTripFee ? ` + £${fareConfig.fixedTripFee.toFixed(2)}` : ''}) platform fee has been added to your pending account balance.`,
           duration: 5000,
         });
-      } catch (err) {
+      } catch (err: any) {
         console.error("Failed to record cash payment:", err);
+        toast.error(err?.message || "Failed to record cash payment.");
+        return;
       }
     } else {
+      const waitFare = (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
       setActiveRide((prev) =>
         prev
           ? {
               ...prev,
               paymentMethod: "cash",
-              finalFare:
-                (prev.fareEstimate || 0) +
-                (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute +
-                (prev.tipAmount || 0),
+              finalFare: (prev.fareEstimate || 0) + waitFare,
+              totalFarePaid: (prev.fareEstimate || 0) + waitFare + (prev.tipAmount || 0),
+              fareContractVersion: "v2_excl_tip",
             }
           : null,
       );
@@ -6624,44 +6662,46 @@ export default function DriverTerminal() {
                     </h2>
 
                     <div className="mb-8">
-                      <motion.h1
-                        initial={{ scale: 0.5, opacity: 0 }}
-                        animate={{ scale: 1, opacity: 1 }}
-                        transition={{ type: "spring", damping: 15 }}
-                        className="text-[56px] leading-[1] font-black text-white tracking-tighter"
-                      >
-                        £
-                        {(
-                          activeRide?.finalFare ||
-                          (activeRide?.fareEstimate || 38.5) +
-                            (totalPaidWaitSeconds / 60) *
-                              fareConfig.waitRatePerMinute +
-                            (activeRide?.tipAmount || 0)
-                        ).toFixed(2)}
-                      </motion.h1>
-                      {activeRide?.tipAmount ? (
-                        <p className="text-emerald-400 font-bold text-[15px] mt-2 mb-4 bg-emerald-500/10 inline-block px-4 py-1.5 rounded-full border border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.2)]">
-                          Includes £{activeRide.tipAmount.toFixed(2)} Tip
-                        </p>
-                      ) : null}
-                      <div className="mt-4 bg-[#00D26A]/10 border border-[#00D26A]/20 py-2.5 px-4 rounded-xl inline-block w-full">
-                        <p className="text-[10px] font-black uppercase text-[#00D26A] tracking-wider mb-0.5">
-                          You Earned
-                        </p>
-                        <p className="text-3xl font-black text-[#00D26A]">
-                          £
-                          {(
-                            (activeRide?.finalFare
-                              ? activeRide.finalFare -
-                                (activeRide.tipAmount || 0)
-                              : (activeRide?.fareEstimate || 38.5) +
-                                (totalPaidWaitSeconds / 60) *
-                                  fareConfig.waitRatePerMinute) *
-                              (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0) +
-                            (activeRide?.tipAmount || 0)
-                          ).toFixed(2)}
-                        </p>
-                      </div>
+                      {(() => {
+                        const tip = Number(activeRide?.tipAmount || 0);
+                        const isV2 =
+                          (activeRide as any)?.fareContractVersion === "v2_excl_tip" ||
+                          (activeRide as any)?.totalFarePaid !== undefined;
+                        const baseJobFare = activeRide?.finalFare !== undefined
+                          ? (isV2 ? Number(activeRide.finalFare) : Math.max(0, Number(activeRide.finalFare) - tip))
+                          : (activeRide?.fareEstimate || 38.5) +
+                            (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
+                        const totalCollected = (activeRide as any)?.totalFarePaid ?? (baseJobFare + tip);
+                        const youEarned =
+                          (activeRide as any)?.driverEarnings ??
+                          (Math.max(0, baseJobFare * (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0)) + tip);
+
+                        return (
+                          <>
+                            <motion.h1
+                              initial={{ scale: 0.5, opacity: 0 }}
+                              animate={{ scale: 1, opacity: 1 }}
+                              transition={{ type: "spring", damping: 15 }}
+                              className="text-[56px] leading-[1] font-black text-white tracking-tighter"
+                            >
+                              £{Number(totalCollected).toFixed(2)}
+                            </motion.h1>
+                            {tip > 0 ? (
+                              <p className="text-emerald-400 font-bold text-[15px] mt-2 mb-4 bg-emerald-500/10 inline-block px-4 py-1.5 rounded-full border border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.2)]">
+                                Includes £{tip.toFixed(2)} Tip
+                              </p>
+                            ) : null}
+                            <div className="mt-4 bg-[#00D26A]/10 border border-[#00D26A]/20 py-2.5 px-4 rounded-xl inline-block w-full">
+                              <p className="text-[10px] font-black uppercase text-[#00D26A] tracking-wider mb-0.5">
+                                You Earned
+                              </p>
+                              <p className="text-3xl font-black text-[#00D26A]">
+                                £{Number(youEarned).toFixed(2)}
+                              </p>
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
 
                     <div className="bg-[#252529] rounded-2xl p-4 text-left mb-6">
@@ -6760,15 +6800,22 @@ export default function DriverTerminal() {
                       })()}
 
                       {(() => {
-                        const baseJobFare = activeRide?.finalFare
-                          ? activeRide.finalFare - (activeRide.tipAmount || 0)
+                        const tip = Number(activeRide?.tipAmount || 0);
+                        const isV2 =
+                          (activeRide as any)?.fareContractVersion === "v2_excl_tip" ||
+                          (activeRide as any)?.totalFarePaid !== undefined;
+                        const baseJobFare = activeRide?.finalFare !== undefined
+                          ? (isV2 ? Number(activeRide.finalFare) : Math.max(0, Number(activeRide.finalFare) - tip))
                           : (activeRide?.fareEstimate || 38.5) +
                             (totalPaidWaitSeconds / 60) *
                               fareConfig.waitRatePerMinute;
-                        const commission = baseJobFare * fareConfig.commissionRate + (fareConfig.fixedTripFee || 0);
-                        const normalEarnings = baseJobFare - commission;
+                        const commission =
+                          (activeRide as any)?.platformFee ??
+                          (baseJobFare * fareConfig.commissionRate + (fareConfig.fixedTripFee || 0));
+                        const normalEarnings = Math.max(0, baseJobFare - commission);
                         const totalEarnings =
-                          normalEarnings + (activeRide?.tipAmount || 0);
+                          (activeRide as any)?.driverEarnings ??
+                          (normalEarnings + tip);
 
                         return (
                           <>
@@ -6888,9 +6935,14 @@ export default function DriverTerminal() {
                               paymentMethod:
                                 activeRide.paymentMethod || "stripe_auto",
                               finalFare:
-                                activeRide.finalFare ||
+                                (activeRide as any).fareContractVersion === "v2_excl_tip"
+                                  ? activeRide.finalFare
+                                  : (activeRide.fareEstimate || 38.5),
+                              totalFarePaid:
+                                (activeRide as any).totalFarePaid ||
                                 (activeRide.fareEstimate || 38.5) +
                                   (activeRide.tipAmount || 0),
+                              fareContractVersion: "v2_excl_tip",
                               driverId: user.uid,
                               assignedDriverId: user.uid,
                               createdAt: serverTimestamp(),

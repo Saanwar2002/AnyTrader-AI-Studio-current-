@@ -339,9 +339,6 @@ export default function Login() {
                       <br /><span className="bg-yellow-200 text-black px-2 py-1 select-all font-mono">https://anytradercombined.firebaseapp.com/__/auth/handler</span>
                     </li>
                   </ul>
-                  <div className="mt-2 text-red-900 font-bold bg-red-100 p-2 rounded border border-red-300">
-                    ⚠️ IMPORTANT: Look at your screenshot! You missed the "https://" part in your 2nd JavaScript origin. It must be exactly <span className="underline">https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app</span> (including the https://)
-                  </div>
                 </li>
               </ol>
               <details className="text-xs text-red-600">

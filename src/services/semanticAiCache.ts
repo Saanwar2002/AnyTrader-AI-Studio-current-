@@ -11,11 +11,19 @@
  * - Full streaming (SSE) compatibility with synthetic fast chunk generator
  */
 
+import { sanitizeExternalUrl } from "../lib/safeExternalUrl";
+
 export interface CachedAiResponse {
   text: string;
   sources: { title: string; url: string }[];
   category?: string;
+  categories?: string[];
   isPreSeeded?: boolean;
+}
+
+export interface SemanticCacheScope {
+  role?: string;
+  hasPersonalizedContext?: boolean;
 }
 
 interface CacheEntry {
@@ -194,23 +202,8 @@ export function extractCanonicalTradeIntent(query: string): { intentKey: string;
     return { intentKey: "intent:tarmac_driveway_surfacing_cost", detectedCategory: "Ready-Mix Concrete & Tarmacadam Surfacing" };
   }
 
-  // Generic Normalized Hash for other recurring user queries (Token-bag signature)
-  const stopWords = new Set([
-    "what", "is", "the", "cost", "of", "to", "how", "much", "does", "it", "a", "an", "for", "in", "on", 
-    "average", "price", "approximate", "estimate", "please", "tell", "me", "i", "need", "want", "would", "like"
-  ]);
-
-  const keywords = normalized
-    .split(" ")
-    .filter(word => word.length > 2 && !stopWords.has(word))
-    .sort()
-    .slice(0, 7)
-    .join("_");
-
-  if (keywords.length >= 6) {
-    return { intentKey: `intent:generic_${keywords}`, detectedCategory: "General Trades" };
-  }
-
+  // Only cache explicit, high-confidence canonical UK trade intents.
+  // Never fall back to loose token-bag hashes that collide unrelated questions or leak user context.
   return null;
 }
 
@@ -377,10 +370,24 @@ const PRE_SEEDED_INTENTS: Record<string, { response: CachedAiResponse; category:
 
 // Initialize Pre-Seeded Cache on startup
 for (const [intentKey, data] of Object.entries(PRE_SEEDED_INTENTS)) {
+  const safeSources = (data.response.sources || [])
+    .map((s) => {
+      const safeUrl = sanitizeExternalUrl(s.url);
+      return safeUrl ? { title: s.title, url: safeUrl } : null;
+    })
+    .filter((s): s is { title: string; url: string } => Boolean(s));
+
   CACHE_STORE.set(intentKey, {
     canonicalKey: intentKey,
     querySample: intentKey.replace("intent:", "").replace(/_/g, " "),
-    response: data.response,
+    response: {
+      ...data.response,
+      sources: safeSources,
+      category: data.category,
+      categories: data.response.categories && data.response.categories.length > 0
+        ? data.response.categories
+        : [data.category]
+    },
     createdAt: Date.now(),
     expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000, // Persistent pre-seeded
     hitCount: 0,
@@ -389,11 +396,32 @@ for (const [intentKey, data] of Object.entries(PRE_SEEDED_INTENTS)) {
   });
 }
 
+function normalizeCacheRole(role?: string): string {
+  const cleaned = String(role || "homeowner").trim().toLowerCase();
+  if (cleaned === "tradesperson" || cleaned === "trader") return "tradesperson";
+  if (cleaned === "business" || cleaned === "landlord" || cleaned === "corporate") return "business";
+  if (cleaned === "admin") return "admin";
+  return "homeowner";
+}
+
+function buildScopedCacheKey(intentKey: string, role?: string): string {
+  return `${normalizeCacheRole(role)}::${intentKey}`;
+}
+
 /**
- * Retrieve cached AI response if available and not expired
+ * Retrieve cached AI response if available and not expired.
+ * Never returns cached entries when the request includes personalized postcode/property context.
  */
-export function getSemanticCachedResponse(query: string): { response: CachedAiResponse; intentKey: string } | null {
+export function getSemanticCachedResponse(
+  query: string,
+  scope?: SemanticCacheScope
+): { response: CachedAiResponse; intentKey: string } | null {
   totalRequests++;
+
+  if (scope?.hasPersonalizedContext) {
+    cacheMisses++;
+    return null;
+  }
 
   const parsed = extractCanonicalTradeIntent(query);
   if (!parsed) {
@@ -401,7 +429,8 @@ export function getSemanticCachedResponse(query: string): { response: CachedAiRe
     return null;
   }
 
-  const entry = CACHE_STORE.get(parsed.intentKey);
+  const scopedKey = buildScopedCacheKey(parsed.intentKey, scope?.role);
+  const entry = CACHE_STORE.get(scopedKey) || CACHE_STORE.get(parsed.intentKey);
   if (!entry) {
     cacheMisses++;
     return null;
@@ -409,7 +438,7 @@ export function getSemanticCachedResponse(query: string): { response: CachedAiRe
 
   // Check TTL expiration (pre-seeded entries have 1-year expiration)
   if (Date.now() > entry.expiresAt) {
-    CACHE_STORE.delete(parsed.intentKey);
+    CACHE_STORE.delete(entry.canonicalKey);
     cacheMisses++;
     return null;
   }
@@ -420,22 +449,49 @@ export function getSemanticCachedResponse(query: string): { response: CachedAiRe
   entry.lastHitAt = Date.now();
   estimatedTokensSaved += 450; // Average response tokens saved
 
+  const resolvedCategories =
+    entry.response.categories && entry.response.categories.length > 0
+      ? entry.response.categories
+      : (entry.response.category ? [entry.response.category] : (entry.category ? [entry.category] : []));
+
   return {
-    response: entry.response,
+    response: {
+      ...entry.response,
+      category: entry.response.category || entry.category,
+      categories: resolvedCategories
+    },
     intentKey: parsed.intentKey
   };
 }
 
 /**
- * Store a newly generated Gemini response into the semantic cache
+ * Store a newly generated Gemini response into the semantic cache.
+ * Refuses to cache personalized responses (postcode/property twin) to prevent cross-user leakage.
  */
 export function setSemanticCachedResponse(
   query: string, 
   response: CachedAiResponse, 
-  ttlMs: number = DEFAULT_TTL_MS
+  ttlMs: number = DEFAULT_TTL_MS,
+  scope?: SemanticCacheScope
 ): void {
+  if (scope?.hasPersonalizedContext) return;
+
   const parsed = extractCanonicalTradeIntent(query);
   if (!parsed) return;
+
+  const scopedKey = buildScopedCacheKey(parsed.intentKey, scope?.role);
+  const safeSources = (response.sources || [])
+    .map((s) => {
+      const safeUrl = sanitizeExternalUrl(s.url);
+      return safeUrl ? { title: String(s.title || safeUrl), url: safeUrl } : null;
+    })
+    .filter((s): s is { title: string; url: string } => Boolean(s));
+
+  const cleanText = String(response.text || "").replace(/\[MATCHED_CATEGORIES:\s*[^\]]*\]?/gi, "").trim();
+  const categories =
+    response.categories && response.categories.length > 0
+      ? response.categories
+      : (response.category ? [response.category] : [parsed.detectedCategory]);
 
   // LRU Eviction if max capacity reached
   if (CACHE_STORE.size >= MAX_CACHE_SIZE) {
@@ -450,38 +506,60 @@ export function setSemanticCachedResponse(
     if (oldestKey) CACHE_STORE.delete(oldestKey);
   }
 
-  CACHE_STORE.set(parsed.intentKey, {
-    canonicalKey: parsed.intentKey,
+  CACHE_STORE.set(scopedKey, {
+    canonicalKey: scopedKey,
     querySample: query.slice(0, 120),
-    response,
+    response: {
+      ...response,
+      text: cleanText,
+      sources: safeSources,
+      category: categories[0] || parsed.detectedCategory,
+      categories
+    },
     createdAt: Date.now(),
     expiresAt: Date.now() + ttlMs,
     hitCount: 1,
     lastHitAt: Date.now(),
-    category: parsed.detectedCategory
+    category: categories[0] || parsed.detectedCategory
   });
 }
 
 /**
  * Simulate ultra-fast streaming output for cached responses
  */
-export async function* streamFromSemanticCache(cached: CachedAiResponse) {
-  const words = cached.text.split(" ");
+export async function* streamFromSemanticCache(cached: CachedAiResponse, abortSignal?: AbortSignal) {
+  const cleanText = String(cached.text || "").replace(/\[MATCHED_CATEGORIES:\s*[^\]]*\]?/gi, "").trim();
+  const words = cleanText.split(" ");
   const chunkSize = 12; // Stream in small rapid word bursts
 
   for (let i = 0; i < words.length; i += chunkSize) {
-    const chunkText = words.slice(i, i + chunkSize).join(" ") + " ";
+    if (abortSignal?.aborted) return;
+    const chunkText = words.slice(i, i + chunkSize).join(" ") + (i + chunkSize < words.length ? " " : "");
     yield { type: "chunk", text: chunkText };
     // Micro-delay for natural UI rendering (2ms)
     await new Promise(r => setTimeout(r, 2));
   }
 
-  if (cached.sources && cached.sources.length > 0) {
-    yield { type: "sources", sources: cached.sources };
+  if (abortSignal?.aborted) return;
+
+  const safeSources = (cached.sources || [])
+    .map((s) => {
+      const safeUrl = sanitizeExternalUrl(s.url);
+      return safeUrl ? { title: s.title, url: safeUrl } : null;
+    })
+    .filter((s): s is { title: string; url: string } => Boolean(s));
+
+  if (safeSources.length > 0) {
+    yield { type: "sources", sources: safeSources };
   }
 
-  if (cached.category) {
-    yield { type: "categories", categories: [cached.category] };
+  const emittedCategories =
+    cached.categories && cached.categories.length > 0
+      ? cached.categories
+      : (cached.category ? [cached.category] : []);
+
+  if (emittedCategories.length > 0) {
+    yield { type: "categories", categories: emittedCategories };
   }
 
   yield { type: "done" };

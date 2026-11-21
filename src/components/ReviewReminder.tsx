@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { db, collection, query, where, getDocs, collectionGroup, serverTimestamp, doc, getDoc, sendNotification } from "@/src/firebase";
+import { db, collection, query, where, getDocs, collectionGroup, doc, getDoc, sendNotification } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { toast } from "sonner";
-import { Star, MessageSquare } from "lucide-react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 
 export function ReviewReminder() {
   const { user, profile } = useAuth();
+  const navigate = useNavigate();
   const [lastChecked, setLastChecked] = useState<number>(0);
 
   useEffect(() => {
@@ -21,19 +21,20 @@ export function ReviewReminder() {
       const fourteenDaysAgo = new Date(now - 14 * 24 * 60 * 60 * 1000);
 
       if (profile.role === "customer" || (profile.role as string) === "homeowner") {
-        // Check jobs where homeowner hasn't reviewed
+        // Query completed homeowner jobs and evaluate both normalized hasHomeownerReview and hasReview flags
         const q = query(
           collection(db, "jobs"),
           where("homeownerId", "==", user.uid),
-          where("status", "==", "completed"),
-          where("hasReview", "==", false)
+          where("status", "==", "completed")
         );
 
         const snapshot = await getDocs(q);
-        snapshot.docs.forEach(async (jobDoc) => {
+        snapshot.docs.forEach((jobDoc) => {
           const jobData = jobDoc.data();
+          const hasAlreadyReviewed = jobData.hasHomeownerReview === true || jobData.hasReview === true;
+          if (hasAlreadyReviewed) return;
           const completedAt = jobData.completedAt?.toDate?.() || (jobData.completedAt ? new Date(jobData.completedAt) : null);
-          
+
           if (completedAt && !isNaN(completedAt.getTime()) && completedAt < fourteenDaysAgo) {
             triggerReminder(jobDoc.id, jobData.title, "homeowner");
           }
@@ -51,7 +52,7 @@ export function ReviewReminder() {
           const quoteData = quoteDoc.data();
           const jobRef = doc(db, "jobs", quoteData.jobId);
           const jobSnap = await getDoc(jobRef);
-          
+
           if (jobSnap.exists()) {
             const jobData = jobSnap.data();
             if (jobData.status === "completed" && !jobData.hasTradespersonReview) {
@@ -65,13 +66,13 @@ export function ReviewReminder() {
       }
     };
 
-    const triggerReminder = async (jobId: string, jobTitle: string, role: string) => {
+    const triggerReminder = async (jobId: string, jobTitle: string, _role: string) => {
       // 1. Show Toast
       toast.info(`Pending Review: ${jobTitle}`, {
         description: "It's been over 14 days since this job was completed. Please leave a review!",
         action: {
           label: "Review Now",
-          onClick: () => window.location.href = `/job/${jobId}`
+          onClick: () => navigate(`/job/${jobId}`)
         },
         duration: 10000,
       });

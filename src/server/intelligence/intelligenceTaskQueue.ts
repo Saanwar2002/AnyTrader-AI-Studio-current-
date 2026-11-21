@@ -166,6 +166,7 @@ export class IntelligenceTaskQueue {
   private workerId: string;
   private maxConcurrency: number;
   private activeTaskIds = new Set<string>();
+  private maintenanceCheck: (() => Promise<boolean>) | null = null;
 
   constructor(
     private maxRetries: number = 3,
@@ -206,6 +207,10 @@ export class IntelligenceTaskQueue {
 
   public getFirestoreDb(): FirestoreTaskDb | null {
     return this.firestoreDb;
+  }
+
+  public setMaintenanceCheck(checkFn: (() => Promise<boolean>) | null): void {
+    this.maintenanceCheck = checkFn;
   }
 
   public registerHandler(type: TaskType, handler: TaskHandler): void {
@@ -305,6 +310,15 @@ export class IntelligenceTaskQueue {
    */
   public async workerTick(): Promise<void> {
     if (!this.firestoreDb) return;
+    if (this.maintenanceCheck) {
+      try {
+        if (await this.maintenanceCheck()) {
+          return;
+        }
+      } catch {
+        // Proceed only if check itself throws unexpectedly
+      }
+    }
     const col = this.firestoreDb.collection('intelligence_tasks');
     if (typeof (col as any).where !== 'function') return;
     if (this.isWorkerRunning) return;

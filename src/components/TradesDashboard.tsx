@@ -186,49 +186,49 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
   }, [user]);
 
   const handleAcceptIM = async () => {
-    if (!activeIMAttempt || !activeIMJob) return;
+    if (!activeIMAttempt || !activeIMJob || !user) return;
     try {
       setShowIMAlert(false);
-      
-      // Update Attempt
-      await updateDoc(doc(db, "instant_match_attempts", activeIMAttempt.id), {
-        status: "accepted",
-        respondedAt: new Date().toISOString()
+      const token = await user.getIdToken();
+      const response = await fetch("/api/instant-match/respond", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          attemptId: activeIMAttempt.id,
+          action: "accept",
+        }),
       });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.error || "Failed to accept instant match");
+      }
 
-      // Update Match Match
-      await updateDoc(doc(db, "instant_matches", activeIMAttempt.instantMatchId), {
-        status: "matched",
-        matchedTraderId: user?.uid,
-        matchedAt: new Date().toISOString()
-      });
-
-      // Update the Job itself to bypass quote process
-      const pin = Math.floor(1000 + Math.random() * 9000).toString();
-      await updateDoc(doc(db, "jobs", activeIMJob.id), {
-        status: "accepted",
-        acceptedTradespersonId: user?.uid,
-        isInstantMatchAccepted: true, // Custom flag if we want it
-        isConfirmedByTradesperson: true,
-        scheduledDate: new Date().toISOString().split('T')[0],
-        verificationPin: pin
-      });
-      
       toast.success("Instant Match accepted! Please contact the customer immediately.");
-      navigate(`/job/${activeIMJob.id}`);
-    } catch (e) {
+      navigate(`/job/${payload?.jobId || activeIMJob.id}`);
+    } catch (e: any) {
       console.error(e);
-      toast.error("Failed to accept. It may have expired.");
+      toast.error(e?.message || "Failed to accept. It may have expired.");
     }
   };
 
   const handleDeclineIM = async () => {
-    if (!activeIMAttempt) return;
+    if (!activeIMAttempt || !user) return;
     setShowIMAlert(false);
     try {
-      await updateDoc(doc(db, "instant_match_attempts", activeIMAttempt.id), {
-        status: "declined",
-        respondedAt: new Date().toISOString()
+      const token = await user.getIdToken();
+      await fetch("/api/instant-match/respond", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          attemptId: activeIMAttempt.id,
+          action: "decline",
+        }),
       });
       setActiveIMAttempt(null);
       setActiveIMJob(null);

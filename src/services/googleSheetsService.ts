@@ -4,29 +4,69 @@
 // In-memory token store for security (H-02: Never persist OAuth bearer tokens in localStorage)
 let inMemorySheetsAccessToken: string | null = null;
 let inMemorySheetsTokenExpiry: number | null = null;
+let inMemorySheetsOwnerUid: string | null = null;
+let activeSheetsSessionUid: string | null = null;
 const STORAGE_KEY_SPREADSHEET_ID = "anytrader_gsheets_spreadsheet_id";
 
-export function getStoredAccessToken(): string | null {
+export function bindGoogleSheetsSessionUid(uid: string | null): void {
+  const normalizedUid = uid || null;
+  if (normalizedUid !== activeSheetsSessionUid) {
+    if (!normalizedUid || inMemorySheetsOwnerUid !== normalizedUid) {
+      disconnectGoogleSheets();
+    }
+    activeSheetsSessionUid = normalizedUid;
+  }
+}
+
+export function getStoredAccessToken(expectedUid: string | null = activeSheetsSessionUid): string | null {
   if (!inMemorySheetsAccessToken || !inMemorySheetsTokenExpiry) return null;
+
+  const normalizedExpected = expectedUid ?? activeSheetsSessionUid ?? null;
+  if (inMemorySheetsOwnerUid !== null && normalizedExpected !== inMemorySheetsOwnerUid) {
+    inMemorySheetsAccessToken = null;
+    inMemorySheetsTokenExpiry = null;
+    inMemorySheetsOwnerUid = null;
+    return null;
+  }
 
   if (Date.now() >= inMemorySheetsTokenExpiry) {
     inMemorySheetsAccessToken = null;
     inMemorySheetsTokenExpiry = null;
+    inMemorySheetsOwnerUid = null;
     return null;
   }
   return inMemorySheetsAccessToken;
 }
 
-export function setStoredAccessToken(token: string, expiresInSeconds: number = 3600) {
+export function setStoredAccessToken(
+  token: string,
+  expiresInSeconds: number = 3600,
+  ownerUid: string | null = activeSheetsSessionUid
+) {
   const expiryTime = Date.now() + (expiresInSeconds - 60) * 1000;
   inMemorySheetsAccessToken = token;
   inMemorySheetsTokenExpiry = expiryTime;
+  inMemorySheetsOwnerUid = ownerUid ?? activeSheetsSessionUid ?? null;
 }
 
 export function disconnectGoogleSheets(): void {
+  const tokenToRevoke = inMemorySheetsAccessToken;
   inMemorySheetsAccessToken = null;
   inMemorySheetsTokenExpiry = null;
-  localStorage.removeItem(STORAGE_KEY_SPREADSHEET_ID);
+  inMemorySheetsOwnerUid = null;
+  if (tokenToRevoke && typeof window !== "undefined") {
+    try {
+      const revoke = (window as any).google?.accounts?.oauth2?.revoke;
+      if (typeof revoke === "function") {
+        revoke(tokenToRevoke, () => {});
+      }
+    } catch {}
+  }
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(STORAGE_KEY_SPREADSHEET_ID);
+    }
+  } catch {}
 }
 
 export function isGoogleSheetsConnected(): boolean {

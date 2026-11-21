@@ -50,8 +50,13 @@ export default function EcosystemAdmin() {
   const [isGeneratingInsights, setIsGeneratingInsights] = useState(false);
   const [showManual, setShowManual] = useState(false);
 
+  const isAuthorized = Boolean(user && (profile?.role === "admin" || profile?.role === "ecosystem_manager"));
+
   useEffect(() => {
-    if (!user || (profile?.role !== "admin" && profile?.role !== "ecosystem_manager")) return;
+    if (!isAuthorized) {
+      setLoading(false);
+      return;
+    }
 
     const unsubPartners = onSnapshot(collection(db, "partners"), (snap) => {
       setPartners(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
@@ -90,7 +95,19 @@ export default function EcosystemAdmin() {
       unsubLeads();
       unsubUsers();
     };
-  }, [user, profile]);
+  }, [isAuthorized]);
+
+  if (!isAuthorized) {
+    return (
+      <div className="max-w-lg mx-auto my-12 bg-white border border-black rounded-2xl p-8 text-center space-y-3 shadow-sm">
+        <Shield className="w-10 h-10 text-red-600 mx-auto" />
+        <h2 className="text-xl font-black text-black">Admin Access Required</h2>
+        <p className="text-sm text-black/70">
+          You do not have permission to view the Ecosystem Management Center.
+        </p>
+      </div>
+    );
+  }
 
   const handleSavePartner = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -159,21 +176,38 @@ export default function EcosystemAdmin() {
   const generateAIInsights = async () => {
     setIsGeneratingInsights(true);
     try {
-      // Gather platform stats for Gemini
+      // AT-ECOSYSTEM-01: Load real aggregated Firestore platform metrics from server endpoint
+      const idToken = user ? await user.getIdToken() : "";
+      if (!idToken) {
+        throw new Error("Admin authentication required to fetch platform analytics.");
+      }
+
+      const statsRes = await fetch("/api/admin/ecosystem/stats", {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      const statsBody = await statsRes.json().catch(() => ({}));
+      if (!statsRes.ok || !statsBody?.stats) {
+        throw new Error(statsBody?.error || "Failed to aggregate real platform statistics.");
+      }
+
       const stats = {
-        totalUsers: 1250, // Mock stats for now, could be fetched
-        totalJobs: 450,
-        topCategories: ["Plumbing", "Electrical", "Carpentry"],
-        expiringDocsCount: expiringTraders.length,
-        currentMonth: new Date().toLocaleString('default', { month: 'long' }),
-        activeCampaigns: campaigns.length
+        ...statsBody.stats,
+        expiringDocsCount:
+          typeof statsBody.stats.expiringDocsCount === "number"
+            ? statsBody.stats.expiringDocsCount
+            : expiringTraders.length,
+        activeCampaigns:
+          typeof statsBody.stats.activeCampaigns === "number"
+            ? statsBody.stats.activeCampaigns
+            : campaigns.filter((c) => c.status === "active").length,
+        currentMonth: new Date().toLocaleString("default", { month: "long" }),
       };
 
       const insights = await getMonetizationOpportunities("ecosystem_admin", stats);
       setAiInsights(insights);
-      toast.success("AI Insights refreshed");
-    } catch (error) {
-      toast.error("Failed to generate AI insights");
+      toast.success("AI Insights refreshed from live platform metrics");
+    } catch (error: any) {
+      toast.error(error?.message || "Failed to generate AI insights");
     } finally {
       setIsGeneratingInsights(false);
     }

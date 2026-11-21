@@ -601,7 +601,20 @@ export default function PassengerRideHistory() {
                 <div className="bg-slate-50 p-5 rounded-3xl border border-black flex flex-col items-center mb-6">
                   <p className="text-[10px] font-black tracking-widest uppercase text-slate-400 mb-2">Total Paid</p>
                   <h2 className="text-4xl font-black text-slate-900 tracking-tighter">
-                    £{(selectedRideDetails.finalFare ? parseFloat(selectedRideDetails.finalFare) : (parseFloat(selectedRideDetails.fareEstimate || selectedRideDetails.price || 0) + (selectedRideDetails.tipAmount || 0) + (selectedRideDetails.cancellationFee || 0))).toFixed(2)}
+                    £{(() => {
+                      if (selectedRideDetails.totalFarePaid !== undefined && selectedRideDetails.totalFarePaid !== null) {
+                        return Number(selectedRideDetails.totalFarePaid).toFixed(2);
+                      }
+                      if (selectedRideDetails.finalFare !== undefined && selectedRideDetails.finalFare !== null) {
+                        const base = parseFloat(selectedRideDetails.finalFare);
+                        return (
+                          selectedRideDetails.fareContractVersion === "v2_excl_tip"
+                            ? base + (selectedRideDetails.tipAmount || 0)
+                            : base
+                        ).toFixed(2);
+                      }
+                      return (parseFloat(selectedRideDetails.fareEstimate || selectedRideDetails.price || 0) + (selectedRideDetails.tipAmount || 0) + (selectedRideDetails.cancellationFee || 0)).toFixed(2);
+                    })()}
                   </h2>
                   <div className="flex gap-2 mt-2 items-center justify-center">
                     <p className="text-xs font-bold text-emerald-600 bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-100 flex items-center">
@@ -632,7 +645,15 @@ export default function PassengerRideHistory() {
                 <div className="space-y-3 mb-6">
                   <div className="flex justify-between text-sm font-bold text-slate-500">
                     <span>Base Fare & Distance</span>
-                    <span className="text-slate-900">£{(selectedRideDetails.finalFare ? parseFloat(selectedRideDetails.finalFare) - (selectedRideDetails.tipAmount || 0) - (selectedRideDetails.unpaidCancellationFeesOwed || selectedRideDetails.cancellationFee || 0) - (selectedRideDetails.isPriority ? 3 : 0) - (selectedRideDetails.isPetFriendly ? 3 : 0) - (((selectedRideDetails.paidWaitSeconds || 0) / 60) * 0.25) : (parseFloat(selectedRideDetails.fareEstimate || selectedRideDetails.price || 5) - (selectedRideDetails.isPriority ? 3 : 0) - (selectedRideDetails.isPetFriendly ? 3 : 0) - (((selectedRideDetails.paidWaitSeconds || 0) / 60) * 0.25))).toFixed(2)}</span>
+                    <span className="text-slate-900">£{(() => {
+                      const isV2 = selectedRideDetails.fareContractVersion === "v2_excl_tip" || selectedRideDetails.totalFarePaid !== undefined;
+                      const base = selectedRideDetails.finalFare !== undefined && selectedRideDetails.finalFare !== null
+                        ? (isV2
+                            ? parseFloat(selectedRideDetails.finalFare) - (selectedRideDetails.unpaidCancellationFeesOwed || selectedRideDetails.cancellationFee || 0) - (selectedRideDetails.isPriority ? 3 : 0) - (selectedRideDetails.isPetFriendly ? 3 : 0) - (((selectedRideDetails.paidWaitSeconds || 0) / 60) * 0.25)
+                            : parseFloat(selectedRideDetails.finalFare) - (selectedRideDetails.tipAmount || 0) - (selectedRideDetails.unpaidCancellationFeesOwed || selectedRideDetails.cancellationFee || 0) - (selectedRideDetails.isPriority ? 3 : 0) - (selectedRideDetails.isPetFriendly ? 3 : 0) - (((selectedRideDetails.paidWaitSeconds || 0) / 60) * 0.25))
+                        : (parseFloat(selectedRideDetails.fareEstimate || selectedRideDetails.price || 5) - (selectedRideDetails.isPriority ? 3 : 0) - (selectedRideDetails.isPetFriendly ? 3 : 0) - (((selectedRideDetails.paidWaitSeconds || 0) / 60) * 0.25));
+                      return Math.max(0, base).toFixed(2);
+                    })()}</span>
                   </div>
                   {selectedRideDetails.isPriority && (
                     <div className="flex justify-between text-sm font-bold text-blue-600">

@@ -29,6 +29,11 @@ function createTransactionalDb(seed: Record<string, any>) {
           }),
           update: (ref: any, patch: any) => writes.push(() => {
             store[ref.path] = { ...store[ref.path], ...structuredClone(patch) };
+          }),
+          set: (ref: any, data: any, options?: { merge?: boolean }) => writes.push(() => {
+            store[ref.path] = options?.merge
+              ? { ...(store[ref.path] || {}), ...structuredClone(data) }
+              : structuredClone(data);
           })
         };
         const result = await handler(tx);

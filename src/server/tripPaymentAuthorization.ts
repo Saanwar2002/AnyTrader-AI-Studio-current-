@@ -1,14 +1,23 @@
 /**
- * AnyTrader V8.3 Task 35-C — Trip Payment Recipient Integrity & Server-Authoritative Payee Resolution
+ * AnyTrader V8.3 Task 35-C & Batch 8 — Trip Payment Recipient Integrity & Authoritative Checkout Binding
  *
- * Enforces server-authoritative recipient determination for trip/fare payments.
- * Rejects client attempts to redirect payment or substitute Stripe/connected accounts.
- * Validates caller relationship (passenger, assigned driver, or platform admin) against authoritative trip state.
+ * Enforces:
+ * - Server-authoritative recipient determination and driver Stripe Connect routing
+ * - Canonical live booking fare & tip contract ("v2_excl_tip": finalFare excludes tip)
+ * - Authoritative `payment_intents` + `client_reference_id` + `intentId` binding for Stripe webhooks (AT-RIDE-PAY-01)
+ * - Durable per-ride idempotency records + deterministic Stripe idempotency keys (AT-RIDE-PAY-02)
  */
 
 import Stripe from "stripe";
-import { UnauthorizedError, ForbiddenError, BadRequestError } from "./httpErrors.ts";
-import { domainEvents } from "./domainEvents.ts";
+import { createHash } from "node:crypto";
+import admin from "firebase-admin";
+import { UnauthorizedError, ForbiddenError, BadRequestError, ConflictError } from "./httpErrors.ts";
+import {
+  computeAuthoritativeRideFare,
+  loadRidesFareConfig,
+  penceToGbp,
+  roundToPence,
+} from "./rideFareCalculator.ts";
 
 export interface AuthenticatedUser {
   uid: string;
@@ -34,6 +43,8 @@ export interface CreateTripPaymentInput {
     transferDestination?: string;
     accountId?: string;
     tipAmount?: number | string;
+    paidWaitSeconds?: number | string;
+    isAbandonment?: boolean;
     baseFare?: number | string;
     amount?: number | string;
     [key: string]: any;
@@ -53,22 +64,23 @@ export interface AuthoritativeTripPaymentResult {
   sanitizedTip: number;
   totalAmount: number;
   feeAmount: number;
+  intentId?: string;
+  reused?: boolean;
   session?: any;
 }
 
-/**
- * Server-authoritative trip payment creation command.
- *
- * Security Invariants:
- * 1. Authenticates caller context.
- * 2. Loads authoritative trip document from Firestore.
- * 3. Asserts caller is an authorized participant (passenger, assigned driver, or platform admin).
- * 4. Resolves the authoritative assigned driver from trip state (rideData.driverId / rideData.assignedDriverId).
- * 5. Rejects any client-supplied recipient fields that conflict with the authoritative driver.
- * 6. Loads the driver's Stripe Connect destination account from the server-authoritative user record.
- * 7. Strictly discards and ignores any client-supplied Stripe / connected account IDs.
- * 8. Creates the Stripe Checkout session routing funds strictly to the authoritative destination.
- */
+function parseMillis(value: any): number {
+  if (!value) return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+  if (typeof value._seconds === "number") return value._seconds * 1000;
+  if (typeof value.seconds === "number") return value.seconds * 1000;
+  return 0;
+}
+
+const TRIP_CHECKOUT_REUSE_WINDOW_MS = 20 * 60 * 60 * 1000; // 20 hours (< Stripe's 24h expiry)
+
 export async function executeCreateTripPaymentCommand(
   input: CreateTripPaymentInput
 ): Promise<AuthoritativeTripPaymentResult> {
@@ -94,6 +106,7 @@ export async function executeCreateTripPaymentCommand(
 
   // 3. Load authoritative ride document from Firestore
   let rideData: any = null;
+  let rideCollectionName: "ride_requests" | "rides" = "ride_requests";
   try {
     const rideSnap = await db.collection("ride_requests").doc(rideId).get();
     if (rideSnap && (typeof rideSnap.exists === "function" ? rideSnap.exists() : rideSnap.exists)) {
@@ -102,6 +115,7 @@ export async function executeCreateTripPaymentCommand(
       const legacySnap = await db.collection("rides").doc(rideId).get();
       if (legacySnap && (typeof legacySnap.exists === "function" ? legacySnap.exists() : legacySnap.exists)) {
         rideData = typeof legacySnap.data === "function" ? legacySnap.data() : legacySnap.data;
+        rideCollectionName = "rides";
       }
     }
   } catch (err: any) {
@@ -112,11 +126,13 @@ export async function executeCreateTripPaymentCommand(
     throw new BadRequestError("Ride record not found");
   }
 
+  if (rideData.paymentStatus === "paid" || rideData.paid === true || rideData.isPaid === true) {
+    throw new ConflictError("This ride has already been paid.");
+  }
+
   // 4. Assert caller authorization against authoritative ride record
   const authoritativePassengerId = rideData.passengerId || rideData.userId || rideData.riderId;
 
-  // Driver Source Verification & Conflict Defense:
-  // If both driverId and assignedDriverId exist but disagree, fail closed immediately.
   if (
     rideData.driverId &&
     rideData.assignedDriverId &&
@@ -128,9 +144,8 @@ export async function executeCreateTripPaymentCommand(
   }
 
   const authoritativeDriverId = rideData.driverId || rideData.assignedDriverId;
-
-  const isPassenger = authoritativePassengerId && callerUid === authoritativePassengerId;
-  const isDriver = authoritativeDriverId && callerUid === authoritativeDriverId;
+  const isPassenger = Boolean(authoritativePassengerId && callerUid === authoritativePassengerId);
+  const isDriver = Boolean(authoritativeDriverId && callerUid === authoritativeDriverId);
 
   if (!isPassenger && !isDriver && !isCallerAdmin) {
     throw new ForbiddenError("Forbidden: You are not authorized to process payment for this trip.");
@@ -141,8 +156,6 @@ export async function executeCreateTripPaymentCommand(
     throw new BadRequestError("No assigned driver found for this ride");
   }
 
-  // Client Recipient Manipulation / Redirection Defense:
-  // If client provided a driverId, recipientId, payeeId, or driverUid, it MUST match the authoritative driver
   const clientSuppliedRecipient = body.driverId || body.recipientId || body.payeeId || body.driverUid;
   if (
     clientSuppliedRecipient &&
@@ -167,47 +180,146 @@ export async function executeCreateTripPaymentCommand(
     throw new BadRequestError("Driver has not completed Stripe onboarding.");
   }
 
-  // NOTE: Any client-supplied stripeAccountId, connectedAccountId, destinationAccountId is completely IGNORED.
-  // The payment destination is strictly authoritativeStripeAccountId.
+  // 7. Compute canonical live fare & tip contract (body.amount and body.baseFare are strictly ignored)
+  const ridesConfig = await loadRidesFareConfig(db);
+  const resolvedPaidWaitSeconds =
+    body.paidWaitSeconds !== undefined && isDriver && Number.isFinite(Number(body.paidWaitSeconds))
+      ? Math.max(Number(rideData.paidWaitSeconds || 0), Math.min(7200, Math.round(Number(body.paidWaitSeconds))))
+      : Number(rideData.paidWaitSeconds || 0);
 
-  // 7. Resolve authoritative base fare from server-authoritative trip record ONLY
-  const rawAuthoritativeFare = (
-    rideData.finalFare ??
-    rideData.fare ??
-    rideData.estimatedFare ??
-    rideData.totalFare ??
-    rideData.price
-  );
+  const isAbandonmentMode =
+    rideData.status === "rider_abandoned" ||
+    (isDriver && body?.isAbandonment === true);
 
-  const effectiveBaseFare = typeof rawAuthoritativeFare === "number" ? rawAuthoritativeFare : Number(rawAuthoritativeFare);
+  const fareBreakdown = computeAuthoritativeRideFare({
+    rideData,
+    driverData,
+    ridesConfig,
+    paidWaitSecondsOverride: resolvedPaidWaitSeconds,
+    tipAmountOverride: body.tipAmount !== undefined ? body.tipAmount : rideData.tipAmount,
+    isAbandonment: isAbandonmentMode,
+  });
 
-  if (!rawAuthoritativeFare || isNaN(effectiveBaseFare) || effectiveBaseFare <= 0) {
+  if (fareBreakdown.baseFarePence <= 0) {
     throw new BadRequestError("Authoritative trip fare could not be resolved from ride record.");
   }
 
-  // Client amount cannot manufacture or override fare: body.amount and body.baseFare are strictly ignored.
-  const rawTip = Number(body.tipAmount) || 0;
-  const sanitizedTip = Math.max(0, Math.min(500, isNaN(rawTip) ? 0 : rawTip));
-  const totalAmount = effectiveBaseFare + sanitizedTip;
+  const effectiveBaseFare = fareBreakdown.baseFareGbp;
+  const sanitizedTip = fareBreakdown.tipGbp;
+  const totalAmount = fareBreakdown.totalCollectedGbp;
+  const totalAmountPence = fareBreakdown.totalCollectedPence;
+  const feeAmount = fareBreakdown.platformFeePence;
 
-  if (totalAmount <= 0) {
+  if (totalAmountPence <= 0) {
     throw new BadRequestError("Trip amount must be greater than zero.");
   }
-
-  const commissionRate = 0.12;
-  const feeAmount = Math.round(effectiveBaseFare * commissionRate * 100);
-  const totalAmountPence = Math.round(totalAmount * 100);
 
   const resolvedAppUrl = appUrl || process.env.APP_URL || "http://localhost:3000";
   let checkoutUrl = `${resolvedAppUrl}/payment-success?rideId=${rideId}&fare=${effectiveBaseFare}&tip=${sanitizedTip}`;
   let createdSession: any = null;
 
+  const payerUserId = authoritativePassengerId || callerUid;
+  const tripCheckoutHash = createHash("sha256")
+    .update(
+      `trip-checkout:${rideId}:${authoritativeDriverId}:${authoritativeStripeAccountId}:${fareBreakdown.baseFarePence}:${fareBreakdown.tipPence}:${isAbandonmentMode ? "abandoned" : "standard"}`
+    )
+    .digest("hex");
+  const stripeIdempotencyKey = `trip_checkout_${tripCheckoutHash.slice(0, 40)}`;
+  const intentId = `trip_chk_${tripCheckoutHash.slice(0, 24)}`;
+
+  const tripCheckoutDocRef = db.collection("trip_checkout_sessions").doc(tripCheckoutHash);
+  const intentDocRef = db.collection("payment_intents").doc(intentId);
+  const canPersistCheckoutState =
+    typeof tripCheckoutDocRef?.set === "function" &&
+    typeof intentDocRef?.set === "function" &&
+    typeof intentDocRef?.update === "function";
+
+  // Check durable per-ride Checkout idempotency record
+  if (canPersistCheckoutState && stripeClient) {
+    try {
+      const existingCheckoutSnap = await tripCheckoutDocRef.get();
+      const existingExists =
+        existingCheckoutSnap &&
+        (typeof existingCheckoutSnap.exists === "function" ? existingCheckoutSnap.exists() : existingCheckoutSnap.exists);
+      if (existingExists) {
+        const existingData =
+          typeof existingCheckoutSnap.data === "function" ? existingCheckoutSnap.data() : existingCheckoutSnap.data;
+        const createdMs = parseMillis(existingData?.createdAt);
+        const isFresh = createdMs === 0 || Date.now() - createdMs < TRIP_CHECKOUT_REUSE_WINDOW_MS;
+        if (
+          existingData?.status === "session_created" &&
+          typeof existingData?.checkoutUrl === "string" &&
+          existingData.checkoutUrl.length > 0 &&
+          Number(existingData?.totalAmountPence) === totalAmountPence &&
+          isFresh
+        ) {
+          return {
+            success: true,
+            url: existingData.checkoutUrl,
+            rideId,
+            driverId: authoritativeDriverId,
+            recipientId: authoritativeDriverId,
+            stripeAccountId: authoritativeStripeAccountId,
+            effectiveBaseFare,
+            sanitizedTip,
+            totalAmount,
+            feeAmount,
+            intentId: existingData.intentId || intentId,
+            reused: true,
+            session: { id: existingData.sessionId, url: existingData.checkoutUrl },
+          };
+        }
+      }
+    } catch (lookupErr: any) {
+      console.warn("Trip checkout idempotency lookup notice:", lookupErr?.message);
+    }
+  }
+
+  const authoritativeMetadata = {
+    intentId,
+    rideId,
+    driverId: authoritativeDriverId,
+    recipientId: authoritativeDriverId,
+    stripeAccountId: authoritativeStripeAccountId,
+    passengerId: payerUserId,
+    baseFare: effectiveBaseFare.toFixed(2),
+    finalFarePence: String(fareBreakdown.baseFarePence),
+    tipAmount: sanitizedTip.toFixed(2),
+    tipPence: String(fareBreakdown.tipPence),
+    totalAmountPence: String(totalAmountPence),
+    driverEarningsPence: String(fareBreakdown.driverEarningsPence),
+    platformFeePence: String(feeAmount),
+    commissionRate: String(fareBreakdown.commissionRate),
+    driverTier: fareBreakdown.driverTier,
+    isDestinationCharge: "true",
+    fareContractVersion: "v2_excl_tip",
+    isAbandonment: isAbandonmentMode ? "true" : "false",
+    type: "taxi_trip",
+  };
+
+  if (canPersistCheckoutState) {
+    await intentDocRef.set({
+      intentId,
+      userId: payerUserId,
+      mode: "payment",
+      currency: "gbp",
+      amount: totalAmountPence,
+      status: "pending",
+      metadata: {
+        ...authoritativeMetadata,
+        rideCollectionName,
+      },
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
   // 8. Create Stripe Checkout Session if client is available
   if (stripeClient) {
     try {
-      createdSession = await stripeClient.checkout.sessions.create({
+      const sessionPayload: Stripe.Checkout.SessionCreateParams = {
         mode: "payment",
         payment_method_types: ["card"],
+        client_reference_id: payerUserId,
         line_items: [
           {
             price_data: {
@@ -224,41 +336,68 @@ export async function executeCreateTripPaymentCommand(
         payment_intent_data: {
           application_fee_amount: feeAmount,
           transfer_data: {
-            destination: authoritativeStripeAccountId, // Strictly server-derived!
+            destination: authoritativeStripeAccountId,
           },
-          metadata: {
-            rideId,
-            driverId: authoritativeDriverId, // Strictly server-derived!
-            recipientId: authoritativeDriverId, // Strictly server-derived!
-            stripeAccountId: authoritativeStripeAccountId, // Strictly server-derived!
-            passengerId: authoritativePassengerId || callerUid,
-            baseFare: effectiveBaseFare.toString(),
-            tipAmount: sanitizedTip.toString(),
-            type: "taxi_trip",
-          },
+          metadata: authoritativeMetadata,
         },
-        metadata: {
-          rideId,
-          driverId: authoritativeDriverId, // Strictly server-derived!
-          recipientId: authoritativeDriverId, // Strictly server-derived!
-          stripeAccountId: authoritativeStripeAccountId, // Strictly server-derived!
-          passengerId: authoritativePassengerId || callerUid,
-          baseFare: effectiveBaseFare.toString(),
-          tipAmount: sanitizedTip.toString(),
-          type: "taxi_trip",
-        },
-        success_url: `${resolvedAppUrl}/payment-success?rideId=${rideId}`,
+        metadata: authoritativeMetadata,
+        success_url: `${resolvedAppUrl}/payment-success?rideId=${rideId}&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${resolvedAppUrl}/payment-failed?rideId=${rideId}`,
+      };
+
+      createdSession = await stripeClient.checkout.sessions.create(sessionPayload, {
+        idempotencyKey: stripeIdempotencyKey,
       });
 
       if (createdSession?.url) {
         checkoutUrl = createdSession.url;
       }
+
+      if (canPersistCheckoutState && createdSession?.id) {
+        const sessionPaymentIntentId =
+          typeof createdSession.payment_intent === "string"
+            ? createdSession.payment_intent
+            : typeof (createdSession.payment_intent as any)?.id === "string"
+              ? (createdSession.payment_intent as any).id
+              : null;
+
+        await intentDocRef.update({
+          checkoutSessionId: createdSession.id,
+          currency: String(createdSession.currency || "gbp").toLowerCase(),
+          paymentIntentId: sessionPaymentIntentId,
+          status: "session_created",
+          sessionCreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        await tripCheckoutDocRef.set({
+          checkoutKey: tripCheckoutHash,
+          stripeIdempotencyKey,
+          intentId,
+          rideId,
+          driverId: authoritativeDriverId,
+          passengerId: payerUserId,
+          sessionId: createdSession.id,
+          checkoutUrl,
+          totalAmountPence,
+          baseFarePence: fareBreakdown.baseFarePence,
+          tipPence: fareBreakdown.tipPence,
+          status: "session_created",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
     } catch (stripeErr: any) {
       console.warn("Stripe trip payment session creation failed:", stripeErr?.message);
+      if (canPersistCheckoutState) {
+        await intentDocRef.update({
+          status: "failed",
+          failureReason: stripeErr?.message || "stripe_session_creation_failed",
+          failedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => undefined);
+      }
       if (process.env.NODE_ENV === "production") {
         throw new BadRequestError("Payment gateway error during session creation.");
       }
+      throw new BadRequestError(stripeErr?.message || "Payment gateway error during session creation.");
     }
   }
 
@@ -273,6 +412,8 @@ export async function executeCreateTripPaymentCommand(
     sanitizedTip,
     totalAmount,
     feeAmount,
+    intentId,
+    reused: false,
     session: createdSession,
   };
 }

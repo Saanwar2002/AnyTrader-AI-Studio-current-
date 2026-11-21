@@ -17,6 +17,7 @@ import {
   assertSucceeds,
   RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import { doc, getDoc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -800,7 +801,7 @@ describe('Task 25 — Scale / Backfill / Resilience Production Firebase Emulator
 
     try {
       const rules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf8');
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: { rules, host: '127.0.0.1', port: 8088 },
       });

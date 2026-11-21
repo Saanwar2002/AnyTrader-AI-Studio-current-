@@ -22,9 +22,11 @@ import {
 import { 
   auditProfileAndAccountReadiness, 
   ProfileAuditResult, 
-  ProfileAuditSuggestion 
+  ProfileAuditSuggestion,
+  ProfileCoachState
 } from "@/src/services/aiProfileOptimizationService";
-import { updateDoc, doc, db } from "@/src/firebase";
+import { auth, updateDoc, setDoc, doc, db } from "@/src/firebase";
+import { sanitizePublicProfilePayload } from "@/src/lib/publicProfileProjection";
 
 interface AiProfileOptimizerSectionProps {
   profile: any;
@@ -36,19 +38,80 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
   const [isAuditing, setIsAuditing] = useState<boolean>(false);
   const [auditResult, setAuditResult] = useState<ProfileAuditResult | null>(profile?.aiProfileAudit || null);
   const [appliedSuggestionIds, setAppliedSuggestionIds] = useState<string[]>([]);
+  const [dismissedSuggestionIds, setDismissedSuggestionIds] = useState<string[]>([]);
+  const [coachState, setCoachState] = useState<ProfileCoachState>({});
+  const [pendingSkillConfirmSug, setPendingSkillConfirmSug] = useState<ProfileAuditSuggestion | null>(null);
+  const [selectedSkillsToConfirm, setSelectedSkillsToConfirm] = useState<string[]>([]);
+  const [capabilityConfirmed, setCapabilityConfirmed] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Initial auto-audit on mount if no audit exists
+  const persistCoachAction = async (payload: {
+    action: "acknowledge" | "dismiss" | "record_audit";
+    suggestionId?: string;
+    healthScore?: number;
+  }) => {
+    try {
+      const token = await auth.currentUser?.getIdToken().catch(() => null);
+      if (!token) return;
+      const res = await fetch("/api/profile/coach/acknowledge", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data?.state) {
+          setCoachState(data.state);
+          if (Array.isArray(data.state.acknowledgedSuggestionIds)) {
+            setAppliedSuggestionIds(data.state.acknowledgedSuggestionIds);
+          }
+          if (Array.isArray(data.state.dismissedSuggestionIds)) {
+            setDismissedSuggestionIds(data.state.dismissedSuggestionIds);
+          }
+        }
+      }
+    } catch {
+      // Best-effort persistence
+    }
+  };
+
+  // Load persisted coach state & run initial audit
   useEffect(() => {
     let isMounted = true;
     async function initAudit() {
-      if (!profile?.aiProfileAudit && profile?.uid) {
+      if (!profile?.uid) return;
+      let loadedState: ProfileCoachState = {};
+      try {
+        const token = await auth.currentUser?.getIdToken().catch(() => null);
+        if (token) {
+          const stateRes = await fetch("/api/profile/coach/state", {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (stateRes.ok) {
+            const payload = await stateRes.json().catch(() => ({}));
+            loadedState = payload?.state || {};
+            if (isMounted) {
+              setCoachState(loadedState);
+              setAppliedSuggestionIds(Array.isArray(loadedState.acknowledgedSuggestionIds) ? loadedState.acknowledgedSuggestionIds : []);
+              setDismissedSuggestionIds(Array.isArray(loadedState.dismissedSuggestionIds) ? loadedState.dismissedSuggestionIds : []);
+            }
+          }
+        }
+      } catch {
+        // Fallback to empty coach state
+      }
+
+      if (!profile?.aiProfileAudit) {
         setIsAuditing(true);
         try {
-          const res = await auditProfileAndAccountReadiness(profile, false);
+          const res = await auditProfileAndAccountReadiness(profile, false, loadedState);
           if (isMounted) {
             setAuditResult(res);
           }
+          await persistCoachAction({ action: "record_audit", healthScore: res.healthScore });
         } catch (e) {
           console.warn("Auto-audit failed:", e);
         } finally {
@@ -63,8 +126,9 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
   const handleRunFreshAudit = async () => {
     setIsAuditing(true);
     try {
-      const freshRes = await auditProfileAndAccountReadiness(profile, true);
+      const freshRes = await auditProfileAndAccountReadiness(profile, true, coachState);
       setAuditResult(freshRes);
+      await persistCoachAction({ action: "record_audit", healthScore: freshRes.healthScore });
       setToastMessage("✨ Fresh AI Profile Audit completed!");
       setTimeout(() => setToastMessage(null), 3000);
     } catch (e) {
@@ -74,8 +138,60 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
     }
   };
 
+  const handleDismissSuggestion = async (sugId: string) => {
+    setDismissedSuggestionIds((prev) => Array.from(new Set([...prev, sugId])));
+    await persistCoachAction({ action: "dismiss", suggestionId: sugId });
+    setToastMessage("Suggestion dismissed and saved.");
+    setTimeout(() => setToastMessage(null), 2500);
+  };
+
+  const commitVerifiedSkills = async () => {
+    if (!profile?.uid || !pendingSkillConfirmSug || selectedSkillsToConfirm.length === 0 || !capabilityConfirmed) return;
+    try {
+      const existingServices = profile.services || profile.skills || [];
+      const mergedServices = Array.from(new Set([...existingServices, ...selectedSkillsToConfirm]));
+      const updates: any = {
+        services: mergedServices,
+        skills: mergedServices,
+        productsAndServices: mergedServices,
+      };
+      onUpdateProfile(updates);
+      await updateDoc(doc(db, "users", profile.uid), updates);
+
+      // Keep public discovery projection in sync with sanitized non-PII allowlist
+      if (profile?.role === "tradesperson" || profile?.role === "business" || profile?.isBusinessProfile) {
+        const sanitizedPublic = sanitizePublicProfilePayload(updates);
+        if (Object.keys(sanitizedPublic).length > 0) {
+          await setDoc(doc(db, "public_profiles", profile.uid), sanitizedPublic, { merge: true }).catch(() => {});
+        }
+      }
+
+      setAppliedSuggestionIds((prev) => Array.from(new Set([...prev, pendingSkillConfirmSug.id])));
+      await persistCoachAction({ action: "acknowledge", suggestionId: pendingSkillConfirmSug.id });
+      setToastMessage(`✅ Added ${selectedSkillsToConfirm.length} confirmed service(s) to your profile.`);
+      setTimeout(() => setToastMessage(null), 3000);
+      setPendingSkillConfirmSug(null);
+      setSelectedSkillsToConfirm([]);
+      setCapabilityConfirmed(false);
+    } catch (err) {
+      console.error("Failed to save confirmed skills:", err);
+    }
+  };
+
   const handleApplySuggestion = async (sug: ProfileAuditSuggestion) => {
     if (!profile?.uid) return;
+
+    // AT-PROFILE-01: Never blindly auto-claim trade skills without explicit capability confirmation
+    if (sug.actionType === "add_skill" && sug.suggestedValue) {
+      const skillsList = Array.isArray(sug.suggestedValue) ? sug.suggestedValue : [sug.suggestedValue];
+      setPendingSkillConfirmSug(sug);
+      setSelectedSkillsToConfirm([]);
+      setCapabilityConfirmed(false);
+      if (skillsList.length === 1) {
+        setSelectedSkillsToConfirm([skillsList[0]]);
+      }
+      return;
+    }
 
     try {
       const updates: any = {};
@@ -83,17 +199,11 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
       if (sug.actionType === "apply_bio" && sug.suggestedValue) {
         const newBio = typeof sug.suggestedValue === "string" ? sug.suggestedValue : sug.suggestedValue[0];
         updates.bio = newBio;
-        updates.description = newBio;
-      } else if (sug.actionType === "add_skill" && sug.suggestedValue) {
-        const skillsToAdd = Array.isArray(sug.suggestedValue) ? sug.suggestedValue : [sug.suggestedValue];
-        const existingServices = profile.services || profile.skills || [];
-        const mergedServices = Array.from(new Set([...existingServices, ...skillsToAdd]));
-        updates.services = mergedServices;
-        updates.skills = mergedServices;
       } else if (sug.actionType === "activate_priority_alerts") {
         updates.priorityAlertsEnabled = true;
       } else if (sug.actionType === "upgrade_subscription") {
-        setAppliedSuggestionIds(prev => [...prev, sug.id]);
+        setAppliedSuggestionIds(prev => Array.from(new Set([...prev, sug.id])));
+        await persistCoachAction({ action: "acknowledge", suggestionId: sug.id });
         const billingEl = document.getElementById("billing") || document.getElementById("subscription");
         if (billingEl) {
           billingEl.scrollIntoView({ behavior: "smooth" });
@@ -104,37 +214,47 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
         setTimeout(() => setToastMessage(null), 3000);
         return;
       } else if (sug.actionType === "explore_ads") {
-        setAppliedSuggestionIds(prev => [...prev, sug.id]);
+        setAppliedSuggestionIds(prev => Array.from(new Set([...prev, sug.id])));
+        await persistCoachAction({ action: "acknowledge", suggestionId: sug.id });
         window.location.href = "/ad-studio";
         return;
       } else if (sug.actionType === "upload_media") {
-        setAppliedSuggestionIds(prev => [...prev, sug.id]);
+        setAppliedSuggestionIds(prev => Array.from(new Set([...prev, sug.id])));
+        await persistCoachAction({ action: "acknowledge", suggestionId: sug.id });
         const videoEl = document.getElementById("trader-video-verification");
         if (videoEl) videoEl.scrollIntoView({ behavior: "smooth" });
         return;
       } else if (sug.actionType === "setup_payment" || sug.actionType === "update_setting") {
-        setAppliedSuggestionIds(prev => [...prev, sug.id]);
+        setAppliedSuggestionIds(prev => Array.from(new Set([...prev, sug.id])));
+        await persistCoachAction({ action: "acknowledge", suggestionId: sug.id });
         const settingEl = document.getElementById("account-settings") || document.getElementById("notifications");
         if (settingEl) settingEl.scrollIntoView({ behavior: "smooth" });
         return;
       }
 
       if (Object.keys(updates).length > 0) {
-        // Update local profile state
         onUpdateProfile(updates);
 
-        // Update Firestore doc
         const userRef = doc(db, "users", profile.uid);
         await updateDoc(userRef, updates);
 
-        // Update local applied state
-        setAppliedSuggestionIds(prev => [...prev, sug.id]);
+        if (profile?.role === "tradesperson" || profile?.role === "business" || profile?.isBusinessProfile) {
+          const sanitizedPublic = sanitizePublicProfilePayload(updates);
+          if (Object.keys(sanitizedPublic).length > 0) {
+            await setDoc(doc(db, "public_profiles", profile.uid), sanitizedPublic, { merge: true }).catch(() => {});
+          }
+        }
+
+        setAppliedSuggestionIds(prev => Array.from(new Set([...prev, sug.id])));
+        await persistCoachAction({ action: "acknowledge", suggestionId: sug.id });
         setToastMessage(`✅ Applied: ${sug.title}`);
         setTimeout(() => setToastMessage(null), 3000);
 
-        // Re-run background lightweight audit update
         setTimeout(async () => {
-          const updatedAudit = await auditProfileAndAccountReadiness({ ...profile, ...updates }, true);
+          const updatedAudit = await auditProfileAndAccountReadiness({ ...profile, ...updates }, true, {
+            ...coachState,
+            acknowledgedSuggestionIds: Array.from(new Set([...appliedSuggestionIds, sug.id])),
+          });
           setAuditResult(updatedAudit);
         }, 500);
       }
@@ -144,8 +264,8 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
   };
 
   const healthScore = auditResult?.healthScore ?? 75;
-  const suggestions = auditResult?.suggestions ?? [];
-  const unappliedSuggestions = suggestions.filter(s => !appliedSuggestionIds.includes(s.id));
+  const suggestions = (auditResult?.suggestions ?? []).filter(s => !dismissedSuggestionIds.includes(s.id));
+  const unappliedSuggestions = suggestions.filter(s => !appliedSuggestionIds.includes(s.id) && !s.isApplied);
   const hasUnread = unappliedSuggestions.length > 0;
 
   // Score status colors
@@ -263,10 +383,10 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
               <Sparkles className="w-5 h-5 text-amber-300 shrink-0 mt-0.5" />
               <div className="text-xs text-slate-200 leading-relaxed">
                 <p className="font-bold text-white text-sm">
-                  Why Profile Readiness Matters
+                  Illustrative Platform Benchmarks
                 </p>
                 <p className="mt-1 text-slate-300">
-                  Profiles with clear professional bios, complete trade keywords, and video credentials receive <strong className="text-emerald-300">3x more local job matches</strong> and <strong className="text-emerald-300">45% higher quote acceptance</strong> from homeowners.
+                  Complete profiles with clear bios, accurate trade keywords, and verified credentials help homeowners evaluate quotes faster. Benchmarks shown here are illustrative platform guidance — individual enquiry and conversion rates vary by trade, region, and availability.
                 </p>
               </div>
             </div>
@@ -346,22 +466,102 @@ export function AiProfileOptimizerSection({ profile, onUpdateProfile }: AiProfil
                             </div>
                           </div>
 
-                          <div className="shrink-0 self-center">
+                          <div className="shrink-0 self-center flex items-center gap-2">
                             {isApplied ? (
                               <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-400 bg-emerald-500/20 px-3 py-1.5 rounded-xl border border-emerald-500/30">
                                 <CheckCircle2 className="w-4 h-4" />
                                 Applied
                               </span>
                             ) : (
-                              <button
-                                onClick={() => handleApplySuggestion(sug)}
-                                className="bg-emerald-400 hover:bg-emerald-300 text-black text-xs font-black px-4 py-2 rounded-xl transition-all shadow-md active:scale-95 flex items-center gap-1.5"
-                              >
-                                <span>{sug.actionLabel}</span>
-                              </button>
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => handleApplySuggestion(sug)}
+                                  className="bg-emerald-400 hover:bg-emerald-300 text-black text-xs font-black px-4 py-2 rounded-xl transition-all shadow-md active:scale-95 flex items-center gap-1.5"
+                                >
+                                  <span>{sug.actionType === "add_skill" ? "Review & Confirm Skills" : sug.actionLabel}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDismissSuggestion(sug.id)}
+                                  className="bg-white/10 hover:bg-white/20 text-slate-200 text-xs font-bold px-3 py-2 rounded-xl border border-white/20 transition"
+                                >
+                                  Dismiss
+                                </button>
+                              </>
                             )}
                           </div>
                         </div>
+
+                        {/* AT-PROFILE-01: Explicit Capability Confirmation Drawer for Skill Additions */}
+                        {pendingSkillConfirmSug?.id === sug.id && Array.isArray(sug.suggestedValue) && (
+                          <div className="mt-4 p-4 rounded-xl bg-slate-900 border border-white/20 space-y-3">
+                            <p className="text-xs font-black text-amber-300">
+                              Confirm Your Qualifications & Scope of Work
+                            </p>
+                            <p className="text-[11px] text-slate-300">
+                              Select only the specific sub-services you are qualified, experienced, and insured to carry out:
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {sug.suggestedValue.map((skill) => {
+                                const checked = selectedSkillsToConfirm.includes(skill);
+                                return (
+                                  <label
+                                    key={skill}
+                                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-bold cursor-pointer ${
+                                      checked
+                                        ? "bg-emerald-500/20 border-emerald-400 text-emerald-200"
+                                        : "bg-white/5 border-white/20 text-slate-300"
+                                    }`}
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={(e) => {
+                                        if (e.target.checked) {
+                                          setSelectedSkillsToConfirm((prev) => Array.from(new Set([...prev, skill])));
+                                        } else {
+                                          setSelectedSkillsToConfirm((prev) => prev.filter((s) => s !== skill));
+                                        }
+                                      }}
+                                    />
+                                    <span>{skill}</span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                            <label className="flex items-start gap-2 text-[11px] text-slate-200 cursor-pointer pt-1">
+                              <input
+                                type="checkbox"
+                                checked={capabilityConfirmed}
+                                onChange={(e) => setCapabilityConfirmed(e.target.checked)}
+                                className="mt-0.5"
+                              />
+                              <span>I confirm I hold the required competence and insurance to perform the selected services.</span>
+                            </label>
+                            <div className="flex items-center gap-2 pt-1">
+                              <button
+                                type="button"
+                                disabled={!capabilityConfirmed || selectedSkillsToConfirm.length === 0}
+                                onClick={commitVerifiedSkills}
+                                className="px-4 py-2 rounded-xl bg-emerald-400 hover:bg-emerald-300 disabled:opacity-40 text-black text-xs font-black transition"
+                              >
+                                Save Confirmed Skills ({selectedSkillsToConfirm.length})
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setPendingSkillConfirmSug(null);
+                                  setSelectedSkillsToConfirm([]);
+                                  setCapabilityConfirmed(false);
+                                }}
+                                className="px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-bold border border-white/20 transition"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })}

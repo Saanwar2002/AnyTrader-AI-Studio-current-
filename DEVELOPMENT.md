@@ -1,5 +1,81 @@
 # AnyTrader Platform Maintenance & Multi-Portal Development Guide
 
+## 🤖 AnyTrader AI Bot Full Audit & Remediation (November 21, 2026)
+- **Model & SDK Alignment (`package.json`, `src/services/geminiServer.ts`)**: Upgraded `@google/genai` to `^3.6.1`, aligned `DEFAULT_FAST_AI_MODEL` to `"gemini-4-hydrogen"`, and rejected deprecated legacy model names while verifying live Google Search grounding compatibility.
+- **Security, Prompt Isolation & Telemetry Governance (`src/services/geminiServer.ts`, `server.ts`, `firestore.rules`, `src/services/searchOptimizationService.ts`)**:
+  - Removed client-driven mutation of the shared server-wide `categoryRegistry` inside `callTradeBot` / `callTradeBotStream`.
+  - Added strict input validation (`sanitizeTradeBotInput`: 1,500-char message cap, 12-turn bounded history, server-authoritative role enforcement, and `<untrusted_user_context>` XML delimiters), client-disconnect stream cancellation (`req.on("close")` + `AbortSignal`), and `sanitizeExternalUrl()` validation on all grounding citations.
+  - Restricted `unmatched_search_telemetry` reads in `firestore.rules` strictly to `isAdmin()` only, added authenticated + rate-limited `POST /api/telemetry/unmatched-search` in `server.ts`, removed non-admin `403` category sync calls from `initSearchOptimizationService()`, and attached Bearer tokens to admin cache/sync calls in `src/services/gemini.ts`.
+- **Semantic Cache & SSE Reliability (`src/services/semanticAiCache.ts`, `src/services/gemini.ts`)**:
+  - Removed collision-prone generic token-bag cache keys, isolated cache keys by normalized role, bypassed caching whenever personalized postcode/Property Twin context is present, sanitized cached sources, and replayed canonical categories on cache hits.
+  - Fixed SSE `{ type: "error" }` swallowing in `callTradeBotStream`, eliminated duplicate unary retries on `400`/`401`/`403`/`429`, and stopped masking server errors behind misleading grounding copy.
+- **Intent Matching, Recommendation Pool Integrity & Handoffs (`src/services/aiRecommendationService.ts`, `src/components/TradeBot.tsx`, `src/components/EmergencyJobWizard.tsx`, `src/components/PublicProfile.tsx`, `src/components/Layout.tsx`)**:
+  - Preserved the **locked hard primary-domain gate (`calculateTradeRelevanceScore`) and intra-domain alias isolation (`getCategoryAliases`) 100% untouched**.
+  - Added `findGenuineTradeCategories` + `isConversationalOrPlatformQuery` so greetings/escrow questions do not show irrelevant builder cards or false demand gaps while restoring real `unmatched_category` logging.
+  - Removed synthetic `INITIAL_MOCK_TRADERS` injection, expanded `public_profiles` query to `limit(200)`, removed rating/review inflation floors, wired real geodesic distance (`computeGeodesicDistanceMiles`), and restricted Gas Safe badges to verified credentials only.
+  - Added progressive `[MATCHED_CATEGORIES: ...]` stripping during streaming, dialog accessibility (`useDialogA11y`, `role="dialog"`, `aria-modal="true"`), `AbortController` cleanup, New Chat reset, inline Retry button, dynamic category count, Emergency Job `?category=` prefill, and direct Trader `Quote` modal auto-open.
+
+## ✅ Live Firestore Rules Deployment & Pre-Production Role-Based User Journey Audit (November 21, 2026)
+- **Live Rules Deployment**: Deployed hardened `firestore.rules` to Firebase project `anytradercombined` (named DB `ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a`). Note: `storage.rules` must still be deployed separately via Firebase CLI (`firebase deploy --only storage`) or Firebase Console.
+- **Role-Based User Journey Remediations**:
+  - **Signup & Onboarding (`src/components/Onboarding.tsx`, `firestore.rules`)**: Removed failing client-side `users` collection queries so `platformConfig.onboardingRestrictionsEnabled` postcode checks always execute; strictly allowlisted the client fallback `setDoc` payload to non-privileged fields permitted by `firestore.rules`.
+  - **Login & Cross-Account Role Switching (`src/components/Login.tsx`, `src/lib/PortalContext.tsx`)**: Removed leftover developer debug banner from `Login.tsx`; updated `PortalContext.tsx` to re-validate `activeRole` against `availableRoles` on profile changes so stale roles in `localStorage` cannot leak across account switches.
+  - **Route-Level Role Guards (`src/App.tsx`, `src/components/EcosystemAdmin.tsx`, `src/components/TraderAdStudio.tsx`)**: Added `<RoleRoute>` guards for `admin`, `ecosystem`, `business`, `driver`, and `corporate` routes, moved `/ad-studio` inside the authenticated `<Layout />` route tree, added `fleet_driver` billing parity, and prevented infinite loading spinners on unauthorized/unauthenticated visits to `EcosystemAdmin` and `TraderAdStudio`.
+  - **Payments & Stripe Auth Integrity (`src/components/BillingManager.tsx`, `src/components/Profile.tsx`, `src/components/driver/DriverExpenses.tsx`, `src/components/passenger/PassengerBooking.tsx`)**: Fixed missing `Authorization: Bearer <token>` headers and silent error swallowing on `/api/create-setup-session` in both `BillingManager.tsx` and `Profile.tsx`; removed simulated client-side payment/subscription/balance bypasses and routed them through real Stripe Checkout / Billing Portal endpoints.
+  - **Profile Saves & Video Verification (`src/components/Profile.tsx`, `src/components/TraderVideoVerificationCard.tsx`, `firestore.rules`)**: Stopped client writes to server-owned `badges` on profile and guarantee saves; updated video credential upload to submit `videoVerificationStatus: "pending"` (and `"none"` on removal); expanded `firestore.rules` `/users/{userId}` allowlist for legitimate non-privileged preferences with strict guards on `isExclusiveActive`, `verificationStatus`, and `videoVerificationStatus`.
+  - **Consultancy Projects & Chat Push (`src/components/ConsultancyProjects.tsx`, `src/components/shared/ProMatchmakerModal.tsx`, `src/components/ConsultancyBids.tsx`, `server.ts`, `firestore.rules`)**: Scoped all consultancy project sub-component reads/writes with `managerId`/`consultantId`, scoped `ProMatchmakerModal` `calendarEvents` queries and replaced `alert()` with `toast`, added `managerId` support to consultancy rules and `fleet_driver` to `isAnyRollerDriver()`, and mounted authenticated + rate-limited `/api/chat-push` delegating to `sendAuthoritativeChatPush`.
+
+## 🔒 Full Pre-Production Security Audit Remediation (November 21, 2026)
+- **Firestore Cross-Account Takeover Hardening (`firestore.rules`)**:
+  - Replaced the overloaded `isConsultancyOwner()` helper with strict non-overlapping `isConsultancyResourceOwner()` (existing `resource.data` only) and `isConsultancyRequestOwner()` (incoming `request.resource.data` only).
+  - Split combined `allow write` rules into explicit `allow create`, `allow update`, and `allow delete` checks across all consultancy and consultant collections (`projects`, `clients`, `proposals`, `proposalTemplates`, `projectRoles`, `projectBids`, `projectShortlists`, `projectMilestones`, `teamMembers`, `projectAssignments`, `projectVenues`, `projectSuppliers`, `supplierContacts`, `projectTimelineItems`, `sessionNotes`, `calendarEvents`, `matchScores`, `enquiries`, `rateCards`, `availabilityWindows`, `calendarSyncs`, `portfolioItems`).
+  - Added immutable ownership keys (`traderId`, `consultantId`, `userId`, `businessId`, `creatorId`) on `invoices` and `expenses`.
+- **Firebase Storage SVG Script & Role Claim Hardening (`storage.rules`)**:
+  - Restricted image uploads strictly to safe raster MIME types (`isSafeImageMimeType()`: `jpeg`, `jpg`, `png`, `webp`, `gif`, `heic`, `heif`, `avif`), blocking `image/svg+xml`.
+  - Aligned `isAdmin()` with `firestore.rules` (removed untrusted `request.auth.token.role` shortcut).
+- **Safe External Link Navigation (`src/lib/safeExternalUrl.ts`)**:
+  - Added `sanitizeExternalUrl()` and `openSafeExternalUrl()` enforcing `https:` (plus dev localhost `http:` and explicit opt-in `blob:`) and `noopener,noreferrer` across `PassengerBooking.tsx`, `TraderDocumentViewerModal.tsx`, `InsuranceMarketplace.tsx`, `PostJobWizard.tsx`, `PartnerAdvertisement.tsx`, and `src/lib/version.ts`.
+- **Production Remote Config & Public API Hardening (`src/services/remoteConfigService.ts`, `server.ts`)**:
+  - Gated `localStorage` simulation overrides (`getSavedOverrides`, `saveSimOverrides`) strictly to development builds (`IS_DEV_RUNTIME`), defaulted `isDemoMode` to `false` in production, and sanitized store URLs.
+  - Attached `generalLimiter` to `GET /api/rides/demand-zones`.
+- **Production Dependency Hardening (`package.json`)**:
+  - Upgraded `@capacitor/android`, `@capacitor/ios`, and `@capacitor/core` to `^8.6.2` and added non-breaking overrides for `proxy-addr` (`>=2.0.8`), `body-parser@1` (`>=1.20.9`), `@grpc/grpc-js` (`>=1.14.7`), `follow-redirects` (`>=1.16.3`), `@fastify/busboy` (`>=3.2.6`), and `source-map-js` (`>=1.2.4`) — reducing `npm audit --omit=dev` from 3 critical / 9 high to **0 critical / 1 high** (only semver-major `zod` v4 remains).
+- **Verification**:
+  - `npm test`: **1,498 / 1,498 tests passing across 103 test files** (including 14 new regression checks in `tests/unit/preProductionSecurityAudit.test.ts`).
+  - `npm run lint` (`tsc --noEmit`): **0 errors**.
+  - `compile_applet` (`npm run build`): **succeeded cleanly**.
+  - `npm run audit:release`: **0 critical failures**.
+  - Detailed `# Security Summary` and `## PoC Verification` documented in `walkthrough.md`.
+
+## 🛡️ Comprehensive Third-Party Audit Remediation — AnyTrader & AnyRoller (November 21, 2026)
+- **Scope**: Owner explicitly authorized full remediation across **both AnyTrader and AnyRoller** (162 verified P1 and P2 findings across Batches 1–16, all verified and ticked off in `implementation_plan.md`).
+- **Financial, Escrow, Subscriptions & AnyRoller Rides (Batches 1–3, 5, 9)**:
+  - Unified Stripe Connect & Checkout flows with strict server-authoritative pricing, idempotency keys, webhook claim fencing, and zero-custody direct destination splits across both AnyTrader jobs/milestones and AnyRoller ride payments, QR fares, tips, and driver payouts.
+  - Canonicalized Banner Ad Studio pricing at **£2.00/day** (`BANNER_AD_DAILY_RATE_GBP = 2.00`) across UI and server pricing catalog, wired real Stripe Checkout activation & impression/click billing, and isolated sanitized public ads into `public_ads`.
+  - Hardened AnyRoller ride lifecycle, fare/commission resolution (`src/lib/rideEarningsDisplay.ts`), settlement math, off-session charging gates, and Stripe payout lease idempotency.
+- **Security Rules, Storage, Privacy Projections & Access Control (Batches 4, 6–8, 10–13)**:
+  - Split public vs private projections (`public_profiles`, `public_ads`, `public_properties`, `public_job_cards`) with strict allowlists on client writes and server-only financial/verification fields.
+  - Enforced strict authentication, rate limiting (ahead of 10 MB Gemini JSON body parser), distributed Firestore-backed rate-limit buckets (`rate_limit_buckets`), fail-closed cron locks, honest provider status (`skipped_no_provider` / `failed_unconfigured`) for Twilio SMS / Email / Outreach / FCM push, and SSRF/redirect/XSS hardening.
+  - Added server-authoritative admin governance (`driver_payout_batches`, `admin_approval_requests`, `broadcast_fanout_jobs`, `platform_feature_flags`, `platform_feature_flags_history`, Operational Health & Incident panel) and single `AbortController` postcode timeout handling.
+- **Scheduling, Calendar, Chat Safety, Google Docs & Accessibility (Batch 15)**:
+  - Replaced hardcoded UTC calendar placeholders with real `Europe/London` (GMT/BST) `VTIMEZONE` `.ics`, Google Calendar (`ctz=Europe/London`), and Outlook exports (`src/lib/calendarExport.ts`).
+  - Migrated `TraderCalendar.tsx` and `Availability.tsx` from legacy `bidding_jobs` to canonical `jobs` (`assignedTradespersonId`).
+  - Implemented server-authoritative "Report / Block Participant" workflow (`src/server/chatSafety.ts`, `/api/chat/blocks`, `/api/chat/report-block`, `chat_user_blocks`, `chat_reports`, `Chat.tsx`).
+  - Hardened Google Docs contract generation (`src/services/googleDriveDocsService.ts`) to derive insurance, warranty, and site-safety clauses strictly from verified trader credentials or mark `[To Confirm]` and fail closed unless `batchUpdate` confirms document population.
+  - Added `useDialogA11y` (Escape-to-close + focus restoration), `role="dialog"`, `aria-modal="true"`, `aria-labelledby`, and programmatic `<label htmlFor>` / `aria-label` links across `PostJobWizard`, `QuoteComparisonModal`, `BnplFinancingModal`, `JobDetails`, `ConsultancyManager`, `DriverEarnings`, `Chat`, and `GoogleDocsContractModal`.
+- **Native Push, Mobile Config, Composite Indexes & Named DB Emulator Parity (Batch 16)**:
+  - Upgraded `src/server/notificationEngine.ts` and `src/lib/pushNotifications.ts` to store per-installation device tokens under `users/{uid}/push_devices/{deviceId}`, enforce token ownership across account switches via `push_device_index/{tokenHash}`, unregister cleanly on logout (`POST /api/notifications/unregister-token`, `DELETE /api/notifications/push-token/:deviceId`), and dispatch multi-device FCM pushes (`admin.messaging().sendEachForMulticast`) behind strict provider config gates with stale token pruning and `push_delivery_receipts` audit logs.
+  - Enforced strict platform-specific Google Maps API key resolution (`VITE_GOOGLE_MAPS_IOS_API_KEY`, `VITE_GOOGLE_MAPS_ANDROID_API_KEY`, `VITE_GOOGLE_MAPS_API_KEY`) in `src/lib/capacitor.ts` without cross-platform fallbacks or placeholders.
+  - Replaced static placeholder `.well-known` files with server-served parameterized `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` (`src/server/mobileDeepLinks.ts`) validated against synthetic fingerprints/Team IDs and failing closed with `503` when unconfigured.
+  - Committed all required collection-group (`quotes`, `push_devices`) and compound query composite indexes into `firestore.indexes.json` (48 indexes total).
+  - Created `tests/unit/helpers/namedDbEmulator.ts` targeting `ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a` explicitly and migrated all 18 Firestore/Storage emulator test suites + `scripts/final-release-audit.mjs` to enforce named-DB parity.
+  - Updated `src/server/tokenVerification.ts` so non-production dev preview accepts cryptographically verified Firebase ID tokens (`verifyIdToken(token, false)`) with best-effort secondary Auth/Firestore revocation checks when Identity Toolkit/IAM is unavailable, while keeping production (`NODE_ENV=production`) and explicit opt-out (`ALLOW_DEGRADED_AUTH=false`) strictly fail-closed.
+- **Verification**:
+  - `npm test`: **1,484 / 1,484 tests passing across 102 test files (0 failures)**.
+  - `npm run lint` (`tsc --noEmit`): **0 errors**.
+  - `npm run build` (`vite build` + `esbuild server.ts`): **succeeded cleanly**.
+  - `npm run audit:release`: **0 critical failures** (48 composite indexes and named-DB emulator parity verified).
+
 ## 🔄 Unified Repository & Task-616 Financial Reconciliation (November 13, 2026)
 - **Unified Codebase Sync**: Merged all improvements from `AnyTrader-main` (`AnyTrader-main_be48a8f2.zip`) into `/app/applet` while preserving all 11 Task-616 files, `_workspace_backup/*`, and workspace config (`android/app/google-services.json`).
 - **FIN-01 + Main Webhook Fencing Unification (`src/server/stripeWebhookHandler.ts`, `src/server/stripeWebhookIdempotency.ts`, `server.ts`)**:

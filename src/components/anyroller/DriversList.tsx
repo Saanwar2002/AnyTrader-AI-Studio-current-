@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, updateDoc, deleteDoc } from "firebase/firestore";
+import { collection, onSnapshot, doc, updateDoc, deleteDoc, query, limit } from "firebase/firestore";
 import { db } from "../../firebase";
 import { 
   Search, Car, Shield, AlertTriangle, CheckCircle, 
@@ -14,8 +14,8 @@ export default function DriversList() {
   const [searchTerm, setSearchTerm] = useState("");
 
   useEffect(() => {
-    // Listen to users
-    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+    // Listen to users (bounded AT-ADMIN-CTRL-05)
+    const unsubUsers = onSnapshot(query(collection(db, "users"), limit(100)), (snapshot) => {
       const allUsers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
       // Filter for drivers (either role is driver, or has D- member prefix, or has vehicle data)
       const drivers = allUsers.filter(u => 
@@ -27,8 +27,8 @@ export default function DriversList() {
       setLoading(false);
     });
 
-    // Listen to real-time driver status
-    const unsubStatus = onSnapshot(collection(db, "driver_status"), (snapshot) => {
+    // Listen to real-time driver status (bounded)
+    const unsubStatus = onSnapshot(query(collection(db, "driver_status"), limit(100)), (snapshot) => {
       const statuses: Record<string, any> = {};
       snapshot.docs.forEach(doc => {
         statuses[doc.id] = doc.data();

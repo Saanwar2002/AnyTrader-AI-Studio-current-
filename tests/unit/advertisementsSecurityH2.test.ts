@@ -11,12 +11,11 @@ describe("Security Remediation H2 — Advertisements Budget & State Integrity Au
   const findTradesCode = fs.readFileSync(path.resolve(__dirname, "../../src/components/FindTrades.tsx"), "utf-8");
 
   describe("1. Firestore Security Rules Hardening for /advertisements/{adId}", () => {
-    it("restricts advertisement creation to signed-in owners with initial zero balance and unapproved state", () => {
+    it("restricts direct advertisement creation to admins only (non-admin campaigns must use server API) and scopes private reads to owner/admin", () => {
       expect(rulesCode).toContain("match /advertisements/{adId}");
-      expect(rulesCode).toContain("request.resource.data.advertiserUid == request.auth.uid");
-      expect(rulesCode).toContain("request.resource.data.get('isActive', false) == false");
-      expect(rulesCode).toContain("request.resource.data.get('approvalStatus', 'pending') == 'pending'");
-      expect(rulesCode).toContain("request.resource.data.get('prepaidBalance', 0) == 0");
+      expect(rulesCode).toContain("allow create: if isAdmin();");
+      expect(rulesCode).toContain("resource.data.get('advertiserUid', '') == request.auth.uid");
+      expect(rulesCode).toContain("match /public_ads/{adId}");
     });
 
     it("strictly isolates protected financial & state fields from client updates", () => {
@@ -31,12 +30,11 @@ describe("Security Remediation H2 — Advertisements Budget & State Integrity Au
       expect(rulesCode).toContain("'advertiserId'");
     });
 
-    it("enforces controlled monotonic engagement tracking (+1 step max, no decrement)", () => {
-      expect(rulesCode).toContain("hasOnly([\n              'clicks', 'bannerClicks', 'searchFeedClicks', 'impressions'\n            ])");
-      expect(rulesCode).toContain("request.resource.data.clicks >= resource.data.get('clicks', 0)");
-      expect(rulesCode).toContain("request.resource.data.clicks <= resource.data.get('clicks', 0) + 1");
-      expect(rulesCode).toContain("request.resource.data.bannerClicks >= resource.data.get('bannerClicks', 0)");
-      expect(rulesCode).toContain("request.resource.data.bannerClicks <= resource.data.get('bannerClicks', 0) + 1");
+    it("forbids direct client mutation of engagement & billing counters (all tracking routes through /api/ads/:id/track)", () => {
+      const adBlock = rulesCode.split("match /advertisements/{adId}")[1].split("match /public_ads/{adId}")[0];
+      expect(adBlock).toContain("!request.resource.data.diff(resource.data).affectedKeys().hasAny([");
+      expect(adBlock).toContain("'clicks', 'bannerClicks', 'searchFeedClicks', 'impressions'");
+      expect(adBlock).toContain("'dailyClicks', 'dailyImpressions', 'dailySpend', 'totalSpend', 'dailyResetDate'");
     });
 
     it("strictly validates ownership on ad deletion", () => {
@@ -44,38 +42,46 @@ describe("Security Remediation H2 — Advertisements Budget & State Integrity Au
     });
   });
 
-  describe("2. Server-Authoritative Endpoints in server.ts", () => {
+  const adEngineCode = fs.readFileSync(path.resolve(__dirname, "../../src/server/adEngine.ts"), "utf-8");
+
+  describe("2. Server-Authoritative Endpoints in server.ts & adEngine.ts", () => {
     it("implements /api/ads/:id/toggle-active with authentication, ownership, and approval validation", () => {
       expect(serverCode).toContain('app.post("/api/ads/:id/toggle-active", requireAuth,');
-      expect(serverCode).toContain("adData.advertiserUid === authUid || adData.advertiserId === authUid");
-      expect(serverCode).toContain('adData.approvalStatus !== "approved"');
-      expect(serverCode).toContain("isActive: nextActive");
+      expect(adEngineCode).toContain("adData.advertiserUid === authUid || adData.advertiserId === authUid");
+      expect(adEngineCode).toContain('adData.approvalStatus !== "approved"');
+      expect(adEngineCode).toContain("isActive: nextActive");
     });
 
-    it("implements /api/ads/create-banner with wallet balance verification and atomic deduction", () => {
+    it("implements /api/ads/create-banner with wallet balance verification, £2/day rate, and pending_review moderation", () => {
       expect(serverCode).toContain('app.post("/api/ads/create-banner", requireAuth,');
-      expect(serverCode).toContain("currentWallet < totalCost");
-      expect(serverCode).toContain("adWalletBalance: admin.firestore.FieldValue.increment(-totalCost)");
-      expect(serverCode).toContain("type: \"trader_promo\"");
+      expect(adEngineCode).toContain("currentWallet < totalCost");
+      expect(adEngineCode).toContain("adWalletBalance: nextWalletBalance");
+      expect(adEngineCode).toContain('type: "trader_promo"');
+      expect(adEngineCode).toContain('approvalStatus: "pending_review"');
     });
 
-    it("implements /api/ads/:id/topup with wallet balance verification and atomic credit", () => {
+    it("implements /api/ads/:id/topup with wallet balance verification and paused-state preservation", () => {
       expect(serverCode).toContain('app.post("/api/ads/:id/topup", requireAuth, paymentLimiter,');
-      expect(serverCode).toContain("currentWallet < topupAmount");
-      expect(serverCode).toContain("prepaidBalance: admin.firestore.FieldValue.increment(topupAmount)");
+      expect(adEngineCode).toContain("currentWallet < topupAmount");
+      expect(adEngineCode).toContain("prepaidBalance: finalBalance");
+    });
+
+    it("implements /api/ads/:id/track for transactional CPC billing and delivery caps", () => {
+      expect(serverCode).toContain('app.post("/api/ads/:id/track", generalLimiter,');
+      expect(adEngineCode).toContain("trackSponsoredAdEventCommand");
     });
   });
 
   describe("3. Client Components Safety Audit", () => {
-    it("PartnerAdvertisement.tsx only updates engagement counters and never client-side balance", () => {
+    it("PartnerAdvertisement.tsx routes ad clicks to server /api/ads/:id/track and never mutates balance client-side", () => {
       expect(partnerAdCode).not.toContain("updateData.prepaidBalance");
-      expect(partnerAdCode).not.toContain("updateData.lastAutoTopUpAt");
-      expect(partnerAdCode).toContain("updateDoc(doc(db, \"advertisements\", clickedAd.id), updateData)");
+      expect(partnerAdCode).not.toContain("prepaidBalance: increment");
+      expect(partnerAdCode).not.toContain("lastAutoTopUpAt");
+      expect(partnerAdCode).toContain('/api/ads/${encodeURIComponent(clickedAd.id)}/track');
     });
 
-    it("FindTrades.tsx only updates engagement counters", () => {
-      expect(findTradesCode).toContain("clicks: increment(1)");
-      expect(findTradesCode).toContain("searchFeedClicks: increment(1)");
+    it("FindTrades.tsx routes promoted card clicks to server /api/ads/:id/track", () => {
+      expect(findTradesCode).toContain('/api/ads/${encodeURIComponent(tp.adId)}/track');
       expect(findTradesCode).not.toContain("prepaidBalance: increment");
     });
 

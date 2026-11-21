@@ -1,7 +1,8 @@
 import { TRADE_CATEGORIES } from "@/src/constants";
-import { INITIAL_MOCK_TRADERS, Tradesperson } from "./seedService";
+import type { Tradesperson } from "./seedService";
 import { db, collection, query, where, getDocs, limit } from "@/src/firebase";
 import { categoryMatchesSearch, getCategoryMetadata } from "@/src/lib/fuzzyMatch";
+import { computeGeodesicDistanceMiles, extractExplicitGeoPoint } from "@/src/lib/geoDistance";
 import { categoryRegistry } from "./categoryRegistrySync";
 
 export interface TraderRecommendationCard {
@@ -36,10 +37,11 @@ export interface AiTradeBotActionPayload {
 }
 
 /**
- * Searches for best matching category names from TRADE_CATEGORIES based on user text.
+ * Searches for genuinely matching category names from TRADE_CATEGORIES based on user text.
+ * Returns an empty array when no category achieves a confident relevance score (no fallback padding).
  */
-export function findMatchingTradeCategories(userText: string, maxResults: number = 3): string[] {
-  if (!userText || userText.trim().length === 0) return ["Building & Construction", "Handyman Services"];
+export function findGenuineTradeCategories(userText: string, maxResults: number = 3): string[] {
+  if (!userText || userText.trim().length === 0) return [];
   
   const textLower = userText.toLowerCase();
   const matchedCategories: { name: string; score: number }[] = [];
@@ -1329,8 +1331,16 @@ export function findMatchingTradeCategories(userText: string, maxResults: number
   // If top category is highly confident (>= 25), do not pad with weak low-scoring categories
   const topScore = matchedCategories[0]?.score || 0;
   const filtered = matchedCategories.filter(c => c.score >= 20 || c.score >= topScore - 10);
-  const result = filtered.slice(0, maxResults).map((c) => c.name);
+  return filtered.slice(0, maxResults).map((c) => c.name);
+}
 
+/**
+ * Searches for best matching category names from TRADE_CATEGORIES based on user text.
+ * Falls back to general construction/handyman categories for legacy callers expecting a non-empty list.
+ */
+export function findMatchingTradeCategories(userText: string, maxResults: number = 3): string[] {
+  if (!userText || userText.trim().length === 0) return ["Building & Construction", "Handyman Services"];
+  const result = findGenuineTradeCategories(userText, maxResults);
   return result.length > 0 ? result : ["Building & Construction", "Handyman / General"];
 }
 
@@ -1647,12 +1657,12 @@ export async function getHybridTraderRecommendations(
 
     let pool: Tradesperson[] = [];
 
-    // 1. Fetch live traders from Firestore if available
+    // 1. Fetch live traders from Firestore public_profiles if no explicit pool was provided
     let firestoreTraders: Tradesperson[] = [];
-    if (!liveTradersPool || liveTradersPool.length === 0) {
+    if (!liveTradersPool) {
       try {
         const profilesRef = collection(db, "public_profiles");
-        const q = query(profilesRef, limit(50));
+        const q = query(profilesRef, limit(200));
         const snap = await getDocs(q);
         if (!snap.empty) {
           firestoreTraders = snap.docs.map(d => ({ uid: d.id, ...d.data() } as Tradesperson));
@@ -1662,15 +1672,8 @@ export async function getHybridTraderRecommendations(
       }
     }
 
-    // Always merge seeded mock traders into pool so verified profiles in all 86+ trade sectors are accessible
-    const seedPool = INITIAL_MOCK_TRADERS as Tradesperson[];
-    if (liveTradersPool && liveTradersPool.length > 0) {
-      const existingUids = new Set(liveTradersPool.map(t => t.uid));
-      pool = [...liveTradersPool, ...seedPool.filter(s => !existingUids.has(s.uid))];
-    } else {
-      const existingUids = new Set(firestoreTraders.map(t => t.uid));
-      pool = [...firestoreTraders, ...seedPool.filter(s => !existingUids.has(s.uid))];
-    }
+    // Use real verified trader profiles only — never merge synthetic demo/mock profiles into live results
+    pool = liveTradersPool ? [...liveTradersPool] : firestoreTraders;
 
     // 2. Strict Trade Relevance Filtering across all detected categories
     const isAllCategories = categoryList.some(c => c.toLowerCase() === "all" || c.toLowerCase() === "general trades" || c.toLowerCase() === "all trades");
@@ -1692,7 +1695,7 @@ export async function getHybridTraderRecommendations(
       .split(/[^a-z0-9]+/i)
       .filter(t => t.length >= 3 && !noiseWords.has(t));
 
-    // Filter and score candidates based on strict trade domain gating
+    // Filter and score candidates based on strict trade domain gating (LOCKED)
     const scoredCandidates: Array<{
       tp: any;
       tradeScore: number;
@@ -1703,15 +1706,38 @@ export async function getHybridTraderRecommendations(
       isNiceic: boolean;
       isVideo: boolean;
       isProSubscribed: boolean;
+      hasActivePaidPlacement: boolean;
       isAreaMatch: boolean;
+      distanceMiles?: number;
       totalScore: number;
       isNewcomer: boolean;
     }> = [];
+
+    // Resolve active paid ad profile placements from public_ads (best-effort; fails open to empty set in offline/unit tests)
+    const activePaidAdProfileIds = new Set<string>();
+    try {
+      const activeAdsQuery = query(collection(db, "public_ads"), where("isActive", "==", true), limit(100));
+      const activeAdsSnap = await getDocs(activeAdsQuery);
+      activeAdsSnap.forEach((adDoc) => {
+        const adData: any = adDoc.data();
+        if (adData?.hasAvailableBudget !== false && typeof adData?.targetProfileId === "string" && adData.targetProfileId.trim()) {
+          activePaidAdProfileIds.add(adData.targetProfileId.trim());
+        }
+      });
+    } catch {
+      // Offline or mocked test environment — rely on explicit trader paid-placement flags only
+    }
 
     const userPrefix = (userPostcode || "").trim().split(" ")[0]?.toUpperCase() || "";
 
     for (const traderObj of pool) {
       const tp: any = traderObj;
+
+      // AT-ACCOUNT-02: Respect trader availability flag — never recommend traders who paused new work
+      if (tp.acceptingNewWork === false || tp.isDisabled === true || tp.isSuspended === true) {
+        continue;
+      }
+
       const tradeScore = isAllCategories ? 50 : calculateTradeRelevanceScore(tp, targetAliases, queryTokens, categoryList);
 
       // STRICT GATE: Must have a valid trade relevance score (> 0) to enter the candidate pool
@@ -1719,19 +1745,45 @@ export async function getHybridTraderRecommendations(
         continue;
       }
 
-      const rating = tp.rating || 4.8;
-      const reviews = tp.reviewsCount || tp.totalReviews || tp.totalJobsCompleted || tp.totalJobsDone || 12;
+      const rating = typeof tp.rating === "number" && Number.isFinite(tp.rating) ? tp.rating : 0;
+      const reviews = Number(tp.reviewsCount ?? tp.totalReviews ?? tp.totalJobsCompleted ?? tp.totalJobsDone ?? 0) || 0;
       const isVerified = tp.verificationStatus === "verified" || tp.isVerified === true;
-      const isGasSafe = tp.isGasSafeRegistered || tp.certifications?.some((c: any) => c.name?.toLowerCase().includes("gas safe")) || tp.recommendedCategories?.includes("Gas & Heating");
-      const isNiceic = tp.isNiceicApproved || tp.certifications?.some((c: any) => c.name?.toLowerCase().includes("niceic"));
+      // Verified-only compliance badges — never infer Gas Safe from category tags alone
+      const isGasSafe = Boolean(
+        tp.isGasSafeRegistered === true ||
+        tp.certifications?.some((c: any) => c?.verified !== false && String(c?.name || "").toLowerCase().includes("gas safe"))
+      );
+      const isNiceic = Boolean(
+        tp.isNiceicApproved === true ||
+        tp.certifications?.some((c: any) => c?.verified !== false && String(c?.name || "").toLowerCase().includes("niceic"))
+      );
       const isVideo = Boolean(tp.videoVerificationUrl || tp.verificationVideoUrl || tp.isVideoVerified || tp.videoVerificationStatus === "verified" || tp.videoVerificationStatus === "approved" || tp.hasVerifiedVideoProSubscription);
       const isProSubscribed = Boolean(tp.subscriptionType === "business" || tp.subscriptionType === "pro" || tp.tier === "premium" || tp.subscriptionTier === "gold" || tp.subscriptionTier === "platinum" || tp.subscriptionTier === "pro" || tp.tierId === "Gold" || tp.tierId === "Platinum" || tp.tierId === "Pro" || tp.isTradeOsPro || tp.hasVerifiedVideoProSubscription);
+      const candidateUid = String(tp.uid || tp.id || "");
+      const hasActivePaidPlacement = Boolean(
+        tp.hasActivePaidAd === true ||
+        tp.isActivePaidPlacement === true ||
+        (candidateUid && activePaidAdProfileIds.has(candidateUid))
+      );
 
       const tpPostcode = (tp.postcode || "").trim().toUpperCase();
       const isAreaMatch = !!(userPrefix && tpPostcode.startsWith(userPrefix));
 
-      // Calculate combined score
-      const totalScore = tradeScore + (rating * 10) + Math.min(reviews, 30) + (isVerified ? 15 : 0) + (isAreaMatch ? 20 : 0);
+      const rawDistanceMiles = userPostcode
+        ? computeGeodesicDistanceMiles(
+            { postcode: userPostcode },
+            { coords: extractExplicitGeoPoint(tp), postcode: tp.postcode }
+          )
+        : null;
+      const distanceMiles = typeof rawDistanceMiles === "number" && Number.isFinite(rawDistanceMiles)
+        ? Math.round(rawDistanceMiles * 10) / 10
+        : undefined;
+
+      // Calculate combined score (reward real proximity when distance is computable)
+      const proximityBoost = typeof distanceMiles === "number"
+        ? (distanceMiles <= 10 ? 25 : distanceMiles <= 25 ? 15 : 0)
+        : (isAreaMatch ? 20 : 0);
+      const totalScore = tradeScore + (rating * 10) + Math.min(reviews, 30) + (isVerified ? 15 : 0) + proximityBoost;
 
       scoredCandidates.push({
         tp,
@@ -1739,11 +1791,13 @@ export async function getHybridTraderRecommendations(
         rating,
         reviews,
         isVerified,
-        isGasSafe: !!isGasSafe,
-        isNiceic: !!isNiceic,
+        isGasSafe,
+        isNiceic,
         isVideo,
         isProSubscribed,
+        hasActivePaidPlacement,
         isAreaMatch,
+        distanceMiles,
         totalScore,
         isNewcomer: reviews <= 5
       });
@@ -1760,37 +1814,40 @@ export async function getHybridTraderRecommendations(
     const recommendations: TraderRecommendationCard[] = [];
     const primaryCategoryLabel = categoryList[0] || "Certified Specialist";
 
-    // --- SLOT 1: FEATURED PRO ⚡ (Monetized / Pro Tier Partner strictly within matching category) ---
-    const featuredCandidates = scoredCandidates.filter((c) => c.isProSubscribed || (c.isVerified && c.rating >= 4.7));
-    const featuredPick = featuredCandidates.length > 0
-      ? featuredCandidates[Math.floor(Date.now() / (1000 * 60 * 30)) % featuredCandidates.length]
-      : scoredCandidates[0];
+    // --- SLOT 1: ACTIVE PAID PARTNER ⚡ (Only tagged Sponsored / Featured Partner when backed by an active paid placement; otherwise Top Verified Match) ---
+    const activePaidCandidates = scoredCandidates.filter((c) => c.hasActivePaidPlacement);
+    const verifiedTopCandidates = scoredCandidates.filter((c) => c.isProSubscribed || (c.isVerified && c.rating >= 4.7));
+    const slot1Pool = activePaidCandidates.length > 0
+      ? activePaidCandidates
+      : (verifiedTopCandidates.length > 0 ? verifiedTopCandidates : [scoredCandidates[0]]);
+    const featuredPick = slot1Pool[Math.floor(Date.now() / (1000 * 60 * 30)) % slot1Pool.length];
 
     if (featuredPick) {
       const tp: any = featuredPick.tp;
       const primaryTradeName = (tp.trades && tp.trades[0]) || tp.category || primaryCategoryLabel;
+      const isPaidPlacement = featuredPick.hasActivePaidPlacement;
       recommendations.push({
         uid: tp.uid || tp.id || "trader-featured-1",
         name: tp.name || tp.displayName || tp.businessName || "Certified Trade Specialist",
         businessName: tp.businessName || tp.companyName || `${tp.name}'s ${primaryTradeName}`,
         avatarUrl: tp.avatarUrl || tp.photoURL || tp.profilePicture || "https://images.unsplash.com/photo-1581578731548-c64695cc6952?w=150",
         category: primaryTradeName,
-        rating: Math.max(4.7, featuredPick.rating),
-        reviewsCount: Math.max(18, featuredPick.reviews),
-        hourlyRate: tp.hourlyRate || tp.miniProfileSettings?.hourlyRate || tp.baseRate || 45,
-        postcode: tp.postcode || "UK Wide",
-        distanceMiles: featuredPick.isAreaMatch ? 1.4 : 3.8,
-        isVerified: true,
+        rating: featuredPick.rating,
+        reviewsCount: featuredPick.reviews,
+        hourlyRate: tp.hourlyRate || tp.miniProfileSettings?.hourlyRate || tp.baseRate || undefined,
+        postcode: tp.postcode || undefined,
+        distanceMiles: featuredPick.distanceMiles,
+        isVerified: featuredPick.isVerified,
         isGasSafe: featuredPick.isGasSafe,
         isNiceic: featuredPick.isNiceic,
         isVideoVerified: featuredPick.isVideo,
-        isSponsored: true, // Tagged as Featured Pro
+        isSponsored: isPaidPlacement,
         badges: [
-          "⚡ Featured Partner",
-          featuredPick.isGasSafe ? "Gas Safe" : (featuredPick.isNiceic ? "NICEIC" : "Verified Pro"),
-          "Fast Response (<15m)"
+          isPaidPlacement ? "⚡ Featured Partner" : "✓ Top Verified Match",
+          featuredPick.isGasSafe ? "Gas Safe" : (featuredPick.isNiceic ? "NICEIC" : (featuredPick.isVerified ? "Verified Pro" : "Registered Trader")),
+          featuredPick.isVideo ? "Video Verified" : (featuredPick.isAreaMatch ? "Local Area" : "Direct Quotes")
         ],
-        bio: tp.bio || `Specialist in ${primaryTradeName} with guaranteed workmanship and public liability insurance.`
+        bio: tp.bio || `Specialist in ${primaryTradeName} available for quotes on AnyTrader.`
       });
     }
 
@@ -1823,9 +1880,9 @@ export async function getHybridTraderRecommendations(
         category: organicTradeName,
         rating: organicPick.rating,
         reviewsCount: organicPick.reviews,
-        hourlyRate: tp.hourlyRate || tp.miniProfileSettings?.hourlyRate || tp.baseRate || 40,
-        postcode: tp.postcode || "Local Area",
-        distanceMiles: organicPick.isAreaMatch ? 0.9 : 2.6,
+        hourlyRate: tp.hourlyRate || tp.miniProfileSettings?.hourlyRate || tp.baseRate || undefined,
+        postcode: tp.postcode || undefined,
+        distanceMiles: organicPick.distanceMiles,
         isVerified: organicPick.isVerified,
         isGasSafe: organicPick.isGasSafe,
         isNiceic: organicPick.isNiceic,
@@ -1834,10 +1891,10 @@ export async function getHybridTraderRecommendations(
         isNewcomerBoost: organicPick.isNewcomer,
         badges: [
           organicPick.isNewcomer ? "🌟 Newcomer Boost" : "Top Local Match",
-          organicPick.isVerified ? "100% Vetted" : "Insured Trader",
-          organicPick.isAreaMatch ? "Near You" : "Guaranteed Work"
+          organicPick.isVerified ? "Verified Pro" : "Registered Trader",
+          organicPick.isAreaMatch ? "Near You" : "Direct Quotes"
         ],
-        bio: tp.bio || `Reliable ${organicTradeName} specialist providing transparent quotes, punctuality, and high-quality finishes.`
+        bio: tp.bio || `${organicTradeName} specialist available for quotes on AnyTrader.`
       });
     }
 

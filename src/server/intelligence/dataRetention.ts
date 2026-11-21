@@ -152,6 +152,9 @@ export interface DataDeletionRequest {
   approvedAt?: string;
   completedAt?: string;
   blockedReason?: string;
+  leaseToken?: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
   dependencyCount?: number;
   dependencies?: DeletionDependency[];
   policyRef?: {
@@ -237,6 +240,13 @@ export class DataRetentionIntegrityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'DataRetentionIntegrityError';
+  }
+}
+
+export class DataRetentionNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DataRetentionNotFoundError';
   }
 }
 
@@ -380,7 +390,65 @@ export class DataRetentionService {
   }
 
   /**
-   * Registers or updates a server-authoritative retention policy for a tenant & recordType.
+   * Verifies caller tenant ownership / authorized relationship on a target physical record.
+   * For job records, requires the job document to exist and belong to the caller
+   * via explicit ownership or tenant relationship fields (never allowing blind or cross-user erasure).
+   */
+  public verifyTargetOwnershipForErasure(
+    targetCollection: string,
+    targetExists: boolean,
+    targetData: Record<string, any> | undefined,
+    callerTenantId: string
+  ): void {
+    if (targetCollection === 'jobs') {
+      if (!targetExists || !targetData) {
+        throw new DataRetentionSecurityError(
+          'Target job document does not exist or caller lacks verified job ownership'
+        );
+      }
+      const isJobOwnerOrTenant =
+        targetData.tenantId === callerTenantId ||
+        targetData.homeownerId === callerTenantId ||
+        targetData.userId === callerTenantId ||
+        targetData.ownerId === callerTenantId ||
+        targetData.posterId === callerTenantId ||
+        targetData.customerId === callerTenantId;
+      if (!isJobOwnerOrTenant) {
+        throw new DataRetentionSecurityError(
+          'Forbidden: authenticated job ownership or authorized tenant relationship required before erasing job records'
+        );
+      }
+      return;
+    }
+
+    if (targetExists && targetData) {
+      if (targetData.tenantId && targetData.tenantId !== callerTenantId) {
+        throw new DataRetentionSecurityError('Target document tenant mismatch during erasure');
+      }
+      const ownerKeys = [
+        'tenantId',
+        'ownerId',
+        'userId',
+        'homeownerId',
+        'posterId',
+        'customerId',
+        'landlordId',
+      ];
+      const presentOwnerKeys = ownerKeys.filter((k) => Boolean(targetData[k]));
+      if (
+        presentOwnerKeys.length > 0 &&
+        !presentOwnerKeys.some((k) => targetData[k] === callerTenantId)
+      ) {
+        throw new DataRetentionSecurityError(
+          `Target document ownership mismatch in '${targetCollection}'`
+        );
+      }
+    }
+  }
+
+  /**
+   * Registers or updates a server-authoritative retention policy transactionally.
+   * Preserves any active administrator legalHold monotonically.
    */
   public async registerRetentionPolicy(input: RegisterRetentionPolicyInput): Promise<RetentionPolicy> {
     if (!input.tenantId || typeof input.tenantId !== 'string' || input.tenantId.trim() === '') {
@@ -404,70 +472,87 @@ export class DataRetentionService {
       retentionUntil = new Date(futureMs).toISOString();
     }
 
-    let existingPolicy: RetentionPolicy | null = null;
-    const snap = await policyRef.get();
-    if (snap.exists) {
-      existingPolicy = snap.data() as RetentionPolicy;
-      if (existingPolicy.tenantId !== input.tenantId) {
-        throw new DataRetentionSecurityError(
-          `Cross-tenant policy modification rejected for policy '${policyId}'`
-        );
+    const committed = await db.runTransaction(async (tx: any) => {
+      const snap = await tx.get(policyRef);
+      let existingPolicy: RetentionPolicy | null = null;
+      if (snap.exists) {
+        existingPolicy = snap.data() as RetentionPolicy;
+        if (existingPolicy.tenantId !== input.tenantId) {
+          throw new DataRetentionSecurityError(
+            `Cross-tenant policy modification rejected for policy '${policyId}'`
+          );
+        }
       }
-    }
 
-    // Preserve existing legal hold if not explicitly overridden by authorized input
-    const isLegalHold = input.legalHold !== undefined ? input.legalHold === true : (existingPolicy ? existingPolicy.legalHold === true : false);
-    const legalHoldReason = isLegalHold ? (input.legalHoldReason || (existingPolicy ? existingPolicy.legalHoldReason : undefined)) : undefined;
+      // Active administrator legal hold MUST NEVER be downgraded or cleared by ordinary policy updates
+      const isLegalHold =
+        existingPolicy?.legalHold === true
+          ? true
+          : input.legalHold === true;
+      const legalHoldReason = isLegalHold
+        ? (existingPolicy?.legalHold === true
+            ? existingPolicy.legalHoldReason || input.legalHoldReason
+            : input.legalHoldReason)
+        : undefined;
 
-    const version = existingPolicy ? existingPolicy.version + 1 : 1;
-    const policyRecord: RetentionPolicy = {
-      policyId,
-      tenantId: input.tenantId,
-      recordType: input.recordType,
-      retentionClass: input.retentionClass,
-      ...(input.retentionPeriodDays !== undefined ? { retentionPeriodDays: input.retentionPeriodDays } : {}),
-      ...(retentionUntil ? { retentionUntil } : {}),
-      legalHold: isLegalHold,
-      ...(isLegalHold && legalHoldReason ? { legalHoldReason } : {}),
-      ...(isLegalHold ? { legalHoldAppliedAt: existingPolicy?.legalHoldAppliedAt || now } : {}),
-      version,
-      status: 'active',
-      createdAt: existingPolicy ? existingPolicy.createdAt : now,
-      updatedAt: now,
-    };
-
-    policyRecord.policyHash = computeSha256(
-      JSON.stringify({
+      const version = existingPolicy ? existingPolicy.version + 1 : 1;
+      const policyRecord: RetentionPolicy = {
         policyId,
         tenantId: input.tenantId,
         recordType: input.recordType,
         retentionClass: input.retentionClass,
-        retentionUntil,
-        legalHold: policyRecord.legalHold,
+        ...(input.retentionPeriodDays !== undefined ? { retentionPeriodDays: input.retentionPeriodDays } : {}),
+        ...(retentionUntil ? { retentionUntil } : {}),
+        legalHold: isLegalHold,
+        ...(isLegalHold && legalHoldReason ? { legalHoldReason } : {}),
+        ...(isLegalHold ? { legalHoldAppliedAt: existingPolicy?.legalHoldAppliedAt || now } : {}),
         version,
-      })
-    );
+        status: 'active',
+        createdAt: existingPolicy ? existingPolicy.createdAt : now,
+        updatedAt: now,
+      };
 
-    const cleanedPolicy = cleanUndefinedValues(policyRecord)!;
+      policyRecord.policyHash = computeSha256(
+        JSON.stringify({
+          policyId,
+          tenantId: input.tenantId,
+          recordType: input.recordType,
+          retentionClass: input.retentionClass,
+          retentionUntil,
+          legalHold: policyRecord.legalHold,
+          version,
+        })
+      );
 
-    await policyRef.set(cleanedPolicy);
+      const cleanedPolicy = cleanUndefinedValues(policyRecord)!;
+      const eventType: DataLifecycleEventType = existingPolicy ? 'POLICY_SUPERSEDED' : 'POLICY_REGISTERED';
+      const eventId = computeLifecycleEventId(input.tenantId, eventType, policyId, now);
+      const eventBase = {
+        eventId,
+        tenantId: input.tenantId,
+        eventType,
+        recordType: input.recordType,
+        recordId: policyId,
+        policyVersion: version,
+        payload: cleanUndefinedValues({
+          retentionClass: input.retentionClass,
+          retentionUntil,
+          legalHold: policyRecord.legalHold,
+          version,
+        }),
+        recordedAt: now,
+      };
+      const lifecycleEvent = cleanUndefinedValues({
+        ...eventBase,
+        eventHash: computeLifecycleEventHash(eventBase),
+      })!;
 
-    // Record lifecycle event
-    await this.recordLifecycleEvent({
-      tenantId: input.tenantId,
-      eventType: existingPolicy ? 'POLICY_SUPERSEDED' : 'POLICY_REGISTERED',
-      recordType: input.recordType,
-      recordId: policyId,
-      policyVersion: version,
-      payload: {
-        retentionClass: input.retentionClass,
-        retentionUntil,
-        legalHold: policyRecord.legalHold,
-        version,
-      },
+      await tx.set(policyRef, cleanedPolicy);
+      await tx.set(db.collection('data_lifecycle_events').doc(eventId), lifecycleEvent);
+      return cleanedPolicy;
     });
 
-    return cleanedPolicy;
+    return committed;
   }
 
   /**
@@ -510,8 +595,7 @@ export class DataRetentionService {
   }
 
   /**
-   * Applies or removes a server-authoritative legal hold on a policy.
-   * If authorizedAdminUid is provided, tenant authority is derived from the authoritative policy record.
+   * Applies or removes a server-authoritative legal hold transactionally on a policy.
    */
   public async setLegalHold(
     tenantId: string,
@@ -523,60 +607,71 @@ export class DataRetentionService {
     if (!policyId) {
       throw new DataRetentionValidationError('Missing policyId for setLegalHold');
     }
-    const db = this.getDb();
-    const policyRef = db.collection('data_retention_policies').doc(policyId);
-    const snap = await policyRef.get();
-    if (!snap.exists) {
-      throw new DataRetentionValidationError(`Retention policy '${policyId}' does not exist`);
-    }
-
-    const policy = snap.data() as RetentionPolicy;
-    // Strict administrative privilege boundary: Only authorized administrators can apply or remove legal holds
     if (!authorizedAdminUid) {
       throw new DataRetentionSecurityError(
         `Privilege required: Only authorized administrators can apply or remove legal holds on policy '${policyId}'`
       );
     }
 
-    const effectiveTenantId = policy.tenantId;
+    const db = this.getDb();
+    const policyRef = db.collection('data_retention_policies').doc(policyId);
     const now = new Date().toISOString();
-    const updatedPolicy: RetentionPolicy = {
-      ...policy,
-      legalHold,
-      ...(legalHold ? { legalHoldReason: reason || 'Under legal investigation', legalHoldAppliedAt: now } : {}),
-      version: policy.version + 1,
-      updatedAt: now,
-    };
-    if (!legalHold) {
-      delete updatedPolicy.legalHoldReason;
-      delete updatedPolicy.legalHoldAppliedAt;
-    }
 
-    updatedPolicy.policyHash = computeSha256(
-      JSON.stringify({
-        policyId: updatedPolicy.policyId,
-        tenantId: updatedPolicy.tenantId,
-        recordType: updatedPolicy.recordType,
-        retentionClass: updatedPolicy.retentionClass,
-        retentionUntil: updatedPolicy.retentionUntil,
-        legalHold: updatedPolicy.legalHold,
-        version: updatedPolicy.version,
-      })
-    );
+    return await db.runTransaction(async (tx: any) => {
+      const snap = await tx.get(policyRef);
+      if (!snap.exists) {
+        throw new DataRetentionValidationError(`Retention policy '${policyId}' does not exist`);
+      }
 
-    const cleaned = cleanUndefinedValues(updatedPolicy)!;
-    await policyRef.set(cleaned);
+      const policy = snap.data() as RetentionPolicy;
+      const effectiveTenantId = policy.tenantId;
+      const updatedPolicy: RetentionPolicy = {
+        ...policy,
+        legalHold,
+        ...(legalHold ? { legalHoldReason: reason || 'Under legal investigation', legalHoldAppliedAt: now } : {}),
+        version: policy.version + 1,
+        updatedAt: now,
+      };
+      if (!legalHold) {
+        delete updatedPolicy.legalHoldReason;
+        delete updatedPolicy.legalHoldAppliedAt;
+      }
 
-    await this.recordLifecycleEvent({
-      tenantId: effectiveTenantId,
-      eventType: legalHold ? 'LEGAL_HOLD_APPLIED' : 'LEGAL_HOLD_REMOVED',
-      recordType: policy.recordType,
-      recordId: policyId,
-      policyVersion: cleaned.version,
-      payload: { legalHold, reason, authorizedAdminUid: authorizedAdminUid || null },
+      updatedPolicy.policyHash = computeSha256(
+        JSON.stringify({
+          policyId: updatedPolicy.policyId,
+          tenantId: updatedPolicy.tenantId,
+          recordType: updatedPolicy.recordType,
+          retentionClass: updatedPolicy.retentionClass,
+          retentionUntil: updatedPolicy.retentionUntil,
+          legalHold: updatedPolicy.legalHold,
+          version: updatedPolicy.version,
+        })
+      );
+
+      const cleaned = cleanUndefinedValues(updatedPolicy)!;
+      const eventType: DataLifecycleEventType = legalHold ? 'LEGAL_HOLD_APPLIED' : 'LEGAL_HOLD_REMOVED';
+      const eventId = computeLifecycleEventId(effectiveTenantId, eventType, policyId, now);
+      const eventBase = {
+        eventId,
+        tenantId: effectiveTenantId,
+        eventType,
+        recordType: policy.recordType,
+        recordId: policyId,
+        policyVersion: cleaned.version,
+        payload: cleanUndefinedValues({ legalHold, reason, authorizedAdminUid: authorizedAdminUid || null }),
+        recordedAt: now,
+      };
+      const lifecycleEvent = cleanUndefinedValues({
+        ...eventBase,
+        eventHash: computeLifecycleEventHash(eventBase),
+      })!;
+
+      await tx.set(policyRef, cleaned);
+      await tx.set(db.collection('data_lifecycle_events').doc(eventId), lifecycleEvent);
+
+      return cleaned;
     });
-
-    return cleaned;
   }
 
   /**
@@ -770,38 +865,49 @@ export class DataRetentionService {
       throw new DataRetentionValidationError('Missing tenantId or reason for revokeDataLifecycleRights');
     }
 
+    // AT-INTEL-LIFECYCLE-01: Require at least one explicit target ID
+    if (!input.rightsId && !input.controlId && !input.provenanceNodeId) {
+      throw new DataRetentionValidationError(
+        'At least one revocation target (rightsId, controlId, or provenanceNodeId) is required.'
+      );
+    }
+
     const now = new Date().toISOString();
     let rightsRevoked = false;
     let aiControlRevoked = false;
     let provenanceRetracted = false;
+    const missingTargets: string[] = [];
 
     // 1. Revoke Data Rights via DataRightsService
     if (input.rightsId) {
       const rights = await this.rightsService.getDataRightsRecord(input.rightsId);
       if (!rights) {
-        throw new DataRetentionValidationError(`Data rights record '${input.rightsId}' not found`);
-      }
-      if (rights.tenantId !== input.tenantId) {
-        throw new DataRetentionSecurityError(
-          `Cross-tenant rights revocation rejected: caller '${input.tenantId}' != owner '${rights.tenantId}'`
-        );
-      }
-      if (rights.status !== 'revoked') {
-        await this.rightsService.updateDataRightsRecord({
-          rightsId: input.rightsId,
-          tenantId: input.tenantId,
-          status: 'revoked',
-          revocationReason: input.reason,
-          updatedBy: input.updatedBy || input.tenantId,
-        });
-        rightsRevoked = true;
+        missingTargets.push(`rightsId:${input.rightsId}`);
+      } else {
+        if (rights.tenantId !== input.tenantId) {
+          throw new DataRetentionSecurityError(
+            `Cross-tenant rights revocation rejected: caller '${input.tenantId}' != owner '${rights.tenantId}'`
+          );
+        }
+        if (rights.status !== 'revoked') {
+          await this.rightsService.updateDataRightsRecord({
+            rightsId: input.rightsId,
+            tenantId: input.tenantId,
+            status: 'revoked',
+            revocationReason: input.reason,
+            updatedBy: input.updatedBy || input.tenantId,
+          });
+          rightsRevoked = true;
+        }
       }
     }
 
     // 2. Revoke AI Usage Controls via AiTrainingUsageControlsService
     if (input.controlId) {
       const control = await this.aiUsageService.getAiUsageControlRecord(input.controlId, input.tenantId);
-      if (control && control.status !== 'revoked') {
+      if (!control) {
+        missingTargets.push(`controlId:${input.controlId}`);
+      } else if (control.status !== 'revoked') {
         await this.aiUsageService.revokeAiUsageControls(
           input.tenantId,
           input.controlId,
@@ -815,7 +921,9 @@ export class DataRetentionService {
     // 3. Retract Provenance Node via ProvenanceGraphService
     if (input.provenanceNodeId) {
       const node = await this.provenanceService.getNode(input.provenanceNodeId, input.tenantId);
-      if (node && node.status !== 'retracted') {
+      if (!node) {
+        missingTargets.push(`provenanceNodeId:${input.provenanceNodeId}`);
+      } else if (node.status !== 'retracted') {
         await this.provenanceService.updateNodeStatus(
           input.tenantId,
           input.provenanceNodeId,
@@ -824,6 +932,12 @@ export class DataRetentionService {
         );
         provenanceRetracted = true;
       }
+    }
+
+    if (missingTargets.length > 0) {
+      throw new DataRetentionNotFoundError(
+        `Revocation target(s) not found for tenant '${input.tenantId}': ${missingTargets.join(', ')}`
+      );
     }
 
     return {
@@ -864,6 +978,17 @@ export class DataRetentionService {
       if (existingReq.status === 'completed') {
         return existingReq;
       }
+    }
+
+    const targetCollection = this.resolveAuthoritativeCollection(input.recordType);
+    if (targetCollection === 'jobs') {
+      const targetSnap = await db.collection('jobs').doc(input.recordId).get();
+      this.verifyTargetOwnershipForErasure(
+        'jobs',
+        targetSnap.exists,
+        targetSnap.exists ? (targetSnap.data() as Record<string, any>) : undefined,
+        input.tenantId
+      );
     }
 
     // Evaluate eligibility
@@ -910,15 +1035,8 @@ export class DataRetentionService {
   }
 
   /**
-   * Processes an approved deletion request and performs actual erasure of the eligible current projection.
-   * State Machine: approved -> processing -> completed.
-   * Enforces:
-   * - Re-checks retention policy, legal hold, and active dependencies.
-   * - Revokes rights and AI controls first.
-   * - Retracts provenance nodes if applicable.
-   * - Erases current target projection from Firestore collection.
-   * - Preserves immutable audit history.
-   * - Emits minimal DATA_ERASURE_COMPLETED lifecycle event.
+   * Processes an approved deletion request using exclusive transactional lease claims
+   * and final pre-commit legal-hold/ownership re-verification inside an atomic transaction.
    */
   public async processDeletion(input: ProcessDeletionInput): Promise<DataDeletionRequest> {
     if (!input.tenantId || !input.requestId) {
@@ -927,29 +1045,98 @@ export class DataRetentionService {
 
     const db = this.getDb();
     const reqRef = db.collection('data_deletion_requests').doc(input.requestId);
-    const snap = await reqRef.get();
-    if (!snap.exists) {
-      throw new DataRetentionValidationError(`Deletion request '${input.requestId}' not found`);
+    const leaseToken = `lease_${computeSha256(`${input.tenantId}:${input.requestId}:${Date.now()}:${Math.random()}`).substring(0, 24)}`;
+    const leaseExpiryMs = Date.now() + 120_000;
+    const now = new Date().toISOString();
+
+    // 1. Exclusive transactional lease claim (prevents duplicate/concurrent erasure execution)
+    const leaseOutcome = await db.runTransaction(async (tx: any) => {
+      const snap = await tx.get(reqRef);
+      if (!snap.exists) {
+        throw new DataRetentionValidationError(`Deletion request '${input.requestId}' not found`);
+      }
+
+      const reqData = snap.data() as DataDeletionRequest;
+      if (reqData.tenantId !== input.tenantId) {
+        throw new DataRetentionSecurityError(
+          `Cross-tenant deletion processing rejected: caller '${input.tenantId}' != owner '${reqData.tenantId}'`
+        );
+      }
+
+      if (reqData.status === 'completed') {
+        return { kind: 'already_completed' as const, record: reqData };
+      }
+
+      if (reqData.status === 'rejected') {
+        throw new DataRetentionValidationError(`Cannot process rejected deletion request '${input.requestId}'`);
+      }
+
+      if (reqData.status === 'processing' && reqData.leaseExpiresAt) {
+        const existingExpiry = new Date(reqData.leaseExpiresAt).getTime();
+        if (Number.isFinite(existingExpiry) && existingExpiry > Date.now() && reqData.leaseToken !== leaseToken) {
+          throw new DataRetentionSecurityError(
+            `Deletion request '${input.requestId}' is already claimed under an active processing lease`
+          );
+        }
+      }
+
+      const policyId = computeRetentionPolicyId(input.tenantId, reqData.recordType);
+      const policySnap = await tx.get(db.collection('data_retention_policies').doc(policyId));
+      const policy = policySnap.exists ? (policySnap.data() as RetentionPolicy) : null;
+
+      if (!policy || policy.status !== 'active') {
+        const blockedReq: DataDeletionRequest = {
+          ...reqData,
+          status: 'blocked',
+          blockedReason: `No active retention policy found for tenant '${input.tenantId}' and recordType '${reqData.recordType}'`,
+          version: reqData.version + 1,
+        };
+        await tx.set(reqRef, cleanUndefinedValues(blockedReq)!);
+        return { kind: 'blocked' as const, reason: blockedReq.blockedReason! };
+      }
+
+      if (policy.legalHold === true) {
+        const blockedReq: DataDeletionRequest = {
+          ...reqData,
+          status: 'blocked',
+          blockedReason: `Record is under server-authoritative legal hold: ${policy.legalHoldReason || 'Active legal hold enforced'}`,
+          version: reqData.version + 1,
+        };
+        await tx.set(reqRef, cleanUndefinedValues(blockedReq)!);
+        return { kind: 'blocked' as const, reason: blockedReq.blockedReason! };
+      }
+
+      const processingReq: DataDeletionRequest = {
+        ...reqData,
+        status: 'processing',
+        leaseToken,
+        leaseOwner: input.processedBy || input.tenantId,
+        leaseExpiresAt: new Date(leaseExpiryMs).toISOString(),
+        version: reqData.version + 1,
+      };
+      await tx.set(reqRef, cleanUndefinedValues(processingReq)!);
+
+      return { kind: 'claimed' as const, reqData: processingReq };
+    });
+
+    if (leaseOutcome.kind === 'already_completed') {
+      return leaseOutcome.record;
+    }
+    if (leaseOutcome.kind === 'blocked') {
+      throw new DataRetentionSecurityError(`Deletion blocked during lease acquisition: ${leaseOutcome.reason}`);
     }
 
-    const reqData = snap.data() as DataDeletionRequest;
-    if (reqData.tenantId !== input.tenantId) {
-      throw new DataRetentionSecurityError(
-        `Cross-tenant deletion processing rejected: caller '${input.tenantId}' != owner '${reqData.tenantId}'`
+    const reqData = leaseOutcome.reqData;
+
+    // Resolve target collection BEFORE performing downstream dependency revocation
+    const targetCollection = this.resolveAuthoritativeCollection(reqData.recordType);
+    if (!targetCollection) {
+      throw new DataRetentionValidationError(
+        `No authoritative physical collection mapping exists for record type '${reqData.recordType}'`
       );
     }
 
-    // Idempotency: if completed, return immediately
-    if (reqData.status === 'completed') {
-      return reqData;
-    }
-
-    // Invalid transition checks
-    if (reqData.status === 'rejected') {
-      throw new DataRetentionValidationError(`Cannot process rejected deletion request '${input.requestId}'`);
-    }
-
-    // Re-evaluate eligibility to ensure state has not drifted
+    // Re-evaluate full retention & dependency eligibility while holding exclusive lease
     const evalResult = await this.evaluateRetentionEligibility(
       input.tenantId,
       reqData.recordType,
@@ -957,11 +1144,12 @@ export class DataRetentionService {
     );
 
     if (!evalResult.allowed) {
-      // Transition back to blocked
       const blockedReq: DataDeletionRequest = {
         ...reqData,
         status: 'blocked',
         blockedReason: evalResult.reason,
+        leaseToken: undefined,
+        leaseExpiresAt: undefined,
         version: reqData.version + 1,
       };
       await reqRef.set(cleanUndefinedValues(blockedReq)!);
@@ -969,14 +1157,6 @@ export class DataRetentionService {
         `Deletion blocked during execution: ${evalResult.reason}`
       );
     }
-
-    const now = new Date().toISOString();
-
-    // 1. Transition to 'processing'
-    await reqRef.update({
-      status: 'processing',
-      version: reqData.version + 1,
-    });
 
     await this.recordLifecycleEvent({
       tenantId: input.tenantId,
@@ -986,7 +1166,6 @@ export class DataRetentionService {
       requestId: input.requestId,
     });
 
-    let erasedRecordsCount = 0;
     let revokedRightsCount = 0;
     let revokedAiControlsCount = 0;
     let retractedNodesCount = 0;
@@ -1051,64 +1230,138 @@ export class DataRetentionService {
       // Ignore
     }
 
-    // 5. Erase target document from server-authoritative collection
-    const targetCollection = this.resolveAuthoritativeCollection(reqData.recordType);
-    if (!targetCollection) {
-      throw new DataRetentionValidationError(
-        `No authoritative physical collection mapping exists for record type '${reqData.recordType}'`
-      );
-    }
+    // 5. Final atomic transaction: re-check legal hold, policy, ownership, and lease prior to irreversible delete
+    const targetRef = db.collection(targetCollection).doc(reqData.recordId);
+    const policyRef = db.collection('data_retention_policies').doc(computeRetentionPolicyId(input.tenantId, reqData.recordType));
+    const completedAt = new Date().toISOString();
 
-    try {
-      const targetRef = db.collection(targetCollection).doc(reqData.recordId);
-      const targetSnap = await targetRef.get();
-      if (targetSnap.exists) {
-        const targetData = targetSnap.data();
-        if (targetData?.tenantId && targetData.tenantId !== input.tenantId) {
-          throw new DataRetentionSecurityError('Target document tenant mismatch during erasure');
-        }
-        await targetRef.delete();
-        erasedRecordsCount++;
+    const commitOutcome = await db.runTransaction(async (tx: any) => {
+      const [latestReqSnap, latestPolicySnap, targetSnap] = await Promise.all([
+        tx.get(reqRef),
+        tx.get(policyRef),
+        tx.get(targetRef),
+      ]);
+
+      if (!latestReqSnap.exists) {
+        throw new DataRetentionValidationError(`Deletion request '${input.requestId}' disappeared during processing`);
       }
-    } catch (err: any) {
-      if (err instanceof DataRetentionSecurityError) throw err;
-      // Target might not exist as a physical document, proceed
-    }
 
-    // 6. Complete deletion request
-    const completedReq: DataDeletionRequest = {
-      ...reqData,
-      status: 'completed',
-      completedAt: now,
-      version: reqData.version + 2,
-      result: {
-        decision: 'eligible_for_deletion',
-        erasedRecordsCount,
-        revokedRightsCount,
-        revokedAiControlsCount,
-        retractedNodesCount,
-      },
-    };
+      const latestReq = latestReqSnap.data() as DataDeletionRequest;
+      if (latestReq.status === 'completed') {
+        return { kind: 'already_completed' as const, record: latestReq };
+      }
+      if (latestReq.leaseToken !== leaseToken) {
+        throw new DataRetentionSecurityError('Deletion lease lost or superseded prior to commit');
+      }
 
-    await reqRef.set(cleanUndefinedValues(completedReq)!);
+      const latestPolicy = latestPolicySnap.exists ? (latestPolicySnap.data() as RetentionPolicy) : null;
+      if (!latestPolicy || latestPolicy.status !== 'active') {
+        const blockedReq: DataDeletionRequest = {
+          ...latestReq,
+          status: 'blocked',
+          blockedReason: 'Retention policy missing or inactive immediately prior to erasure commit',
+          leaseToken: undefined,
+          leaseExpiresAt: undefined,
+          version: latestReq.version + 1,
+        };
+        await tx.set(reqRef, cleanUndefinedValues(blockedReq)!);
+        return { kind: 'blocked' as const, reason: blockedReq.blockedReason! };
+      }
 
-    // 7. Record minimal non-PII immutable audit event
-    await this.recordLifecycleEvent({
-      tenantId: input.tenantId,
-      eventType: 'DATA_ERASURE_COMPLETED',
-      recordType: reqData.recordType,
-      recordId: reqData.recordId,
-      requestId: input.requestId,
-      payload: {
-        completedAt: now,
-        erasedRecordsCount,
-        revokedRightsCount,
-        revokedAiControlsCount,
-        retractedNodesCount,
-      },
+      if (latestPolicy.legalHold === true) {
+        const blockedReq: DataDeletionRequest = {
+          ...latestReq,
+          status: 'blocked',
+          blockedReason: `Aborted immediately prior to erasure: active legal hold (${latestPolicy.legalHoldReason || 'Locked'})`,
+          leaseToken: undefined,
+          leaseExpiresAt: undefined,
+          version: latestReq.version + 1,
+        };
+        await tx.set(reqRef, cleanUndefinedValues(blockedReq)!);
+        return { kind: 'blocked' as const, reason: blockedReq.blockedReason! };
+      }
+
+      if (latestPolicy.retentionUntil && new Date(latestPolicy.retentionUntil).getTime() > Date.now()) {
+        const blockedReq: DataDeletionRequest = {
+          ...latestReq,
+          status: 'blocked',
+          blockedReason: `Aborted prior to erasure: retention period active until ${latestPolicy.retentionUntil}`,
+          leaseToken: undefined,
+          leaseExpiresAt: undefined,
+          version: latestReq.version + 1,
+        };
+        await tx.set(reqRef, cleanUndefinedValues(blockedReq)!);
+        return { kind: 'blocked' as const, reason: blockedReq.blockedReason! };
+      }
+
+      this.verifyTargetOwnershipForErasure(
+        targetCollection,
+        targetSnap.exists,
+        targetSnap.exists ? (targetSnap.data() as Record<string, any>) : undefined,
+        input.tenantId
+      );
+
+      let erasedRecordsCount = 0;
+      if (targetSnap.exists) {
+        await tx.delete(targetRef);
+        erasedRecordsCount = 1;
+      }
+
+      const completedReq: DataDeletionRequest = {
+        ...latestReq,
+        status: 'completed',
+        completedAt,
+        leaseToken: undefined,
+        leaseExpiresAt: undefined,
+        version: latestReq.version + 1,
+        result: {
+          decision: 'eligible_for_deletion',
+          erasedRecordsCount,
+          revokedRightsCount,
+          revokedAiControlsCount,
+          retractedNodesCount,
+        },
+      };
+
+      const cleanedCompleted = cleanUndefinedValues(completedReq)!;
+      await tx.set(reqRef, cleanedCompleted);
+
+      const eventId = computeLifecycleEventId(
+        input.tenantId,
+        'DATA_ERASURE_COMPLETED',
+        reqData.recordId,
+        completedAt
+      );
+      const eventBase = {
+        eventId,
+        tenantId: input.tenantId,
+        eventType: 'DATA_ERASURE_COMPLETED' as const,
+        recordType: reqData.recordType,
+        recordId: reqData.recordId,
+        requestId: input.requestId,
+        payload: {
+          completedAt,
+          erasedRecordsCount,
+          revokedRightsCount,
+          revokedAiControlsCount,
+          retractedNodesCount,
+        },
+        recordedAt: completedAt,
+      };
+      const lifecycleEvent = cleanUndefinedValues({
+        ...eventBase,
+        eventHash: computeLifecycleEventHash(eventBase),
+      })!;
+      await tx.set(db.collection('data_lifecycle_events').doc(eventId), lifecycleEvent);
+
+      return { kind: 'completed' as const, record: cleanedCompleted };
     });
 
-    return completedReq;
+    if (commitOutcome.kind === 'blocked') {
+      throw new DataRetentionSecurityError(`Deletion aborted at final commit check: ${commitOutcome.reason}`);
+    }
+
+    return commitOutcome.record;
   }
 
   /**

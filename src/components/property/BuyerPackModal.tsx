@@ -6,10 +6,17 @@ import { calculatePropertyHealthScore } from "./propertyUtils";
 interface BuyerPackModalProps {
   property: any;
   completedJobs: any[];
+  provenance?: {
+    snapshotId?: string | null;
+    contentHash?: string | null;
+    pipelineVersion?: string | null;
+    generatedAt?: string | null;
+    evidenceCount?: number;
+  } | null;
   onClose: () => void;
 }
 
-export function BuyerPackModal({ property, completedJobs, onClose }: BuyerPackModalProps) {
+export function BuyerPackModal({ property, completedJobs, provenance, onClose }: BuyerPackModalProps) {
   const healthScore = calculatePropertyHealthScore(property, completedJobs);
   const todayFormatted = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
   const referenceId = `AT-CONV-${(property?.id || "PROP").slice(0, 8).toUpperCase()}-${new Date().getFullYear()}`;
@@ -84,6 +91,18 @@ export function BuyerPackModal({ property, completedJobs, onClose }: BuyerPackMo
               </div>
             </div>
 
+            {/* Canonical Snapshot Provenance Notice */}
+            <div className="p-3 bg-slate-50 border border-black rounded-xl text-[11px] text-black flex flex-wrap items-center justify-between gap-2">
+              <span className="font-black">
+                Snapshot Provenance: <span className="font-mono">{provenance?.snapshotId || property?.passportSnapshotId || "Direct Property Record"}</span>
+              </span>
+              <span className="font-medium">
+                {provenance?.pipelineVersion ? `Pipeline ${provenance.pipelineVersion}` : "Canonical Passport Schedule"}
+                {provenance?.contentHash ? ` • Hash ${String(provenance.contentHash).slice(0, 12)}` : ""}
+                {provenance?.generatedAt ? ` • Built ${new Date(provenance.generatedAt).toLocaleDateString("en-GB")}` : ""}
+              </span>
+            </div>
+
             {/* Section 1: Property Identity & Digital Specs */}
             <div className="space-y-2">
               <h2 className="text-sm font-black uppercase tracking-wider text-slate-900 border-b border-slate-300 pb-1">
@@ -92,22 +111,26 @@ export function BuyerPackModal({ property, completedJobs, onClose }: BuyerPackMo
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
                   <p className="text-[10px] uppercase font-bold text-slate-500">Property Type</p>
-                  <p className="font-black text-slate-900 capitalize">{property.propertyType || "Residential"}</p>
+                  <p className="font-black text-slate-900 capitalize">{property.propertyType || "Unverified / Not recorded"}</p>
                 </div>
 
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
                   <p className="text-[10px] uppercase font-bold text-slate-500">EPC Energy Grade</p>
-                  <p className="font-black text-blue-600">Grade {property.epcRating || "C"}</p>
+                  <p className="font-black text-blue-600">{property.epcRating ? `Grade ${property.epcRating}` : "Unverified / Not recorded"}</p>
                 </div>
 
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
                   <p className="text-[10px] uppercase font-bold text-slate-500">Boiler Make & Model</p>
-                  <p className="font-black text-slate-900">{property.boilerInfo?.brand || "Standard"} {property.boilerInfo?.model || ""}</p>
+                  <p className="font-black text-slate-900">
+                    {property.boilerInfo?.brand
+                      ? `${property.boilerInfo.brand} ${property.boilerInfo?.model || ""}`.trim()
+                      : "Unverified / Not recorded"}
+                  </p>
                 </div>
 
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl">
                   <p className="text-[10px] uppercase font-bold text-slate-500">Roof Condition</p>
-                  <p className="font-black text-slate-900">{property.roofCondition || "Good"}</p>
+                  <p className="font-black text-slate-900">{property.roofCondition || "Unverified / Not recorded"}</p>
                 </div>
 
                 {property.componentRegistry?.stopcockLocation && (
@@ -184,9 +207,15 @@ export function BuyerPackModal({ property, completedJobs, onClose }: BuyerPackMo
                       EPC Energy Performance
                     </td>
                     <td className="p-2.5 border-r border-slate-300 text-slate-600">10-Year Efficiency Rating</td>
-                    <td className="p-2.5 font-mono font-bold border-r border-slate-300">Grade {property.epcRating || "C"}</td>
+                    <td className="p-2.5 font-mono font-bold border-r border-slate-300">
+                      {property.epcRating ? `Grade ${property.epcRating}` : "Unverified / Not recorded"}
+                    </td>
                     <td className="p-2.5">
-                      <span className="text-blue-700 font-bold bg-blue-100 px-2 py-0.5 rounded text-[11px]">Active EPC</span>
+                      {property.epcRating ? (
+                        <span className="text-blue-700 font-bold bg-blue-100 px-2 py-0.5 rounded text-[11px]">Active EPC</span>
+                      ) : (
+                        <span className="text-amber-800 font-bold bg-amber-100 px-2 py-0.5 rounded text-[11px]">Unverified / Not recorded</span>
+                      )}
                     </td>
                   </tr>
                 </tbody>

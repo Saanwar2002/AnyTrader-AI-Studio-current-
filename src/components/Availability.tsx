@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from "react";
-import { db, doc, getDoc, updateDoc, setDoc, handleFirestoreError, OperationType, collection, query, where, orderBy, onSnapshot } from "@/src/firebase";
+import { db, doc, getDoc, updateDoc, setDoc, handleFirestoreError, OperationType, collection, query, where, orderBy, limit, onSnapshot } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { Calendar as CalendarIcon, ChevronLeft, ChevronRight, Loader2, Save, Check, AlertCircle, Settings, CheckCircle2, Clock, CalendarDays, HelpCircle, X, Zap, CalendarClock } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { cn } from "@/src/lib/utils";
+import { toast } from "sonner";
 import { 
   format, addMonths, subMonths, startOfMonth, endOfMonth, eachDayOfInterval, 
   isSameMonth, isSameDay, isToday, startOfWeek, endOfWeek, parseISO, isBefore, startOfDay
@@ -99,12 +100,18 @@ export default function Availability() {
         console.error("Error fetching appointments:", err);
       });
 
+      // AT-CJ-SCHED-03: Query canonical `jobs` collection instead of legacy `bidding_jobs`
       const qJobs = query(
-        collection(db, "bidding_jobs"),
-        where("assignedTo", "==", user.uid)
+        collection(db, "jobs"),
+        where("assignedTradespersonId", "==", user.uid),
+        limit(100)
       );
       const unsubJobs = onSnapshot(qJobs, (snapshot) => {
-        setJobs(snapshot.docs.map(d => ({id: d.id, ...d.data()})));
+        setJobs(
+          snapshot.docs
+            .map(d => ({ id: d.id, ...(d.data() as Record<string, any>) }))
+            .filter((j: any) => !["cancelled", "deleted", "draft"].includes(String(j.status || "").toLowerCase()))
+        );
       }, err => {
         console.error("Error fetching jobs:", err);
       });
@@ -122,10 +129,10 @@ export default function Availability() {
       await updateDoc(doc(db, "appointments", appointmentId), {
         status: action
       });
-      alert(`Appointment ${action} successfully!`);
+      toast.success(`Appointment ${action} successfully.`);
     } catch(err) {
       handleFirestoreError(err, OperationType.UPDATE, `appointments/${appointmentId}`);
-      alert("Action failed.");
+      toast.error("Failed to update appointment status.");
     }
   };
 

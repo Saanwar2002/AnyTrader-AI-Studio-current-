@@ -243,27 +243,21 @@ export function calculateFlexiPayMerchantFee(
  * Generates the Stripe Onboarding Link for a trader or driver.
  * Calls real server endpoint /api/stripe/create-connect-account with user auth token.
  */
-export async function getStripeOnboardingLink(userId: string): Promise<string> {
-  try {
-    const token = await auth.currentUser?.getIdToken();
-    const res = await fetch("/api/stripe/create-connect-account", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      }
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data.url) return data.url;
+export async function getStripeOnboardingLink(_userId: string): Promise<string> {
+  const token = await auth.currentUser?.getIdToken();
+  const res = await fetch("/api/stripe/create-connect-account", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
     }
-  } catch (err) {
-    console.warn("Failed to get real Stripe Connect onboarding link, using fallback:", err);
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.url) {
+    throw new Error(data?.error || `Failed to create Stripe Connect onboarding link (${res.status})`);
   }
-  
-  // Safe fallback for offline/demo
-  return `https://connect.stripe.com/express/onboard/${userId}_mock_session`;
+  return data.url;
 }
 
 /**
@@ -338,13 +332,18 @@ export async function getStripeConnectBalance(): Promise<{ available: number; pe
 /**
  * Requests an instant payout from the connected Stripe account to provider's bank.
  */
-export async function requestStripeConnectPayout(amount?: number): Promise<{ success: boolean; payout?: any; error?: string }> {
+export async function requestStripeConnectPayout(
+  amount?: number,
+  idempotencyKey?: string
+): Promise<{ success: boolean; payout?: any; error?: string; idempotentReplay?: boolean }> {
   try {
     const token = await auth.currentUser?.getIdToken();
+    const idemKey = idempotencyKey || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `payout_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`);
     const res = await fetch("/api/stripe/request-payout", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Idempotency-Key": idemKey,
         ...(token ? { Authorization: `Bearer ${token}` } : {})
       },
       body: JSON.stringify({ amount })
@@ -353,20 +352,16 @@ export async function requestStripeConnectPayout(amount?: number): Promise<{ suc
     if (!res.ok) {
       return { success: false, error: data.error || "Failed to initiate payout" };
     }
-    return { success: true, payout: data.payout };
+    return { success: true, payout: data.payout, idempotentReplay: data.idempotentReplay };
   } catch (err: any) {
     return { success: false, error: err.message };
   }
 }
 
 /**
- * Marks a trader as onboarded (simulate webhook behavior for local testing).
+ * Deprecated client bypass disabled: Connect onboarding state is verified strictly via
+ * signed Stripe Connect `account.updated` webhooks and server `/api/stripe/account-status`.
  */
-export async function completeStripeOnboarding(userId: string, accountId: string) {
-  const userRef = doc(db, "users", userId);
-  await updateDoc(userRef, {
-    stripeAccountId: accountId,
-    stripeOnboardingComplete: true,
-    payoutsEnabled: true
-  });
+export async function completeStripeOnboarding(_userId: string, _accountId: string): Promise<never> {
+  throw new Error("Client-side Connect onboarding writes are disabled; status syncs exclusively via Stripe webhooks.");
 }

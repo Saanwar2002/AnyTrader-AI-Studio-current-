@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, updateDoc } from "firebase/firestore";
+import { collection, onSnapshot, doc, updateDoc, query, limit } from "firebase/firestore";
 import { db } from "../../firebase";
 import { 
   Search, Car, Shield, AlertTriangle, CheckCircle, 
@@ -27,7 +27,7 @@ export default function VehicleManagement() {
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
-    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+    const unsubUsers = onSnapshot(query(collection(db, "users"), limit(100)), (snapshot) => {
       const allUsers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
       // Filter for drivers
       const drivers = allUsers.filter(u => 

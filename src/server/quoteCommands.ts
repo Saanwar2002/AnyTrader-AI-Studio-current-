@@ -80,6 +80,83 @@ export const QUOTE_MILESTONE_SCHEMA = z.object({
 });
 
 /**
+ * Proportionally reconciles existing milestone amounts whenever a quote total is
+ * revised without an explicit new milestone breakdown so sum(milestones) === targetAmount.
+ * Funded/released/locked milestones retain their settled values; editable milestones
+ * are scaled in pence with any rounding remainder placed on the final editable milestone.
+ */
+export function reconcileMilestonesToAmount(existingMilestones: any[], targetAmount: number): any[] {
+  const targetPence = Math.round(Number(targetAmount) * 100);
+  if (!Array.isArray(existingMilestones) || existingMilestones.length === 0) {
+    return existingMilestones;
+  }
+
+  const currentTotalPence = existingMilestones.reduce(
+    (sum, m) => sum + Math.round(Number(m.amount || 0) * 100),
+    0
+  );
+  if (Math.abs(currentTotalPence - targetPence) <= 1) {
+    return existingMilestones;
+  }
+
+  const lockedStatuses = new Set(["funded", "in_progress", "submitted", "approved", "released", "funds_released"]);
+  let lockedPence = 0;
+  const editableIndices: number[] = [];
+
+  existingMilestones.forEach((m, idx) => {
+    const st = String(m.status || "pending");
+    if (lockedStatuses.has(st)) {
+      lockedPence += Math.round(Number(m.amount || 0) * 100);
+    } else {
+      editableIndices.push(idx);
+    }
+  });
+
+  if (lockedPence > targetPence) {
+    throw new BadRequestError(
+      `Revised quote amount (£${(targetPence / 100).toFixed(2)}) cannot be less than already funded/locked milestones (£${(lockedPence / 100).toFixed(2)}).`
+    );
+  }
+
+  const remainingTargetPence = targetPence - lockedPence;
+  if (editableIndices.length === 0) {
+    if (remainingTargetPence > 0) {
+      throw new BadRequestError("Cannot revise quote amount when all milestones are already funded or released without adding a new milestone.");
+    }
+    return existingMilestones;
+  }
+
+  const editableCurrentPence = editableIndices.reduce(
+    (sum, idx) => sum + Math.max(0, Math.round(Number(existingMilestones[idx].amount || 0) * 100)),
+    0
+  );
+
+  let allocatedPence = 0;
+  const updated = existingMilestones.map((m) => ({ ...m }));
+
+  editableIndices.forEach((idx, pos) => {
+    const isLast = pos === editableIndices.length - 1;
+    let newPence: number;
+    if (isLast) {
+      newPence = Math.max(1, remainingTargetPence - allocatedPence);
+    } else if (editableCurrentPence > 0) {
+      const origPence = Math.max(0, Math.round(Number(existingMilestones[idx].amount || 0) * 100));
+      newPence = Math.max(1, Math.round((origPence / editableCurrentPence) * remainingTargetPence));
+      allocatedPence += newPence;
+    } else {
+      newPence = Math.max(1, Math.floor(remainingTargetPence / editableIndices.length));
+      allocatedPence += newPence;
+    }
+    updated[idx] = {
+      ...updated[idx],
+      amount: Math.round(newPence) / 100,
+    };
+  });
+
+  return updated;
+}
+
+/**
  * 1. CreateQuote Schema
  */
 export const CREATE_QUOTE_SCHEMA = z.object({
@@ -340,6 +417,70 @@ export async function executeQuoteCommand(
     const jobData = jobSnap.data() || {};
     const homeownerId = jobData.homeownerId || jobData.userId || jobData.ownerId;
 
+    const isAdmin =
+      identity.accountType === "admin" ||
+      (identity as any).isAdmin === true ||
+      (identity as any).role === "admin";
+
+    if (commandType === "CreateQuote" && identity.uid === homeownerId) {
+      throw new BadRequestError("Homeowners cannot submit quotes on their own jobs.");
+    }
+
+    const traderProfileSnap =
+      !isAdmin && ["CreateQuote", "UpdateQuote", "RespondToRequote"].includes(commandType)
+        ? await transaction.get(db.collection("users").doc(identity.uid))
+        : null;
+
+    if (!isAdmin && ["CreateQuote", "UpdateQuote", "RespondToRequote"].includes(commandType)) {
+      const hasTraderCapability =
+        hasCapability(identity, "tradesperson") ||
+        identity.accountType === "service_provider" ||
+        identity.accountType === "business";
+      if (!hasTraderCapability || identity.accountType === "consumer") {
+        throw new ForbiddenError("Only verified tradespeople can submit or revise quotes on jobs.");
+      }
+
+      const idVerifStatus = String(identity.verification?.status || "").trim().toLowerCase();
+      if (["unverified", "rejected", "suspended", "revoked"].includes(idVerifStatus)) {
+        throw new ForbiddenError(`Tradesperson account verification status '${idVerifStatus}' cannot submit quotes.`);
+      }
+
+      if (traderProfileSnap?.exists) {
+        const traderData =
+          (typeof traderProfileSnap.data === "function" ? traderProfileSnap.data() : traderProfileSnap.data) || {};
+        const storedStatus = String(traderData.status || "").trim().toLowerCase();
+        const storedVerifStatus = String(traderData.verificationStatus || "").trim().toLowerCase();
+        const storedRole = String(traderData.role || "").trim().toLowerCase();
+        const storedAccountType = String(traderData.accountType || "").trim().toLowerCase();
+
+        if (
+          traderData.isSuspended === true ||
+          traderData.isDisabled === true ||
+          traderData.disabled === true ||
+          traderData.isBanned === true ||
+          traderData.banned === true ||
+          ["suspended", "frozen", "banned", "deleted", "disabled"].includes(storedStatus)
+        ) {
+          throw new ForbiddenError("Tradesperson account is suspended or disabled and cannot submit quotes.");
+        }
+
+        if (
+          ["rejected", "revoked", "suspended", "expired", "unverified"].includes(storedVerifStatus) ||
+          traderData.isVerified === false
+        ) {
+          throw new ForbiddenError("Tradesperson account must be verified before submitting quotes.");
+        }
+
+        if (
+          (["homeowner", "customer", "passenger", "driver"].includes(storedRole) &&
+            !Array.isArray(traderData.capabilities)) ||
+          storedAccountType === "consumer"
+        ) {
+          throw new ForbiddenError("Consumer accounts cannot submit tradesperson quotes.");
+        }
+      }
+    }
+
     let targetQuoteRef: any = null;
     let existingQuoteData: Record<string, any> | null = null;
 
@@ -380,9 +521,10 @@ export async function executeQuoteCommand(
           throw new ForbiddenError("This direct quote request was sent exclusively to another tradesperson.");
         }
 
-        // Validation: Maximum 5 quotes per job limit
+        // Validation: Maximum 5 quotes per job limit (allow explicit 1-to-1 direct invitation to respond)
+        const isExplicitlyInvitedTrader = Boolean(targetedTrader && identity.uid === targetedTrader);
         const currentQuoteCount = Number(jobData.quoteCount || jobData.quotesCount || 0);
-        if (currentQuoteCount >= 5) {
+        if (currentQuoteCount >= 5 && !isExplicitlyInvitedTrader) {
           throw new ForbiddenError("This job has reached the maximum limit of 5 quotes.");
         }
 
@@ -571,6 +713,8 @@ export async function executeQuoteCommand(
             description: m.description || "",
             status: "pending",
           }));
+        } else if (Array.isArray(existingQuoteData?.milestones) && existingQuoteData.milestones.length > 0) {
+          milestones = reconcileMilestonesToAmount(existingQuoteData.milestones, updatedAmount);
         }
 
         const existingHistory = Array.isArray(existingQuoteData?.history) ? existingQuoteData?.history : [];
@@ -706,12 +850,32 @@ export async function executeQuoteCommand(
         transaction.set(targetQuoteRef, resultingQuoteDoc, { merge: true });
 
         // Update Trader Lock on Reject
-        const rejectLockRef = db.collection("trader_quote_locks").doc(`${jobId}_${existingQuoteData?.tradespersonId || existingQuoteData?.traderId}`);
+        const rejectedTraderId = existingQuoteData?.tradespersonId || existingQuoteData?.traderId || existingQuoteData?.proId;
+        const rejectLockRef = db.collection("trader_quote_locks").doc(`${jobId}_${rejectedTraderId}`);
         transaction.set(
           rejectLockRef,
-          { jobId, quoteId: resultingQuoteId, traderId: existingQuoteData?.tradespersonId || existingQuoteData?.traderId, status: resultingStatus, updatedAt: nowIso },
+          { jobId, quoteId: resultingQuoteId, traderId: rejectedTraderId, status: resultingStatus, updatedAt: nowIso },
           { merge: true }
         );
+
+        // Decrement active quote counter on parent job if rejecting an active quote (AT-QUOTE-05)
+        const wasActiveQuote = ["pending", "requoted", "requote_requested", "submitted"].includes(
+          String(existingQuoteData?.status || "")
+        );
+        if (wasActiveQuote) {
+          const currentQuoteCount = Number(jobData.quoteCount ?? jobData.quotesCount ?? 1);
+          const decrementedCount = Math.max(0, currentQuoteCount - 1);
+          const jobUpdateOnReject: Record<string, any> = {
+            quoteCount: decrementedCount,
+            quotesCount: decrementedCount,
+            hasQuotes: decrementedCount > 0,
+            updatedAt: nowIso,
+          };
+          if (jobData.status === "quoted" && decrementedCount === 0) {
+            jobUpdateOnReject.status = "open";
+          }
+          transaction.update(jobRef, jobUpdateOnReject);
+        }
         break;
       }
 
@@ -792,6 +956,8 @@ export async function executeQuoteCommand(
             description: m.description || "",
             status: "pending",
           }));
+        } else if (Array.isArray(existingQuoteData?.milestones) && existingQuoteData.milestones.length > 0) {
+          milestones = reconcileMilestonesToAmount(existingQuoteData.milestones, numAmount);
         }
 
         const existingHistory = Array.isArray(existingQuoteData?.history) ? existingQuoteData?.history : [];
@@ -935,7 +1101,7 @@ export async function executeQuoteCommand(
           }
         }
 
-        // 10. Atomic Write: Update Job Record
+        // 10. Atomic Write: Update Job Record (AT-CJ-SEC-START-01: keep plaintext PIN out of trader-readable job doc)
         transaction.update(jobRef, {
           status: "accepted",
           acceptedQuoteId: quoteId,
@@ -944,8 +1110,18 @@ export async function executeQuoteCommand(
           tradespersonId: quotingTrader,
           scheduledDate,
           isConfirmedByTradesperson,
-          verificationPin: pin,
+          hasVerificationPin: true,
           acceptedAt: nowIso,
+          updatedAt: nowIso,
+        });
+
+        // 10b. Store arrival verification PIN strictly in homeowner/admin-only security record
+        const arrivalPinRef = db.collection("job_arrival_pins").doc(jobId);
+        transaction.set(arrivalPinRef, {
+          jobId,
+          homeownerId,
+          verificationPin: pin,
+          createdAt: nowIso,
           updatedAt: nowIso,
         });
 
@@ -958,7 +1134,7 @@ export async function executeQuoteCommand(
         const acceptedLockRef = db.collection("trader_quote_locks").doc(`${jobId}_${quotingTrader}`);
         transaction.set(acceptedLockRef, { jobId, quoteId, traderId: quotingTrader, status: "accepted", updatedAt: nowIso }, { merge: true });
 
-        // Augment local resultingQuoteDoc for commandResponse
+        // Augment local resultingQuoteDoc for commandResponse (returned only to homeowner/admin caller of AcceptQuote)
         resultingQuoteDoc.scheduledDate = scheduledDate;
         resultingQuoteDoc.verificationPin = pin;
         resultingQuoteDoc.isConfirmedByTradesperson = isConfirmedByTradesperson;
@@ -974,7 +1150,7 @@ export async function executeQuoteCommand(
       status: resultingStatus,
       acceptedTradespersonId: resultingQuoteDoc?.tradespersonId || resultingQuoteDoc?.traderId || (resultingQuoteDoc as any)?.acceptedTradespersonId || jobData?.acceptedTradespersonId,
       scheduledDate: resultingQuoteDoc?.scheduledDate || jobData?.scheduledDate || resultingQuoteDoc?.startDate,
-      verificationPin: resultingQuoteDoc?.verificationPin || jobData?.verificationPin,
+      ...(commandType === "AcceptQuote" ? { verificationPin: resultingQuoteDoc?.verificationPin } : {}),
       isConfirmedByTradesperson: resultingQuoteDoc?.isConfirmedByTradesperson ?? jobData?.isConfirmedByTradesperson ?? false,
       quote: resultingQuoteDoc,
       wasReplayed: false,

@@ -7,7 +7,6 @@ import { useSyncStatus } from "@/src/lib/syncTracker";
 import { toast } from "sonner";
 import React, { useEffect, useState, useRef } from "react";
 import { TradeBot } from "./TradeBot";
-import { FloatingTradeBotWidget } from "./FloatingTradeBotWidget";
 import { Logo } from "./Logo";
 import { AnimatePresence, motion } from "motion/react";
 import { setNativeStatusBar, triggerHaptic } from "@/src/lib/capacitor";
@@ -50,7 +49,24 @@ export default function Layout() {
   const initialNotificationsLoaded = useRef(false);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setFavorites([]);
+      setJourneys([]);
+      setPreferredDrivers([]);
+      setEmergencyContacts([]);
+      setBlockedDrivers([]);
+      setRecentRides([]);
+      setUnreadCount(0);
+      setUnreadTypes(new Set());
+      setShopRecommendations([]);
+      initialNotificationsLoaded.current = false;
+      return;
+    }
+    setFavorites([]);
+    setJourneys([]);
+    setPreferredDrivers([]);
+    setEmergencyContacts([]);
+    setBlockedDrivers([]);
     return onSnapshot(doc(db, "users", user.uid), (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.data();
@@ -63,10 +79,14 @@ export default function Layout() {
     }, (error) => {
       console.error("Layout Snapshot Error (users):", error);
     });
-  }, [user]);
+  }, [user?.uid]);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setRecentRides([]);
+      return;
+    }
+    setRecentRides([]);
     const q = query(
       collection(db, "ride_requests"),
       where("riderId", "==", user.uid),
@@ -79,7 +99,7 @@ export default function Layout() {
       console.error("Error fetching recent rides:", error);
     });
     return () => unsubscribe();
-  }, [user]);
+  }, [user?.uid]);
   useEffect(() => {
     setNativeStatusBar(false); // Light mode status bar for the light-themed app
   }, []);
@@ -150,31 +170,46 @@ export default function Layout() {
   const enterShop = async (category?: string) => {
     try {
       setIsLoadingShop(true);
-      const idToken = user ? await user.getIdToken() : "";
+      if (!user) {
+        toast.error("Please sign in to launch TradeShop.");
+        return;
+      }
+      const idToken = await user.getIdToken();
+      if (!idToken) {
+        toast.error("Unable to authenticate your TradeShop session. Please sign in again.");
+        return;
+      }
+
+      // AT-SSO-02: Server derives identity, role, category, and entitlement discount strictly from Bearer token
       const res = await fetch("/api/sso-token", {
         method: "POST",
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
-          ...(idToken ? { "Authorization": `Bearer ${idToken}` } : {})
+          Authorization: `Bearer ${idToken}`,
         },
-        body: JSON.stringify({
-          uid: user?.uid,
-          role: profile?.role,
-          email: user?.email,
-          category: profile?.category || profile?.businessCategory
-        })
+        body: JSON.stringify({}),
       });
       const data = await res.json().catch(() => ({}));
-      
-      let shopUrl = `https://shop.tradequote.uk/?token=${data?.token || ''}`;
+
+      const signedToken = typeof data?.token === "string" ? data.token.trim() : "";
+      if (!res.ok || signedToken.split(".").length !== 3 || signedToken.length < 32) {
+        throw new Error(data?.error || "TradeShop SSO token could not be issued.");
+      }
+
+      let shopUrl = `https://shop.tradequote.uk/?token=${encodeURIComponent(signedToken)}`;
       if (category) shopUrl += `&category=${encodeURIComponent(category)}`;
-      
-      window.open(shopUrl, "_blank");
+
+      const link = document.createElement("a");
+      link.href = shopUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
       setShowShopPopover(false);
-    } catch (err) {
-      console.error("Failed to generate SSO token:", err);
-      // Fallback redirection
-      window.open(`https://shop.tradequote.uk/?uid=${user?.uid}`, "_blank");
+    } catch (err: any) {
+      console.error("Failed to generate verified SSO token:", err);
+      toast.error(err?.message || "Could not launch TradeShop securely. Please try again shortly.");
     } finally {
       setIsLoadingShop(false);
     }
@@ -210,7 +245,16 @@ export default function Layout() {
   };
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setUnreadCount(0);
+      setUnreadTypes(new Set());
+      initialNotificationsLoaded.current = false;
+      return;
+    }
+
+    setUnreadCount(0);
+    setUnreadTypes(new Set());
+    initialNotificationsLoaded.current = false;
 
     const q = query(
       collection(db, "notifications"),
@@ -242,11 +286,8 @@ export default function Layout() {
         snapshot.docChanges().forEach(change => {
           if (change.type === 'added') {
             const data = change.doc.data();
-            // Optional: You could filter out notifications that have a visibleAt in the future here as well 
-            // but usually this triggers the moment the current condition is met.
             // Skip stale Gemini API Error notifications
             if (data.title && (data.title.includes("Gemini") || data.title.includes("Error"))) {
-              // Optionally mark as read to clear from db, but definitely do not toast
               if (change.doc.ref) {
                  import("firebase/firestore").then(({ updateDoc }) => {
                     updateDoc(change.doc.ref, { read: true });
@@ -278,7 +319,7 @@ export default function Layout() {
     });
 
     return () => unsubscribe();
-  }, [user]);
+  }, [user?.uid]);
 
   const handleLogout = async () => {
     try {

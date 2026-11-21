@@ -228,6 +228,56 @@ function ShareGlobalContainer() {
   );
 }
 
+type RoleGroup = "admin" | "ecosystem" | "business" | "driver" | "corporate";
+
+function hasRoleAccess(profile: any, allowed: RoleGroup): boolean {
+  if (!profile) return false;
+  const role = String(profile.role || "").toLowerCase();
+  const caps: string[] = Array.isArray(profile.capabilities) ? profile.capabilities : [];
+  const isAdminUser = role === "admin" || role === "super_admin";
+  const isEcosystemUser = isAdminUser || role === "ecosystem_manager";
+
+  switch (allowed) {
+    case "admin":
+      return isAdminUser;
+    case "ecosystem":
+      return isEcosystemUser;
+    case "business":
+      return (
+        isEcosystemUser ||
+        ["tradesperson", "trader", "business", "consultant"].includes(role) ||
+        profile.subscriptionType === "business" ||
+        caps.some((c) => ["tradesperson", "contractor", "consultant"].includes(c))
+      );
+    case "driver":
+      return (
+        isAdminUser ||
+        role === "driver" ||
+        role === "fleet_driver" ||
+        profile.isDriver === true ||
+        caps.includes("fleet_driver")
+      );
+    case "corporate":
+      return (
+        isEcosystemUser ||
+        ["business", "landlord", "property_manager", "estate_agent"].includes(role) ||
+        profile.businessLayer === "properties" ||
+        profile.hasLandlordPro === true ||
+        caps.some((c) => ["landlord", "property_manager", "estate_agent"].includes(c))
+      );
+    default:
+      return false;
+  }
+}
+
+function RoleRoute({ allowed, children }: { allowed: RoleGroup; children: React.ReactElement }) {
+  const { profile } = useAuth();
+  if (!hasRoleAccess(profile, allowed)) {
+    return <Navigate to="/" replace />;
+  }
+  return children;
+}
+
 export default function App() {
   const { user, profile, isAuthReady } = useAuth();
   const [platformConfig, setPlatformConfig] = useState<any>(null);
@@ -332,7 +382,6 @@ export default function App() {
             <Routes>
             <Route path="/ref/:code" element={<RefRedirect />} />
             <Route path="/ad-report/:id" element={<AdReport />} />
-            <Route path="/ad-studio" element={<TraderAdStudio />} />
             <Route path="/tenant-report" element={<TenantReportPortal />} />
             <Route path="/passport/view/:id" element={<PublicPropertyPassportView />} />
             <Route path="/move-in" element={<MoveInLanding />} />
@@ -348,23 +397,24 @@ export default function App() {
               <Route path="/" element={<Layout />}>
                 <Route index element={<IndexRoute />} />
                 <Route path="dashboard" element={profile.subscriptionType === "business" ? <BusinessDashboard /> : <Dashboard />} />
-                <Route path="trades-dashboard" element={<TradesDashboard />} />
+                <Route path="trades-dashboard" element={<RoleRoute allowed="business"><TradesDashboard /></RoleRoute>} />
                 <Route path="job-feed" element={<JobFeed />} />
                 <Route path="my-jobs" element={<MyJobs />} />
-                <Route path="trade-jobs" element={<TradeJobs />} />
-                <Route path="trader/calendar" element={<TraderCalendar />} />
-                <Route path="consultancy/calendar" element={<BusinessDashboard />} />
-                <Route path="consultancy/projects" element={<BusinessDashboard />} />
-                <Route path="consultancy/clients" element={<BusinessDashboard />} />
-                <Route path="consultancy/billing" element={<BusinessDashboard />} />
-                <Route path="consultancy/portfolio" element={<BusinessDashboard />} />
-                <Route path="consultancy/proposals" element={<BusinessDashboard />} />
-                <Route path="consultancy/new" element={<BusinessDashboard />} />
-                <Route path="trader/outreach" element={<TraderOutreachAgent />} />
+                <Route path="trade-jobs" element={<RoleRoute allowed="business"><TradeJobs /></RoleRoute>} />
+                <Route path="trader/calendar" element={<RoleRoute allowed="business"><TraderCalendar /></RoleRoute>} />
+                <Route path="consultancy/calendar" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/projects" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/clients" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/billing" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/portfolio" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/proposals" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/new" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
+                <Route path="trader/outreach" element={<RoleRoute allowed="business"><TraderOutreachAgent /></RoleRoute>} />
                 <Route path="portfolio" element={<Portfolio />} />
                 <Route path="move-in" element={<MoveInLanding />} />
                 <Route path="passport/view/:id" element={<PublicPropertyPassportView />} />
-                <Route path="trader/banner-ads" element={<TradesBannerAdStudio />} />
+                <Route path="trader/banner-ads" element={<RoleRoute allowed="business"><TradesBannerAdStudio /></RoleRoute>} />
+                <Route path="ad-studio" element={<RoleRoute allowed="business"><TraderAdStudio /></RoleRoute>} />
                 <Route path="post-job" element={<PostJobWizard />} />
                 <Route path="post-emergency-job" element={<EmergencyJobWizard />} />
                 <Route path="my-quotes" element={<MyQuotes />} />
@@ -373,21 +423,21 @@ export default function App() {
                 <Route path="chat/:conversationId" element={<Chat />} />
                 <Route path="profile" element={<Profile />} />
                 <Route path="profile/:id" element={<PublicProfile />} />
-                <Route path="availability" element={<Availability />} />
+                <Route path="availability" element={<RoleRoute allowed="business"><Availability /></RoleRoute>} />
                 <Route path="analytics" element={<Analytics />} />
-                <Route path="billing" element={profile?.role === "driver" ? <DriverEarnings /> : <BillingManager />} />
-                <Route path="team" element={<BusinessTeamManagement />} />
+                <Route path="billing" element={(profile?.role === "driver" || profile?.role === "fleet_driver") ? <DriverEarnings /> : <BillingManager />} />
+                <Route path="team" element={<RoleRoute allowed="business"><BusinessTeamManagement /></RoleRoute>} />
                 <Route path="find-trades" element={<FindTrades />} />
-                <Route path="admin" element={<MasterAdminLayout />} />
-                <Route path="ecosystem" element={<EcosystemAdmin />} />
-                <Route path="corporate" element={<CorporatePortal />} />
-                <Route path="social-housing" element={<GothamHousingPortal />} />
-                <Route path="gotham-portal" element={<GothamHousingPortal />} />
+                <Route path="admin" element={<RoleRoute allowed="admin"><MasterAdminLayout /></RoleRoute>} />
+                <Route path="ecosystem" element={<RoleRoute allowed="ecosystem"><EcosystemAdmin /></RoleRoute>} />
+                <Route path="corporate" element={<RoleRoute allowed="corporate"><CorporatePortal /></RoleRoute>} />
+                <Route path="social-housing" element={<RoleRoute allowed="corporate"><GothamHousingPortal /></RoleRoute>} />
+                <Route path="gotham-portal" element={<RoleRoute allowed="corporate"><GothamHousingPortal /></RoleRoute>} />
                 <Route path="job/:id" element={<JobDetails />} />
                 <Route path="job/:id/timeline" element={<JobTimeline />} />
                 
                 {/* AnyRoller specific routes inside Layout */}
-                <Route path="driver-terminal" element={<DriverTerminal />} />
+                <Route path="driver-terminal" element={<RoleRoute allowed="driver"><DriverTerminal /></RoleRoute>} />
                 <Route path="book-ride" element={<PassengerBooking />} />
                 <Route path="my-rides" element={<PassengerRideHistory />} />
                 <Route path="saved-journeys" element={<SavedJourneys />} />

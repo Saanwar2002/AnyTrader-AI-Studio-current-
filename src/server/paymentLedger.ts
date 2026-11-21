@@ -260,16 +260,24 @@ export class PaymentLedgerEngine {
     if (!db || !jobId || !authUid) throw new BadRequestError("Job and authenticated user are required");
     const jobRef = db.collection("jobs").doc(jobId);
     const attemptRef = jobRef.collection("handshake_attempts").doc(authUid);
+    const arrivalPinRef = db.collection("job_arrival_pins").doc(jobId);
     const now = Date.now();
     const outcome = await db.runTransaction(async (tx: any) => {
-      const [jobSnap, attemptSnap] = await Promise.all([tx.get(jobRef), tx.get(attemptRef)]);
+      const [jobSnap, attemptSnap, arrivalPinSnap] = await Promise.all([
+        tx.get(jobRef),
+        tx.get(attemptRef),
+        tx.get(arrivalPinRef),
+      ]);
       if (!jobSnap.exists) return "invalid";
       const job = jobSnap.data() || {};
+      const pinData = arrivalPinSnap?.exists
+        ? (typeof arrivalPinSnap.data === "function" ? arrivalPinSnap.data() : arrivalPinSnap.data)
+        : null;
       const attempt = attemptSnap.exists ? attemptSnap.data() || {} : {};
       if (Number(attempt.lockedUntilMs || 0) > now) return "locked";
       const acceptedTrader = [job.acceptedTradespersonId, job.acceptedTraderId, job.tradespersonId]
         .some((id) => typeof id === "string" && id === authUid);
-      const expected = String(job.handshakeCode || job.verificationPin || "").trim();
+      const expected = String(pinData?.verificationPin || job.handshakeCode || job.verificationPin || "").trim();
       const supplied = String(handshakeCode || "").trim();
       if (acceptedTrader && expected !== "" && supplied !== "" && expected === supplied) {
         tx.set(attemptRef, { attempts: 0, windowStartedAtMs: now, lockedUntilMs: 0, lastSuccessAtMs: now });
@@ -323,9 +331,15 @@ export class PaymentLedgerEngine {
     // Revalidate current authorization before idempotency replay can return a cached
     // result. The transaction below repeats these checks against its own snapshot
     // before any new release transition is committed.
-    const authorizationJobSnap = await db.collection("jobs").doc(jobId).get();
+    const [authorizationJobSnap, authorizationPinSnap] = await Promise.all([
+      db.collection("jobs").doc(jobId).get(),
+      db.collection("job_arrival_pins").doc(jobId).get(),
+    ]);
     if (!authorizationJobSnap.exists) throw new BadRequestError("Job not found");
     const authorizationJob = authorizationJobSnap.data();
+    const authorizationPinData = authorizationPinSnap?.exists
+      ? (typeof authorizationPinSnap.data === "function" ? authorizationPinSnap.data() : authorizationPinSnap.data)
+      : null;
     const currentlyOwner = Boolean(
       (authorizationJob?.homeownerId && authorizationJob.homeownerId === authUid) ||
       (authorizationJob?.userId && authorizationJob.userId === authUid) ||
@@ -336,7 +350,12 @@ export class PaymentLedgerEngine {
       (authorizationJob?.acceptedTraderId && authorizationJob.acceptedTraderId === authUid) ||
       (authorizationJob?.tradespersonId && authorizationJob.tradespersonId === authUid)
     );
-    const expectedHandshakeCode = (authorizationJob?.handshakeCode || authorizationJob?.verificationPin || "").toString().trim();
+    const expectedHandshakeCode = (
+      authorizationPinData?.verificationPin ||
+      authorizationJob?.handshakeCode ||
+      authorizationJob?.verificationPin ||
+      ""
+    ).toString().trim();
     const suppliedHandshakeCode = (handshakeCode || "").toString().trim();
     const currentlyValidHandshake = Boolean(
       currentlyAcceptedTrader && isQrHandshake && expectedHandshakeCode !== "" &&
@@ -357,10 +376,21 @@ export class PaymentLedgerEngine {
       // Execute everything inside a single Firestore transaction for atomic safety
       const transactionResult = await db.runTransaction(async (transaction: any) => {
         const jobRef = db.collection("jobs").doc(jobId);
-        const jobDoc = await transaction.get(jobRef);
+        const arrivalPinRef = db.collection("job_arrival_pins").doc(jobId);
+        const [jobDoc, arrivalPinDoc] = await Promise.all([
+          transaction.get(jobRef),
+          transaction.get(arrivalPinRef),
+        ]);
         if (!jobDoc.exists) throw new BadRequestError("Job not found");
 
         const jobData = jobDoc.data();
+        const arrivalPinData = arrivalPinDoc?.exists
+          ? (typeof arrivalPinDoc.data === "function" ? arrivalPinDoc.data() : arrivalPinDoc.data)
+          : null;
+        if (jobData?.chargebackFreeze === true || jobData?.payoutFrozen === true || jobData?.escrowFrozen === true) {
+          throw new ConflictError("Escrow release blocked: funds are frozen under active chargeback or cancellation review.");
+        }
+
         const isOwner = Boolean(
           authUid && (
             (jobData?.homeownerId && jobData.homeownerId === authUid) ||
@@ -381,7 +411,12 @@ export class PaymentLedgerEngine {
         // An accepted tradesperson can only release if they supply the homeowner's secret handshake code / PIN.
         let hasValidHandshakeAuth = false;
         if (isAcceptedTrader && isQrHandshake) {
-          const expectedCode = (jobData?.handshakeCode || jobData?.verificationPin || "").toString().trim();
+          const expectedCode = (
+            arrivalPinData?.verificationPin ||
+            jobData?.handshakeCode ||
+            jobData?.verificationPin ||
+            ""
+          ).toString().trim();
           const suppliedCode = (handshakeCode || "").toString().trim();
           if (expectedCode !== "" && suppliedCode !== "" && expectedCode === suppliedCode) {
             hasValidHandshakeAuth = true;
@@ -398,12 +433,21 @@ export class PaymentLedgerEngine {
 
         const quoteData = quoteDoc.data();
 
-        // Canonical IDOR / BOLA validation:
+        // Canonical IDOR / BOLA & Accepted Binding validation (AT-PAY-14):
         if (quoteData?.jobId && quoteData.jobId !== jobId) {
           throw new BadRequestError("IDOR rejection: Quote does not belong to the specified job");
         }
-        if (jobData?.acceptedQuoteId && jobData.acceptedQuoteId !== quoteId) {
-          throw new BadRequestError(`Cannot release funds for quote '${quoteId}': Job has accepted quote '${jobData.acceptedQuoteId}'`);
+        if (!jobData?.acceptedQuoteId || jobData.acceptedQuoteId !== quoteId) {
+          throw new BadRequestError(
+            jobData?.acceptedQuoteId
+              ? `Cannot release funds for quote '${quoteId}': Job has accepted quote '${jobData.acceptedQuoteId}'`
+              : `Cannot release funds for quote '${quoteId}': Job does not have an accepted quote binding`
+          );
+        }
+        if (quoteData?.status !== "accepted") {
+          throw new BadRequestError(
+            `Cannot release funds for quote '${quoteId}': Quote status is '${quoteData?.status || "unknown"}' and must be 'accepted'`
+          );
         }
         if (jobData?.acceptedTradespersonId && quoteData?.tradespersonId && jobData.acceptedTradespersonId !== quoteData.tradespersonId) {
           throw new BadRequestError("IDOR rejection: Quote tradesperson does not match job accepted tradesperson");
@@ -593,6 +637,295 @@ export class PaymentLedgerEngine {
     });
 
     return result;
+  }
+
+  /**
+   * Submits completed milestone deliverables for homeowner review & approval (AT-CJ-MILESTONE-01).
+   * Transitions funded -> in_progress -> submitted (or updates an in_progress/submitted deliverable).
+   */
+  public static async submitMilestoneWork(
+    db: any,
+    params: {
+      jobId: string;
+      quoteId: string;
+      milestoneId: string;
+      authUid: string;
+      deliverableNotes: string;
+      deliverablePhotos?: string[];
+    }
+  ): Promise<{ success: boolean; jobId: string; quoteId: string; milestoneId: string; status: string; milestone: any }> {
+    const { jobId, quoteId, milestoneId, authUid, deliverableNotes, deliverablePhotos = [] } = params;
+    if (!db) throw new InternalServerError("Database is required for milestone deliverable submission.");
+    if (!authUid) throw new ForbiddenError("Authentication required.");
+    if (!jobId || !quoteId || !milestoneId) {
+      throw new BadRequestError("jobId, quoteId, and milestoneId are required.");
+    }
+    const trimmedNotes = String(deliverableNotes || "").trim();
+    if (trimmedNotes.length < 3) {
+      throw new BadRequestError("Please provide work summary notes (at least 3 characters) for your deliverable submission.");
+    }
+
+    const nowIso = new Date().toISOString();
+    const txOut = await db.runTransaction(async (transaction: any) => {
+      const jobRef = db.collection("jobs").doc(jobId);
+      const quoteRef = jobRef.collection("quotes").doc(quoteId);
+      const [jobDoc, quoteDoc] = await Promise.all([
+        transaction.get(jobRef),
+        transaction.get(quoteRef),
+      ]);
+      if (!jobDoc.exists) throw new BadRequestError("Job not found.");
+      if (!quoteDoc.exists) throw new BadRequestError("Quote not found.");
+
+      const jobData = jobDoc.data() || {};
+      const quoteData = quoteDoc.data() || {};
+
+      if (quoteData.jobId && quoteData.jobId !== jobId) {
+        throw new ForbiddenError("Quote does not belong to the specified job.");
+      }
+      if (jobData.acceptedQuoteId !== quoteId || quoteData.status !== "accepted") {
+        throw new ConflictError("Milestone deliverables can only be submitted on the accepted quote.");
+      }
+
+      const assignedTrader =
+        jobData.acceptedTradespersonId ||
+        jobData.acceptedTraderId ||
+        quoteData.tradespersonId ||
+        quoteData.traderId;
+      if (!assignedTrader || assignedTrader !== authUid) {
+        throw new ForbiddenError("Only the assigned tradesperson can submit deliverables for this milestone.");
+      }
+
+      const currentMilestones = Array.isArray(quoteData.milestones) ? quoteData.milestones : [];
+      const targetMilestone = currentMilestones.find((m: any) => m.id === milestoneId);
+      if (!targetMilestone) {
+        throw new BadRequestError(`Milestone '${milestoneId}' not found on quote '${quoteId}'.`);
+      }
+
+      const currentStatus = String(targetMilestone.status || "pending");
+      if (["released", "funds_released", "refunded", "disputed"].includes(currentStatus)) {
+        throw new ConflictError(`Cannot submit work for milestone in '${currentStatus}' state.`);
+      }
+      if (currentStatus === "pending" || currentStatus === "pending_funding") {
+        throw new ConflictError("Escrow funding is required before submitting deliverables for this milestone.");
+      }
+
+      if (currentStatus === "funded") {
+        validateMilestoneTransition("funded", "in_progress");
+        validateMilestoneTransition("in_progress", "submitted");
+      } else if (currentStatus === "in_progress") {
+        validateMilestoneTransition("in_progress", "submitted");
+      } else if (currentStatus === "approved") {
+        throw new ConflictError("Milestone deliverables have already been approved by the homeowner.");
+      }
+
+      const sanitizedPhotos = Array.isArray(deliverablePhotos)
+        ? deliverablePhotos.filter((p) => typeof p === "string" && p.trim().length > 0).slice(0, 10)
+        : [];
+      const nextSubmissionCount = Number(targetMilestone.submissionCount || 0) + 1;
+      let updatedTarget: any = null;
+
+      const updatedMilestones = currentMilestones.map((m: any) => {
+        if (m.id !== milestoneId) return m;
+        updatedTarget = {
+          ...m,
+          status: "submitted",
+          deliverableNotes: trimmedNotes.slice(0, 2000),
+          deliverablePhotos: sanitizedPhotos,
+          submittedAt: nowIso,
+          submittedBy: authUid,
+          submissionCount: nextSubmissionCount,
+          updatedAt: nowIso,
+        };
+        return updatedTarget;
+      });
+
+      transaction.update(quoteRef, {
+        milestones: updatedMilestones,
+        updatedAt: nowIso,
+      });
+
+      const homeownerId = jobData.homeownerId || jobData.userId || jobData.ownerId;
+      if (homeownerId) {
+        transaction.set(
+          db.collection("notifications").doc(`ms_submit_${jobId}_${milestoneId}_${nextSubmissionCount}`),
+          {
+            userId: homeownerId,
+            title: "Milestone Deliverable Submitted",
+            message: `Tradesperson submitted work for "${targetMilestone.title || "Milestone"}". Please review to approve or request a revision.`,
+            type: "status",
+            read: false,
+            jobId,
+            quoteId,
+            milestoneId,
+            link: `/job/${jobId}`,
+            createdAt: nowIso,
+          }
+        );
+      }
+
+      return { updatedTarget };
+    });
+
+    await domainEvents.dispatch(
+      "MILESTONE_SUBMITTED",
+      milestoneId,
+      authUid,
+      { jobId, quoteId, milestoneId },
+      `ms_submit_${jobId}_${milestoneId}_${txOut.updatedTarget?.submissionCount || 1}`,
+      db
+    );
+
+    return {
+      success: true,
+      jobId,
+      quoteId,
+      milestoneId,
+      status: "submitted",
+      milestone: txOut.updatedTarget,
+    };
+  }
+
+  /**
+   * Homeowner review decision for a submitted milestone deliverable (AT-CJ-MILESTONE-01).
+   * Supports approving deliverables (unlocked for payout release) or requesting revision (submitted -> in_progress).
+   */
+  public static async reviewMilestoneWork(
+    db: any,
+    params: {
+      jobId: string;
+      quoteId: string;
+      milestoneId: string;
+      authUid: string;
+      decision: "approve" | "request_revision";
+      revisionReason?: string;
+      isAdmin?: boolean;
+    }
+  ): Promise<{ success: boolean; jobId: string; quoteId: string; milestoneId: string; status: string; milestone: any }> {
+    const { jobId, quoteId, milestoneId, authUid, decision, revisionReason, isAdmin } = params;
+    if (!db) throw new InternalServerError("Database is required for milestone review.");
+    if (!authUid) throw new ForbiddenError("Authentication required.");
+    if (!jobId || !quoteId || !milestoneId) {
+      throw new BadRequestError("jobId, quoteId, and milestoneId are required.");
+    }
+    if (decision !== "approve" && decision !== "request_revision") {
+      throw new BadRequestError("decision must be 'approve' or 'request_revision'.");
+    }
+    const cleanReason = String(revisionReason || "").trim();
+    if (decision === "request_revision" && cleanReason.length < 3) {
+      throw new BadRequestError("Please provide a revision reason when requesting changes.");
+    }
+
+    const nowIso = new Date().toISOString();
+    const txOut = await db.runTransaction(async (transaction: any) => {
+      const jobRef = db.collection("jobs").doc(jobId);
+      const quoteRef = jobRef.collection("quotes").doc(quoteId);
+      const [jobDoc, quoteDoc] = await Promise.all([
+        transaction.get(jobRef),
+        transaction.get(quoteRef),
+      ]);
+      if (!jobDoc.exists) throw new BadRequestError("Job not found.");
+      if (!quoteDoc.exists) throw new BadRequestError("Quote not found.");
+
+      const jobData = jobDoc.data() || {};
+      const quoteData = quoteDoc.data() || {};
+
+      if (quoteData.jobId && quoteData.jobId !== jobId) {
+        throw new ForbiddenError("Quote does not belong to the specified job.");
+      }
+      if (jobData.acceptedQuoteId !== quoteId || quoteData.status !== "accepted") {
+        throw new ConflictError("Milestone deliverables can only be reviewed on the accepted quote.");
+      }
+
+      const ownerId = jobData.homeownerId || jobData.userId || jobData.ownerId;
+      if (!isAdmin && (!ownerId || ownerId !== authUid)) {
+        throw new ForbiddenError("Only the job homeowner or an admin can review milestone deliverables.");
+      }
+
+      const currentMilestones = Array.isArray(quoteData.milestones) ? quoteData.milestones : [];
+      const targetMilestone = currentMilestones.find((m: any) => m.id === milestoneId);
+      if (!targetMilestone) {
+        throw new BadRequestError(`Milestone '${milestoneId}' not found on quote '${quoteId}'.`);
+      }
+
+      const targetStatus = decision === "approve" ? "approved" : "in_progress";
+      const currentStatus = String(targetMilestone.status || "pending");
+      if (decision === "approve" && currentStatus === "approved") {
+        return { updatedTarget: targetMilestone, nextStatus: "approved" };
+      }
+
+      validateMilestoneTransition(currentStatus as any, targetStatus);
+
+      let updatedTarget: any = null;
+      const revisionCount = Number(targetMilestone.revisionCount || 0) + (decision === "request_revision" ? 1 : 0);
+
+      const updatedMilestones = currentMilestones.map((m: any) => {
+        if (m.id !== milestoneId) return m;
+        updatedTarget = {
+          ...m,
+          status: targetStatus,
+          ...(decision === "approve"
+            ? {
+                approvedAt: nowIso,
+                approvedBy: authUid,
+                payoutUnlocked: true,
+              }
+            : {
+                revisionRequestedAt: nowIso,
+                revisionRequestedBy: authUid,
+                revisionReason: cleanReason.slice(0, 1000),
+                revisionCount,
+              }),
+          updatedAt: nowIso,
+        };
+        return updatedTarget;
+      });
+
+      transaction.update(quoteRef, {
+        milestones: updatedMilestones,
+        updatedAt: nowIso,
+      });
+
+      const traderId =
+        jobData.acceptedTradespersonId ||
+        jobData.acceptedTraderId ||
+        quoteData.tradespersonId ||
+        quoteData.traderId;
+      if (traderId) {
+        const notifId =
+          decision === "approve"
+            ? `ms_approve_${jobId}_${milestoneId}`
+            : `ms_rev_${jobId}_${milestoneId}_${revisionCount}`;
+        transaction.set(db.collection("notifications").doc(notifId), {
+          userId: traderId,
+          title:
+            decision === "approve"
+              ? "Milestone Work Approved"
+              : "Milestone Revision Requested",
+          message:
+            decision === "approve"
+              ? `Your work for "${targetMilestone.title || "Milestone"}" was approved and unlocked for payout release.`
+              : `Homeowner requested a revision for "${targetMilestone.title || "Milestone"}": ${cleanReason.slice(0, 200)}`,
+          type: "status",
+          read: false,
+          jobId,
+          quoteId,
+          milestoneId,
+          link: `/job/${jobId}`,
+          createdAt: nowIso,
+        });
+      }
+
+      return { updatedTarget, nextStatus: targetStatus };
+    });
+
+    return {
+      success: true,
+      jobId,
+      quoteId,
+      milestoneId,
+      status: txOut.nextStatus,
+      milestone: txOut.updatedTarget,
+    };
   }
 
   /**

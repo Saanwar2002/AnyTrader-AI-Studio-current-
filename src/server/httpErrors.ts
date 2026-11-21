@@ -79,6 +79,12 @@ export class InternalServerError extends HttpError {
   }
 }
 
+export class ServiceUnavailableError extends HttpError {
+  constructor(message: string = "Service temporarily unavailable", details?: Record<string, any>) {
+    super(503, message, "SERVICE_UNAVAILABLE", true, details);
+  }
+}
+
 /**
  * Express error responder that guarantees no sensitive paths, stack traces,
  * or credentials are leaked to the client.

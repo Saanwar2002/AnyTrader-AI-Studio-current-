@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { FileText, ShieldAlert, CheckCircle2, FileCheck, ExternalLink, Loader2, X, FileSpreadsheet } from "lucide-react";
-import { generateLegalContractDoc, ContractDetails } from "@/src/services/googleDriveDocsService";
+import { FileText, ShieldAlert, CheckCircle2, FileCheck, ExternalLink, Loader2, X } from "lucide-react";
+import { generateLegalContractDoc, ContractDetails, VerifiedTraderCredentials } from "@/src/services/googleDriveDocsService";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 import { toast } from "sonner";
 
 interface GoogleDocsContractModalProps {
@@ -11,6 +12,7 @@ interface GoogleDocsContractModalProps {
   quote?: any;
   traderName?: string;
   clientName?: string;
+  traderProfile?: any;
 }
 
 export function GoogleDocsContractModal({
@@ -20,10 +22,12 @@ export function GoogleDocsContractModal({
   quote,
   traderName = "Assigned Tradesperson",
   clientName = "Client / Homeowner",
+  traderProfile,
 }: GoogleDocsContractModalProps) {
   const [selectedType, setSelectedType] = useState<"Trade Service Agreement" | "Liability Waiver" | "Job Completion Certificate">("Trade Service Agreement");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedDocUrl, setGeneratedDocUrl] = useState<string | null>(null);
+  const dialogRef = useDialogA11y<HTMLDivElement>(isOpen && Boolean(job), onClose);
 
   if (!isOpen || !job) return null;
 
@@ -35,17 +39,34 @@ export function GoogleDocsContractModal({
     setIsGenerating(true);
     setGeneratedDocUrl(null);
 
+    const verifiedCredentials: VerifiedTraderCredentials = {
+      publicLiabilityVerified: Boolean(
+        traderProfile?.insuranceVerified === true ||
+          traderProfile?.publicLiabilityVerified === true
+      ),
+      insuranceProvider: traderProfile?.insuranceProvider || undefined,
+      insurancePolicyNumber: traderProfile?.insurancePolicyNumber || undefined,
+      publicLiabilityLimit: traderProfile?.publicLiabilityLimit || undefined,
+      warrantyVerified: Boolean(traderProfile?.warrantyVerified === true && Number(traderProfile?.warrantyMonths) > 0),
+      warrantyMonths: Number(traderProfile?.warrantyMonths) > 0 ? Number(traderProfile.warrantyMonths) : undefined,
+      siteSafetyVerified: Boolean(traderProfile?.siteSafetyVerified === true || traderProfile?.isVerified === true),
+      certifications: Array.isArray(traderProfile?.verifiedCertifications)
+        ? traderProfile.verifiedCertifications
+        : undefined,
+    };
+
     const details: ContractDetails = {
       documentType: selectedType,
       jobTitle,
       jobRef,
       clientName: clientName || job.clientName || "Client",
-      clientAddress: job.postcode ? `${job.location || 'Location'}, ${job.postcode}` : job.location,
+      clientAddress: job.postcode ? `${job.location || "Location"}, ${job.postcode}` : job.location,
       traderName: traderName || "Trader",
       amount,
       startDate: quote?.startDate || job.preferredStartDate || new Date().toISOString().split("T")[0],
       scopeOfWork: quote?.quoteScope || job.description || jobTitle,
-      completionNotes: job.completionNotes || "All agreed trade specifications fulfilled.",
+      completionNotes: job.completionNotes || undefined,
+      verifiedCredentials,
     };
 
     const res = await generateLegalContractDoc(details);
@@ -63,10 +84,15 @@ export function GoogleDocsContractModal({
     <AnimatePresence>
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
         <motion.div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="google-docs-contract-modal-title"
+          tabIndex={-1}
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0, scale: 0.95 }}
-          className="bg-white rounded-2xl border border-black shadow-2xl max-w-lg w-full overflow-hidden"
+          className="bg-white rounded-2xl border border-black shadow-2xl max-w-lg w-full overflow-hidden focus:outline-none"
         >
           {/* Header */}
           <div className="bg-[#1e3a5f] text-white p-5 flex items-center justify-between border-b border-black">
@@ -75,12 +101,14 @@ export function GoogleDocsContractModal({
                 <FileText className="w-5 h-5 text-blue-300" />
               </div>
               <div>
-                <h3 className="text-base font-bold text-white">Google Docs Legal Contract Engine</h3>
+                <h3 id="google-docs-contract-modal-title" className="text-base font-bold text-white">Google Docs Legal Contract Engine</h3>
                 <p className="text-xs text-blue-200">{jobRef} • {jobTitle}</p>
               </div>
             </div>
             <button
+              type="button"
               onClick={onClose}
+              aria-label="Close Google Docs contract modal"
               className="p-1.5 hover:bg-white/10 rounded-xl text-white/80 transition-colors"
             >
               <X className="w-5 h-5" />
@@ -89,9 +117,9 @@ export function GoogleDocsContractModal({
 
           <div className="p-6 space-y-5">
             <div>
-              <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block mb-2">
+              <p className="text-xs font-bold text-slate-700 uppercase tracking-wider block mb-2">
                 Select Contract / Certificate Type
-              </label>
+              </p>
               <div className="grid grid-cols-1 gap-2.5">
                 <button
                   type="button"

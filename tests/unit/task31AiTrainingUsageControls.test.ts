@@ -18,6 +18,7 @@ import {
   assertSucceeds,
   RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import {
   doc,
   getDoc,
@@ -55,7 +56,7 @@ describe('V8.3 Task 31 — Firebase Emulator AI Training & Usage Controls Suite'
 
   beforeAll(async () => {
     try {
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: {
           rules: firestoreRules,

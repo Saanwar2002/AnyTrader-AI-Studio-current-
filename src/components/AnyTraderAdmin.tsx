@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { db, collection, query, onSnapshot, doc, updateDoc, deleteDoc, setDoc, serverTimestamp, orderBy, limit, sendNotification, getDoc, addDoc, getDocs, handleFirestoreError as handleGlobalFirestoreError, OperationType } from "@/src/firebase";
+import { toast } from "sonner";
+import { db, collection, query, onSnapshot, doc, updateDoc, deleteDoc, setDoc, serverTimestamp, orderBy, limit, startAfter, sendNotification, getDoc, addDoc, getDocs, handleFirestoreError as handleGlobalFirestoreError, OperationType } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { useCategories } from "../lib/CategoryProvider";
 import { TRADE_CATEGORIES } from "@/src/constants";
@@ -26,6 +27,8 @@ import AdminAdvertsTab from "./AdminAdvertsTab";
 import AffiliatesManager from "./AffiliatesManager";
 import AdminAiAgentsTab from "./AdminAiAgentsTab";
 import AdminFlashDealsAndAiAnalyticsTab from "./AdminFlashDealsAndAiAnalyticsTab";
+import AdminFinancialReconciliationTab from "./AdminFinancialReconciliationTab";
+import AdminOperationalHealthTab from "./AdminOperationalHealthTab";
 import AdminAlertToastContainer from "./AdminAlertToastContainer";
 import AdminAlertThresholdsModal from "./AdminAlertThresholdsModal";
 import { startAdminThresholdBreachListener, ActiveBreachAlert } from "../services/adminAlertThresholdService";
@@ -45,12 +48,12 @@ export default function AnyTraderAdmin() {
   const [searchParams, setSearchParams] = useSearchParams();
   
   const tabFromUrl = searchParams.get("tab") as any;
-  const initialTab = ["users", "jobs", "disputes", "logs", "team", "broadcast", "analytics", "settings", "verifications", "insights", "risk", "trends", "categories", "monetization", "advertising", "affiliates", "ai_agents", "sentinel_analytics", "subscriptions"].includes(tabFromUrl) ? tabFromUrl : "users";
+  const initialTab = ["users", "jobs", "disputes", "logs", "team", "broadcast", "analytics", "settings", "verifications", "insights", "risk", "trends", "categories", "monetization", "advertising", "affiliates", "ai_agents", "sentinel_analytics", "subscriptions", "reconciliation", "ops_health"].includes(tabFromUrl) ? tabFromUrl : "users";
   
-  const [activeTab, setActiveTab] = useState<"users" | "jobs" | "disputes" | "logs" | "team" | "broadcast" | "analytics" | "settings" | "verifications" | "insights" | "risk" | "trends" | "categories" | "security" | "guest_jobs" | "monetization" | "advertising" | "affiliates" | "ai_agents" | "sentinel_analytics" | "subscriptions">(initialTab as any);
+  const [activeTab, setActiveTab] = useState<"users" | "jobs" | "disputes" | "logs" | "team" | "broadcast" | "analytics" | "settings" | "verifications" | "insights" | "risk" | "trends" | "categories" | "security" | "guest_jobs" | "monetization" | "advertising" | "affiliates" | "ai_agents" | "sentinel_analytics" | "subscriptions" | "reconciliation" | "ops_health">(initialTab as any);
   
   useEffect(() => {
-    const validTab = ["users", "jobs", "disputes", "logs", "team", "broadcast", "analytics", "settings", "verifications", "insights", "risk", "trends", "categories", "security", "guest_jobs", "monetization", "advertising", "affiliates", "ai_agents", "sentinel_analytics", "subscriptions"].includes(tabFromUrl) ? tabFromUrl : "users";
+    const validTab = ["users", "jobs", "disputes", "logs", "team", "broadcast", "analytics", "settings", "verifications", "insights", "risk", "trends", "categories", "security", "guest_jobs", "monetization", "advertising", "affiliates", "ai_agents", "sentinel_analytics", "subscriptions", "reconciliation", "ops_health"].includes(tabFromUrl) ? tabFromUrl : "users";
     if (validTab !== activeTab) {
       setActiveTab(validTab);
       setFilter(validTab === "jobs" ? "emergency" : "all");
@@ -70,6 +73,13 @@ export default function AnyTraderAdmin() {
   const [users, setUsers] = useState<any[]>([]);
   const [jobs, setJobs] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);
+  const [usersPageSize, setUsersPageSize] = useState(50);
+  const [jobsPageSize, setJobsPageSize] = useState(50);
+  const [logsPageSize, setLogsPageSize] = useState(50);
+  const [lastUsersCursor, setLastUsersCursor] = useState<any>(null);
+  const [lastJobsCursor, setLastJobsCursor] = useState<any>(null);
+  const [hasMoreUsers, setHasMoreUsers] = useState(false);
+  const [hasMoreJobs, setHasMoreJobs] = useState(false);
   const [invitations, setInvitations] = useState<any[]>([]);
   const [broadcasts, setBroadcasts] = useState<any[]>([]);
   const [reviews, setReviews] = useState<any[]>([]);
@@ -184,6 +194,7 @@ export default function AnyTraderAdmin() {
     { title: "Audit & Logs", tab: "logs", keywords: ["history", "actions", "security", "who did what"], icon: <FileText className="w-4 h-4" /> },
     { title: "Security & API Keys", tab: "security", keywords: ["gemini", "stripe", "secrets", "env"], icon: <Key className="w-4 h-4" /> },
     { title: "Growth Stats", tab: "analytics", keywords: ["data", "report", "revenue", "charts"], icon: <BarChart3 className="w-4 h-4" /> },
+    { title: "Financial Reconciliation (FIN-05)", tab: "reconciliation", keywords: ["reconcile", "ledger", "stripe", "escrow", "payout", "dispute", "audit"], icon: <ShieldCheck className="w-4 h-4" /> },
     { title: "Monetization Mode", tab: "settings", elementId: "monetization-control", keywords: ["paywall", "beta", "free", "charging"], icon: <DollarSign className="w-4 h-4" /> },
     { title: "Maintenance Mode", tab: "settings", elementId: "maintenance-control", keywords: ["offline", "killswitch", "update"], icon: <Lock className="w-4 h-4" /> },
     { title: "Scheduled Maintenance", tab: "settings", elementId: "scheduled-maintenance", keywords: ["banner", "warning", "timer"], icon: <Calendar className="w-4 h-4" /> },
@@ -242,28 +253,89 @@ export default function AnyTraderAdmin() {
     { id: "manage_team", label: "Manage Team", description: "Invite and manage other staff members" }
   ];
 
+  // AT-ADMIN-CTRL-05: Bounded, paginated queries for users, jobs, logs, and invitations (no unbounded full-collection listeners)
+  const handleLoadMoreUsers = async () => {
+    if (!lastUsersCursor) return;
+    try {
+      const nextSnap = await getDocs(
+        query(collection(db, "users"), startAfter(lastUsersCursor), limit(50))
+      );
+      if (!nextSnap.empty) {
+        const nextRows = nextSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setUsers((prev) => {
+          const seen = new Set(prev.map((u) => u.id));
+          return [...prev, ...nextRows.filter((u) => !seen.has(u.id))];
+        });
+        setLastUsersCursor(nextSnap.docs[nextSnap.docs.length - 1]);
+        setHasMoreUsers(nextSnap.docs.length === 50);
+      } else {
+        setHasMoreUsers(false);
+      }
+    } catch (error) {
+      handleGlobalFirestoreError(error, OperationType.GET, "users");
+    }
+  };
+
+  const handleLoadMoreJobs = async () => {
+    if (!lastJobsCursor) return;
+    try {
+      const nextSnap = await getDocs(
+        query(collection(db, "jobs"), startAfter(lastJobsCursor), limit(50))
+      );
+      if (!nextSnap.empty) {
+        const nextRows = nextSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setJobs((prev) => {
+          const seen = new Set(prev.map((j) => j.id));
+          return [...prev, ...nextRows.filter((j) => !seen.has(j.id))];
+        });
+        setLastJobsCursor(nextSnap.docs[nextSnap.docs.length - 1]);
+        setHasMoreJobs(nextSnap.docs.length === 50);
+      } else {
+        setHasMoreJobs(false);
+      }
+    } catch (error) {
+      handleGlobalFirestoreError(error, OperationType.GET, "jobs");
+    }
+  };
+
   useEffect(() => {
     if (profile?.role !== "admin") return;
 
-    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
-      setUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    }, (error) => handleGlobalFirestoreError(error, OperationType.GET, "users"));
+    const unsubUsers = onSnapshot(
+      query(collection(db, "users"), limit(usersPageSize)),
+      (snapshot) => {
+        setUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+        setLastUsersCursor(snapshot.docs[snapshot.docs.length - 1] || null);
+        setHasMoreUsers(snapshot.docs.length >= usersPageSize);
+      },
+      (error) => handleGlobalFirestoreError(error, OperationType.GET, "users")
+    );
 
-    const unsubJobs = onSnapshot(collection(db, "jobs"), (snapshot) => {
-      setJobs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    }, (error) => handleGlobalFirestoreError(error, OperationType.GET, "jobs"));
+    const unsubJobs = onSnapshot(
+      query(collection(db, "jobs"), limit(jobsPageSize)),
+      (snapshot) => {
+        setJobs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+        setLastJobsCursor(snapshot.docs[snapshot.docs.length - 1] || null);
+        setHasMoreJobs(snapshot.docs.length >= jobsPageSize);
+      },
+      (error) => handleGlobalFirestoreError(error, OperationType.GET, "jobs")
+    );
 
     const unsubLogs = onSnapshot(
-      query(collection(db, "audit_logs"), orderBy("createdAt", "desc"), limit(50)), 
+      query(collection(db, "audit_logs"), orderBy("createdAt", "desc"), limit(logsPageSize)), 
       (snapshot) => {
         setLogs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
       },
       (error) => handleGlobalFirestoreError(error, OperationType.GET, "audit_logs")
     );
 
-    const unsubInvites = onSnapshot(collection(db, "invitations"), (snapshot) => {
-      setInvitations(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    }, (error) => handleGlobalFirestoreError(error, OperationType.GET, "invitations"));
+    const unsubInvites = onSnapshot(
+      query(collection(db, "invitations"), limit(50)),
+      (snapshot) => {
+        setInvitations(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      },
+      (error) => handleGlobalFirestoreError(error, OperationType.GET, "invitations")
+    );
 
     const unsubBroadcasts = onSnapshot(
       query(collection(db, "broadcasts"), orderBy("createdAt", "desc"), limit(20)), 
@@ -382,7 +454,7 @@ export default function AnyTraderAdmin() {
       unsubThresholdBreaches();
       unsubConfig();
     };
-  }, [profile]);
+  }, [profile, usersPageSize, jobsPageSize, logsPageSize]);
 
   useEffect(() => {
     if (activeTab === "insights" && !platformInsights && !isFetchingInsights && users.length > 0) {
@@ -485,6 +557,21 @@ export default function AnyTraderAdmin() {
     setShowMaintenanceConfirm(false);
     
     try {
+      const idToken = user ? await user.getIdToken() : "";
+      if (idToken) {
+        const res = await fetch("/api/admin/maintenance", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ maintenanceMode: newStatus }),
+        });
+        if (res.ok) {
+          showToast("System Updated", `Maintenance mode is now ${newStatus ? "ON" : "OFF"}`, newStatus ? "error" : "success");
+          return;
+        }
+      }
       await setDoc(doc(db, "platform_config", "global"), {
         ...updatedConfig,
         updatedAt: serverTimestamp(),
@@ -594,57 +681,33 @@ export default function AnyTraderAdmin() {
         milestoneEscrow: { enabled: true, homeownerMediationStake: 25.00, traderMediationStake: 25.00, description: "Stripe Connect milestone stage payments & dispute mediation staking" }
       };
 
-      await setDoc(doc(db, "platform_config", "global"), {
-        ...tempConfig,
-        feeTiers,
-        businessTiers,
-        paidAddons,
-        updatedAt: serverTimestamp(),
-        updatedBy: user.uid
+      const idToken = await user.getIdToken();
+      const res = await fetch("/api/admin/pricing-config/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          tempConfig,
+          feeTiers,
+          businessTiers,
+          paidAddons,
+        }),
       });
-
-      // Synchronize trade tiers into platform_config/global_tiers so both config schemas stay perfectly in sync
-      try {
-        const globalTiersRef = doc(db, "platform_config", "global_tiers");
-        const globalTiersSnap = await getDoc(globalTiersRef);
-        const currentGlobalTiers = globalTiersSnap.exists() ? globalTiersSnap.data() : { providerModels: {} };
-
-        const mappedOneOffTiers: Record<string, any> = {};
-        feeTiers.forEach((ft: any) => {
-          const canonical = normalizeTraderTier(ft.name);
-          mappedOneOffTiers[canonical] = {
-            price: Number(ft.price) || 0,
-            commission: (Number(ft.commission) || 0) > 1 ? ((Number(ft.commission) || 0) / 100) : (Number(ft.commission) || 0.05),
-            maxQuotes: Number(ft.maxQuotes) || 9999,
-            maxAcceptedQuotes: Number(ft.maxAcceptedQuotes) || 9999,
-            leadFee: Number(ft.leadFee) || 0,
-            description: ft.description || "",
-            features: ft.features || (ft.description ? [ft.description] : [])
-          };
-        });
-
-        await setDoc(globalTiersRef, {
-          ...currentGlobalTiers,
-          providerModels: {
-            ...(currentGlobalTiers.providerModels || {}),
-            one_off_trades: {
-              tiers: {
-                ...(currentGlobalTiers.providerModels?.one_off_trades?.tiers || {}),
-                ...mappedOneOffTiers
-              }
-            }
-          }
-        }, { merge: true });
-      } catch (syncErr) {
-        console.warn("Could not sync global_tiers:", syncErr);
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Atomic config publish failed (${res.status})`);
       }
 
-      await createAuditLog("update_settings", "global", "config", "Updated platform settings, tiers, and paid add-on feature pricing");
       setHasUnsavedChanges(false);
-      showToast("Success", "Settings, tiers, and paid feature pricing saved and synchronized successfully.");
-    } catch (err) {
+      showToast(
+        "Success",
+        `Settings, tiers, and pricing published atomically (config v${data.configVersion || 1}).`
+      );
+    } catch (err: any) {
       console.error(err);
-      showToast("Error", "Failed to save settings. Please check your connection.", "error");
+      showToast("Error", err?.message || "Failed to publish settings atomically.", "error");
     } finally {
       setIsSavingSettings(false);
     }
@@ -669,52 +732,47 @@ export default function AnyTraderAdmin() {
     }
   };
 
+  // AT-ADMIN-CTRL-04: Bounded server-authoritative broadcast fan-out queue with honest delivery receipts
   const handleSendBroadcast = async () => {
     if (!user || !broadcastTitle || !broadcastContent || broadcastSegments.length === 0) return;
     setIsBroadcasting(true);
     try {
-      const broadcastRef = doc(collection(db, "broadcasts"));
-      const targetUsers = users.filter(u => {
-        const segmentMatch = broadcastSegments.includes(u.role);
-        if (!segmentMatch) return false;
-        
-        // If targeting tradespeople and specific trades are selected, filter by them
-        if (u.role === "tradesperson" && broadcastTrades.length > 0) {
-          return u.trades?.some((t: string) => broadcastTrades.includes(t));
-        }
-        
-        return true;
+      const idToken = await user.getIdToken();
+      const response = await fetch("/api/admin/broadcasts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          title: broadcastTitle,
+          content: broadcastContent,
+          type: broadcastType,
+          targetSegments: broadcastSegments,
+          targetTrades: broadcastTrades,
+          channels: { inApp: true, email: false, sms: false },
+        }),
       });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || "Broadcast dispatch failed");
+      }
 
-      await setDoc(broadcastRef, {
-        id: broadcastRef.id,
-        title: broadcastTitle,
-        content: broadcastContent,
-        type: broadcastType,
-        targetSegments: broadcastSegments,
-        targetTrades: broadcastTrades,
-        sentBy: user.uid,
-        recipientCount: targetUsers.length,
-        createdAt: serverTimestamp()
-      });
-
-      // Send in-app notifications to all target users
-      const notificationPromises = targetUsers.map(u => 
-        sendNotification(u.id, broadcastTitle, broadcastContent, "system")
-      );
-      await Promise.all(notificationPromises);
-
-      const targetDesc = `${broadcastSegments.join(", ")}${broadcastTrades.length > 0 ? ` (${broadcastTrades.join(", ")})` : ""}`;
-      await createAuditLog("send_broadcast", broadcastRef.id, "broadcast", `Sent ${broadcastType} to ${targetDesc} (${targetUsers.length} recipients)`);
-      
       setShowBroadcastModal(false);
       setBroadcastTitle("");
       setBroadcastContent("");
       setBroadcastSegments(["homeowners", "tradespeople"]);
       setBroadcastTrades([]);
-      alert(`Broadcast sent to ${targetUsers.length} users! In production, this would also trigger Email/SMS.`);
-    } catch (err) {
+
+      const receiptMsg = `Broadcast queued: ${result.sentCount ?? 0} in-app sent, ${result.failedCount ?? 0} failed (matched ${result.totalMatched ?? 0}${result.truncated ? ", batch capped" : ""}).`;
+      if ((result.failedCount ?? 0) > 0) {
+        toast.warning(receiptMsg);
+      } else {
+        toast.success(receiptMsg);
+      }
+    } catch (err: any) {
       console.error(err);
+      toast.error(err?.message || "Failed to dispatch broadcast");
     } finally {
       setIsBroadcasting(false);
     }
@@ -724,25 +782,39 @@ export default function AnyTraderAdmin() {
     if (!user || !inviteEmail || invitePermissions.length === 0) return;
     setIsInviting(true);
     try {
-      const inviteRef = doc(collection(db, "invitations"));
-      await setDoc(inviteRef, {
-        id: inviteRef.id,
-        email: inviteEmail.toLowerCase(),
-        role: "admin",
-        permissions: invitePermissions,
-        status: "pending",
-        invitedBy: user.uid,
-        createdAt: serverTimestamp()
+      const idToken = await user.getIdToken();
+      const res = await fetch("/api/admin/invitations", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          email: inviteEmail.trim().toLowerCase(),
+          permissions: invitePermissions,
+        }),
       });
+      const data = await res.json().catch(() => ({} as any));
 
-      await createAuditLog("send_invitation", inviteRef.id, "user", `Invited ${inviteEmail} with ${invitePermissions.length} permissions`);
-      
+      if (!res.ok || !data?.success) {
+        showToast(
+          "Invitation Delivery Failed",
+          data?.error || `Failed to dispatch invitation (${res.status}). Check mail provider settings.`,
+          "error"
+        );
+        return;
+      }
+
       setShowInviteModal(false);
       setInviteEmail("");
       setInvitePermissions([]);
-      alert(`Invitation link for ${inviteEmail} created! In production, an email would be sent.`);
-    } catch (err) {
+      showToast(
+        "Invitation Sent",
+        `Secure invitation dispatched to ${data.email} (expires ${new Date(data.expiresAt).toLocaleDateString()}).`
+      );
+    } catch (err: any) {
       console.error(err);
+      showToast("Invitation Error", err?.message || "Failed to send staff invitation.", "error");
     } finally {
       setIsInviting(false);
     }
@@ -771,51 +843,56 @@ export default function AnyTraderAdmin() {
   }, [toastMessage]);
 
   const handleToggleStaffStatus = async (userId: string, currentStatus: boolean) => {
-    console.log(`Attempting to toggle status for user ${userId}. Current isDisabled: ${currentStatus}`);
+    if (!user) return;
+    const willSuspend = !currentStatus;
     try {
-      await updateDoc(doc(db, "users", userId), {
-        isDisabled: !currentStatus,
-        updatedAt: serverTimestamp()
+      const idToken = await user.getIdToken();
+      const endpoint = willSuspend
+        ? `/api/admin/users/${encodeURIComponent(userId)}/suspend`
+        : `/api/admin/users/${encodeURIComponent(userId)}/reinstate`;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          reason: willSuspend ? "Suspended via Admin Console" : "Reinstated via Admin Console",
+        }),
       });
-      console.log("User document updated successfully");
-      
-      try {
-        await createAuditLog(
-          !currentStatus ? "restrict_staff" : "reinstate_staff", 
-          userId, 
-          "user", 
-          !currentStatus ? "Account restricted" : "Account reinstated"
-        );
-        console.log("Audit log created successfully");
-      } catch (auditErr) {
-        console.error("Failed to create audit log:", auditErr);
-        // We don't fail the whole operation if just the audit log fails, 
-        // but we should know about it.
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Failed to update user lifecycle (${res.status})`);
       }
 
       showToast(
-        !currentStatus ? "User Suspended" : "User Allowed",
-        !currentStatus ? "The user account has been successfully suspended." : "The user account has been successfully reinstated."
+        willSuspend ? "User Suspended" : "User Reinstated",
+        willSuspend
+          ? `Auth tokens revoked, public listing removed, ${data.pausedAdsCount || 0} ad(s) paused, and ${data.frozenJobsCount || 0} active job(s) safety-frozen.`
+          : `Account re-enabled (${data.safetyFlaggedJobsNeedingReview || 0} safety-flagged job(s) pending review).`
       );
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error in handleToggleStaffStatus:", err);
-      showToast("Error", "Failed to update user status. Check console for details.", "error");
+      showToast("Error", err?.message || "Failed to update user status cleanly.", "error");
     }
   };
 
   const createAuditLog = async (action: string, targetId: string, targetType: string, details: string) => {
     if (!user) return;
     try {
-      const logRef = doc(collection(db, "audit_logs"));
-      await setDoc(logRef, {
-        id: logRef.id,
-        adminId: user.uid,
-        action,
-        targetId,
-        targetType,
-        details,
-        createdAt: serverTimestamp()
+      const idToken = await user.getIdToken();
+      const res = await fetch("/api/admin/audit-logs", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ action, targetId, targetType, details }),
       });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        throw new Error(payload?.error || `Audit log server rejected (${res.status})`);
+      }
     } catch (err) {
       handleFirestoreError(err, "create", `audit_logs`);
       throw err;
@@ -826,11 +903,24 @@ export default function AnyTraderAdmin() {
     try {
       const userRef = doc(db, "users", userId);
       const userSnap = await getDoc(userRef);
-      
-      await updateDoc(userRef, {
-        verificationStatus: status,
-        updatedAt: serverTimestamp()
+
+      const idToken = await user?.getIdToken();
+      if (!idToken) {
+        throw new Error("Admin authentication required to update trader verification.");
+      }
+
+      const verifyRes = await fetch(`/api/admin/traders/${encodeURIComponent(userId)}/verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ status }),
       });
+      const verifyPayload = await verifyRes.json().catch(() => ({}));
+      if (!verifyRes.ok) {
+        throw new Error(verifyPayload?.error || `Verification update failed (${verifyRes.status})`);
+      }
 
       // Handle Founding Member ID Assignment if upgraded to at least verified
       if (status !== "rejected" && userSnap.exists()) {
@@ -1195,20 +1285,12 @@ export default function AnyTraderAdmin() {
     }
   };
   const handleFlushAuditLogs = async () => {
-    setIsSubmitting(true);
-    try {
-      const q = query(collection(db, "audit_logs"));
-      const snapshot = await getDocs(q);
-      const deletePromises = snapshot.docs.map(d => deleteDoc(d.ref));
-      await Promise.all(deletePromises);
-      showToast("Success", `Flushed ${snapshot.docs.length} audit logs`);
-      setShowFlushLogsModal(false);
-    } catch (err) {
-      console.error("Flush logs error:", err);
-      showToast("Error", "Failed to flush audit logs", "error");
-    } finally {
-      setIsSubmitting(false);
-    }
+    setShowFlushLogsModal(false);
+    showToast(
+      "Immutable Compliance Log",
+      "Audit logs are append-only and cannot be deleted from the client.",
+      "error"
+    );
   };
 
   const exportUsersCSV = (roleFilter?: string) => {
@@ -1369,13 +1451,27 @@ export default function AnyTraderAdmin() {
   };
 
   const confirmDeleteUser = async () => {
-    if (!userToDelete) return;
+    if (!userToDelete || !user) return;
     try {
-      await deleteDoc(doc(db, "users", userToDelete));
-      await createAuditLog("delete_user", userToDelete, "user", "User account deleted");
-      showToast("User Deleted", "The user account has been permanently deleted.");
-    } catch (err) {
-      handleFirestoreError(err, "delete", `users/${userToDelete}`);
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(userToDelete)}`, {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ reason: "Permanent deletion via Admin Console" }),
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Failed to delete user (${res.status})`);
+      }
+      showToast(
+        "User Deleted",
+        `Account revoked & deleted cleanly (${data.pausedAdsCount || 0} ad(s) paused, ${data.frozenJobsCount || 0} active job(s) frozen for reassignment).`
+      );
+    } catch (err: any) {
+      showToast("Delete Failed", err?.message || "Failed to delete user account.", "error");
     } finally {
       setUserToDelete(null);
     }
@@ -1823,6 +1919,8 @@ export default function AnyTraderAdmin() {
                 <TabButton active={activeTab === "insights"} onClick={() => handleTabChange("insights")} icon={<Sparkles className="w-4 h-4" />} label="Insights" />
                 <TabButton active={activeTab === "monetization"} onClick={() => handleTabChange("monetization")} icon={<DollarSign className="w-4 h-4" />} label="Tiers" />
                 <TabButton active={activeTab === "subscriptions"} onClick={() => handleTabChange("subscriptions")} icon={<CreditCard className="w-4 h-4 text-emerald-500" />} label="Subscriptions" />
+                <TabButton active={activeTab === "reconciliation"} onClick={() => handleTabChange("reconciliation")} icon={<ShieldCheck className="w-4 h-4 text-emerald-700" />} label="Reconcile" />
+                <TabButton active={activeTab === "ops_health"} onClick={() => handleTabChange("ops_health")} icon={<Activity className="w-4 h-4 text-blue-700" />} label="Ops Health & Flags" />
               </div>
             </div>
 
@@ -2949,34 +3047,57 @@ export default function AnyTraderAdmin() {
                 <div className="space-y-3">
                   <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Pending Invitations</h4>
                   <div className="space-y-2">
-                    {invitations.filter(i => i.status === "pending").map(invite => (
-                      <div key={invite.id} className="bg-white p-4 rounded-2xl border border-black flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 rounded-full bg-amber-50 flex items-center justify-center">
-                            <Mail className="w-5 h-5 text-amber-600" />
+                    {invitations.filter(i => i.status === "pending" || i.status === "delivery_failed").map(invite => {
+                      const createdDateLabel = invite.createdAt?.seconds
+                        ? new Date(invite.createdAt.seconds * 1000).toLocaleDateString()
+                        : invite.createdAtIso
+                        ? new Date(invite.createdAtIso).toLocaleDateString()
+                        : "Recently";
+                      const isExpired = invite.expiresAt ? Date.parse(invite.expiresAt) <= Date.now() : false;
+                      return (
+                        <div key={invite.id} className="bg-white p-4 rounded-2xl border border-black flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className={cn("w-10 h-10 rounded-full flex items-center justify-center", invite.status === "delivery_failed" ? "bg-red-50" : "bg-amber-50")}>
+                              <Mail className={cn("w-5 h-5", invite.status === "delivery_failed" ? "text-red-600" : "text-amber-600")} />
+                            </div>
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <p className="font-bold text-slate-900 text-sm">{invite.email}</p>
+                                {invite.status === "delivery_failed" && (
+                                  <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-red-100 text-red-700 border border-red-300">
+                                    Delivery Failed
+                                  </span>
+                                )}
+                                {isExpired && (
+                                  <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-300">
+                                    Expired
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[10px] text-slate-500 uppercase font-bold">
+                                Invited {createdDateLabel}{invite.expiresAt ? ` • Expires ${new Date(invite.expiresAt).toLocaleDateString()}` : ""}
+                              </p>
+                              {invite.status === "delivery_failed" && invite.deliveryError && (
+                                <p className="text-[11px] text-red-600 mt-0.5">{invite.deliveryError}</p>
+                              )}
+                            </div>
                           </div>
-                          <div>
-                            <p className="font-bold text-slate-900 text-sm">{invite.email}</p>
-                            <p className="text-[10px] text-slate-400 uppercase font-bold">
-                              Invited on {new Date(invite.createdAt?.seconds * 1000).toLocaleDateString()}
-                            </p>
+                          <div className="flex items-center gap-4">
+                            <div className="text-right">
+                              <p className="text-[10px] font-bold text-slate-400 uppercase">Permissions</p>
+                              <p className="text-xs text-slate-600">{Array.isArray(invite.permissions) ? invite.permissions.length : 0} granted</p>
+                            </div>
+                            <button 
+                              onClick={() => handleCancelInvite(invite.id)}
+                              className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
                           </div>
                         </div>
-                        <div className="flex items-center gap-4">
-                          <div className="text-right">
-                            <p className="text-[10px] font-bold text-slate-400 uppercase">Permissions</p>
-                            <p className="text-xs text-slate-600">{invite.permissions.length} granted</p>
-                          </div>
-                          <button 
-                            onClick={() => handleCancelInvite(invite.id)}
-                            className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                    {invitations.filter(i => i.status === "pending").length === 0 && (
+                      );
+                    })}
+                    {invitations.filter(i => i.status === "pending" || i.status === "delivery_failed").length === 0 && (
                       <p className="text-sm text-slate-400 italic py-4">No pending invitations.</p>
                     )}
                   </div>
@@ -4955,6 +5076,49 @@ export default function AnyTraderAdmin() {
             </div>
           )}
 
+          {activeTab === "reconciliation" && (
+            <AdminFinancialReconciliationTab
+              user={user}
+              disputedJobs={jobs.filter((j) => j.status === "disputed")}
+              onResolveDispute={handleResolveDispute}
+              onOpenDisputesTab={() => handleTabChange("disputes")}
+            />
+          )}
+
+          {activeTab === "ops_health" && <AdminOperationalHealthTab />}
+
+          {(activeTab === "users" || activeTab === "jobs" || activeTab === "logs") && (
+            <div className="px-6 py-3 bg-slate-50 border-t border-black flex flex-wrap items-center justify-between gap-2 text-xs text-black">
+              <span className="font-bold">
+                Paginated view: showing {activeTab === "users" ? users.length : activeTab === "jobs" ? jobs.length : logs.length} {activeTab}
+              </span>
+              {activeTab === "users" && hasMoreUsers && (
+                <button
+                  onClick={handleLoadMoreUsers}
+                  className="px-3 py-1.5 bg-white text-black font-bold rounded-lg border border-black hover:bg-slate-100"
+                >
+                  Load Next 50 Users
+                </button>
+              )}
+              {activeTab === "jobs" && hasMoreJobs && (
+                <button
+                  onClick={handleLoadMoreJobs}
+                  className="px-3 py-1.5 bg-white text-black font-bold rounded-lg border border-black hover:bg-slate-100"
+                >
+                  Load Next 50 Jobs
+                </button>
+              )}
+              {activeTab === "logs" && logs.length >= logsPageSize && (
+                <button
+                  onClick={() => setLogsPageSize((prev) => prev + 50)}
+                  className="px-3 py-1.5 bg-white text-black font-bold rounded-lg border border-black hover:bg-slate-100"
+                >
+                  Load More Logs
+                </button>
+              )}
+            </div>
+          )}
+
           {activeTab === "settings" && tempConfig && (
             <div className="p-6 space-y-8">
               <div className="flex items-center justify-between">
@@ -6174,24 +6338,15 @@ export default function AnyTraderAdmin() {
             </div>
             
             <p className="text-slate-600 mb-8">
-              Are you sure you want to permanently delete <span className="font-bold text-slate-900">ALL</span> audit logs? This will remove the entire history of administrative actions.
+              Compliance audit logs are <span className="font-bold text-slate-900">immutable and append-only</span>. Purging administrative history is disabled to preserve security provenance.
             </p>
 
             <div className="flex gap-3">
               <button 
                 onClick={() => setShowFlushLogsModal(false)}
-                disabled={isSubmitting}
-                className="flex-1 py-3 rounded-xl font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 transition-colors disabled:opacity-50"
+                className="flex-1 py-3 rounded-xl font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors"
               >
-                Cancel
-              </button>
-              <button 
-                onClick={handleFlushAuditLogs}
-                disabled={isSubmitting}
-                className="flex-1 py-3 rounded-xl font-bold text-white bg-red-600 hover:bg-red-700 transition-colors shadow-lg shadow-red-200 disabled:opacity-50 flex items-center justify-center gap-2"
-              >
-                {isSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                Flush All Logs
+                Close
               </button>
             </div>
           </motion.div>

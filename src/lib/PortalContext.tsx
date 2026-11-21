@@ -20,7 +20,8 @@ interface PortalContextType {
 const PortalContext = createContext<PortalContextType | undefined>(undefined);
 
 export function PortalProvider({ children }: { children: React.ReactNode }) {
-  const { profile } = useAuth();
+  const { user, profile } = useAuth();
+  const prevUidRef = React.useRef<string | null>(user?.uid ?? null);
   
   // Default to anyroller if fleet_driver, otherwise anytrader
   const defaultPortal = profile?.role === "fleet_driver" ? "anyroller" : "anytrader";
@@ -88,34 +89,58 @@ export function PortalProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem("anytrader_active_role", activeRole);
   }, [activeRole]);
 
-  // Sync role if portal switches to anyroller (force driver or customer)
   useEffect(() => {
-    // Force activeRole update when profile becomes available
-    if (profile) {
-      const saved = localStorage.getItem("anytrader_active_role") as ActiveRoleType;
-      // If user is admin but current role state is customer, we need to fix it
-      if (profile.role === "admin" && activeRole !== "admin") {
-        setActiveRoleState("admin");
+    const nextUid = user?.uid ?? null;
+    if (nextUid !== prevUidRef.current) {
+      prevUidRef.current = nextUid;
+      setPreventPortalSwitch(false);
+      if (!nextUid) {
+        setActivePortal("anytrader");
+        setActiveRoleState("customer");
         return;
       }
-      if (profile.role === "ecosystem_manager" && activeRole !== "ecosystem_manager") {
-        setActiveRoleState("ecosystem_manager");
-        return;
-      }
+      setActivePortal(profile?.role === "fleet_driver" ? "anyroller" : "anytrader");
+      setActiveRoleState(determineInitialRole());
+    }
+  }, [user?.uid]);
+
+  // Sync role when profile loads/changes or portal switches (prevents stale role leaks across accounts)
+  useEffect(() => {
+    if (!profile) return;
+
+    if (profile.role === "admin") {
+      if (activeRole !== "admin") setActiveRoleState("admin");
+      return;
+    }
+    if (profile.role === "ecosystem_manager") {
+      if (activeRole !== "ecosystem_manager") setActiveRoleState("ecosystem_manager");
+      return;
     }
 
-    if (profile?.role === "admin" || profile?.role === "ecosystem_manager") return;
+    const isDriverProfile = profile.role === "fleet_driver" || profile.role === "driver";
+    const isBusinessOrTrader =
+      profile.subscriptionType === "business" ||
+      profile.role === "tradesperson" ||
+      profile.role === "business";
 
     if (activePortal === "anyroller") {
-       if (profile?.role === "fleet_driver" || profile?.role === "driver") setActiveRoleState("driver");
-       else setActiveRoleState("customer");
-    } else {
-       // if they switch back to anytrader and were acting as driver, put them back to default trader/business/customer
-       if (activeRole === "driver") {
-          setActiveRoleState((profile?.subscriptionType === "business" || profile?.role === "tradesperson" || profile?.role === "business") ? "business" : "customer");
-       }
+      const targetRole: ActiveRoleType = isDriverProfile ? "driver" : "customer";
+      if (activeRole !== targetRole) setActiveRoleState(targetRole);
+      return;
     }
-  }, [activePortal, profile]);
+
+    // AnyTrader portal: never retain an unauthorized or stale role from a prior session
+    if (!availableRoles.includes(activeRole) || activeRole === "driver") {
+      setActiveRoleState(isBusinessOrTrader ? "business" : "customer");
+      return;
+    }
+
+    // If user landed with no saved role preference and is a business/trader, default to business
+    const saved = localStorage.getItem("anytrader_active_role") as ActiveRoleType | null;
+    if (!saved && isBusinessOrTrader && activeRole === "customer") {
+      setActiveRoleState("business");
+    }
+  }, [activePortal, profile, activeRole, availableRoles.join(",")]);
 
   const switchPortal = (portal: PortalType) => {
     setActivePortal(portal);

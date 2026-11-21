@@ -45,6 +45,7 @@ process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8088';
 import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest';
 import * as admin from 'firebase-admin';
 import { initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -135,7 +136,7 @@ describe('Task 17-V — Property AI Security Boundary Final Verification (Real F
     const storageRules = fs.readFileSync(path.resolve(process.cwd(), 'storage.rules'), 'utf-8');
 
     try {
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: {
           rules: firestoreRules,

@@ -69,7 +69,7 @@ describe("Task 1: Canonical Identity & Capability Model", () => {
       expect(identityDriver.capabilities).not.toContain("tradesperson");
     });
 
-    it("maps legacy 'business' with properties layer to business with landlord, estate_agent, property_manager capabilities", () => {
+    it("maps legacy 'business' with properties layer without granting contractor or tradesperson execution capabilities", () => {
       const identityBusinessProps = resolveCanonicalIdentity({
         uid: "user_6",
         role: "business",
@@ -79,10 +79,11 @@ describe("Task 1: Canonical Identity & Capability Model", () => {
       expect(identityBusinessProps.capabilities).toContain("landlord");
       expect(identityBusinessProps.capabilities).toContain("property_manager");
       expect(identityBusinessProps.capabilities).toContain("estate_agent");
-      expect(identityBusinessProps.capabilities).toContain("contractor");
+      expect(identityBusinessProps.capabilities).not.toContain("contractor");
+      expect(identityBusinessProps.capabilities).not.toContain("tradesperson");
     });
 
-    it("maps legacy 'business' with consultancy layer to business with consultant and contractor capabilities", () => {
+    it("maps legacy 'business' with consultancy layer without granting contractor or tradesperson capabilities", () => {
       const identityConsultant = resolveCanonicalIdentity({
         uid: "user_7",
         role: "business",
@@ -90,7 +91,27 @@ describe("Task 1: Canonical Identity & Capability Model", () => {
       });
       expect(identityConsultant.accountType).toBe("business");
       expect(identityConsultant.capabilities).toContain("consultant");
-      expect(identityConsultant.capabilities).toContain("contractor");
+      expect(identityConsultant.capabilities).not.toContain("contractor");
+      expect(identityConsultant.capabilities).not.toContain("tradesperson");
+    });
+
+    it("grants contractor and tradesperson capabilities only when businessLayer is explicit trades or field_services", () => {
+      const tradeBiz = resolveCanonicalIdentity({
+        uid: "user_7b",
+        role: "business",
+        businessLayer: "trades",
+      });
+      expect(tradeBiz.accountType).toBe("business");
+      expect(tradeBiz.capabilities).toContain("contractor");
+      expect(tradeBiz.capabilities).toContain("tradesperson");
+
+      const fieldBiz = resolveCanonicalIdentity({
+        uid: "user_7c",
+        role: "business",
+        businessLayer: "field_services",
+      });
+      expect(fieldBiz.capabilities).toContain("contractor");
+      expect(fieldBiz.capabilities).toContain("tradesperson");
     });
 
     it("maps 'admin' and 'ecosystem_manager' roles to admin account type with full supervisory capabilities", () => {

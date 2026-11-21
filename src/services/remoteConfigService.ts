@@ -1,5 +1,8 @@
 import { getRemoteConfig, fetchAndActivate, getValue, isSupported } from "firebase/remote-config";
 import { app } from "../firebase";
+import { sanitizeExternalUrl } from "../lib/safeExternalUrl";
+
+const IS_DEV_RUNTIME = Boolean(import.meta.env?.DEV);
 
 export interface RemoteConfigValues {
   platformCommissionRate: number;      // e.g. 0.12 for 12%
@@ -21,7 +24,7 @@ export const REMOTE_CONFIG_DEFAULTS: RemoteConfigValues = {
   platformCommissionRate: 0.12,
   driverWaitTimeLimitMins: 5,
   emergencySurgePricingEnabled: false,
-  isDemoMode: true,
+  isDemoMode: IS_DEV_RUNTIME,
   latestVersion: "1.0.0",
   minRequiredVersion: "1.0.0",
   forceUpdate: false,
@@ -102,9 +105,9 @@ export async function initRemoteConfig(): Promise<RemoteConfigValues> {
   }
 }
 
-// Local simulation overrides stored in localStorage for robust testing in AI Studio Preview!
+// Local simulation overrides stored in localStorage ONLY in non-production development builds
 export function getSavedOverrides(): Partial<RemoteConfigValues> {
-  if (typeof window === "undefined") return {};
+  if (!IS_DEV_RUNTIME || typeof window === "undefined") return {};
   try {
     const data = localStorage.getItem("anytrader_remote_config_sim_overrides");
     return data ? JSON.parse(data) : {};
@@ -114,7 +117,7 @@ export function getSavedOverrides(): Partial<RemoteConfigValues> {
 }
 
 export function saveSimOverrides(overrides: Partial<RemoteConfigValues>): void {
-  if (typeof window === "undefined") return;
+  if (!IS_DEV_RUNTIME || typeof window === "undefined") return;
   try {
     localStorage.setItem("anytrader_remote_config_sim_overrides", JSON.stringify(overrides));
   } catch (e) {
@@ -133,8 +136,13 @@ export function clearSimOverrides(): void {
 
 function getMergedValuesWithOverrides(base: RemoteConfigValues): RemoteConfigValues {
   const overrides = getSavedOverrides();
-  return {
+  const merged: RemoteConfigValues = {
     ...base,
-    ...overrides
+    ...overrides,
+  };
+  return {
+    ...merged,
+    androidAppUrl: sanitizeExternalUrl(merged.androidAppUrl) || REMOTE_CONFIG_DEFAULTS.androidAppUrl,
+    iosAppUrl: sanitizeExternalUrl(merged.iosAppUrl) || REMOTE_CONFIG_DEFAULTS.iosAppUrl,
   };
 }

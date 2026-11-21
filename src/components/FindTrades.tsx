@@ -2,11 +2,12 @@ import React, { useState, useEffect, useMemo } from "react";
 import { Search, Filter, Star, MapPin, CheckCircle, ChevronRight, X, SlidersHorizontal, Award, ShieldCheck, Clock, Briefcase, Users, FileText, Shield, Heart, Zap, MessageSquare, AlertTriangle, Info, Plus, Building, Mic, History, Trash2, Tag, ArrowRightLeft, CheckSquare, Square, Scale, Sparkles, Check, Map, List, Compass, GripHorizontal, GripVertical, ChevronDown, Trophy, Play, Pause, Share2, Loader2 } from "lucide-react";
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindowF, CircleF } from "@react-google-maps/api";
 import { getGoogleMapsApiKey, triggerHaptic } from "@/src/lib/capacitor";
-import { db, collection, query, where, orderBy, onSnapshot, setDoc, updateDoc, doc, handleFirestoreError, OperationType, increment } from "@/src/firebase";
+import { db, auth, collection, query, where, orderBy, onSnapshot, setDoc, updateDoc, doc, handleFirestoreError, OperationType, increment } from "@/src/firebase";
 import { DidYouMeanSuggestion } from "./common/DidYouMeanSuggestion";
 import { findFuzzySuggestion, buildCandidateDictionary, matchTraderWithSearchQuery, textContainsTokenMatch, categoryMatchesSearch, CATEGORY_SYNONYMS, FuzzyMatchResult, CandidateItem } from "@/src/lib/fuzzyMatch";
 import { initSearchOptimizationService, recordUnmatchedSearch, onDynamicSynonymsUpdate } from "@/src/services/searchOptimizationService";
 import { cn, getDealPricing, getHomeownerAreaName } from "@/src/lib/utils";
+import { isWithinAdRadiusMiles, extractExplicitGeoPoint } from "@/src/lib/geoDistance";
 import { Link, useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "./AuthProvider";
 import { useCategories } from "../lib/CategoryProvider";
@@ -845,15 +846,15 @@ export default function FindTrades() {
       }
     });
 
-    // Subscribe to active search-feed promoted campaigns for dynamic rotation
-    const adsQuery = query(collection(db, "advertisements"), where("approvalStatus", "==", "approved"), where("isActive", "==", true));
+    // Subscribe to sanitized public_ads projection for search-feed promoted campaigns
+    const adsQuery = query(collection(db, "public_ads"), where("isActive", "==", true));
     const unsubAds = onSnapshot(adsQuery, (snapshot) => {
       const ads = snapshot.docs
         .map(d => ({ id: d.id, ...d.data() }))
-        .filter((ad: any) => (ad.prepaidBalance || 0) > 0);
+        .filter((ad: any) => ad.hasAvailableBudget !== false);
       setActiveAds(ads);
     }, (err) => {
-      console.error("Error fetching active search ads:", err);
+      console.error("Error fetching active public search ads:", err);
     });
 
     const q = query(collection(db, "public_profiles"));
@@ -916,7 +917,7 @@ export default function FindTrades() {
 
   const filteredTradespeople = useMemo(() => {
     return tradespeople
-      .filter(tp => !tp.isDisabled)
+      .filter(tp => !tp.isDisabled && (tp as any).acceptingNewWork !== false)
       .filter(tp => {
         const matchesSearch = matchTraderWithSearchQuery(tp, searchQuery, candidateDictionary);
         
@@ -996,17 +997,17 @@ export default function FindTrades() {
     const effectiveSearchPostcode = searchPostcode || userLocationPostcode;
 
     const matchingAds = activeAds.filter((ad: any) => {
-      if ((ad.prepaidBalance || 0) <= 0) return false;
+      if (ad.hasAvailableBudget === false) return false;
 
       const placementMatch = !ad.placement || ad.placement === "search_feed" || ad.placement === "both";
       if (!placementMatch) return false;
 
-      const tp = tradespeople.find(t => t.uid === ad.advertiserUid);
-      if (!tp || tp.isDisabled) return false;
+      const targetUid = ad.targetProfileId || ad.advertiserUid;
+      const tp = targetUid ? tradespeople.find(t => t.uid === targetUid) : undefined;
+      if (!tp || tp.isDisabled || (tp as any).acceptingNewWork === false) return false;
 
       // 1. Search Query Relevance Filter
       if (searchQuery.trim().length > 0) {
-        const queryLower = searchQuery.toLowerCase().trim();
         const tpMatches = matchTraderWithSearchQuery(tp, searchQuery, candidateDictionary);
         
         const adMatches = 
@@ -1034,29 +1035,14 @@ export default function FindTrades() {
       if (quickFastReply && (tp.responseRate || 0) < 70) return false;
       if (minRating !== null && (tp.rating || 0) < minRating) return false;
 
-      // 4. Radius / Location targeting check
-      let radiusMatch = true;
-      if (ad.promotionRadius && ad.promotionRadius !== "nationwide") {
-        const radiusMiles = Number(ad.promotionRadius);
-        const traderPostcode = tp.postcode?.toUpperCase().replace(/\s/g, "") || "";
-
-        if (effectiveSearchPostcode && traderPostcode && radiusMiles > 0) {
-          const tpOutward = traderPostcode.substring(0, 3);
-          const searchOutward = effectiveSearchPostcode.substring(0, 3);
-          const tpArea = traderPostcode.substring(0, 2);
-          const searchArea = effectiveSearchPostcode.substring(0, 2);
-
-          if (radiusMiles <= 10) {
-            radiusMatch = tpOutward === searchOutward || tpArea === searchArea;
-          } else if (radiusMiles <= 25) {
-            radiusMatch = tpArea === searchArea || traderPostcode.charAt(0) === effectiveSearchPostcode.charAt(0);
-          } else {
-            radiusMatch = traderPostcode.charAt(0) === effectiveSearchPostcode.charAt(0);
-          }
-        }
-      }
-
-      return radiusMatch;
+      // 4. Geodesic Haversine radius targeting check (AT-ADS-12)
+      return isWithinAdRadiusMiles({
+        promotionRadius: ad.promotionRadius,
+        traderCoords: extractExplicitGeoPoint(tp),
+        traderPostcode: tp.postcode || ad.postcodeArea,
+        searchCoords: extractExplicitGeoPoint(profile),
+        searchPostcode: effectiveSearchPostcode,
+      }).withinRadius;
     });
 
     if (matchingAds.length === 0) {
@@ -1067,7 +1053,7 @@ export default function FindTrades() {
     const currentHourSeed = new Date().getHours() + new Date().getDate() * 24 + new Date().getMonth() * 720;
     
     const scoredPromotedUids = matchingAds.map((ad: any) => {
-      const uid = ad.advertiserUid;
+      const uid = String(ad.targetProfileId || ad.advertiserUid || ad.id);
       let hash = 0;
       for (let i = 0; i < uid.length; i++) {
         hash = (hash << 5) - hash + uid.charCodeAt(i);
@@ -1076,29 +1062,24 @@ export default function FindTrades() {
       const pseudoRandomHash = Math.abs(hash + currentHourSeed) % 1000;
       const tp = tradespeople.find(t => t.uid === uid);
       const rating = tp?.rating || 4.0;
-      const budgetWeight = Math.min(2.0, 1 + (ad.prepaidBalance || 0) / 200);
-      const score = pseudoRandomHash * (rating / 5) * budgetWeight;
+      const score = pseudoRandomHash * (rating / 5);
 
-      return { uid, score, adId: ad.id, costPerDisplay: ad.costPerDisplay || 1.00, adData: ad };
+      return { uid, score, adId: ad.id, adData: ad };
     });
 
     scoredPromotedUids.sort((a, b) => b.score - a.score);
     const topPromotedCandidates = scoredPromotedUids.slice(0, 3);
     const topPromotedUidSet = new Set(topPromotedCandidates.map(c => c.uid));
 
-    const promotedTraders: (Tradesperson & { isPromotedAd?: boolean; adId?: string; costPerDisplay?: number; clicks?: number; searchFeedClicks?: number; prepaidBalance?: number })[] = [];
+    const promotedTraders: (Tradesperson & { isPromotedAd?: boolean; adId?: string; adData?: any })[] = [];
     
     topPromotedCandidates.forEach(cand => {
       const tp = tradespeople.find(t => t.uid === cand.uid);
-      if (tp && !tp.isDisabled) {
+      if (tp && !tp.isDisabled && (tp as any).acceptingNewWork !== false) {
         promotedTraders.push({
           ...tp,
           isPromotedAd: true,
           adId: cand.adId,
-          costPerDisplay: cand.costPerDisplay,
-          clicks: cand.adData.clicks || 0,
-          searchFeedClicks: cand.adData.searchFeedClicks || 0,
-          prepaidBalance: cand.adData.prepaidBalance || 0,
           adData: cand.adData
         });
       }
@@ -1235,14 +1216,21 @@ export default function FindTrades() {
     }
   }, [searchQuery, finalDisplayList.length, autocompleteSuggestions?.matchingCategories?.length, profile?.postcode, postcodeFilterValue]);
 
-  // Handle logging clicks on promoted profile cards
+  // Handle logging clicks on promoted profile cards via server-authoritative CPC billing
   const handlePromotedCardClick = async (tp: any) => {
     if (tp.isPromotedAd && tp.adId && !String(tp.adId).startsWith("default") && !String(tp.adId).startsWith("seed-")) {
       try {
-        const adRef = doc(db, "advertisements", tp.adId);
-        await updateDoc(adRef, {
-          clicks: increment(1),
-          searchFeedClicks: increment(1)
+        const token = await auth.currentUser?.getIdToken().catch(() => null);
+        await fetch(`/api/ads/${encodeURIComponent(tp.adId)}/track`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            eventType: "click",
+            placement: "search_feed",
+          }),
         });
       } catch (e) {
         console.error("Error logging promoted profile click:", e);

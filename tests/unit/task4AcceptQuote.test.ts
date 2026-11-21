@@ -440,7 +440,9 @@ describe("Task 4: Single Authoritative Atomic AcceptQuote Suite", () => {
       expect(jobInDb.acceptedQuoteId).toBe("quote_dave_1");
       expect(jobInDb.acceptedTradespersonId).toBe("trader_dave");
       expect(jobInDb.acceptedTraderId).toBe("trader_dave");
-      expect(jobInDb.verificationPin).toBe(result.verificationPin);
+      expect(jobInDb.verificationPin).toBeUndefined();
+      expect(jobInDb.hasVerificationPin).toBe(true);
+      expect(mockDb._store["job_arrival_pins/job_boiler_1"]?.verificationPin).toBe(result.verificationPin);
 
       // Verify Target Quote in Firestore
       const targetQuoteInDb = mockDb._store["jobs/job_boiler_1/quotes/quote_dave_1"];

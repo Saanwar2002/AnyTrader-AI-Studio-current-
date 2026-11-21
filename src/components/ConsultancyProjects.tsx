@@ -6,6 +6,7 @@ import { format } from "date-fns";
 import { ProMatchmakerModal } from "./shared/ProMatchmakerModal";
 
 function ProjectRolesList({ projectId }: { projectId: string }) {
+  const { user } = useAuth();
   const [roles, setRoles] = useState<any[]>([]);
   const [shortlists, setShortlists] = useState<any[]>([]);
   const [newRoleName, setNewRoleName] = useState("");
@@ -13,34 +14,38 @@ function ProjectRolesList({ projectId }: { projectId: string }) {
   const [newRoleDate, setNewRoleDate] = useState("");
 
   useEffect(() => {
+    if (!user) return;
     const q = query(
       collection(db, "projectRoles"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("managerId", "==", user.uid)
     );
     const unsub = onSnapshot(q, snap => {
       setRoles(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project roles listener error:", err));
 
     const q2 = query(
       collection(db, "projectShortlists"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("managerId", "==", user.uid)
     );
     const unsub2 = onSnapshot(q2, snap => {
       setShortlists(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project shortlists listener error:", err));
 
     return () => {
       unsub();
       unsub2();
     };
-  }, [projectId]);
+  }, [projectId, user]);
 
   const addRole = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newRoleName.trim()) return;
+    if (!newRoleName.trim() || !user) return;
     try {
       await addDoc(collection(db, "projectRoles"), {
         projectId,
+        managerId: user.uid,
         roleName: newRoleName,
         estimatedBudget: newRoleBudget ? parseFloat(newRoleBudget) : 0,
         requiredDate: newRoleDate || null,
@@ -131,27 +136,31 @@ function ProjectRolesList({ projectId }: { projectId: string }) {
 }
 
 function ProjectMilestones({ projectId }: { projectId: string }) {
+  const { user } = useAuth();
   const [milestones, setMilestones] = useState<any[]>([]);
   const [newTask, setNewTask] = useState("");
 
   useEffect(() => {
+    if (!user) return;
     const q = query(
       collection(db, "projectMilestones"),
       where("projectId", "==", projectId),
+      where("managerId", "==", user.uid),
       orderBy("createdAt", "asc")
     );
     const unsub = onSnapshot(q, snap => {
       setMilestones(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project milestones listener error:", err));
     return () => unsub();
-  }, [projectId]);
+  }, [projectId, user]);
 
   const addTask = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTask.trim()) return;
+    if (!newTask.trim() || !user) return;
     try {
       await addDoc(collection(db, "projectMilestones"), {
         projectId,
+        managerId: user.uid,
         title: newTask,
         status: "pending",
         createdAt: serverTimestamp()
@@ -207,27 +216,31 @@ function ProjectMilestones({ projectId }: { projectId: string }) {
 }
 
 function ProjectTeam({ projectId }: { projectId: string }) {
+  const { user } = useAuth();
   const [members, setMembers] = useState<any[]>([]);
   const [newRole, setNewRole] = useState("");
   const [newEmail, setNewEmail] = useState("");
 
   useEffect(() => {
+    if (!user) return;
     const q = query(
       collection(db, "teamMembers"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("managerId", "==", user.uid)
     );
     const unsub = onSnapshot(q, snap => {
       setMembers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project team listener error:", err));
     return () => unsub();
-  }, [projectId]);
+  }, [projectId, user]);
 
   const addMember = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newEmail.trim() || !newRole.trim()) return;
+    if (!newEmail.trim() || !newRole.trim() || !user) return;
     try {
       await addDoc(collection(db, "teamMembers"), {
         projectId,
+        managerId: user.uid,
         consultantId: newEmail, // Simulating linked user via email
         role: newRole,
         accessLevel: "read"
@@ -279,25 +292,28 @@ function ProjectTeam({ projectId }: { projectId: string }) {
 }
 
 function ProjectEventTimeline({ projectId }: { projectId: string }) {
+  const { user } = useAuth();
   const [items, setItems] = useState<any[]>([]);
   const [newTitle, setNewTitle] = useState("");
   const [newStartTime, setNewStartTime] = useState("");
 
   useEffect(() => {
+    if (!user) return;
     const q = query(
       collection(db, "projectTimelineItems"),
       where("projectId", "==", projectId),
+      where("managerId", "==", user.uid),
       orderBy("startTime", "asc")
     );
     const unsub = onSnapshot(q, snap => {
       setItems(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project timeline listener error:", err));
     return () => unsub();
-  }, [projectId]);
+  }, [projectId, user]);
 
   const addItem = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTitle.trim() || !newStartTime) return;
+    if (!newTitle.trim() || !newStartTime || !user) return;
     try {
       const today = new Date();
       const [hours, minutes] = newStartTime.split(":");
@@ -306,6 +322,7 @@ function ProjectEventTimeline({ projectId }: { projectId: string }) {
       
       await addDoc(collection(db, "projectTimelineItems"), {
         projectId,
+        managerId: user.uid,
         title: newTitle,
         startTime: today.toISOString()
       });
@@ -359,6 +376,7 @@ function ProjectEventTimeline({ projectId }: { projectId: string }) {
 }
 
 function ProjectResources({ projectId }: { projectId: string }) {
+  const { user } = useAuth();
   const [venues, setVenues] = useState<any[]>([]);
   const [suppliers, setSuppliers] = useState<any[]>([]);
   
@@ -367,34 +385,38 @@ function ProjectResources({ projectId }: { projectId: string }) {
   const [newSupplierService, setNewSupplierService] = useState("");
 
   useEffect(() => {
+    if (!user) return;
     const qVenues = query(
       collection(db, "projectVenues"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("managerId", "==", user.uid)
     );
     const unsubVenues = onSnapshot(qVenues, snap => {
       setVenues(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project venues listener error:", err));
 
     const qSuppliers = query(
       collection(db, "projectSuppliers"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("managerId", "==", user.uid)
     );
     const unsubSuppliers = onSnapshot(qSuppliers, snap => {
       setSuppliers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project suppliers listener error:", err));
 
     return () => {
       unsubVenues();
       unsubSuppliers();
     };
-  }, [projectId]);
+  }, [projectId, user]);
 
   const addVenue = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newVenueName.trim()) return;
+    if (!newVenueName.trim() || !user) return;
     try {
       await addDoc(collection(db, "projectVenues"), {
         projectId,
+        managerId: user.uid,
         venueId: newVenueName, // Using name as ID for simplicity
         bookingStatus: "requested"
       });
@@ -406,10 +428,11 @@ function ProjectResources({ projectId }: { projectId: string }) {
 
   const addSupplier = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newSupplierName.trim() || !newSupplierService.trim()) return;
+    if (!newSupplierName.trim() || !newSupplierService.trim() || !user) return;
     try {
       await addDoc(collection(db, "projectSuppliers"), {
         projectId,
+        managerId: user.uid,
         supplierId: newSupplierName, // Using name as ID for simplicity
         serviceProvided: newSupplierService,
         cost: 0,
@@ -497,27 +520,30 @@ function ProjectFinancials({ projectId, budget = 0 }: { projectId: string; budge
   const [newExpenseCategory, setNewExpenseCategory] = useState("");
 
   useEffect(() => {
+    if (!user) return;
     const qExp = query(
       collection(db, "expenses"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("consultantId", "==", user.uid)
     );
     const unsubExp = onSnapshot(qExp, snap => {
       setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project expenses listener error:", err));
 
     const qInv = query(
       collection(db, "invoices"),
-      where("projectId", "==", projectId)
+      where("projectId", "==", projectId),
+      where("consultantId", "==", user.uid)
     );
     const unsubInv = onSnapshot(qInv, snap => {
       setInvoices(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    });
+    }, err => console.error("Project invoices listener error:", err));
 
     return () => {
       unsubExp();
       unsubInv();
     };
-  }, [projectId]);
+  }, [projectId, user]);
 
   const addExpense = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -525,6 +551,7 @@ function ProjectFinancials({ projectId, budget = 0 }: { projectId: string; budge
     try {
       await addDoc(collection(db, "expenses"), {
         projectId,
+        managerId: user.uid,
         consultantId: user.uid,
         amount: parseFloat(newExpenseAmount),
         category: newExpenseCategory || "General",

@@ -24,35 +24,59 @@ export const isCapacitor = () => {
   return Capacitor.isNativePlatform();
 };
 
+const MAPS_KEY_PLACEHOLDER_PATTERNS = [
+  "your_",
+  "replace_with",
+  "placeholder",
+  "example",
+  "changeme",
+  "test_key",
+  "dummy",
+  "xxxx",
+];
+
+export const isValidGoogleMapsApiKey = (key?: string): boolean => {
+  if (!key || typeof key !== "string") return false;
+  const clean = key.trim();
+  if (clean.length < 20) return false;
+  const lower = clean.toLowerCase();
+  if (MAPS_KEY_PLACEHOLDER_PATTERNS.some((pattern) => lower.includes(pattern))) {
+    return false;
+  }
+  return true;
+};
+
+/**
+ * AT-MOBILE-02: Strict platform-specific Google Maps API key resolution.
+ * - iOS native: strictly requires VITE_GOOGLE_MAPS_IOS_API_KEY
+ * - Android native: strictly requires VITE_GOOGLE_MAPS_ANDROID_API_KEY (or legacy VITE_GOOGLE_MAPS_API_KEY_ANDROID)
+ * - Web: strictly requires VITE_GOOGLE_MAPS_API_KEY
+ * Never silently falls back to a wrong-platform key (e.g., web key in native iOS/Android WebView or Android key on iOS).
+ */
+export const resolveGoogleMapsApiKey = (
+  platform: string,
+  env: Record<string, string | undefined>
+): string => {
+  const normalizedPlatform = String(platform || "web").trim().toLowerCase();
+
+  if (normalizedPlatform === "ios") {
+    const iosKey = env.VITE_GOOGLE_MAPS_IOS_API_KEY;
+    return isValidGoogleMapsApiKey(iosKey) ? iosKey!.trim() : "";
+  }
+
+  if (normalizedPlatform === "android") {
+    const androidKey = env.VITE_GOOGLE_MAPS_ANDROID_API_KEY || env.VITE_GOOGLE_MAPS_API_KEY_ANDROID;
+    return isValidGoogleMapsApiKey(androidKey) ? androidKey!.trim() : "";
+  }
+
+  const webKey = env.VITE_GOOGLE_MAPS_API_KEY;
+  return isValidGoogleMapsApiKey(webKey) ? webKey!.trim() : "";
+};
+
 export const getGoogleMapsApiKey = (): string => {
-  const androidKey = (import.meta as any).env.VITE_GOOGLE_MAPS_API_KEY_ANDROID;
-  const webKey = (import.meta as any).env.VITE_GOOGLE_MAPS_API_KEY;
-
-  const isValid = (key?: string) => {
-    if (!key) return false;
-    const clean = key.trim();
-    return (
-      clean !== "" &&
-      clean !== "your_google_maps_android_key" &&
-      clean !== "your_google_maps_key" &&
-      !clean.startsWith("your_") &&
-      !clean.includes("placeholder")
-    );
-  };
-
-  // If we are running inside native Capacitor, check and prefer the Android/Native API key first,
-  // since the Web API key is usually restricted to web referrers which would fail inside WebViews.
-  if (Capacitor.isNativePlatform() && isValid(androidKey)) {
-    return androidKey.trim();
-  }
-
-  if (isValid(webKey)) {
-    return webKey.trim();
-  }
-  if (isValid(androidKey)) {
-    return androidKey.trim();
-  }
-  return "";
+  const env = ((import.meta as any).env || {}) as Record<string, string | undefined>;
+  const platform = Capacitor.isNativePlatform() ? Capacitor.getPlatform() : "web";
+  return resolveGoogleMapsApiKey(platform, env);
 };
 
 export const triggerHaptic = async (style: ImpactStyle = ImpactStyle.Medium) => {

@@ -94,30 +94,88 @@ export class PropertyPassportService {
     const allEvidenceIds = new Set<string>();
     const sourceCollections = new Set<string>(['properties']);
 
-    // 4. Load & Aggregate Condition History (Bounded Query)
+    // 4. Load & Aggregate Condition History (Bounded Query, filtering retracted & superseded observations — AT-PASS-01)
     sourceCollections.add('property_condition_history');
-    const conditionSnap = await activeDb
-      .collection('property_condition_history')
-      .where('propertyId', '==', propertyId)
-      .limit(MAX_PASSPORT_HISTORY_QUERY_LIMIT)
-      .get();
+    sourceCollections.add('property_condition_retractions');
+
+    const [conditionSnap, conditionRetractionSnap] = await Promise.all([
+      activeDb
+        .collection('property_condition_history')
+        .where('propertyId', '==', propertyId)
+        .limit(MAX_PASSPORT_HISTORY_QUERY_LIMIT)
+        .get(),
+      (async () => {
+        try {
+          return await activeDb
+            .collection('property_condition_retractions')
+            .where('propertyId', '==', propertyId)
+            .limit(MAX_PASSPORT_HISTORY_QUERY_LIMIT)
+            .get();
+        } catch {
+          return { docs: [] };
+        }
+      })(),
+    ]);
+
+    const conditionRetractionDocs = conditionRetractionSnap && Array.isArray(conditionRetractionSnap.docs)
+      ? conditionRetractionSnap.docs
+      : (conditionRetractionSnap && Array.isArray(conditionRetractionSnap) ? conditionRetractionSnap : []);
+
+    const retractedConditionIds = new Set<string>();
+    for (const doc of conditionRetractionDocs) {
+      const data = typeof doc.data === 'function' ? doc.data() : doc.data;
+      if (data) {
+        if (data.propertyId && data.propertyId !== propertyId) {
+          throw new Error(`[PropertyPassport Lineage Violation] Condition retraction record belongs to '${data.propertyId}', not '${propertyId}'`);
+        }
+        if (data.conditionId) retractedConditionIds.add(String(data.conditionId));
+        if (data.observationId) retractedConditionIds.add(String(data.observationId));
+        if (data.originalConditionId) retractedConditionIds.add(String(data.originalConditionId));
+        if (data.targetRecordId) retractedConditionIds.add(String(data.targetRecordId));
+        if (doc.id) allSourceRecordIds.add(doc.id);
+      }
+    }
 
     const conditionDocs = conditionSnap && Array.isArray(conditionSnap.docs)
       ? conditionSnap.docs
       : (conditionSnap && Array.isArray(conditionSnap) ? conditionSnap : []);
 
-    const rawConditions: any[] = [];
+    const candidateConditions: any[] = [];
+    const supersededConditionIds = new Set<string>();
+
     for (const doc of conditionDocs) {
       const data = typeof doc.data === 'function' ? doc.data() : doc.data;
-      const cId = doc.id || data.conditionId;
+      const cId = doc.id || data?.conditionId;
       if (data) {
         // Lineage Check: Cross-property record rejection
         if (data.propertyId && data.propertyId !== propertyId) {
           throw new Error(`[PropertyPassport Lineage Violation] Condition record '${cId}' belongs to '${data.propertyId}', not '${propertyId}'`);
         }
-        rawConditions.push({ id: cId, ...data });
+        const statusLower = String(data.status || '').toLowerCase();
+        const lifecycleLower = String(data.lifecycleState || '').toLowerCase();
+        const isRetracted =
+          retractedConditionIds.has(String(cId)) ||
+          data.retracted === true ||
+          data.isRetracted === true ||
+          statusLower === 'retracted' ||
+          lifecycleLower === 'retracted';
+        const isSuperseded =
+          data.superseded === true ||
+          data.isSuperseded === true ||
+          Boolean(data.supersededBy) ||
+          statusLower === 'superseded' ||
+          lifecycleLower === 'superseded';
+
+        if (!isRetracted && !isSuperseded) {
+          if (data.supersedesConditionId) supersededConditionIds.add(String(data.supersedesConditionId));
+          if (data.replacesConditionId) supersededConditionIds.add(String(data.replacesConditionId));
+          if (data.supersedesId) supersededConditionIds.add(String(data.supersedesId));
+          candidateConditions.push({ id: cId, ...data });
+        }
       }
     }
+
+    const rawConditions = candidateConditions.filter((c) => !supersededConditionIds.has(String(c.id)));
 
     // Sort condition observations descending by observedAt
     rawConditions.sort((a, b) => {
@@ -126,7 +184,7 @@ export class PropertyPassportService {
       return dateB - dateA;
     });
 
-    // Group conditions by componentType (most recent per component)
+    // Group conditions by componentType (most recent active observation per component)
     const latestConditionByComponent = new Map<string, any>();
     for (const c of rawConditions) {
       if (c.componentType) {

@@ -145,6 +145,7 @@ export interface EligibilityEvaluationRequest {
   context?: {
     callerUid?: string;
     isInternalAi?: boolean;
+    executionChannel?: 'public_api' | 'internal_worker' | 'trusted_server';
     clientRole?: string;
   };
 }
@@ -371,16 +372,6 @@ export class DataClassificationEligibilityService {
     const restrictions = [...(input.restrictions || [])].sort();
 
     const docRef = this.activeDb.collection('data_classifications').doc(classificationId);
-    const existingDoc = await docRef.get();
-
-    let version = 1;
-    if (existingDoc.exists) {
-      const data = existingDoc.data() as DataClassificationRecord;
-      if (data.tenantId !== tenantId) {
-        throw new DataClassificationSecurityError('Cross-tenant classification mutation denied');
-      }
-      version = (data.version || 1) + 1;
-    }
 
     // Clean provenanceRef
     const provenanceRef: ClassificationProvenanceRef = {
@@ -414,55 +405,76 @@ export class DataClassificationEligibilityService {
       }
     }
 
-    const record: DataClassificationRecord = {
-      classificationId,
-      tenantId,
-      recordType: input.recordType.trim(),
-      recordId: input.recordId.trim(),
-      category: input.category,
-      sensitivity,
-      restrictions,
-      version,
-      provenanceRef,
-      rightsRef: input.rightsRef
-        ? {
-            rightsId: input.rightsRef.rightsId.trim(),
-            tenantId: input.rightsRef.tenantId.trim(),
-          }
-        : undefined,
-      archiveRef: input.archiveRef
-        ? {
-            archiveId: input.archiveRef.archiveId.trim(),
-            tenantId: input.archiveRef.tenantId.trim(),
-            componentKey: input.archiveRef.componentKey,
-          }
-        : undefined,
-      status: 'active',
-      contentHash: '',
-      createdAt: existingDoc.exists ? (existingDoc.data() as DataClassificationRecord).createdAt : now,
-      updatedAt: now,
-    };
+    // Atomic transactional registration enforcing monotonic status transitions (revoked is terminal)
+    const committedRecord = await this.activeDb.runTransaction(async (tx: any) => {
+      const existingDoc = await tx.get(docRef);
+      let version = 1;
+      let createdAt = now;
 
-    record.contentHash = computeClassificationContentHash(record);
+      if (existingDoc.exists) {
+        const data = existingDoc.data() as DataClassificationRecord;
+        if (data.tenantId !== tenantId) {
+          throw new DataClassificationSecurityError('Cross-tenant classification mutation denied');
+        }
+        if (data.status === 'revoked') {
+          throw new DataClassificationSecurityError(
+            `Cannot modify or resurrect revoked classification record '${classificationId}'`
+          );
+        }
+        version = (data.version || 1) + 1;
+        createdAt = data.createdAt || now;
+      }
 
-    const cleanRecord = cleanUndefinedValues(record);
+      const record: DataClassificationRecord = {
+        classificationId,
+        tenantId,
+        recordType: input.recordType.trim(),
+        recordId: input.recordId.trim(),
+        category: input.category,
+        sensitivity,
+        restrictions,
+        version,
+        provenanceRef,
+        rightsRef: input.rightsRef
+          ? {
+              rightsId: input.rightsRef.rightsId.trim(),
+              tenantId: input.rightsRef.tenantId.trim(),
+            }
+          : undefined,
+        archiveRef: input.archiveRef
+          ? {
+              archiveId: input.archiveRef.archiveId.trim(),
+              tenantId: input.archiveRef.tenantId.trim(),
+              componentKey: input.archiveRef.componentKey,
+            }
+          : undefined,
+        status: 'active',
+        contentHash: '',
+        createdAt,
+        updatedAt: now,
+      };
 
-    // Write to Firestore and append to history
-    const historyId = `dclasshist_${computeSha256(`${classificationId}:${version}:${now}`).slice(0, 24)}`;
-    const historyRef = this.activeDb.collection('data_classification_history').doc(historyId);
+      record.contentHash = computeClassificationContentHash(record);
+      const cleanRecord = cleanUndefinedValues(record);
 
-    const batch = this.activeDb.batch();
-    batch.set(docRef, cleanRecord);
-    batch.set(historyRef, cleanUndefinedValues({
-      historyId,
-      ...cleanRecord,
-      recordedAt: now,
-      recordedBy: input.recordedBy || tenantId,
-    }));
+      const historyId = `dclasshist_${computeSha256(`${classificationId}:${version}:${now}`).slice(0, 24)}`;
+      const historyRef = this.activeDb.collection('data_classification_history').doc(historyId);
 
-    await batch.commit();
+      await tx.set(docRef, cleanRecord);
+      await tx.set(
+        historyRef,
+        cleanUndefinedValues({
+          historyId,
+          ...cleanRecord,
+          recordedAt: now,
+          recordedBy: input.recordedBy || tenantId,
+        })
+      );
 
-    return record;
+      return record;
+    });
+
+    return committedRecord;
   }
 
   /**
@@ -830,10 +842,13 @@ export class DataClassificationEligibilityService {
         });
       }
 
-      // If internal platform operation or internal AI, check default/context
+      // If internal platform operation or verified server/worker internal AI context
+      const isTrustedInternalAi =
+        request.context?.isInternalAi === true &&
+        request.context?.executionChannel !== 'public_api';
       if (
         request.requestedPurpose === 'internal_platform_operation' ||
-        (request.requestedPurpose === 'internal_ai_use' && request.context?.isInternalAi)
+        (request.requestedPurpose === 'internal_ai_use' && isTrustedInternalAi)
       ) {
         return this.buildDecisionResult({
           eligible: true,
@@ -966,43 +981,50 @@ export class DataClassificationEligibilityService {
     }
 
     const docRef = this.activeDb.collection('data_classifications').doc(classificationId);
-    const doc = await docRef.get();
-    if (!doc.exists) {
-      throw new DataClassificationValidationError(`Classification record '${classificationId}' not found`);
-    }
-
-    const record = doc.data() as DataClassificationRecord;
-    if (record.tenantId !== tenantId.trim()) {
-      throw new DataClassificationSecurityError('Cross-tenant classification revocation denied');
-    }
-
     const now = new Date().toISOString();
-    const updatedRecord: DataClassificationRecord = {
-      ...record,
-      status: 'revoked',
-      version: record.version + 1,
-      updatedAt: now,
-      revokedAt: now,
-      revocationReason: reason,
-    };
 
-    updatedRecord.contentHash = computeClassificationContentHash(updatedRecord);
+    return await this.activeDb.runTransaction(async (tx: any) => {
+      const doc = await tx.get(docRef);
+      if (!doc.exists) {
+        throw new DataClassificationValidationError(`Classification record '${classificationId}' not found`);
+      }
 
-    const historyId = `dclasshist_${computeSha256(`${classificationId}:${updatedRecord.version}:${now}`).slice(0, 24)}`;
-    const historyRef = this.activeDb.collection('data_classification_history').doc(historyId);
+      const record = doc.data() as DataClassificationRecord;
+      if (record.tenantId !== tenantId.trim()) {
+        throw new DataClassificationSecurityError('Cross-tenant classification revocation denied');
+      }
 
-    const batch = this.activeDb.batch();
-    batch.set(docRef, cleanUndefinedValues(updatedRecord));
-    batch.set(historyRef, cleanUndefinedValues({
-      historyId,
-      ...updatedRecord,
-      recordedAt: now,
-      recordedBy: tenantId,
-    }));
+      if (record.status === 'revoked') {
+        return record;
+      }
 
-    await batch.commit();
+      const updatedRecord: DataClassificationRecord = {
+        ...record,
+        status: 'revoked',
+        version: record.version + 1,
+        updatedAt: now,
+        revokedAt: now,
+        revocationReason: reason,
+      };
 
-    return updatedRecord;
+      updatedRecord.contentHash = computeClassificationContentHash(updatedRecord);
+
+      const historyId = `dclasshist_${computeSha256(`${classificationId}:${updatedRecord.version}:${now}`).slice(0, 24)}`;
+      const historyRef = this.activeDb.collection('data_classification_history').doc(historyId);
+
+      await tx.set(docRef, cleanUndefinedValues(updatedRecord));
+      await tx.set(
+        historyRef,
+        cleanUndefinedValues({
+          historyId,
+          ...updatedRecord,
+          recordedAt: now,
+          recordedBy: tenantId,
+        })
+      );
+
+      return updatedRecord;
+    });
   }
 
   /**

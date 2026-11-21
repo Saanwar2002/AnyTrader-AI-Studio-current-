@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import * as admin from 'firebase-admin';
 import { initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -472,7 +473,7 @@ describe('Task 20 — Property Condition & Lifecycle Intelligence', () => {
       const firestoreRules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf-8');
 
       try {
-        testEnv = await initializeTestEnvironment({
+        testEnv = await initializeNamedDbTestEnvironment({
           projectId: PROJECT_ID,
           firestore: {
             rules: firestoreRules,

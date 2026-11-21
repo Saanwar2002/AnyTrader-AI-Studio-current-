@@ -316,3 +316,191 @@ export async function recordConfirmedRefund(
     return { entry, wasReplayed: false, cumulativeRefundedPence };
   });
 }
+
+export interface RefundAggregateDriftReport {
+  scanned: number;
+  driftDetectedCount: number;
+  repairedCount: number;
+  newlyRecordedRefunds: number;
+  anomalies: Array<{ paymentIntentId: string; reason: string }>;
+}
+
+/**
+ * Continuously verifies persisted `payment_refund_totals` aggregates against
+ * source Stripe refund objects for each tracked PaymentIntent and repairs drift.
+ */
+export async function reconcilePaymentRefundAggregates(
+  db: any,
+  stripeClient: any,
+  options?: { maxDocs?: number }
+): Promise<RefundAggregateDriftReport> {
+  if (!db || !stripeClient?.refunds?.list) {
+    return {
+      scanned: 0,
+      driftDetectedCount: 0,
+      repairedCount: 0,
+      newlyRecordedRefunds: 0,
+      anomalies: [],
+    };
+  }
+
+  const maxDocs = Math.min(200, Math.max(1, Number(options?.maxDocs || 100)));
+  let totalsQuery = db.collection("payment_refund_totals");
+  if (typeof totalsQuery.orderBy === "function") {
+    totalsQuery = totalsQuery.orderBy("__name__");
+  }
+  const totalsSnap = await totalsQuery.limit(maxDocs).get();
+  const docs = totalsSnap?.docs || [];
+
+  let scanned = 0;
+  let driftDetectedCount = 0;
+  let repairedCount = 0;
+  let newlyRecordedRefunds = 0;
+  const anomalies: Array<{ paymentIntentId: string; reason: string }> = [];
+
+  for (const totalDoc of docs) {
+    const totalData = typeof totalDoc.data === "function" ? totalDoc.data() : totalDoc.data || {};
+    const paymentIntentId = typeof totalData.paymentIntentId === "string" ? totalData.paymentIntentId.trim() : "";
+    const originalLedgerEntryId = typeof totalData.originalLedgerEntryId === "string" ? totalData.originalLedgerEntryId.trim() : "";
+    const originalAmountPence = Number(totalData.originalAmountPence || 0);
+    const currency = String(totalData.currency || "gbp").trim().toLowerCase();
+
+    if (!paymentIntentId || !/^pi_[A-Za-z0-9]+$/.test(paymentIntentId)) {
+      continue;
+    }
+    scanned += 1;
+
+    try {
+      const stripeRefunds: any[] = [];
+      let startingAfter: string | undefined;
+      const seenCursors = new Set<string>();
+      for (;;) {
+        const page = await stripeClient.refunds.list({
+          payment_intent: paymentIntentId,
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {}),
+        });
+        if (!page || !Array.isArray(page.data)) {
+          throw new Error(`Malformed Stripe refunds page for ${paymentIntentId}`);
+        }
+        stripeRefunds.push(...page.data);
+        if (!page.has_more) break;
+        const lastId = page.data[page.data.length - 1]?.id;
+        if (!lastId || seenCursors.has(lastId)) {
+          throw new Error(`Non-advancing Stripe refunds pagination for ${paymentIntentId}`);
+        }
+        seenCursors.add(lastId);
+        startingAfter = lastId;
+      }
+
+      const succeededRefunds = stripeRefunds.filter(
+        (r) => String(r?.status || "").toLowerCase() === "succeeded" && Number.isSafeInteger(r?.amount) && r.amount > 0
+      );
+
+      // Ensure any missing succeeded Stripe refund object is recorded cleanly first.
+      for (const refund of succeededRefunds) {
+        if (!originalLedgerEntryId) continue;
+        const refundSnap = await db.collection("refund_records").doc(refund.id).get();
+        if (!refundSnap.exists) {
+          const chargeId = typeof refund.charge === "string" ? refund.charge : refund.charge?.id || "";
+          if (chargeId) {
+            try {
+              const recorded = await recordConfirmedRefund(db, {
+                refundId: refund.id,
+                chargeId,
+                paymentIntentId,
+                originalLedgerEntryId,
+                amountPence: refund.amount,
+                currency: String(refund.currency || currency).toLowerCase(),
+                stripeRefundStatus: refund.status || "succeeded",
+                operationId: refund.metadata?.refundOperationId || undefined,
+                reason: refund.reason || null,
+              });
+              if (!recorded.wasReplayed) newlyRecordedRefunds += 1;
+            } catch (err: any) {
+              anomalies.push({
+                paymentIntentId,
+                reason: `Failed to record missing Stripe refund ${refund.id}: ${err?.message || "error"}`,
+              });
+            }
+          }
+        }
+      }
+
+      const authoritativeRefundedPence = succeededRefunds.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+      const authoritativeRemainingPence = Math.max(0, originalAmountPence - authoritativeRefundedPence);
+      const freshTotalSnap = await totalDoc.ref.get();
+      const freshData = freshTotalSnap.exists ? freshTotalSnap.data() || {} : totalData;
+      const recordedRefundedPence = Number(freshData.refundedAmountPence || 0);
+      const recordedRemainingPence = Number(freshData.remainingAmountPence ?? (originalAmountPence - recordedRefundedPence));
+
+      const hasOverCapture = originalAmountPence > 0 && authoritativeRefundedPence > originalAmountPence;
+      if (hasOverCapture) {
+        anomalies.push({
+          paymentIntentId,
+          reason: `Stripe succeeded refunds (${authoritativeRefundedPence}p) exceed original captured amount (${originalAmountPence}p).`,
+        });
+      }
+
+      const hasDrift =
+        recordedRefundedPence !== authoritativeRefundedPence ||
+        recordedRemainingPence !== authoritativeRemainingPence;
+
+      if (hasDrift) {
+        driftDetectedCount += 1;
+        const nowIso = new Date().toISOString();
+        await db.runTransaction(async (tx: any) => {
+          const latestSnap = await tx.get(totalDoc.ref);
+          const latest = latestSnap.exists ? latestSnap.data() || {} : {};
+          tx.set(
+            totalDoc.ref,
+            {
+              paymentIntentId,
+              originalLedgerEntryId: latest.originalLedgerEntryId || originalLedgerEntryId,
+              originalAmountPence,
+              refundedAmountPence: authoritativeRefundedPence,
+              remainingAmountPence: authoritativeRemainingPence,
+              stripeRefundCount: succeededRefunds.length,
+              stripeRefundIds: succeededRefunds.map((r) => r.id),
+              driftRepairedPence: authoritativeRefundedPence - Number(latest.refundedAmountPence || 0),
+              requiresManualReview: hasOverCapture,
+              lastReconciledFromStripeAt: nowIso,
+              repairedAt: nowIso,
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          );
+          if (typeof db.collection("refund_reconciliation_audits")?.doc === "function") {
+            const auditRef = db.collection("refund_reconciliation_audits").doc();
+            tx.set(auditRef, {
+              id: auditRef.id,
+              paymentIntentId,
+              previousRefundedAmountPence: recordedRefundedPence,
+              authoritativeRefundedPence,
+              previousRemainingAmountPence: recordedRemainingPence,
+              authoritativeRemainingPence,
+              stripeRefundIds: succeededRefunds.map((r) => r.id),
+              hasOverCapture,
+              repairedAt: nowIso,
+            });
+          }
+        });
+        repairedCount += 1;
+      }
+    } catch (err: any) {
+      anomalies.push({
+        paymentIntentId,
+        reason: err?.message || "Stripe refund aggregate check failed",
+      });
+    }
+  }
+
+  return {
+    scanned,
+    driftDetectedCount,
+    repairedCount,
+    newlyRecordedRefunds,
+    anomalies,
+  };
+}
+

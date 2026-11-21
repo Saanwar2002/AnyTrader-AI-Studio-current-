@@ -1,7 +1,7 @@
 import { initializeApp } from "firebase/app";
 import { initializeAppCheck, ReCaptchaV3Provider, CustomProvider } from "firebase/app-check";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signInAnonymously, type User as FirebaseUser, createUserWithEmailAndPassword, signInWithEmailAndPassword, sendEmailVerification, sendPasswordResetEmail, RecaptchaVerifier, linkWithPhoneNumber, PhoneAuthProvider, initializeAuth, indexedDBLocalPersistence, browserLocalPersistence, browserSessionPersistence, inMemoryPersistence, signInWithCredential, browserPopupRedirectResolver } from "firebase/auth";
-import { enableMultiTabIndexedDbPersistence, initializeFirestore, getFirestore, collection, collectionGroup, doc, getDoc, getDocs, setDoc as originalSetDoc, updateDoc as originalUpdateDoc, deleteDoc as originalDeleteDoc, onSnapshot as originalOnSnapshot, query, where, or, and, orderBy, limit, getDocFromServer, serverTimestamp, addDoc as originalAddDoc, runTransaction as originalRunTransaction, writeBatch as originalWriteBatch, deleteField, arrayUnion, arrayRemove, increment } from "firebase/firestore";
+import { enableMultiTabIndexedDbPersistence, initializeFirestore, getFirestore, collection, collectionGroup, doc, getDoc, getDocs, setDoc as originalSetDoc, updateDoc as originalUpdateDoc, deleteDoc as originalDeleteDoc, onSnapshot as originalOnSnapshot, query, where, or, and, orderBy, limit, startAfter, getDocFromServer, serverTimestamp, addDoc as originalAddDoc, runTransaction as originalRunTransaction, writeBatch as originalWriteBatch, deleteField, arrayUnion, arrayRemove, increment } from "firebase/firestore";
 import { getPerformance, trace } from "firebase/performance";
 import { getStorage, ref, uploadBytes, getDownloadURL, uploadBytesResumable, uploadString } from "firebase/storage";
 import { Capacitor } from "@capacitor/core";
@@ -261,12 +261,21 @@ const executeWebViewGoogleSignIn = async () => {
     throw popupErr;
   }
 };
+import { purgeClientSessionOnUidTransition } from "./lib/sessionIsolation";
+import { unregisterCurrentDevicePushToken } from "./lib/pushNotifications";
 export const handleRedirectResult = () => getRedirectResult(auth);
 export const signInAsGuest = () => signInAnonymously(auth);
 export const logout = async () => {
-  try {
-    sessionStorage.removeItem("is_test_admin");
-  } catch (_) {}
+  const activeUser = auth.currentUser;
+  if (activeUser) {
+    try {
+      const idToken = await activeUser.getIdToken();
+      await unregisterCurrentDevicePushToken(idToken);
+    } catch {
+      // Non-blocking: ensure signOut always completes even if network is offline
+    }
+  }
+  purgeClientSessionOnUidTransition(activeUser?.uid ?? null, null);
   return await auth.signOut();
 };
 export const signUpWithEmail = (email: string, pass: string) => createUserWithEmailAndPassword(auth, email, pass);
@@ -420,12 +429,18 @@ export const submitReview = async (
     }
 
     const errJson = await response.json().catch(() => ({}));
-    console.warn("[submitReview] Server submission unavailable or requested client fallback:", errJson.error || response.statusText);
-  } catch (netErr) {
+    if (errJson?.fallbackToClient !== true) {
+      throw new Error(errJson?.error || response.statusText || `Failed to submit review (${response.status})`);
+    }
+    console.warn("[submitReview] Server requested explicit sandbox client fallback:", errJson.error || response.statusText);
+  } catch (netErr: any) {
+    if (netErr && !(netErr instanceof TypeError)) {
+      throw netErr;
+    }
     console.warn("[submitReview] Server submission network unreachable. Proceeding with client-side Firestore submission:", netErr);
   }
 
-  // 2. Client-side Firestore direct submission fallback
+  // 2. Client-side Firestore direct submission fallback (only when server unreachable or explicit 503 fallbackToClient)
   try {
     const numRating = Math.max(1, Math.min(5, Math.round(Number(rating) || 5)));
     const isLowRating = numRating <= 2 && type === "tradesperson_review";
@@ -454,6 +469,7 @@ export const submitReview = async (
       if (type === "tradesperson_review") {
         await originalUpdateDoc(doc(db, "jobs", jobId), {
           hasReview: true,
+          hasHomeownerReview: true,
           updatedAt: serverTimestamp()
         });
       } else {
@@ -677,6 +693,6 @@ export const uploadStorageFile = async (
 };
 
 export { 
-  collection, collectionGroup, doc, getDoc, getDocs, query, where, or, and, orderBy, limit, onAuthStateChanged, type FirebaseUser, serverTimestamp, deleteField, arrayUnion, arrayRemove, increment,
+  collection, collectionGroup, doc, getDoc, getDocs, query, where, or, and, orderBy, limit, startAfter, onAuthStateChanged, type FirebaseUser, serverTimestamp, deleteField, arrayUnion, arrayRemove, increment,
   ref, uploadBytes, getDownloadURL, uploadBytesResumable, uploadString, signInWithEmailAndPassword
 };

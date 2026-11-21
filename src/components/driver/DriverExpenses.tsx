@@ -158,15 +158,57 @@ export default function DriverExpenses({ onClose }: { onClose?: () => void }) {
   const handleTogglePro = async () => {
     if (!user) return;
     try {
-      await updateDoc(doc(db, "users", user.uid), {
-        proFeaturesEnabled: !isPro,
-        proValidUntil: !isPro ? serverTimestamp() : null // In real app, integrate via Stripe
+      const token = await user.getIdToken();
+      if (!token) {
+        toast.error("Please sign in again to manage your subscription.");
+        return;
+      }
+
+      if (isPro) {
+        const res = await fetch("/api/cancel-subscription", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ subscriptionType: "driver_gold" }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.error || "Unable to cancel subscription right now.");
+        }
+        toast.success(data.message || "Driver Gold cancellation scheduled at period end.");
+        setShowProModal(false);
+        return;
+      }
+
+      const res = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "Idempotency-Key": crypto.randomUUID(),
+        },
+        body: JSON.stringify({
+          mode: "subscription",
+          metadata: {
+            type: "driver_gold",
+            subscriptionType: "driver_gold",
+            userId: user.uid,
+          },
+          successUrl: `${window.location.origin}/billing?upgrade=success`,
+          cancelUrl: `${window.location.origin}/billing?upgrade=cancelled`,
+        }),
       });
-      toast.success(isPro ? "Pro features disabled" : "Pro features enabled");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || "Unable to start Driver Gold checkout.");
+      }
       setShowProModal(false);
-    } catch (err) {
+      window.location.href = data.url;
+    } catch (err: any) {
       console.error(err);
-      toast.error("Failed to update status");
+      toast.error(err?.message || "Failed to update Pro subscription status.");
     }
   };
 

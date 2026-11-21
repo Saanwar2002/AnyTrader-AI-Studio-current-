@@ -3,10 +3,11 @@ import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { db, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, handleFirestoreError, OperationType, updateDoc, doc, getDoc, sendNotification, uploadStorageFile, arrayUnion } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { motion, AnimatePresence } from "motion/react";
-import { Send, ChevronLeft, Loader2, User as UserIcon, Briefcase, Image as ImageIcon, X, Mic, Square, Play, Pause, MousePointer2, Trash2, FileText, Download, Maximize2, Paperclip } from "lucide-react";
+import { Send, ChevronLeft, Loader2, User as UserIcon, Briefcase, Image as ImageIcon, X, Mic, Square, Play, Pause, MousePointer2, Trash2, FileText, Download, Maximize2, Paperclip, ShieldAlert, Ban } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 import { playSound } from "@/src/lib/sound";
 import { toast } from "sonner";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 
 export default function Chat() {
   const { conversationId } = useParams();
@@ -24,6 +25,13 @@ export default function Chat() {
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [activeLightboxImage, setActiveLightboxImage] = useState<string | null>(null);
+  const [blockedUserIds, setBlockedUserIds] = useState<string[]>([]);
+  const [showSafetyModal, setShowSafetyModal] = useState(false);
+  const [safetyAction, setSafetyAction] = useState<"report" | "block" | "report_and_block">("report_and_block");
+  const [safetyReason, setSafetyReason] = useState("harassment_or_abuse");
+  const [safetyDetails, setSafetyDetails] = useState("");
+  const [isSubmittingSafety, setIsSubmittingSafety] = useState(false);
+  const safetyDialogRef = useDialogA11y<HTMLDivElement>(showSafetyModal, () => setShowSafetyModal(false));
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -92,8 +100,114 @@ export default function Chat() {
     return () => clearTimeout(timer);
   }, []);
 
+  // AT-CJ-CHAT-03: Load user's active chat blocks from server
+  useEffect(() => {
+    if (!user) {
+      setBlockedUserIds([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch("/api/chat/blocks", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.ok && !cancelled) {
+          const data = await res.json();
+          if (Array.isArray(data.blockedUserIds)) {
+            setBlockedUserIds(data.blockedUserIds);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch chat blocks:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  const otherParticipantId: string | null =
+    Array.isArray(conversation?.participants) && user?.uid
+      ? conversation.participants.find((pid: string) => pid !== user.uid) || null
+      : null;
+
+  const isOtherParticipantBlocked = Boolean(
+    otherParticipantId && blockedUserIds.includes(otherParticipantId)
+  );
+
+  const handleSubmitSafetyAction = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !conversationId || !otherParticipantId) return;
+    setIsSubmittingSafety(true);
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch("/api/chat/report-block", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          conversationId,
+          targetUserId: otherParticipantId,
+          action: safetyAction,
+          reason: safetyReason,
+          details: safetyDetails,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.error || "Unable to complete safety action.");
+        return;
+      }
+      if (safetyAction === "block" || safetyAction === "report_and_block") {
+        setBlockedUserIds((prev) =>
+          prev.includes(otherParticipantId) ? prev : [...prev, otherParticipantId]
+        );
+      }
+      toast.success(
+        safetyAction === "report"
+          ? "Participant reported to Trust & Safety."
+          : safetyAction === "block"
+          ? "Participant blocked. Their messages are now hidden."
+          : "Participant reported and blocked."
+      );
+      setSafetyDetails("");
+      setShowSafetyModal(false);
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to submit safety request.");
+    } finally {
+      setIsSubmittingSafety(false);
+    }
+  };
+
+  const handleUnblockParticipant = async () => {
+    if (!user || !otherParticipantId) return;
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch(`/api/chat/blocks/${encodeURIComponent(otherParticipantId)}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        toast.error("Failed to unblock participant.");
+        return;
+      }
+      setBlockedUserIds((prev) => prev.filter((uid) => uid !== otherParticipantId));
+      toast.success("Participant unblocked.");
+    } catch {
+      toast.error("Failed to unblock participant.");
+    }
+  };
+
   const sendText = async (text: string) => {
     if (!text || !user || !conversationId) return;
+    if (isOtherParticipantBlocked) {
+      toast.error("Unblock this participant before sending messages.");
+      return;
+    }
 
     try {
       await addDoc(collection(db, "conversations", conversationId, "messages"), {
@@ -422,8 +536,21 @@ export default function Chat() {
             </div>
           )}
 
+          {otherParticipantId && (
+            <button
+              type="button"
+              onClick={() => setShowSafetyModal(true)}
+              aria-label="Report or block participant"
+              title="Report or Block Participant"
+              className="p-1.5 sm:p-2 rounded-xl text-slate-500 hover:text-amber-700 hover:bg-amber-50 transition-all flex items-center gap-1 shrink-0"
+            >
+              <ShieldAlert className="w-4 h-4 sm:w-5 sm:h-5 shrink-0" />
+            </button>
+          )}
+
           <button
             onClick={handleDeleteConversation}
+            aria-label="Delete conversation"
             className={cn(
               "p-1.5 sm:p-2 rounded-xl transition-all flex items-center gap-1.5 shrink-0",
               confirmDelete ? "bg-red-600 text-white px-2.5 sm:px-3" : "text-slate-400 hover:text-red-600 hover:bg-red-50"
@@ -438,13 +565,32 @@ export default function Chat() {
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {isOtherParticipantBlocked && (
+          <div className="p-3 bg-amber-50 border border-black rounded-xl text-black text-xs flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Ban className="w-4 h-4 text-red-600 shrink-0" />
+              <span className="font-semibold">
+                You have blocked this participant. Incoming messages from them are hidden.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handleUnblockParticipant}
+              className="px-3 py-1 bg-white border border-black rounded-lg text-xs font-bold text-black hover:bg-slate-100 shrink-0"
+            >
+              Unblock
+            </button>
+          </div>
+        )}
         {error && (
           <div className="p-3 bg-red-50 border border-red-100 rounded-lg text-red-600 text-xs text-center">
             {error}
           </div>
         )}
         <AnimatePresence initial={false}>
-          {messages.map((msg) => (
+          {messages
+            .filter((msg) => !blockedUserIds.includes(msg.senderId))
+            .map((msg) => (
             <motion.div
               key={msg.id}
               initial={{ opacity: 0, y: 10 }}
@@ -566,7 +712,7 @@ export default function Chat() {
       </AnimatePresence>
 
       {/* Quick Replies */}
-      {quickReplies.length > 0 && (
+      {quickReplies.length > 0 && !isOtherParticipantBlocked && (
         <div className="px-2 sm:px-4 pb-2 pt-2 bg-white flex gap-2 overflow-x-auto shrink-0 border-t border-black/5 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
           {quickReplies.map((reply) => (
             <button
@@ -600,6 +746,7 @@ export default function Chat() {
             <button
               type="button"
               onClick={stopRecording}
+              aria-label="Stop voice recording"
               className="p-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors flex-shrink-0"
             >
               <Square className="w-4 h-4" />
@@ -610,7 +757,8 @@ export default function Chat() {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={isUploading}
+              disabled={isUploading || isOtherParticipantBlocked}
+              aria-label="Share photo or document"
               className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all disabled:opacity-50 flex-shrink-0"
               title="Share photo or document"
             >
@@ -619,7 +767,8 @@ export default function Chat() {
             <button
               type="button"
               onClick={startRecording}
-              disabled={isUploading}
+              disabled={isUploading || isOtherParticipantBlocked}
+              aria-label="Record voice message"
               className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all disabled:opacity-50 flex-shrink-0"
               title="Record voice message"
             >
@@ -627,14 +776,17 @@ export default function Chat() {
             </button>
             <input
               type="text"
+              aria-label="Message input"
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
-              placeholder="Type a message..."
-              className="flex-1 min-w-0 p-2 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm"
+              disabled={isOtherParticipantBlocked}
+              placeholder={isOtherParticipantBlocked ? "Participant blocked — unblock to send messages" : "Type a message..."}
+              className="flex-1 min-w-0 p-2 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm disabled:bg-slate-100"
             />
             <button
               type="submit"
-              disabled={!newMessage.trim() || isUploading}
+              disabled={!newMessage.trim() || isUploading || isOtherParticipantBlocked}
+              aria-label="Send message"
               className="bg-blue-600 text-white p-2 rounded-xl hover:bg-blue-700 transition-colors disabled:opacity-50 flex-shrink-0"
             >
               <Send className="w-5 h-5" />
@@ -642,6 +794,109 @@ export default function Chat() {
           </>
         )}
       </form>
+
+      {/* AT-CJ-CHAT-03: Report / Block Participant Modal */}
+      <AnimatePresence>
+        {showSafetyModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+            <motion.div
+              ref={safetyDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="chat-safety-modal-title"
+              tabIndex={-1}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-2xl border border-black shadow-2xl w-full max-w-md p-6 space-y-4 focus:outline-none"
+            >
+              <div className="flex items-center justify-between border-b border-black pb-3">
+                <div className="flex items-center gap-2">
+                  <ShieldAlert className="w-5 h-5 text-red-600" />
+                  <h3 id="chat-safety-modal-title" className="text-base font-black text-black">
+                    Report or Block Participant
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowSafetyModal(false)}
+                  aria-label="Close report or block modal"
+                  className="p-1.5 rounded-lg border border-black text-black hover:bg-slate-100"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <form onSubmit={handleSubmitSafetyAction} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label htmlFor="chat-safety-action" className="text-xs font-bold text-black uppercase tracking-wider block">
+                    Action
+                  </label>
+                  <select
+                    id="chat-safety-action"
+                    value={safetyAction}
+                    onChange={(e) => setSafetyAction(e.target.value as any)}
+                    className="w-full p-2.5 rounded-xl border border-black bg-white text-sm text-black font-medium"
+                  >
+                    <option value="report_and_block">Report &amp; Block Participant</option>
+                    <option value="block">Block Participant Only</option>
+                    <option value="report">Report to Trust &amp; Safety Only</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label htmlFor="chat-safety-reason" className="text-xs font-bold text-black uppercase tracking-wider block">
+                    Reason
+                  </label>
+                  <select
+                    id="chat-safety-reason"
+                    value={safetyReason}
+                    onChange={(e) => setSafetyReason(e.target.value)}
+                    className="w-full p-2.5 rounded-xl border border-black bg-white text-sm text-black font-medium"
+                  >
+                    <option value="harassment_or_abuse">Harassment or abusive language</option>
+                    <option value="spam_or_solicitation">Spam or off-platform solicitation</option>
+                    <option value="scam_or_fraud">Suspected scam or fraud</option>
+                    <option value="safety_concern">Personal or property safety concern</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label htmlFor="chat-safety-details" className="text-xs font-bold text-black uppercase tracking-wider block">
+                    Additional Details (Optional)
+                  </label>
+                  <textarea
+                    id="chat-safety-details"
+                    rows={3}
+                    value={safetyDetails}
+                    onChange={(e) => setSafetyDetails(e.target.value)}
+                    placeholder="Provide context for Trust & Safety review..."
+                    className="w-full p-2.5 rounded-xl border border-black bg-white text-sm text-black resize-none"
+                  />
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowSafetyModal(false)}
+                    className="px-4 py-2 rounded-xl border border-black bg-white text-black text-xs font-bold hover:bg-slate-100"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSubmittingSafety}
+                    className="px-4 py-2 rounded-xl border border-black bg-red-600 text-white text-xs font-bold hover:bg-red-700 disabled:opacity-50"
+                  >
+                    {isSubmittingSafety ? "Submitting..." : "Confirm"}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

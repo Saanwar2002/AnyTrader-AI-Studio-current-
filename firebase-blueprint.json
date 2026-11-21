@@ -4140,7 +4140,7 @@
     },
     "/driver_metrics/{driverId}": {
       "schema": "DriverMetrics",
-      "description": "Driver performance metrics for fairness."
+      "description": "Server-authoritative driver performance metrics for fairness and daily online-hours telemetry (client writes denied)."
     },
     "/driver_expenses/{expenseId}": {
       "schema": "DriverExpense",

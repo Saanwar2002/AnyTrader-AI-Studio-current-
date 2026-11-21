@@ -35,6 +35,13 @@ export interface ProfileAuditResult {
   auditType: "initial_signup" | "periodic_audit" | "manual_request";
 }
 
+export interface ProfileCoachState {
+  acknowledgedSuggestionIds?: string[];
+  dismissedSuggestionIds?: string[];
+  lastAuditedAt?: string | null;
+  lastHealthScore?: number | null;
+}
+
 /**
  * Executes the AI Profile Optimization & Readiness Coach Agent audit.
  * Audits trader or homeowner profile completeness, professional wording,
@@ -42,7 +49,8 @@ export interface ProfileAuditResult {
  */
 export async function auditProfileAndAccountReadiness(
   profile: any,
-  forceFresh: boolean = false
+  forceFresh: boolean = false,
+  coachState?: ProfileCoachState
 ): Promise<ProfileAuditResult> {
   if (!profile || !profile.uid) {
     return {
@@ -237,7 +245,7 @@ export async function auditProfileAndAccountReadiness(
         category: "credentials",
         title: "Upload Past Job Work Photos",
         impact: "medium",
-        description: `You currently have ${portfolioCount} portfolio photo(s). Adding 3-5 quality photos of completed work increases quote acceptance rates by up to 3x.`,
+        description: `You currently have ${portfolioCount} portfolio photo(s). Adding 3-5 quality photos of completed work helps homeowners evaluate workmanship (illustrative platform benchmark — individual results vary by trade and region).`,
         actionType: "upload_media",
         actionLabel: "📷 Add Work Photos"
       });
@@ -326,13 +334,23 @@ export async function auditProfileAndAccountReadiness(
           category: "subscriptions",
           title: "Top-Spot Search Placement via Ad Studio",
           impact: "medium",
-          description: "Pin your profile to the top spot in homeowner search results across your local town. Featured directory profiles average 4.2x more quote views.",
+          description: "Pin your profile to the top spot in homeowner search results across your local town. Illustrative platform benchmark: sponsored placements typically gain higher profile visibility than unpromoted listings.",
           actionType: "explore_ads",
           actionLabel: "📢 View Ad Studio"
         });
       }
     }
   }
+
+  const acknowledgedSet = new Set(coachState?.acknowledgedSuggestionIds || []);
+  const dismissedSet = new Set(coachState?.dismissedSuggestionIds || []);
+  const visibleSuggestions = suggestions
+    .filter((s) => !dismissedSet.has(s.id))
+    .map((s) => ({
+      ...s,
+      isApplied: acknowledgedSet.has(s.id),
+    }));
+  const unreadSuggestions = visibleSuggestions.filter((s) => !s.isApplied);
 
   const healthScore = Math.max(10, Math.min(100, points));
   const status: "optimized" | "needs_attention" | "critical_gaps" =
@@ -342,59 +360,38 @@ export async function auditProfileAndAccountReadiness(
     lastAuditedAt: new Date().toISOString(),
     healthScore,
     status,
-    totalSuggestions: suggestions.length,
-    unreadSuggestionsCount: suggestions.length,
+    totalSuggestions: visibleSuggestions.length,
+    unreadSuggestionsCount: unreadSuggestions.length,
     summary:
-      status === "optimized"
-        ? "Your profile is fully optimized and ready for maximum job matching!"
-        : `AI found ${suggestions.length} improvement(s) to boost your profile readiness and job match rate.`,
-    suggestions,
+      status === "optimized" || unreadSuggestions.length === 0
+        ? "Your profile is fully optimized and ready for local job matching!"
+        : `AI found ${unreadSuggestions.length} suggestion(s) to improve your profile readiness.`,
+    suggestions: visibleSuggestions,
     professionalBioDraft,
     recommendedSkillsToAdd: recommendedSkillsToAdd.slice(0, 6),
     auditType
   };
 
-  // Dispatch In-App Notification if suggestions exist
-  if (suggestions.length > 0 && profile.uid) {
+  // Dispatch In-App Notification ONLY when there are genuinely new unacknowledged suggestions
+  // and no recent audit was already acknowledged in the last 14 days
+  const lastAuditedMs = coachState?.lastAuditedAt ? new Date(coachState.lastAuditedAt).getTime() : 0;
+  const shouldNotify =
+    unreadSuggestions.length > 0 &&
+    Boolean(profile.uid) &&
+    (!lastAuditedMs || (Date.now() - lastAuditedMs) >= 14 * 24 * 60 * 60 * 1000);
+
+  if (shouldNotify) {
     try {
       await sendNotification(
         profile.uid,
         "✨ Profile Optimization Suggestions Available",
-        `Our AI Coach found ${suggestions.length} simple ways to improve your profile & match score for local jobs.`,
+        `Our AI Coach found ${unreadSuggestions.length} simple ways to improve your profile readiness for local jobs.`,
         "profile_optimization",
         "/profile#ai-profile-optimizer"
       );
     } catch (notifErr) {
       console.warn("Could not dispatch profile optimization notification:", notifErr);
     }
-  }
-
-  // Persist audit state to user document in Firestore
-  if (profile.uid) {
-    try {
-      const userRef = doc(db, "users", profile.uid);
-      await updateDoc(userRef, {
-        aiProfileAudit: auditResult,
-        updatedAt: serverTimestamp()
-      });
-    } catch (dbErr) {
-      console.warn("Could not persist aiProfileAudit to Firestore user doc:", dbErr);
-    }
-  }
-
-  // Log to AI Agent Audit Logs
-  try {
-    await addDoc(collection(db, "ai_agent_audit_logs"), {
-      agentType: "profile_optimization_coach",
-      action: "PROFILE_AUDITED",
-      details: `Audited ${profile.role || "user"} ${profile.name || profile.uid}`,
-      summary: `Health Score: ${healthScore}%. ${suggestions.length} suggestions generated.`,
-      timestamp: new Date().toISOString(),
-      status: "success",
-      triggerSource: auditType
-    });
-  } catch (auditLogErr) {
-    console.warn("Could not record agent audit log:", auditLogErr);
   }
 
   return auditResult;

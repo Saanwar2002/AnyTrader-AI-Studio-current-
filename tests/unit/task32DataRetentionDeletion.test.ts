@@ -20,6 +20,7 @@ import {
   assertSucceeds,
   RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import {
   doc,
   getDoc,
@@ -61,7 +62,7 @@ describe('V8.3 Task 32 — Firebase Emulator Data Retention, Revocation & Deleti
 
   beforeAll(async () => {
     try {
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: {
           rules: firestoreRules,

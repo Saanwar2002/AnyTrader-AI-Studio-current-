@@ -1,4 +1,4 @@
-import { db } from "@/src/firebase";
+import { auth, db } from "@/src/firebase";
 import { doc, getDoc, setDoc, updateDoc, serverTimestamp, collection, getDocs, query, where, limit, orderBy } from "firebase/firestore";
 import { runServerAutonomousAgentTask } from "@/src/services/gemini";
 
@@ -261,6 +261,30 @@ export async function getAiAgentSettings(): Promise<AiAgentSettings> {
 }
 
 /**
+ * Fetches strictly non-secret public platform flags from `platform_settings/public_flags`.
+ * Secret/admin webhook URLs and API keys are never stored or exposed on this document.
+ */
+export async function getPublicPlatformFlags(): Promise<Record<string, boolean | string | number>> {
+  try {
+    const flagsSnap = await getDoc(doc(db, "platform_settings", "public_flags"));
+    if (flagsSnap.exists()) {
+      const data = flagsSnap.data() || {};
+      const safeFlags: Record<string, boolean | string | number> = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (/webhook|apikey|api_key|secret|token|password/i.test(k)) continue;
+        if (typeof v === "boolean" || typeof v === "string" || typeof v === "number") {
+          safeFlags[k] = v;
+        }
+      }
+      return safeFlags;
+    }
+  } catch (err) {
+    console.warn("Could not fetch public platform flags:", err);
+  }
+  return {};
+}
+
+/**
  * Updates the persistent AI Agent Ecosystem settings in Firestore.
  */
 export async function updateAiAgentSettings(newSettings: Partial<AiAgentSettings>): Promise<boolean> {
@@ -508,46 +532,51 @@ export async function runFinancialIntelligenceAnalysis(
 
   // Direct Job / On-Demand Commissions (12% AnyTrader commission on completed trades & deliveries)
   const completedJobs = jobs.filter(j => j.status === "completed");
-  const totalCompletedValue = completedJobs.reduce((acc, j) => acc + (j.finalPrice || j.agreedPrice || j.budget || 120), 0);
-  const monthlyJobCommissions = completedJobs.length > 0 ? (totalCompletedValue * 0.12) : 240.00; // default baseline
+  const totalCompletedValue = completedJobs.reduce(
+    (acc, j) => acc + (Number(j.finalPrice ?? j.agreedPrice ?? j.budget ?? 0) || 0),
+    0
+  );
+  const monthlyJobCommissions = completedJobs.length > 0 ? totalCompletedValue * 0.12 : 0;
 
   // BNPL FlexiPay Repair Financing Commission (2.5% referral yield)
   const bnplJobs = jobs.filter(j => j.isBnplFinanced);
-  const monthlyBnplFees = bnplJobs.reduce((acc, j) => acc + ((j.agreedPrice || 1000) * 0.025), 0);
+  const monthlyBnplFees = bnplJobs.reduce((acc, j) => acc + ((Number(j.agreedPrice || j.finalPrice || 0) || 0) * 0.025), 0);
 
   const baseMonthlyRevenue = monthlyGoldRev + monthlyPlatinumRev + monthlyVideoProRev + monthlyGothamRev + monthlyJobCommissions + monthlyBnplFees;
-  const periodRevenue = Math.max(baseMonthlyRevenue * periodMultiplier, 120 * periodMultiplier);
+  const periodRevenue = baseMonthlyRevenue * periodMultiplier;
 
-  // 2. Calculate Outgoings / Platform Running Costs
-  // Server Cloud Run instance (~£35/mo base)
+  // 2. Calculate Outgoings / Platform Running Costs (estimated infra baselines + per-transaction Stripe fee)
   const cloudRunCost = 35.00 * periodMultiplier;
-  // Firestore DB reads/writes (~£15/mo base for current user load)
   const firestoreCost = 15.00 * periodMultiplier;
-  // Gemini AI API usage (~£12/mo based on model token volume)
   const geminiCost = 12.00 * periodMultiplier;
-  // Stripe Processing Fees (~1.5% + 20p per transaction)
   const stripeFees = (periodRevenue * 0.015) + (jobs.length * 0.20 * periodMultiplier);
-  // SMS & Verification Costs (~£8/mo)
   const smsVerificationCost = 8.00 * periodMultiplier;
 
   const periodOutgoings = cloudRunCost + firestoreCost + geminiCost + stripeFees + smsVerificationCost;
   const periodNetProfit = periodRevenue - periodOutgoings;
   const profitMarginPct = periodRevenue > 0 ? Math.round((periodNetProfit / periodRevenue) * 100) : 0;
 
+  const subAmt = Math.round((monthlyGoldRev + monthlyPlatinumRev + monthlyVideoProRev) * periodMultiplier * 100) / 100;
+  const gothamAmt = Math.round(monthlyGothamRev * periodMultiplier * 100) / 100;
+  const jobCommAmt = Math.round(monthlyJobCommissions * periodMultiplier * 100) / 100;
+  const bnplAmt = Math.round(monthlyBnplFees * periodMultiplier * 100) / 100;
+  const pctOfRev = (amt: number) => (periodRevenue > 0 ? Math.round((amt / periodRevenue) * 100) : 0);
+  const pctOfOut = (amt: number) => (periodOutgoings > 0 ? Math.round((amt / periodOutgoings) * 100) : 0);
+
   // Breakdown Arrays
   const revenueBreakdown: BreakdownItem[] = [
-    { label: "Trader Subscriptions (Gold / Platinum)", amount: Math.round((monthlyGoldRev + monthlyPlatinumRev + monthlyVideoProRev) * periodMultiplier * 100) / 100, percentage: 35, color: "#3B82F6" },
-    { label: "Gotham B2B Housing SaaS Licensing", amount: Math.round(monthlyGothamRev * periodMultiplier * 100) / 100, percentage: 28, color: "#6366F1" },
-    { label: "Trade & Delivery Job Commissions (12%)", amount: Math.round(monthlyJobCommissions * periodMultiplier * 100) / 100, percentage: 25, color: "#10B981" },
-    { label: "FlexiPay BNPL Financing Yields", amount: Math.round(monthlyBnplFees * periodMultiplier * 100) / 100, percentage: 12, color: "#F59E0B" },
+    { label: "Trader Subscriptions (Gold / Platinum)", amount: subAmt, percentage: pctOfRev(subAmt), color: "#3B82F6" },
+    { label: "Gotham B2B Housing SaaS Licensing", amount: gothamAmt, percentage: pctOfRev(gothamAmt), color: "#6366F1" },
+    { label: "Trade & Delivery Job Commissions (12%)", amount: jobCommAmt, percentage: pctOfRev(jobCommAmt), color: "#10B981" },
+    { label: "FlexiPay BNPL Financing Yields", amount: bnplAmt, percentage: pctOfRev(bnplAmt), color: "#F59E0B" },
   ];
 
   const outgoingsBreakdown: BreakdownItem[] = [
-    { label: "Cloud Run Infrastructure & Hosting", amount: Math.round(cloudRunCost * 100) / 100, percentage: 32, color: "#EF4444" },
-    { label: "Stripe & Banking Merchant Processing", amount: Math.round(stripeFees * 100) / 100, percentage: 28, color: "#F97316" },
-    { label: "Firestore Multi-Portal Database Queries", amount: Math.round(firestoreCost * 100) / 100, percentage: 18, color: "#8B5CF6" },
-    { label: "Gemini AI API Tokens & Intelligence", amount: Math.round(geminiCost * 100) / 100, percentage: 14, color: "#EC4899" },
-    { label: "SMS Authentication & Verification", amount: Math.round(smsVerificationCost * 100) / 100, percentage: 8, color: "#64748B" },
+    { label: "Cloud Run Infrastructure & Hosting", amount: Math.round(cloudRunCost * 100) / 100, percentage: pctOfOut(cloudRunCost), color: "#EF4444" },
+    { label: "Stripe & Banking Merchant Processing", amount: Math.round(stripeFees * 100) / 100, percentage: pctOfOut(stripeFees), color: "#F97316" },
+    { label: "Firestore Multi-Portal Database Queries", amount: Math.round(firestoreCost * 100) / 100, percentage: pctOfOut(firestoreCost), color: "#8B5CF6" },
+    { label: "Gemini AI API Tokens & Intelligence", amount: Math.round(geminiCost * 100) / 100, percentage: pctOfOut(geminiCost), color: "#EC4899" },
+    { label: "SMS Authentication & Verification", amount: Math.round(smsVerificationCost * 100) / 100, percentage: pctOfOut(smsVerificationCost), color: "#64748B" },
   ];
 
   // AI Forecasting & Optimization Recommendations via Gemini
@@ -623,48 +652,30 @@ export async function runDisputeMediatorScan(
   // Find disputed or cancelled jobs or sample active jobs needing quality arbitration
   const disputedJobs = jobs.filter(j => j.status === "disputed" || j.status === "cancelled" || j.isDisputed);
 
-  // Default sample cases if none in DB
   if (disputedJobs.length === 0) {
+    return [];
+  }
+
+  for (const job of disputedJobs.slice(0, 5)) {
+    const budget = Number(job.agreedPrice ?? job.budget ?? 0) || 0;
     cases.push({
-      id: `DISPUTE_SAMPLE_101`,
-      jobId: `JOB_PLUMB_402`,
-      customerName: "Sarah Jenkins",
-      traderName: "Apex Plumbing Ltd",
-      category: "Plumbing & Heating",
-      disputeReason: "Customer claims tile sealing around bath was incomplete and shower bar leaks, trader claims tiles were out of plumb.",
-      amountInDispute: 280,
-      evidenceSummary: "Uploaded 3 photos of bath seal & chat transcript showing initial £450 quote for full suite fit.",
+      id: `DISPUTE_${job.id || Date.now()}`,
+      jobId: job.id || "JOB_UNK",
+      customerName: job.customerName || job.userName || "Homeowner",
+      traderName: job.traderName || job.assignedTraderName || "Assigned Trader",
+      category: job.category || "General Repairs",
+      disputeReason: job.disputeReason || "Disputed job outcome submitted for arbitration.",
+      amountInDispute: budget,
+      evidenceSummary: job.evidenceSummary || "Job specification notes and submitted records.",
       proposedSettlement: {
-        traderPayout: 380,
-        customerRefund: 70,
-        actionRequired: "Trader to replace silicone seal around bath edge within 48 hours to receive final £380 payout.",
-        rationale: "Per BS 5385 UK tiling standards, perimeter movement joint sealing is installer responsibility. £70 adjustment reflects minor materials re-work."
+        traderPayout: Math.round(budget * 0.8),
+        customerRefund: Math.round(budget * 0.2),
+        actionRequired: "Pending arbitrator review of submitted evidence.",
+        rationale: "Initial triage prior to AI arbitration evaluation."
       },
       status: "proposed",
       createdAt: now
     });
-  } else {
-    for (const job of disputedJobs.slice(0, 5)) {
-      const budget = job.agreedPrice || job.budget || 350;
-      cases.push({
-        id: `DISPUTE_${job.id || Date.now()}`,
-        jobId: job.id || "JOB_UNK",
-        customerName: job.customerName || job.userName || "Homeowner",
-        traderName: job.traderName || job.assignedTraderName || "Assigned Trader",
-        category: job.category || "General Repairs",
-        disputeReason: job.disputeReason || "Quality of finish and uncompleted snagging items.",
-        amountInDispute: budget,
-        evidenceSummary: "Job specification notes, initial price quote, and photo evidence submitted to AnyTrader Guarantee.",
-        proposedSettlement: {
-          traderPayout: Math.round(budget * 0.8),
-          customerRefund: Math.round(budget * 0.2),
-          actionRequired: "Trader to complete final snagging list within 3 business days or refund 20% to customer.",
-          rationale: "Stage 1 arbitration evaluated against standard UK trade completion benchmarks."
-        },
-        status: "proposed",
-        createdAt: now
-      });
-    }
   }
 
   // Gemini AI enhancement via secure server proxy
@@ -701,72 +712,50 @@ export async function runComplianceGuardianScan(
 
   // 1. Audit Gas Safe & EICR certification expirations for tradespeople
   const traders = users.filter(u => u.role === "tradesperson" || u.isTradesperson);
+  const nowMs = Date.now();
   traders.forEach((t) => {
-    if (t.gasSafeRegisterNumber || t.gasSafeNumber) {
-      alerts.push({
-        id: `COMP_GAS_${t.id}`,
-        entityType: "trader_credential",
-        entityName: `${t.name || "Trader"} (Gas Safe #${t.gasSafeRegisterNumber || t.gasSafeNumber || "592014"})`,
-        issueType: "expiring_soon",
-        daysRemaining: 18,
-        details: "Annual Gas Safe registration renewal due within 30 days.",
-        recommendedAction: "Send automated SMS reminder & request updated Gas Safe registration certificate download.",
-        autoActionTaken: true,
-        status: "reminder_sent",
-        auditDate: now
-      });
+    const expiryIso = t.gasSafeExpiry || t.certificationExpiry;
+    if ((t.gasSafeRegisterNumber || t.gasSafeNumber) && expiryIso) {
+      const daysRem = Math.ceil((Date.parse(expiryIso) - nowMs) / 86_400_000);
+      if (Number.isFinite(daysRem) && daysRem <= 30) {
+        alerts.push({
+          id: `COMP_GAS_${t.id}`,
+          entityType: "trader_credential",
+          entityName: `${t.name || "Trader"} (Gas Safe #${t.gasSafeRegisterNumber || t.gasSafeNumber})`,
+          issueType: daysRem <= 0 ? "expired" : "expiring_soon",
+          daysRemaining: Math.max(0, daysRem),
+          details: daysRem <= 0
+            ? "Gas Safe registration certificate has expired."
+            : `Annual Gas Safe registration renewal due within ${daysRem} days.`,
+          recommendedAction: "Send reminder and request updated Gas Safe registration certificate.",
+          autoActionTaken: false,
+          status: "flagged",
+          auditDate: now
+        });
+      }
     }
   });
 
-  // 2. Audit B2B Gotham Landlord doors for CP12 & EICR expirations
-  alerts.push({
-    id: `COMP_CP12_GOTHAM_101`,
-    entityType: "gotham_cp12",
-    entityName: "Gotham Estate: 14-28 Birchwood Avenue (12 Doors)",
-    issueType: "expiring_soon",
-    daysRemaining: 12,
-    details: "Annual CP12 Gas Safety Inspection Certificate expires on August 20, 2026.",
-    recommendedAction: "Auto-dispatch 1-Tap CP12 Gas Safety job to certified local Gas Safe engineer.",
-    autoActionTaken: true,
-    status: "renewal_dispatched",
-    auditDate: now
-  });
-
-  // 3. Audit Awaab's Law Damp & Mould 24h Emergency / 14d Inspection SLA
-  const dampJobs = jobs.filter(j => 
+  // 2. Audit Awaab's Law Damp & Mould open jobs from Firestore records
+  const dampJobs = jobs.filter(j =>
     (j.category?.toLowerCase().includes("damp") || j.title?.toLowerCase().includes("mould") || j.description?.toLowerCase().includes("damp")) &&
     j.status !== "completed"
   );
 
-  if (dampJobs.length > 0) {
-    dampJobs.forEach((j) => {
-      alerts.push({
-        id: `COMP_AWAAB_${j.id}`,
-        entityType: "awaabs_law_damp",
-        entityName: `Awaab's Law Ticket: ${j.title || "Damp & Mould Inspection"} (${j.postcode || "M1 2WD"})`,
-        issueType: "damp_mould_sla_warning",
-        daysRemaining: 1,
-        details: "Statutory 14-day Awaab's Law damp investigation deadline expires within 24 hours.",
-        recommendedAction: "Escalate ticket to Gotham B2B landlord command dashboard and dispatch certified ventilation contractor immediately.",
-        autoActionTaken: true,
-        status: "flagged",
-        auditDate: now
-      });
-    });
-  } else {
+  dampJobs.forEach((j) => {
     alerts.push({
-      id: `COMP_AWAAB_SAMPLE`,
+      id: `COMP_AWAAB_${j.id}`,
       entityType: "awaabs_law_damp",
-      entityName: "Awaab's Law Ticket: Flat 4B Oakridge House (Social Housing Unit)",
+      entityName: `Awaab's Law Ticket: ${j.title || "Damp & Mould Inspection"} (${j.postcode || "Postcode Unknown"})`,
       issueType: "damp_mould_sla_warning",
-      daysRemaining: 2,
-      details: "Statutory Awaab's Law 14-day investigation window closing. Property Passport shows relative humidity >75%.",
-      recommendedAction: "Trigger priority contractor dispatch and notify housing association compliance officer.",
-      autoActionTaken: true,
-      status: "reminder_sent",
+      daysRemaining: 1,
+      details: "Open damp/mould case requiring statutory Awaab's Law SLA tracking.",
+      recommendedAction: "Prioritize qualified damp & ventilation specialist dispatch.",
+      autoActionTaken: false,
+      status: "flagged",
       auditDate: now
     });
-  }
+  });
 
   // Gemini AI enhancement via secure server proxy
   try {
@@ -794,56 +783,33 @@ export async function runCustomerConciergeScan(
   const specs: PrequalifiedLeadSpec[] = [];
   const now = new Date().toISOString();
 
-  if (jobs && jobs.length > 0) {
-    jobs.slice(0, 5).forEach((job, index) => {
-      specs.push({
-        id: `CONCIERGE_${job.id || index}`,
-        jobId: job.id || `JOB_${index}`,
-        customerName: job.customerName || job.userName || "Homeowner",
-        rawJobTitle: job.title || "General Repair Request",
-        category: job.category || "Plumbing & Heating",
-        qualityScore: 92,
-        structuredPassportSpec: {
-          applianceBrandModel: job.applianceBrand || "Worcester Bosch Greenstar 30i",
-          diagnosticQuestionsAnswered: [
-            "Issue: Pressure loss & E119 error code on display",
-            "Affected Service: Hot water operational, central heating intermittent",
-            "Access: Ground floor utility room, off-street driveway parking"
-          ],
-          photoVideoAttached: true,
-          urgencyLevel: job.isEmergency ? "emergency" : "same_day",
-          estimatedLaborHours: 2.5
-        },
-        conciergeSummary: "Concierge verified boiler brand, error code E119, and confirmed off-street parking. 10-second inspection video attached.",
-        status: "prequalified",
-        processedAt: now
-      });
-    });
-  } else {
-    // Default sample prequalified leads
+  if (!jobs || jobs.length === 0) {
+    return [];
+  }
+
+  jobs.slice(0, 5).forEach((job, index) => {
+    const hasMedia = Array.isArray(job.photos) ? job.photos.length > 0 : Boolean(job.mediaUrl || job.videoUrl);
     specs.push({
-      id: "CONCIERGE_LEAD_101",
-      jobId: "JOB_BOILER_204",
-      customerName: "David Miller",
-      rawJobTitle: "Boiler making knocking noise",
-      category: "Plumbing & Heating",
-      qualityScore: 95,
+      id: `CONCIERGE_${job.id || index}`,
+      jobId: job.id || `JOB_${index}`,
+      customerName: job.customerName || job.userName || "Homeowner",
+      rawJobTitle: job.title || "Repair Request",
+      category: job.category || "General Repairs",
+      qualityScore: Number(job.qualityScore) || (hasMedia && job.description ? 85 : 55),
       structuredPassportSpec: {
-        applianceBrandModel: "Ideal Logic C30 Combi",
-        diagnosticQuestionsAnswered: [
-          "Issue: Loud kettling noise during central heating startup",
-          "System Type: Sealed combi system, pressure at 1.2 bar",
-          "Property Passport Specs: EPC C rating, last serviced Oct 2025"
-        ],
-        photoVideoAttached: true,
-        urgencyLevel: "standard",
-        estimatedLaborHours: 3.0
+        applianceBrandModel: job.applianceBrand || undefined,
+        diagnosticQuestionsAnswered: Array.isArray(job.diagnosticQuestions)
+          ? job.diagnosticQuestions
+          : (job.description ? [job.description] : []),
+        photoVideoAttached: hasMedia,
+        urgencyLevel: job.isEmergency ? "emergency" : "same_day",
+        estimatedLaborHours: Number(job.estimatedLaborHours) || 0
       },
-      conciergeSummary: "Pre-qualified lead: AI Concierge identified heat exchanger limescale kettling on Ideal Logic C30. Photos & 8s audio sample captured.",
-      status: "prequalified",
+      conciergeSummary: job.conciergeSummary || job.description || "Awaiting diagnostic summary.",
+      status: job.conciergeSummary ? "prequalified" : "raw_post",
       processedAt: now
     });
-  }
+  });
 
   // Gemini AI enhancement via secure server proxy
   try {
@@ -1171,8 +1137,22 @@ export async function generateHomeownerOutreachPack(
   return fallbackCampaign;
 }
 
+async function getAdminAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  try {
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : "";
+    if (idToken) {
+      headers.Authorization = `Bearer ${idToken}`;
+    }
+  } catch {
+    // Ignore token lookup error; server will enforce 401
+  }
+  return headers;
+}
+
 /**
- * Executes an on-demand AI scan for Material Arbitrage via backend endpoint
+ * Executes an on-demand AI scan for Material Arbitrage via authenticated backend endpoint.
+ * Fails honestly when backend/AI is unavailable rather than fabricating demo items.
  */
 export async function runMaterialsArbitrageScan(region: string = "Greater Manchester"): Promise<{
   items: MaterialArbitrageItem[];
@@ -1180,304 +1160,107 @@ export async function runMaterialsArbitrageScan(region: string = "Greater Manche
   topSavingsCategory: string;
   generatedAt: string;
 }> {
-  try {
-    const response = await fetch("/api/admin/agents/scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentType: "materials_arbitrage",
-        payload: { region }
-      })
-    });
-    if (response.ok) {
-      const data = await response.json();
-      if (data.data) return data.data;
-    }
-  } catch (err) {
-    console.warn("Server arbitrage scan fallback to client:", err);
+  const response = await fetch("/api/admin/agents/scan", {
+    method: "POST",
+    headers: await getAdminAuthHeaders(),
+    body: JSON.stringify({
+      agentType: "materials_arbitrage",
+      payload: { region }
+    })
+  });
+  const data = await response.json().catch(() => ({} as any));
+  if (!response.ok || !data?.data) {
+    throw new Error(data?.error || `Materials arbitrage scan unavailable (${response.status})`);
   }
-
-  // Client-side fallback
-  const fallbackItems: MaterialArbitrageItem[] = [
-    {
-      id: "arb-cu-15",
-      materialName: "15mm Copper Pipe (3m Length x 10 Pack)",
-      category: "Plumbing & Heating",
-      retailBenchmarkPrice: 68.50,
-      merchants: [
-        { merchantName: "Screwfix Trade", price: 54.20, inStock: true, discountPct: 20.8, distanceMiles: 1.8, skuCode: "SCR-CU-1510" },
-        { merchantName: "Travis Perkins", price: 49.90, inStock: true, discountPct: 27.1, distanceMiles: 3.2, skuCode: "TP-COP-15X10" },
-        { merchantName: "Toolstation", price: 52.80, inStock: true, discountPct: 22.9, distanceMiles: 2.4, skuCode: "TS-15MM-3M" }
-      ],
-      bestPrice: 49.90,
-      bestMerchant: "Travis Perkins",
-      savingsAmount: 18.60,
-      arbitrageOpportunityRating: "high",
-      suggestedTraderBroadcast: "⚡ Travis Perkins flash trade deal: 15mm Copper Pipe pack at £49.90 (27% below retail). Pre-order via TradeOS 1-Click BOM."
-    },
-    {
-      id: "arb-cbl-25",
-      materialName: "2.5mm² Twin & Earth Cable 6242Y (100m Drum)",
-      category: "Electrical",
-      retailBenchmarkPrice: 105.00,
-      merchants: [
-        { merchantName: "Screwfix Trade", price: 79.99, inStock: true, discountPct: 23.8, distanceMiles: 1.8, skuCode: "SCR-TNE-25100" },
-        { merchantName: "Toolstation", price: 76.50, inStock: true, discountPct: 27.1, distanceMiles: 2.4, skuCode: "TS-6242Y-25" },
-        { merchantName: "Selco", price: 82.00, inStock: true, discountPct: 21.9, distanceMiles: 4.1, skuCode: "SLC-CAB-25T" }
-      ],
-      bestPrice: 76.50,
-      bestMerchant: "Toolstation",
-      savingsAmount: 28.50,
-      arbitrageOpportunityRating: "high",
-      suggestedTraderBroadcast: "⚡ Toolstation pricing drop: 100m 2.5mm² Twin & Earth at £76.50 (Save £28.50 per drum)."
-    },
-    {
-      id: "arb-pb-125",
-      materialName: "12.5mm Square Edge Plasterboard (2400 x 1200mm x 5 Sheets)",
-      category: "Building & Carpentry",
-      retailBenchmarkPrice: 62.50,
-      merchants: [
-        { merchantName: "B&Q TradePoint", price: 46.00, inStock: true, discountPct: 26.4, distanceMiles: 2.1, skuCode: "BND-PB-125S" },
-        { merchantName: "Travis Perkins", price: 44.50, inStock: true, discountPct: 28.8, distanceMiles: 3.2, skuCode: "TP-PB-GYPROC" },
-        { merchantName: "Selco", price: 47.20, inStock: true, discountPct: 24.5, distanceMiles: 4.1, skuCode: "SLC-PB-125" }
-      ],
-      bestPrice: 44.50,
-      bestMerchant: "Travis Perkins",
-      savingsAmount: 18.00,
-      arbitrageOpportunityRating: "high",
-      suggestedTraderBroadcast: "⚡ Bulk Plasterboard alert: £8.90/sheet at Travis Perkins. Reserve via 1-Click BOM."
-    },
-    {
-      id: "arb-trv-set",
-      materialName: "15mm Angled Thermostatic Radiator Valve (TRV) & Lockshield 5-Pack",
-      category: "Plumbing & Heating",
-      retailBenchmarkPrice: 74.00,
-      merchants: [
-        { merchantName: "Screwfix Trade", price: 56.00, inStock: true, discountPct: 24.3, distanceMiles: 1.8, skuCode: "SCR-TRV-ANG5" },
-        { merchantName: "City Plumbing", price: 53.50, inStock: true, discountPct: 27.7, distanceMiles: 3.5, skuCode: "CP-DRAYTON-5" },
-        { merchantName: "Toolstation", price: 58.20, inStock: true, discountPct: 21.3, distanceMiles: 2.4, skuCode: "TS-TRV-PACK5" }
-      ],
-      bestPrice: 53.50,
-      bestMerchant: "City Plumbing",
-      savingsAmount: 20.50,
-      arbitrageOpportunityRating: "medium",
-      suggestedTraderBroadcast: "⚡ City Plumbing TRV 5-pack trade discount: £53.50. Perfect for pre-winter heating upgrades."
-    }
-  ];
-
-  return {
-    items: fallbackItems,
-    executiveSummary: `Travis Perkins and Toolstation currently offer the highest average margin savings (up to 28.8%) across plumbing pipe and electrical cable in ${region}.`,
-    topSavingsCategory: "Plumbing & Heating",
-    generatedAt: new Date().toISOString()
-  };
+  return data.data;
 }
 
 /**
- * Executes an on-demand AI scan for Trader Churn & Retention
+ * Executes an on-demand AI scan for Trader Churn & Retention via authenticated backend endpoint.
  */
 export async function runTraderChurnPredictorScan(sampleTraders: any[] = []): Promise<{
   profiles: TraderChurnRiskProfile[];
-  overallRetentionHealthScore: number;
+  overallRetentionHealthScore: number | null;
   highRiskCount: number;
   recommendedInterventionSummary: string;
   generatedAt: string;
 }> {
-  try {
-    const response = await fetch("/api/admin/agents/scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentType: "trader_churn",
-        payload: { sampleTraders }
-      })
-    });
-    if (response.ok) {
-      const data = await response.json();
-      if (data.data) return data.data;
-    }
-  } catch (err) {
-    console.warn("Server churn scan fallback to client:", err);
+  const response = await fetch("/api/admin/agents/scan", {
+    method: "POST",
+    headers: await getAdminAuthHeaders(),
+    body: JSON.stringify({
+      agentType: "trader_churn",
+      payload: { sampleTraders }
+    })
+  });
+  const data = await response.json().catch(() => ({} as any));
+  if (!response.ok || !data?.data) {
+    throw new Error(data?.error || `Trader churn scan unavailable (${response.status})`);
   }
-
-  const defaultProfiles: TraderChurnRiskProfile[] = [
-    {
-      id: "trader_churn_01",
-      traderName: "Liam O'Connor (O'Connor Electrical)",
-      tradeCategory: "Electrical",
-      cityLocation: "Manchester M14",
-      daysSinceLastQuote: 16,
-      quoteWinRatePct: 18,
-      quotesSubmittedLast30Days: 2,
-      riskLevel: "high",
-      churnDrivers: [
-        "Uncompetitive pricing vs local NICEIC average (quotes were 22% higher than AI Pre-Quote benchmark)",
-        "Zero video verification intro uploaded",
-        "Quote response lag (>4.5 hours after homeowner job post)"
-      ],
-      prescribedRetentionAction: {
-        actionType: "fee_discount_boost",
-        title: "Offer 50% Platform Fee Rebate for 14 Days & Fast-Track Lead Alerts",
-        description: "Apply a temporary 7.5% success fee rate (down from 15%) and enable 1-Click SMS Instant Job Notifications.",
-        estimatedRetentionProbability: "82%",
-        discountCode: "RETENTION-50OFF-LIAM"
-      }
-    },
-    {
-      id: "trader_churn_02",
-      traderName: "Marcus Sterling (Sterling Joinery)",
-      tradeCategory: "Carpentry & Joinery",
-      cityLocation: "Birmingham B1",
-      daysSinceLastQuote: 22,
-      quoteWinRatePct: 25,
-      quotesSubmittedLast30Days: 1,
-      riskLevel: "critical",
-      churnDrivers: [
-        "Lost 3 consecutive bids due to lack of photo portfolio on custom wardrobes",
-        "No activity for 3 weeks"
-      ],
-      prescribedRetentionAction: {
-        actionType: "portfolio_review_credit",
-        title: "Send Portfolio Setup Assist & £25 First-Win Wallet Bonus",
-        description: "AI Portfolio Optimizer to auto-generate high-res project tags and award £25 Stripe payout bonus on next won job.",
-        estimatedRetentionProbability: "74%",
-        discountCode: "WIN-BONUS-25"
-      }
-    },
-    {
-      id: "trader_churn_03",
-      traderName: "Dean Bradley (Bradley Roofing)",
-      tradeCategory: "Roofing",
-      cityLocation: "Leeds LS2",
-      daysSinceLastQuote: 11,
-      quoteWinRatePct: 35,
-      quotesSubmittedLast30Days: 3,
-      riskLevel: "medium",
-      churnDrivers: [
-        "High travel distance (>15 miles) resulting in low quote acceptance",
-        "Prefers emergency leak repairs over full re-roofs"
-      ],
-      prescribedRetentionAction: {
-        actionType: "radius_recalibration",
-        title: "Recalibrate Work Radius to 5 Miles & Lock Emergency Leak Priority",
-        description: "Re-target Bradley Roofing exclusively to high-urgency Category 5 Roofing Leak repairs within 5 miles.",
-        estimatedRetentionProbability: "89%",
-        discountCode: "ROOF-EMERGENCY-LOCK"
-      }
-    }
-  ];
-
-  return {
-    profiles: defaultProfiles,
-    overallRetentionHealthScore: 78,
-    highRiskCount: 2,
-    recommendedInterventionSummary: "2 verified tradespeople are at high risk of churning due to quote pricing mismatches and response time lag. Triggering personalized retention fee concessions will recover an estimated £420 in monthly platform commissions.",
-    generatedAt: new Date().toISOString()
-  };
+  return data.data;
 }
 
 /**
- * Executes an on-demand AI scan for Dynamic Weather & Demand Surge
+ * Executes an on-demand AI scan for Dynamic Weather & Demand Surge via authenticated backend endpoint.
  */
-export async function runDemandSurgePredictorScan(region: string = "UK Wide", weatherCondition: string = "Sub-Zero Freeze & Frost Alert"): Promise<DemandSurgeForecast> {
-  try {
-    const response = await fetch("/api/admin/agents/scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentType: "demand_surge",
-        payload: { region, weatherCondition }
-      })
-    });
-    if (response.ok) {
-      const data = await response.json();
-      if (data.data) return data.data;
-    }
-  } catch (err) {
-    console.warn("Server demand surge scan fallback to client:", err);
+export async function runDemandSurgePredictorScan(
+  region: string = "UK Wide",
+  weatherCondition: string = "Sub-Zero Freeze & Frost Alert"
+): Promise<DemandSurgeForecast> {
+  const response = await fetch("/api/admin/agents/scan", {
+    method: "POST",
+    headers: await getAdminAuthHeaders(),
+    body: JSON.stringify({
+      agentType: "demand_surge",
+      payload: { region, weatherCondition }
+    })
+  });
+  const data = await response.json().catch(() => ({} as any));
+  if (!response.ok || !data?.data) {
+    throw new Error(data?.error || `Demand surge scan unavailable (${response.status})`);
   }
-
-  return {
-    forecastRegion: region,
-    activeWeatherAlert: weatherCondition,
-    severity: "warning",
-    temperatureForecast: "-2°C to 1°C overnight freezing snap",
-    impactWindow: "Next 48–72 Hours",
-    projectedDemandSurges: [
-      {
-        category: "Plumbing & Heating",
-        projectedIncreasePct: 185,
-        primaryJobTypes: ["Frozen Condensate Pipes", "Burst Mains Pipes", "Combi Boiler Pressure Loss (E119/F22)"],
-        activeTraderAvailabilityScore: "low",
-        recommendedAction: "Pre-alert 15 local Gas Safe & Plumbing engineers with +15% Emergency Callout Rate surge.",
-        automatedSmsBroadcastDraft: "❄️ FREEZING WEATHER SURGE: Heavy boiler pressure & burst pipe demand forecast across your area over the next 48h. Tap to toggle Emergency On-Call mode: https://anytrader.app/trader/oncall"
-      },
-      {
-        category: "Roofing & Gutters",
-        projectedIncreasePct: 95,
-        primaryJobTypes: ["Ice Damming in Gutters", "Dislodged Ridge Tiles from Frost Heave", "Chimney Flashing Leaks"],
-        activeTraderAvailabilityScore: "medium",
-        recommendedAction: "Queue emergency roof repair alerts for certified roofers in postcodes with older housing stock.",
-        automatedSmsBroadcastDraft: "❄️ Ice & frost surge: High emergency roof leak requests incoming. Review local specs with pre-inspected photos on AnyTrader."
-      }
-    ],
-    recommendedSurgeModeActive: true,
-    estimatedSurgeCommissionGross: 1450.00,
-    generatedAt: new Date().toISOString()
-  };
+  return data.data;
 }
 
 /**
  * 1-Click Closed-Loop Action Executor
  */
-export async function executeAgentAction(actionType: string, payload: any, agentName: string = "AI_ECOSYSTEM_AGENT"): Promise<{
+export async function executeAgentAction(
+  actionType: string,
+  payload: any,
+  agentName: string = "AI_ECOSYSTEM_AGENT"
+): Promise<{
   success: boolean;
   outcomeMessage: string;
   executedAt: string;
 }> {
-  try {
-    const response = await fetch("/api/admin/agents/execute-action", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ actionType, payload, agentName })
-    });
-    if (response.ok) {
-      return await response.json();
-    }
-  } catch (err) {
-    console.warn("Execute agent action server error, recording locally:", err);
-  }
-
-  const timestamp = new Date().toISOString();
-  const fallbackMessage = `Executed ${actionType} for ${payload?.title || payload?.materialName || payload?.traderName || "system item"}.`;
-  
-  await logAiAgentAuditAction({
-    agentType: agentName,
-    action: actionType,
-    details: fallbackMessage,
-    payload,
-    timestamp,
-    status: "executed",
-    triggerSource: "admin_one_click"
+  const response = await fetch("/api/admin/agents/execute-action", {
+    method: "POST",
+    headers: await getAdminAuthHeaders(),
+    body: JSON.stringify({ actionType, payload, agentName })
   });
-
-  return {
-    success: true,
-    outcomeMessage: fallbackMessage,
-    executedAt: timestamp
-  };
+  const data = await response.json().catch(() => ({} as any));
+  if (!response.ok || !data?.success) {
+    throw new Error(data?.error || `Failed to execute agent action ${actionType} (${response.status})`);
+  }
+  return data;
 }
 
 /**
- * Fetches persistent audit logs from Firestore or backend
+ * Fetches persistent audit logs from backend or Firestore (returns [] when empty — never synthetic seeds).
  */
 export async function getAiAgentAuditLogs(): Promise<AiAgentAuditLogEntry[]> {
   try {
-    const response = await fetch("/api/admin/agents/audit-logs");
-    if (response.ok) {
-      const data = await response.json();
-      if (data.logs && Array.isArray(data.logs) && data.logs.length > 0) {
-        return data.logs;
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : "";
+    if (idToken) {
+      const response = await fetch("/api/admin/agents/audit-logs", {
+        headers: { Authorization: `Bearer ${idToken}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.logs && Array.isArray(data.logs)) {
+          return data.logs;
+        }
       }
     }
   } catch (err) {
@@ -1492,42 +1275,10 @@ export async function getAiAgentAuditLogs(): Promise<AiAgentAuditLogEntry[]> {
       return snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as AiAgentAuditLogEntry));
     }
   } catch (err) {
-    console.warn("Direct Firestore audit logs query fallback:", err);
+    console.warn("Direct Firestore audit logs query notice:", err);
   }
 
-  // Fallback initial seeds
-  return [
-    {
-      id: "log_init_01",
-      agentType: "compliance_guardian",
-      action: "AUTONOMOUS_CRON_AUDIT",
-      details: "Audited 142 B2B Gotham housing units & 88 verified trader Gas Safe / EICR certificates. 0 critical SLA breaches detected.",
-      summary: "Compliance audit passed cleanly with 100% statutory coverage.",
-      timestamp: new Date(Date.now() - 3600000 * 2).toISOString(),
-      status: "success",
-      triggerSource: "autonomous_cron"
-    },
-    {
-      id: "log_init_02",
-      agentType: "sentinel_guard",
-      action: "AUTONOMOUS_ANOMALY_SCAN",
-      details: "Scanned user registrations & IP telemetry over last 120 minutes. All profiles cleared Sybil / disposable domain filters.",
-      summary: "0 Sybil profiles detected.",
-      timestamp: new Date(Date.now() - 3600000 * 4).toISOString(),
-      status: "success",
-      triggerSource: "autonomous_cron"
-    },
-    {
-      id: "log_init_03",
-      agentType: "materials_arbitrage",
-      action: "BROADCAST_ARBITRAGE_ALERT",
-      details: "Broadcasted flash trade savings for 15mm Copper Pipe (27.1% off at Travis Perkins) to 38 active verified plumbers.",
-      summary: "38 tradespeople notified via in-app TradeOS alert.",
-      timestamp: new Date(Date.now() - 3600000 * 7).toISOString(),
-      status: "executed",
-      triggerSource: "admin_one_click"
-    }
-  ];
+  return [];
 }
 
 /**
@@ -1546,21 +1297,22 @@ export async function logAiAgentAuditAction(entry: Partial<AiAgentAuditLogEntry>
   };
 
   try {
-    await fetch("/api/admin/agents/audit-logs", {
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : "";
+    const res = await fetch("/api/admin/agents/audit-logs", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+      },
       body: JSON.stringify(fullEntry)
     });
+    if (!res.ok) {
+      throw new Error(`Audit log endpoint rejected (${res.status})`);
+    }
     return true;
   } catch (err) {
-    try {
-      const logsCol = collection(db, "ai_agent_audit_logs");
-      await setDoc(doc(logsCol), fullEntry);
-      return true;
-    } catch (e) {
-      console.warn("Failed to write audit log:", e);
-      return false;
-    }
+    console.warn("Failed to write agent audit log via server:", err);
+    return false;
   }
 }
 

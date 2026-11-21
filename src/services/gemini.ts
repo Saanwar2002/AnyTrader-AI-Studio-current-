@@ -128,6 +128,9 @@ export interface MonetizationOpportunity {
   type: "fast_pass" | "premium_lead" | "subscription_upgrade" | "featured_profile";
   title: string;
   description: string;
+  impact: "High" | "Medium" | "Low";
+  targetRole: "homeowner" | "tradesperson" | "business" | "all";
+  action: string;
   potentialMonthlyValueGBP: number;
   unlockedFeatures: string[];
   conversionTips: string[];
@@ -405,11 +408,21 @@ export interface TradeBotStreamCallbacks {
   onError?: (error: any) => void;
 }
 
+export class TradeBotHttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "TradeBotHttpError";
+    this.status = status;
+  }
+}
+
 export async function callTradeBotStream(
   userMessage: string,
   history: { role: "user" | "model"; text: string }[],
   userContext?: TradeBotUserContext,
-  callbacks?: TradeBotStreamCallbacks
+  callbacks?: TradeBotStreamCallbacks,
+  signal?: AbortSignal
 ): Promise<{ text: string; sources: { title: string; url: string }[]; categories?: string[] }> {
   const targetUrl = getApiUrl("/api/gemini/stream");
   const user = auth.currentUser;
@@ -427,6 +440,7 @@ export async function callTradeBotStream(
     const response = await fetch(targetUrl, {
       method: "POST",
       headers,
+      signal,
       body: JSON.stringify({
         task: "callTradeBotStream",
         args: [userMessage, history, userContext]
@@ -434,14 +448,28 @@ export async function callTradeBotStream(
     });
 
     if (!response.ok || !response.body) {
-      throw new Error(`Streaming request failed with status: ${response.status}`);
+      let errMsg = `Streaming request failed with status: ${response.status}`;
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const errBody = await response.json().catch(() => ({}));
+        if (errBody?.error) errMsg = errBody.error;
+      }
+      throw new TradeBotHttpError(errMsg, response.status);
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
+    let streamError: Error | null = null;
 
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel().catch(() => {});
+        const abortErr = new Error("Aborted");
+        abortErr.name = "AbortError";
+        throw abortErr;
+      }
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -456,35 +484,58 @@ export async function callTradeBotStream(
         const dataStr = trimmed.replace(/^data:\s*/, "");
         if (dataStr === "[DONE]") break;
 
+        let parsed: any = null;
         try {
-          const parsed = JSON.parse(dataStr);
-          if (parsed.type === "chunk" && parsed.text) {
-            accumulatedText += parsed.text;
-            callbacks?.onChunk?.(parsed.text, accumulatedText);
-          } else if (parsed.type === "sources" && Array.isArray(parsed.sources)) {
-            sources = parsed.sources;
-            callbacks?.onSources?.(sources);
-          } else if (parsed.type === "categories" && Array.isArray(parsed.categories)) {
-            categories = parsed.categories;
-            callbacks?.onCategories?.(categories);
-          } else if (parsed.type === "error") {
-            throw new Error(parsed.error || "Streaming error occurred");
-          }
-        } catch (e: any) {
-          if (e.message && !e.message.includes("JSON")) {
-            console.warn("SSE event parsing warning:", e);
-          }
+          parsed = JSON.parse(dataStr);
+        } catch {
+          // Ignore malformed/partial JSON frames only
+          continue;
+        }
+
+        if (parsed.type === "chunk" && parsed.text) {
+          accumulatedText += parsed.text;
+          callbacks?.onChunk?.(parsed.text, accumulatedText);
+        } else if (parsed.type === "sources" && Array.isArray(parsed.sources)) {
+          sources = parsed.sources;
+          callbacks?.onSources?.(sources);
+        } else if (parsed.type === "categories" && Array.isArray(parsed.categories)) {
+          categories = parsed.categories;
+          callbacks?.onCategories?.(categories);
+        } else if (parsed.type === "error") {
+          streamError = new Error(parsed.error || "Streaming error occurred");
+          break;
         }
       }
+
+      if (streamError) {
+        await reader.cancel().catch(() => {});
+        throw streamError;
+      }
+    }
+
+    if (!accumulatedText.trim()) {
+      throw new Error("Empty response received from TradeBot stream");
     }
 
     callbacks?.onDone?.(accumulatedText);
     return { text: accumulatedText, sources, categories };
   } catch (error: any) {
+    // Never fall back on user abort or deterministic auth/validation/rate-limit statuses
+    if (error?.name === "AbortError" || signal?.aborted) {
+      throw error;
+    }
+    if (error instanceof TradeBotHttpError && [400, 401, 403, 429].includes(error.status)) {
+      callbacks?.onError?.(error);
+      throw error;
+    }
+
     console.warn("SSE Stream failed, falling back to unary call:", error);
     callbacks?.onError?.(error);
     const fallback = await callTradeBot(userMessage, history, userContext);
-    const fallbackText = typeof fallback === "object" ? fallback.text : fallback;
+    const fallbackText = typeof fallback === "object" ? (fallback.text || "") : String(fallback || "");
+    if (!fallbackText.trim()) {
+      throw new Error("Empty response received from TradeBot");
+    }
     const fallbackSources = typeof fallback === "object" && Array.isArray(fallback.sources) ? fallback.sources : [];
     const fallbackCategories = typeof fallback === "object" && Array.isArray(fallback.categories) ? fallback.categories : [];
     callbacks?.onChunk?.(fallbackText, fallbackText);
@@ -708,9 +759,20 @@ export interface AiCacheStats {
   topIntents: { intent: string; hits: number; sample: string; category: string }[];
 }
 
+async function getOptionalAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const user = auth.currentUser;
+  const token = user ? await user.getIdToken().catch(() => null) : null;
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 export async function getAiCacheStats(): Promise<AiCacheStats> {
   const targetUrl = getApiUrl("/api/gemini/cache-stats");
-  const res = await fetch(targetUrl);
+  const headers = await getOptionalAuthHeaders();
+  const res = await fetch(targetUrl, { headers });
   if (!res.ok) throw new Error("Failed to fetch AI cache stats");
   return res.json().catch(() => ({
     totalRequests: 0,
@@ -726,7 +788,8 @@ export async function getAiCacheStats(): Promise<AiCacheStats> {
 
 export async function clearAiCache(): Promise<{ success: boolean; message: string }> {
   const targetUrl = getApiUrl("/api/gemini/cache-clear");
-  const res = await fetch(targetUrl, { method: "POST" });
+  const headers = await getOptionalAuthHeaders();
+  const res = await fetch(targetUrl, { method: "POST", headers });
   if (!res.ok) throw new Error("Failed to clear AI cache");
   return res.json().catch(() => ({ success: true, message: "Cache cleared" }));
 }
@@ -744,18 +807,22 @@ export async function classifyUnmatchedSearchTerm(term: string, availableCategor
 }
 
 /**
- * Explicitly sends the dynamic category and synonym registry from client to server
+ * Explicitly sends the dynamic category and synonym registry from admin client to server
  */
 export async function syncCategoryRegistryWithServer(categories?: any[], synonyms?: any[] | Record<string, any>): Promise<{ success: boolean; totalCategories: number; lastSyncedAt: number }> {
   try {
+    const user = auth.currentUser;
+    if (!user) {
+      return { success: false, totalCategories: 0, lastSyncedAt: Date.now() };
+    }
     const targetUrl = getApiUrl("/api/gemini/sync-categories");
+    const headers = await getOptionalAuthHeaders();
     const res = await fetch(targetUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ categories, synonyms })
     });
     if (!res.ok) {
-      console.warn("Category registry server sync notice: endpoint returned", res.status);
       return { success: false, totalCategories: 0, lastSyncedAt: Date.now() };
     }
     return await res.json();

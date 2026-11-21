@@ -75,16 +75,20 @@ export function ConsultancyBids() {
         const roleDoc = await getDoc(doc(db, "projectRoles", bidData.projectRoleId));
         if (roleDoc.exists()) {
           const roleData = roleDoc.data();
-          // Mark role as filled
-          await updateDoc(doc(db, "projectRoles", bidData.projectRoleId), {
-            status: "filled"
-          });
+          // Mark role as filled if caller has permission on the role document
+          try {
+            await updateDoc(doc(db, "projectRoles", bidData.projectRoleId), {
+              status: "filled"
+            });
+          } catch (roleUpdateErr) {
+            console.warn("Role status update deferred to project manager:", roleUpdateErr);
+          }
 
           // Map to calendar if a date is set
           if (roleData.requiredDate) {
-            import("firebase/firestore").then(({ addDoc, collection, serverTimestamp }) => {
+            import("firebase/firestore").then(({ addDoc, collection }) => {
               addDoc(collection(db, "calendarEvents"), {
-                consultantId: bidData.consultantId,
+                consultantId: bidData.consultantId || user?.uid,
                 projectId: bidData.projectId,
                 title: `Role: ${roleData.roleName}`,
                 startTime: new Date(roleData.requiredDate).toISOString(),
@@ -94,24 +98,33 @@ export function ConsultancyBids() {
           }
 
           // Fetch project to get managerId
-          const projDoc = await getDoc(doc(db, "projects", bidData.projectId));
-          if (projDoc.exists()) {
-             const projData = projDoc.data();
-             sendNotification(
-               projData.managerId,
-               "Bid Accepted",
-               `A professional has accepted the role: ${roleData.roleName}`,
-               "system",
-               undefined,
-               { projectId: bidData.projectId }
-             ).catch(console.error);
+          let projectManagerId: string | undefined = bidData.managerId;
+          try {
+            const projDoc = await getDoc(doc(db, "projects", bidData.projectId));
+            if (projDoc.exists()) {
+               const projData = projDoc.data();
+               projectManagerId = projData.managerId || projectManagerId;
+               if (projData.managerId) {
+                 sendNotification(
+                   projData.managerId,
+                   "Bid Accepted",
+                   `A professional has accepted the role: ${roleData.roleName}`,
+                   "system",
+                   undefined,
+                   { projectId: bidData.projectId }
+                 ).catch(console.error);
+               }
+            }
+          } catch (projErr) {
+            console.warn("Project lookup skipped:", projErr);
           }
 
           // Add to team members
           import("firebase/firestore").then(({ addDoc, collection }) => {
             addDoc(collection(db, "teamMembers"), {
               projectId: bidData.projectId,
-              consultantId: bidData.consultantId,
+              ...(projectManagerId ? { managerId: projectManagerId } : {}),
+              consultantId: bidData.consultantId || user?.uid,
               role: roleData.roleName,
               accessLevel: "read"
             }).catch(console.error);
@@ -120,6 +133,8 @@ export function ConsultancyBids() {
             if (roleData.requiredDate) {
               addDoc(collection(db, "projectTimelineItems"), {
                 projectId: bidData.projectId,
+                ...(projectManagerId ? { managerId: projectManagerId } : {}),
+                consultantId: bidData.consultantId || user?.uid,
                 title: `${roleData.roleName} Booking Confirmed`,
                 startTime: new Date(roleData.requiredDate).toISOString()
               }).catch(console.error);

@@ -12,6 +12,7 @@ import {
 import { db, auth, sendNotification } from "../firebase";
 import { useAuth } from "./AuthProvider";
 import { cn } from "../lib/utils";
+import { BANNER_AD_DAILY_RATE_GBP } from "../lib/adPricing";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -25,7 +26,7 @@ export default function TradesBannerAdStudio() {
   const [showModal, setShowModal] = useState(false);
   const [headline, setHeadline] = useState("");
   const [durationDays, setDurationDays] = useState(7);
-  const DAILY_RATE = 2.00; // £2.00 per day flat rate
+  const DAILY_RATE = BANNER_AD_DAILY_RATE_GBP; // Canonical £2.00/day flat rate
   const [isSaving, setIsSaving] = useState(false);
   
   // Wallet Top-up modal
@@ -221,16 +222,16 @@ export default function TradesBannerAdStudio() {
       try {
         await sendNotification(
           user.uid,
-          "🚀 Promotion Boost Live!",
-          `Your banner promotion for "${businessTitle}" is now live on homeowner dashboards for ${durationDays} days.`,
+          "⏳ Promotion Submitted for Review",
+          `Your ${durationDays}-day banner promotion for "${businessTitle}" (£${totalCost.toFixed(2)}) has been submitted for moderation review.`,
           "promotion"
         );
       } catch {
         // Non-blocking
       }
 
-      toast.success("Ad Campaign Launched!", {
-        description: `Your profile is now actively promoted on homeowner dashboards for ${durationDays} days.`
+      toast.success("Campaign Submitted for Review!", {
+        description: `Your ${durationDays}-day promotion (£${totalCost.toFixed(2)}) is pending admin approval before going live.`
       });
       setShowModal(false);
       setHeadline("");
@@ -511,6 +512,15 @@ export default function TradesBannerAdStudio() {
                         <span className="bg-slate-100 text-slate-600 text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md">
                           Expired
                         </span>
+                      ) : (ad.approvalStatus === "pending_review" || ad.approvalStatus === "pending") ? (
+                        <span className="bg-blue-100 text-blue-800 text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md flex items-center gap-1">
+                          <Clock className="w-3 h-3" />
+                          Pending Review
+                        </span>
+                      ) : ad.approvalStatus === "rejected" ? (
+                        <span className="bg-red-100 text-red-800 text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md">
+                          Rejected
+                        </span>
                       ) : ad.isActive ? (
                         <span className="bg-emerald-100 text-emerald-800 text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md flex items-center gap-1">
                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
@@ -575,7 +585,7 @@ export default function TradesBannerAdStudio() {
                     </button>
                   </div>
 
-                  {!ad.isExpired && (
+                  {!ad.isExpired && ad.approvalStatus === "approved" && (
                     <button 
                       onClick={() => handleToggleActive(ad)}
                       className={cn(

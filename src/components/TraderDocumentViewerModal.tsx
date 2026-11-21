@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { UnifiedTrustBadge, getTraderUnifiedTrustBadges } from "@/src/lib/trustBadges";
 import { cn } from "@/src/lib/utils";
+import { openSafeExternalUrl, sanitizeExternalUrl } from "@/src/lib/safeExternalUrl";
 
 interface TraderDocumentViewerModalProps {
   isOpen: boolean;
@@ -282,7 +283,7 @@ export const TraderDocumentViewerModal: React.FC<TraderDocumentViewerModalProps>
                       <div className="absolute inset-0 bg-slate-950/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-3">
                         <button
                           type="button"
-                          onClick={() => window.open(activeBadge.docUrl, "_blank")}
+                          onClick={() => openSafeExternalUrl(activeBadge.docUrl)}
                           className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-lg transition-transform active:scale-95"
                         >
                           <ExternalLink className="w-4 h-4" /> View Full Certificate
@@ -293,14 +294,16 @@ export const TraderDocumentViewerModal: React.FC<TraderDocumentViewerModalProps>
 
                   <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1">
                     <span className="truncate">{activeBadge.docName || "Proof_Document.pdf"}</span>
-                    <a
-                      href={activeBadge.docUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-400 hover:text-blue-300 font-bold flex items-center gap-1 underline cursor-pointer"
-                    >
-                      <Download className="w-3.5 h-3.5" /> Download Proof
-                    </a>
+                    {sanitizeExternalUrl(activeBadge.docUrl) ? (
+                      <a
+                        href={sanitizeExternalUrl(activeBadge.docUrl)!}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-400 hover:text-blue-300 font-bold flex items-center gap-1 underline cursor-pointer"
+                      >
+                        <Download className="w-3.5 h-3.5" /> Download Proof
+                      </a>
+                    ) : null}
                   </div>
                 </div>
               </div>

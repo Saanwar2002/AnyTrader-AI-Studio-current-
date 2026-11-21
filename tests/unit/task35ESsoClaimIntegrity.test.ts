@@ -36,6 +36,7 @@ function createMockSsoDb() {
       primaryTrade: "Plumbing",
       category: "Plumbing",
       tierId: "Growth",
+      subscriptionStatus: "active",
       providers: {
         google: "google_sub_bob_456",
       },

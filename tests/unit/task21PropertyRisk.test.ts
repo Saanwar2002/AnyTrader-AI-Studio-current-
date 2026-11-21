@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import * as admin from 'firebase-admin';
 import { initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -588,7 +589,7 @@ describe('V8.2 Task 21 — Real Firebase Emulator & Security Rules Integration',
 
     try {
       const rules = fs.readFileSync(path.resolve(process.cwd(), 'firestore.rules'), 'utf8');
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: { rules, host: '127.0.0.1', port: 8088 },
       });

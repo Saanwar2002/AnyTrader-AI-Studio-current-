@@ -379,6 +379,7 @@ describe("Task 6: Comprehensive Payment Authority & Escrow Security Suite", () =
     id: quoteId,
     jobId,
     tradespersonId: traderId,
+    status: "accepted",
     milestones: [
       {
         id: milestoneId,

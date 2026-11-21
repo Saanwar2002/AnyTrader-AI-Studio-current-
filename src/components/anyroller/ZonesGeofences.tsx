@@ -5,7 +5,7 @@ import {
   Map as MapIcon, Compass, AlertCircle, Save, Check,
   Target, ShieldCheck, HelpCircle, Edit2, CheckCircle, Search
 } from "lucide-react";
-import { db, collection, doc, onSnapshot, getDoc, setDoc, updateDoc, query, where } from "@/src/firebase";
+import { db, collection, doc, onSnapshot, getDoc, setDoc, updateDoc, query, where, limit } from "@/src/firebase";
 import { GoogleMap, useJsApiLoader, MarkerF, CircleF, InfoWindowF, OverlayViewF, OverlayView } from "@react-google-maps/api";
 import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
 import { toast } from "sonner";
@@ -174,9 +174,9 @@ export default function ZonesGeofences() {
     return () => unsub();
   }, []);
 
-  // 2. Fetch driver profiles
+  // 2. Fetch driver profiles (bounded AT-ADMIN-CTRL-05)
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, "users"), (snapshot) => {
+    const unsub = onSnapshot(query(collection(db, "users"), limit(100)), (snapshot) => {
       const profiles: DriverProfile[] = [];
       snapshot.forEach(doc => {
         const d = doc.data();

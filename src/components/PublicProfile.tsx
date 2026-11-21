@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useParams, Link, useNavigate, useLocation } from "react-router-dom";
 import { 
   db, doc, getDoc, collection, query, where, orderBy, onSnapshot, 
@@ -102,6 +102,8 @@ export default function PublicProfile() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const autoOpenedQuoteRef = useRef(false);
+
   useEffect(() => {
     if (location.state?.activeDeal) {
       const isSoldOut = isDealSoldOut(location.state.activeDeal);
@@ -111,15 +113,15 @@ export default function PublicProfile() {
         setSelectedDealForQuote(null);
       }
     }
-    if (location.state?.autoOpenQuoteModal && location.state?.activeDeal) {
-      const isSoldOut = isDealSoldOut(location.state.activeDeal);
-      if (!isSoldOut) {
+    if (location.state?.autoOpenQuoteModal && profile && !isOwnProfile && !autoOpenedQuoteRef.current) {
+      autoOpenedQuoteRef.current = true;
+      if (location.state?.activeDeal && !isDealSoldOut(location.state.activeDeal)) {
         openQuoteModal(location.state.activeDeal);
       } else {
         openQuoteModal(null);
       }
     }
-  }, [location.state]);
+  }, [location.state, profile, isOwnProfile]);
 
   // Smooth scroll to Active Deals when navigated from search deal pill
   useEffect(() => {

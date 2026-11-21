@@ -1,50 +1,67 @@
-import { db, collection, addDoc, serverTimestamp, updateDoc, doc, increment } from "@/src/firebase";
+import { auth } from "@/src/firebase";
 
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error("Authentication required for partner attribution.");
+  }
+  const token = await user.getIdToken();
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+/**
+ * AT-LEAD-02: Routes partner lead creation through the server-verified campaign
+ * attribution endpoint so partnerId, userId, and userRole are derived server-side.
+ */
 export async function generateLead(
   partnerId: string,
   campaignId: string,
-  userId: string,
-  userRole: string,
+  _userId?: string,
+  _userRole?: string,
   data: any = {}
-) {
+): Promise<boolean> {
   try {
-    // 1. Create the lead
-    await addDoc(collection(db, "leads"), {
-      partnerId,
-      campaignId,
-      userId,
-      userRole,
-      status: "new",
-      data,
-      createdAt: serverTimestamp()
+    if (!campaignId) return false;
+    const headers = await getAuthHeaders();
+    const response = await fetch("/api/partner-leads", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        partnerId,
+        campaignId,
+        data: data && typeof data === "object" ? data : {},
+      }),
     });
-
-    // 2. Increment campaign metrics
-    if (campaignId) {
-      await updateDoc(doc(db, "campaigns", campaignId), {
-        leads: increment(1)
-      });
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      console.error("Server rejected partner lead attribution:", errBody?.error || response.status);
+      return false;
     }
-
-    // 3. Notify partner (Simulated for now, could be a real notification)
-    // In a real app, this would trigger a cloud function to send an email/webhook
-    console.log(`Lead distributed to partner ${partnerId}`);
-    
     return true;
   } catch (error) {
-    console.error("Error generating lead:", error);
+    console.error("Error generating server-verified lead:", error);
     return false;
   }
 }
 
-export async function trackClick(campaignId: string) {
+/**
+ * AT-LEAD-02: Routes campaign click tracking through the authenticated,
+ * rate-limited server attribution endpoint.
+ */
+export async function trackClick(campaignId: string): Promise<boolean> {
   try {
-    if (campaignId) {
-      await updateDoc(doc(db, "campaigns", campaignId), {
-        clicks: increment(1)
-      });
-    }
+    if (!campaignId) return false;
+    const headers = await getAuthHeaders();
+    const response = await fetch(`/api/partner-campaigns/${encodeURIComponent(campaignId)}/click`, {
+      method: "POST",
+      headers,
+    });
+    return response.ok;
   } catch (error) {
-    console.error("Error tracking click:", error);
+    console.error("Error tracking campaign click:", error);
+    return false;
   }
 }

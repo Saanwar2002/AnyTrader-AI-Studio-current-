@@ -90,34 +90,31 @@ export class PropertyIntelligenceService {
   }> {
     const propInput: PropertySourceInput = typeof property === 'string' ? { propertyId: property } : property;
 
-    const activeDb = options?.firestoreDb || this.defaultDb || getGlobalIntelligenceDb();
-    if (activeDb) {
-      evidenceRegistry.setDb(activeDb);
-      evidenceLineageValidator.setDb(activeDb);
-
-      try {
-        const propRef = activeDb.collection('properties').doc(propInput.propertyId);
-        const existingDoc = await propRef.get();
-        if (!existingDoc || !existingDoc.exists) {
-          await propRef.set({
-            propertyId: propInput.propertyId,
-            propertyType: propInput.propertyType || 'Residential',
-            address: propInput.address || '',
-            createdAt: new Date().toISOString(),
-          });
-        }
-      } catch {
-        // Ignore if error occurs during upsert attempt
-      }
-    }
-
-    // 0. Lineage Verification: All historical jobs provided MUST strictly belong to this target property
+    // 0. Lineage Verification FIRST: All historical jobs provided MUST strictly belong to this target property
     for (const job of historicalJobs) {
       const jobPropId = job.propertyId;
       if (jobPropId && jobPropId !== propInput.propertyId) {
         throw new Error(
           `[PropertyLineage Violation] Job '${job.jobId}' belongs to property '${jobPropId}', not target property '${propInput.propertyId}'. Cross-property contamination rejected.`
         );
+      }
+    }
+
+    const activeDb = options?.firestoreDb || this.defaultDb || getGlobalIntelligenceDb();
+    if (activeDb) {
+      evidenceRegistry.setDb(activeDb);
+      evidenceLineageValidator.setDb(activeDb);
+
+      // AT-INTEL-PROP-01: Never synthesize placeholder properties for missing targets.
+      // When persisting against an authoritative Firestore database, reject missing target properties cleanly.
+      if (options?.persist !== false) {
+        const propRef = activeDb.collection('properties').doc(propInput.propertyId);
+        const existingDoc = await propRef.get();
+        if (!existingDoc || !existingDoc.exists) {
+          throw new Error(
+            `[PropertyRollup Error] Target property '${propInput.propertyId}' not found in authoritative 'properties' collection. Placeholder property creation is forbidden.`
+          );
+        }
       }
     }
 

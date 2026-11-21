@@ -143,21 +143,36 @@ export default function BillingManager() {
     if (!user) return;
     setIsProcessing(true);
     try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) {
+        toast.error("Please sign in again to add a payment method.");
+        return;
+      }
       const response = await fetch("/api/create-setup-session", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({
           userId: user.uid,
           successUrl: `${window.location.origin}/billing`,
           cancelUrl: `${window.location.origin}/billing`
         })
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        toast.error(data.error || "Unable to open card setup right now.");
+        return;
+      }
       if (data.url) {
         window.location.href = data.url;
+      } else {
+        toast.error("Card setup URL was not returned by payment provider.");
       }
     } catch (err) {
       console.error("Setup Error:", err);
+      toast.error("Failed to start payment method setup.");
     } finally {
       setIsProcessing(false);
     }

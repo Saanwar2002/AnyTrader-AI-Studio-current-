@@ -1,4 +1,5 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import { sanitizeExternalUrl } from './safeExternalUrl';
 
 export interface AppLauncherPlugin {
   canOpenUrl(options: { url: string }): Promise<{ value: boolean }>;
@@ -122,19 +123,28 @@ export async function openUpdateStore(config?: PlatformUpdateConfig) {
     }
   }
 
-  // Web or fallback store URL handling
-  let fallbackUrl = config?.webAppUrl || "https://anytrader.app";
-  if (platform === "android") {
-    fallbackUrl = config?.androidAppUrl || `https://play.google.com/store/apps/details?id=${appId}`;
-  } else if (platform === "ios") {
-    fallbackUrl = config?.iosAppUrl || "https://apps.apple.com/app/id647000000";
-  }
+  // Web or fallback store URL handling (strictly validated against https:)
+  const defaultStoreUrl =
+    platform === "android"
+      ? `https://play.google.com/store/apps/details?id=${appId}`
+      : platform === "ios"
+        ? "https://apps.apple.com/app/id647000000"
+        : "https://anytrader.app";
+
+  const candidateUrl =
+    platform === "android"
+      ? config?.androidAppUrl
+      : platform === "ios"
+        ? config?.iosAppUrl
+        : config?.webAppUrl;
+
+  const fallbackUrl = sanitizeExternalUrl(candidateUrl) || defaultStoreUrl;
 
   try {
     if (Capacitor.isNativePlatform()) {
-      await AppLauncher.openUrl({ url: fallbackUrl }).catch(() => window.open(fallbackUrl, "_system"));
+      await AppLauncher.openUrl({ url: fallbackUrl }).catch(() => window.open(fallbackUrl, "_system", "noopener,noreferrer"));
     } else {
-      window.open(fallbackUrl, "_blank");
+      window.open(fallbackUrl, "_blank", "noopener,noreferrer");
     }
   } catch (e) {
     window.location.href = fallbackUrl;
@@ -158,7 +168,7 @@ export async function requestStoreReview() {
   const fallbackUrl = Capacitor.getPlatform() === "ios"
     ? "https://apps.apple.com/app/id647000000?action=write-review"
     : `https://play.google.com/store/apps/details?id=${appId}`;
-  window.open(fallbackUrl, "_blank");
+  window.open(fallbackUrl, "_blank", "noopener,noreferrer");
   return false;
 }
 

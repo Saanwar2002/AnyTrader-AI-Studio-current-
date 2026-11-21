@@ -4,10 +4,10 @@ import fs from "fs";
 import path from "path";
 
 describe("Security Vulnerabilities Remediation Audit", () => {
-  // Vulnerability 1: AI endpoints rate limit attached
-  it("Vulnerability 1: verifies aiLimiter is attached to /api/gemini/call and /api/gemini/stream in server.ts", () => {
+  // Vulnerability 1: AI endpoints rate limit attached BEFORE body parser (AT-ADMIN-OPS-07)
+  it("Vulnerability 1: verifies requireAuth and aiLimiter execute before geminiJsonParser on /api/gemini/call and aiLimiter is attached to /api/gemini/stream in server.ts", () => {
     const serverCode = fs.readFileSync(path.resolve(__dirname, "../../server.ts"), "utf-8");
-    expect(serverCode).toContain('app.post("/api/gemini/call", express.json({ limit: "10mb" }), requireAuth, aiLimiter,');
+    expect(serverCode).toContain('app.post("/api/gemini/call", requireAuth, aiLimiter, geminiJsonParser,');
     expect(serverCode).toContain('app.post("/api/gemini/stream", requireAuth, aiLimiter,');
   });
 
@@ -26,12 +26,14 @@ describe("Security Vulnerabilities Remediation Audit", () => {
     expect(rulesCode).toMatch(/match \/dynamic_search_synonyms\/\{synonymId\}[\s\S]*?allow write: if isAdmin\(\);/);
   });
 
-  // Vulnerability 4: advertisements creation restricted by advertiser ID
+  // Vulnerability 4: advertisements creation restricted to admins (server API only) and update/delete scoped to advertiser or admin
   it("Vulnerability 4: verifies advertisements collection restricts create/update/delete by advertiserId or admin in firestore.rules", () => {
     const rulesCode = fs.readFileSync(path.resolve(__dirname, "../../firestore.rules"), "utf-8");
     expect(rulesCode).toContain("match /advertisements/{adId}");
-    expect(rulesCode).toContain("request.resource.data.advertiserUid == request.auth.uid");
-    expect(rulesCode).toContain("request.resource.data.get('advertiserId', request.auth.uid) == request.auth.uid");
+    const adBlock = rulesCode.split("match /advertisements/{adId}")[1].split("match /public_ads/{adId}")[0];
+    expect(adBlock).toContain("allow create: if isAdmin();");
+    expect(adBlock).toContain("resource.data.advertiserUid == request.auth.uid");
+    expect(adBlock).toContain("resource.data.get('advertiserId', '') == request.auth.uid");
   });
 
   // Vulnerability 5: consistent admin checks
@@ -66,13 +68,15 @@ describe("Security Vulnerabilities Remediation Audit", () => {
     });
   });
 
-  // Vulnerability 6: Token revocation fallback check
+  // Vulnerability 6: Token revocation fallback check (modularized in src/server/tokenVerification.ts with fail-closed production guard)
   it("Vulnerability 6: verifies verifyTokenSafely inspects user disabled/banned/revocation status on fallback without crashing on disabled Identity Toolkit API", () => {
     const serverCode = fs.readFileSync(path.resolve(__dirname, "../../server.ts"), "utf-8");
-    expect(serverCode).toContain("userRecord.tokensValidAfterTime");
-    expect(serverCode).toContain("Account has been disabled or banned");
-    expect(serverCode).toContain("tokensRevokedAt");
-    expect(serverCode).toContain('authErr?.code === "auth/user-disabled"');
+    const tokenVerifierCode = fs.readFileSync(path.resolve(__dirname, "../../src/server/tokenVerification.ts"), "utf-8");
+    expect(serverCode).toContain("verifyFirebaseIdTokenWithRevocation(token");
+    expect(tokenVerifierCode).toContain("userRecord.tokensValidAfterTime");
+    expect(tokenVerifierCode).toContain("Account has been disabled or banned");
+    expect(tokenVerifierCode).toContain("tokensRevokedAt");
+    expect(tokenVerifierCode).toContain('authErr?.code === "auth/user-disabled"');
   });
 
   // Vulnerability 7: Loose localhost origin check prevention
@@ -205,11 +209,13 @@ describe("Security Vulnerabilities Remediation Audit", () => {
 
   // Part 2 Vulnerability 14: Postcode SSRF and Rate Limiting Protection
   describe("Part 2 - Vulnerability 14: Postcode Proxy SSRF & Rate Limiting", () => {
-    it("verifies server.ts validates postcode regex and applies postcodeLimiter", () => {
+    it("verifies server.ts validates postcode regex, applies postcodeLimiter, and delegates URL-encoded timeout fetch", () => {
       const serverCode = fs.readFileSync(path.resolve(__dirname, "../../server.ts"), "utf-8");
+      const cronWorkersCode = fs.readFileSync(path.resolve(__dirname, "../../src/server/cronWorkers.ts"), "utf-8");
       expect(serverCode).toContain('app.get("/api/postcode/:postcode", postcodeLimiter,');
       expect(serverCode).toContain("/^[A-Z0-9]{2,8}$/.test(formattedPostcode)");
-      expect(serverCode).toContain("encodeURIComponent(formattedPostcode)");
+      expect(serverCode).toContain("fetchPostcodeWithTimeout(");
+      expect(cronWorkersCode).toContain("encodeURIComponent(formattedPostcode)");
     });
   });
 

@@ -1,14 +1,31 @@
 import express from "express";
 import { decrementGothamPropertyUsage, evaluateGothamPropertyQuota } from "./src/server/gothamPropertyQuota.ts";
-import { getSubscriptionIdForProduct, isExplicitMockSubscriptionAllowed, isMockSubscriptionId } from "./src/server/stripeSubscriptionGuards.ts";
+import { getSubscriptionIdForProduct, isExplicitMockSubscriptionAllowed, isMockSubscriptionId, resolveVerifiedSubscriptionTarget } from "./src/server/stripeSubscriptionGuards.ts";
 import { buildLandlordCheckoutFulfillmentPatch, buildSubscriptionLifecyclePatch, extractInvoiceSubscriptionId, isStripeSubscriptionLifecycleEventType, resolveSubscriptionProductMatch } from "./src/server/subscriptionLifecycle.ts";
 import { ownsStripeWebhookClaim } from "./src/server/stripeWebhookIdempotency.ts";
 import { claimStripeEventLease, markStripeEventCompleted, markStripeEventFailed } from "./src/server/stripeWebhookHandler.ts";
-import { generateFinancialReconciliationReport } from "./src/server/reconciliationReport.ts";
+import { generateFinancialReconciliationReport, executeReconciliationOperatorAction } from "./src/server/reconciliationReport.ts";
+import { suspendOrDeleteAccount, reinstateSuspendedAccount, verifyTraderAccountWithProjection } from "./src/server/accountLifecycle.ts";
+import { publishPlatformPricingConfigAtomic } from "./src/server/pricingConfigPublish.ts";
 import { createMediationStakePaymentIntent, confirmMediationStakePayment, recordMediationStakePaymentFailure } from "./src/server/mediationStake.ts";
-import { getRefundEventReconciliationStatus, recordConfirmedRefund } from "./src/server/refundReconciliation.ts";
+import { getRefundEventReconciliationStatus, recordConfirmedRefund, reconcilePaymentRefundAggregates } from "./src/server/refundReconciliation.ts";
 import { listAllChargeRefunds } from "./src/server/stripeRefundPagination.ts";
-import { evaluateCheckoutIntentBinding } from "./src/server/checkoutIntentIntegrity.ts";
+import { evaluateCheckoutIntentBinding, transitionCheckoutIntentState, sweepStaleCheckoutIntents } from "./src/server/checkoutIntentIntegrity.ts";
+import {
+  assertPayoutEligibleRole,
+  ensureStripeAccountForProvider,
+  ensureStripeCustomerIdForUser,
+  reconcileStripeAccountUpdatedWebhook,
+} from "./src/server/stripeConnectHelpers.ts";
+import {
+  executeTransitionRideCommand,
+  executeCompleteRideCommand,
+  executeCancelRideCommand,
+  fulfillTaxiTripCheckout,
+  createDriverFeeSettlementCheckout,
+  fulfillDriverFeeSettlementWebhook,
+  recordDriverOnlineHeartbeat,
+} from "./src/server/rideLifecycleCommands.ts";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import crypto from "crypto";
@@ -25,21 +42,58 @@ import twilio from 'twilio';
 import rateLimit from "express-rate-limit";
 import { startInstantMatchEngine } from "./instantMatchWorker.ts";
 import * as geminiServer from "./src/services/geminiServer.ts";
-import { sendHttpError, BadRequestError, UnauthorizedError, ForbiddenError, NotFoundError, ConflictError, InternalServerError } from "./src/server/httpErrors.ts";
+import { sendHttpError, BadRequestError, UnauthorizedError, ForbiddenError, NotFoundError, ConflictError, InternalServerError, ServiceUnavailableError } from "./src/server/httpErrors.ts";
 import { runProductionChecks } from "./src/server/productionChecks.ts";
+import { isMaintenanceModeActive, invalidateMaintenanceCache, createMaintenanceEmergencyStopMiddleware } from "./src/server/maintenanceGate.ts";
+import { verifyFirebaseIdTokenWithRevocation } from "./src/server/tokenVerification.ts";
+import { buildClaimPropertyTransferUpdate } from "./src/server/propertyTransferCommand.ts";
+import { assertCanReadJobIntelligence } from "./src/server/intelligence/jobIntelligenceAccess.ts";
+import {
+  resolveAdminCapabilityTier,
+  assertAdminCapability,
+  createDualControlApprovalRequest,
+  reviewDualControlApprovalRequest,
+  consumeDualControlApproval,
+  enqueueAdminBroadcastCommand,
+  upsertFeatureFlagCommand,
+  listFeatureFlagsCommand,
+  getOperationalHealthSnapshot,
+  DUAL_CONTROL_THRESHOLD_GBP,
+  type AdminCapabilityTier,
+  type AdminActor,
+} from "./src/server/adminGovernance.ts";
+import { FirestoreRateLimitStore } from "./src/server/distributedRateLimit.ts";
+import {
+  reportOrBlockChatParticipantCommand,
+  unblockChatParticipantCommand,
+  listUserChatBlocksCommand,
+} from "./src/server/chatSafety.ts";
+import {
+  processSmsQueueCommand,
+  runConsultancyRecurringSessionCreatorCommand,
+  runConsultancyScoreRecalculatorCommand,
+  buildCronDispatchResponse,
+  fetchPostcodeWithTimeout,
+} from "./src/server/cronWorkers.ts";
 import { validateJobTransition, validateMilestoneTransition, validateRideTransition, validateQuoteTransition, JobStatus } from "./src/server/stateMachine.ts";
 import { PaymentLedgerEngine } from "./src/server/paymentLedger.ts";
 import { sanitizeRedirectUrl, getAuthoritativeAppUrl } from "./src/server/paymentVerification.ts";
 import { assertResourceOwner, assertCanManageMilestone, sanitizeClientPayload, validateNotificationPayload, authorizeNotificationRequest, isUserAdminClaim } from "./src/server/authorization.ts";
-import { assertCanReview, ReviewType } from "./src/server/reviewAuthorization.ts";
+import { assertCanReview, ReviewType, getJobParticipantIds } from "./src/server/reviewAuthorization.ts";
 import { executeBootstrapProfileCommand, bootstrapProfileSchema } from "./src/server/accountBootstrap.ts";
 import {
   listAuthoritativeNotifications,
   markAuthoritativeNotificationRead,
   deleteAuthoritativeNotification,
   registerAuthoritativePushToken,
+  unregisterAuthoritativePushToken,
+  dispatchAuthoritativeFcmPush,
   sendAuthoritativeChatPush,
 } from "./src/server/notificationEngine.ts";
+import {
+  buildAndroidAssetLinksPayload,
+  buildAppleAppSiteAssociationPayload,
+} from "./src/server/mobileDeepLinks.ts";
 import {
   generateAuthoritativeSsoToken,
   executeAuthoritativeAccountLinking,
@@ -49,7 +103,7 @@ import { BusinessLogicDefense } from "./src/server/businessLogicDefense.ts";
 import { domainEvents } from "./src/server/domainEvents.ts";
 import { resolveAuthoritativeLineItem, SERVER_PRICING_CATALOG, calculateGothamSaaSPlanServer, getDynamicFirestoreConfigs } from "./src/server/pricingCatalog.ts";
 import { resolveTrustedCanonicalIdentity } from "./src/server/identity.ts";
-import { executeCreateJobCommand, resolveCreateJobQuota } from "./src/server/createJobCommand.ts";
+import { executeCreateJobCommand, executeUpdateJobCommand, resolveCreateJobQuota } from "./src/server/createJobCommand.ts";
 import { executeQuoteCommand, executeAcceptQuoteCommand } from "./src/server/quoteCommands.ts";
 import { executeAcceptRideCommand } from "./src/server/driverAuthorization.ts";
 import { executeCreateTripPaymentCommand } from "./src/server/tripPaymentAuthorization.ts";
@@ -60,7 +114,11 @@ import {
   sanitizeJobToPublicCard,
   startPublicPropertiesSync,
   backfillPublicProperties,
-  sanitizePropertyToPublicPassport
+  sanitizePropertyToPublicPassport,
+  isPropertyEligibleForPublicPassport,
+  startPublicAdsSync,
+  backfillPublicAds,
+  isDirectJob
 } from "./src/server/projectionSync.ts";
 import {
   jobIntelligenceService,
@@ -101,11 +159,16 @@ import {
   aiTrainingUsageControlsService,
   AiUsageControlsSecurityError,
   AiUsageControlsValidationError,
+  computeJobAnalysisVersionHash,
+  computeSha256,
   DataRetentionService,
   dataRetentionService,
   DataRetentionSecurityError,
   DataRetentionValidationError,
+  DataRetentionNotFoundError,
 } from "./src/server/intelligence/index.ts";
+import { enqueueOutreachMessageCommand, listOutreachQueueCommand } from "./src/server/outreachQueue.ts";
+import { updateFieldEntityWithOwnershipGuard } from "./src/server/fieldOperationsCommands.ts";
 import { executeDriverPayoutOrchestrationCommand } from "./src/server/driverPayoutOrchestration.ts";
 import {
   runBootstrapSequence,
@@ -113,6 +176,36 @@ import {
   verifyIntelligenceHandlersRegistered,
   BootstrapLifecycleHooks
 } from "./src/server/bootstrap.ts";
+import {
+  acquireSchedulerLock,
+  renewSchedulerLeaseHeartbeat,
+  releaseSchedulerLock,
+} from "./src/server/schedulerLock.ts";
+import { dispatchTransactionalEmail } from "./src/server/emailTransport.ts";
+import {
+  createAndDispatchStaffInvitation,
+  acceptStaffInvitationToken,
+  StaffInvitationError,
+} from "./src/server/staffInvitations.ts";
+import {
+  parseAdminBackfillOptions,
+  BackfillValidationError,
+} from "./src/server/intelligence/backfillEngine.ts";
+import { isStripeChargebackEventType, processStripeChargebackEvent } from "./src/server/chargebackLifecycle.ts";
+import { filterEligibleLeadRecipients } from "./src/server/leadDistribution.ts";
+import { createManualInvoiceCommand } from "./src/server/invoiceCreation.ts";
+import { respondToInstantMatchAttempt } from "./src/server/instantMatchEligibility.ts";
+import {
+  createBannerAdCommand,
+  createCpcCampaignCommand,
+  moderateAdCommand,
+  processAdAutoTopUpCommand,
+  toggleAdActiveCommand,
+  topUpAdCampaignCommand,
+  trackSponsoredAdEventCommand,
+  updateAdAutoTopUpSettingsCommand,
+} from "./src/server/adEngine.ts";
+import { executeProviderPayoutCommand } from "./src/server/providerPayoutCommand.ts";
 
 dotenv.config();
 
@@ -578,6 +671,9 @@ async function getCachedConfig(docId: string): Promise<any> {
             (docSnap) => {
               const data = docSnap.exists ? docSnap.data() : null;
               configCache.set(docId, data);
+              if (docId === "global") {
+                invalidateMaintenanceCache(Boolean(data?.maintenanceMode === true));
+              }
               if (!isResolved) {
                 isResolved = true;
                 resolve();
@@ -614,6 +710,10 @@ async function getCachedConfig(docId: string): Promise<any> {
 // Scheduled task: Daily Profitability Aggregation
 async function runDailyAggregation() {
   if (!db) return;
+  if (await isMaintenanceModeActive({ db })) {
+    console.log("[Maintenance] Daily aggregation skipped (maintenance mode active).");
+    return;
+  }
   console.log("Running daily profitability aggregation...");
   try {
     // Only fetch tradespeople
@@ -669,83 +769,71 @@ async function runDailyAggregation() {
   }
 }
 
-// Distributed Cron Lease Locking Helper (Task 5.4)
+// Distributed Cron Lease Locking Helper (Fail-Closed + Heartbeat Fencing)
 async function acquireCronLock(jobName: string, lockDurationMs: number = 60000): Promise<boolean> {
-  if (!db) return true;
-  try {
-    const lockRef = db.collection("cron_locks").doc(jobName);
-    const now = Date.now();
-    return await db.runTransaction(async (t) => {
-      const snap = await t.get(lockRef);
-      if (snap.exists) {
-        const data = snap.data();
-        const lastRun = data?.lastRunAt?.toMillis ? data.lastRunAt.toMillis() : (data?.timestamp || 0);
-        if (now - lastRun < lockDurationMs) {
-          return false; // Lock is still held by another instance
-        }
-      }
-      t.set(lockRef, {
-        jobName,
-        lastRunAt: admin.firestore.FieldValue.serverTimestamp(),
-        timestamp: now,
-        instanceId: process.env.K_REVISION || process.env.HOSTNAME || "local"
-      }, { merge: true });
-      return true;
-    });
-  } catch (err: any) {
-    const msg = err?.message || String(err);
-    if (!msg.includes("PERMISSION_DENIED") && !msg.includes("UNAUTHENTICATED")) {
-      console.warn(`Distributed lock check for ${jobName} bypassed on error:`, err);
+  const res = await acquireSchedulerLock(db, jobName, lockDurationMs);
+  return res.acquired;
+}
+
+async function runWithSchedulerLease<T>(
+  jobName: string,
+  lockDurationMs: number,
+  work: (leaseCtx: { isFenced: () => boolean }) => Promise<T>
+): Promise<{ acquired: boolean; fencedOut: boolean; reason?: string; result?: T }> {
+  const lease = await acquireSchedulerLock(db, jobName, lockDurationMs);
+  if (!lease.acquired || !lease.leaseToken) {
+    return { acquired: false, fencedOut: false, reason: lease.reason || "lock_unavailable" };
+  }
+
+  let fencedOut = false;
+  const heartbeatEveryMs = Math.max(2000, Math.floor(lockDurationMs / 3));
+  const timer = setInterval(async () => {
+    const hb = await renewSchedulerLeaseHeartbeat(db, jobName, lease.leaseToken, lockDurationMs);
+    if (!hb.renewed && hb.fencedOut) {
+      fencedOut = true;
+      console.warn(`[SchedulerLease] Worker '${jobName}' fenced out (${hb.reason}); stopping iteration.`);
     }
-    return true; // Fallback to allowing execution if lock check fails
+  }, heartbeatEveryMs);
+  if (typeof (timer as any).unref === "function") {
+    (timer as any).unref();
+  }
+
+  try {
+    const result = await work({ isFenced: () => fencedOut });
+    return { acquired: true, fencedOut, result };
+  } finally {
+    clearInterval(timer);
+    await releaseSchedulerLock(db, jobName, lease.leaseToken);
   }
 }
 
-// Scheduled task: Process SMS Queue
+// Scheduled task: Process SMS Queue (AT-ADMIN-OPS-03 strict Twilio config gate)
 async function processSmsQueue() {
-  if (!db) return;
-  const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN 
-      ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
-      
-  try {
-    const queueSnap = await db.collection("sms_queue").where("status", "==", "pending").limit(50).get();
-    if (queueSnap.empty) return;
-
-    for (const docSnap of queueSnap.docs) {
-      const data = docSnap.data();
-      if (!data.to || !data.body) {
-        await docSnap.ref.update({ status: "failed", error: "Missing to or body" });
-        continue;
-      }
-
-      if (twilioClient) {
-        try {
-          const msg = await twilioClient.messages.create({
-            body: data.body,
-            from: process.env.TWILIO_PHONE_NUMBER || "AnyTrader",
-            to: data.to,
-          });
-          await docSnap.ref.update({ status: "sent", sentAt: admin.firestore.FieldValue.serverTimestamp(), twilioSid: msg.sid });
-        } catch (err: any) {
-          console.error("Twilio send error:", err.message);
-          await docSnap.ref.update({ status: "failed", error: err.message });
-        }
-      } else {
-        console.log(`Mock sent SMS to ${data.to}: ${data.body}`);
-        await docSnap.ref.update({ status: "sent", sentAt: admin.firestore.FieldValue.serverTimestamp(), mockStatus: true });
-      }
-    }
-  } catch (err: any) {
-    const msg = err?.message || String(err);
-    if (!msg.includes("PERMISSION_DENIED") && !msg.includes("UNAUTHENTICATED") && !msg.includes("Could not load the default credentials")) {
-      console.error("SMS Queue Processor Error:", err);
-    }
+  const maintenanceActive = db ? await isMaintenanceModeActive({ db }) : false;
+  if (maintenanceActive) {
+    console.log("[Maintenance] SMS queue processing paused (maintenance mode active).");
   }
+  return await processSmsQueueCommand({
+    db,
+    env: process.env,
+    twilioFactory: (sid, token) => twilio(sid, token) as any,
+    maintenanceActive,
+  });
 }
 
-// Scheduled task: Background Orchestration for Automated Driver Payouts
-async function runDriverPayoutOrchestration() {
+// Scheduled task: Background Orchestration for Automated Driver Payouts (AT-ADMIN-AUDIT-02)
+async function runDriverPayoutOrchestration(initiatedBy?: {
+  uid: string;
+  email?: string;
+  triggerSource?: "manual_admin" | "cron" | "approval_execution";
+  reason?: string;
+  approvalRequestId?: string;
+}) {
   if (!db) return { success: false, error: "Firebase not initialized" };
+  if (await isMaintenanceModeActive({ db })) {
+    console.log("[Maintenance] Driver payout orchestration paused (maintenance mode active).");
+    return { success: false, pausedByMaintenance: true, processed: 0 };
+  }
   let stripe: any = null;
   try {
     stripe = getStripe();
@@ -756,52 +844,68 @@ async function runDriverPayoutOrchestration() {
   return await executeDriverPayoutOrchestrationCommand({
     db,
     stripeClient: stripe,
+    initiatedBy: initiatedBy || {
+      uid: "system_cron",
+      email: "cron@anytrader.internal",
+      triggerSource: "cron",
+      reason: "Scheduled driver payout orchestration",
+    },
     logger: console,
   });
 }
 
-// Scheduled task: Consultancy Recurring Session Creator
+// Scheduled task: Consultancy Recurring Session Creator (AT-CONS-SCHED-01 real worker + error propagation)
 async function runConsultancyRecurringSessionCreator() {
-  if (!db) return;
-  console.log("Running Consultancy Recurring Session Creator...");
-  try {
-     const recurringEventsSnapshot = await db.collection("calendarEvents")
-      .where("isRecurring", "==", true)
-      .get();
-      
-     console.log(`Checked ${recurringEventsSnapshot.size} recurring events.`);
-  } catch (error: any) {
-     const msg = error?.message || String(error);
-     if (!msg.includes("PERMISSION_DENIED") && !msg.includes("UNAUTHENTICATED") && !msg.includes("Could not load the default credentials")) {
-       console.error("Error in recurring session creator:", error);
-     }
+  const maintenanceActive = db ? await isMaintenanceModeActive({ db }) : false;
+  if (maintenanceActive) {
+    console.log("[Maintenance] Consultancy recurring session creator paused (maintenance mode active).");
   }
+  return await runConsultancyRecurringSessionCreatorCommand(db, { maintenanceActive });
 }
 
-// Scheduled task: Consultancy Match Score Recalculator
+// Scheduled task: Consultancy Match Score Recalculator (AT-CONS-SCHED-01 real worker + error propagation)
 async function runConsultancyScoreRecalculator() {
-  if (!db) return;
-  console.log("Running Consultancy Match Score Recalculator...");
-  try {
-     const usersSnapshot = await db.collection("users").where("role", "==", "consultant").get();
-     console.log(`Recalculated match scores for ${usersSnapshot.size} consultants.`);
-  } catch (error: any) {
-     const msg = error?.message || String(error);
-     if (!msg.includes("PERMISSION_DENIED") && !msg.includes("UNAUTHENTICATED") && !msg.includes("Could not load the default credentials")) {
-       console.error("Error recalculating match scores:", error);
-     }
+  const maintenanceActive = db ? await isMaintenanceModeActive({ db }) : false;
+  if (maintenanceActive) {
+    console.log("[Maintenance] Consultancy match score recalculator paused (maintenance mode active).");
   }
+  return await runConsultancyScoreRecalculatorCommand(db, { maintenanceActive });
 }
 
-// Scheduled task: Autonomous Compliance Guardian Audit
+// Scheduled task: Autonomous Compliance Guardian Audit (Real Firestore Counts)
 async function runComplianceGuardianAudit() {
   if (!db) return;
+  if (await isMaintenanceModeActive({ db })) {
+    console.log("[Maintenance] Compliance Guardian audit paused (maintenance mode active).");
+    return;
+  }
   console.log("🤖 Running Compliance Guardian audit...");
   try {
+    const [tradersSnap, propertiesSnap] = await Promise.all([
+      db.collection("users").where("role", "==", "tradesperson").limit(200).get(),
+      db.collection("properties").limit(200).get(),
+    ]);
+    const unverifiedTraders = tradersSnap.docs.filter((d) => !d.data().idVerified && !d.data().verifiedTrader).length;
+    const expiringGasSafe = tradersSnap.docs.filter((d) => {
+      const exp = d.data().gasSafeExpiry;
+      return exp && Date.parse(exp) - Date.now() <= 30 * 86_400_000;
+    }).length;
+    const expiringCp12 = propertiesSnap.docs.filter((d) => {
+      const exp = d.data().cp12Expiry;
+      return exp && Date.parse(exp) - Date.now() <= 30 * 86_400_000;
+    }).length;
+
     await db.collection("ai_agent_audit_logs").add({
       agentType: "compliance_guardian",
       action: "AUTONOMOUS_CRON_AUDIT",
-      details: "Audited B2B Gotham housing units & verified Gas Safe / EICR statutory certificates.",
+      details: `Audited ${propertiesSnap.size} properties (${expiringCp12} CP12 due <=30d) and ${tradersSnap.size} traders (${unverifiedTraders} unverified, ${expiringGasSafe} Gas Safe due <=30d).`,
+      metrics: {
+        propertiesAudited: propertiesSnap.size,
+        expiringCp12,
+        tradersAudited: tradersSnap.size,
+        unverifiedTraders,
+        expiringGasSafe,
+      },
       timestamp: new Date().toISOString(),
       status: "success",
       triggerSource: "autonomous_cron"
@@ -814,15 +918,41 @@ async function runComplianceGuardianAudit() {
   }
 }
 
-// Scheduled task: Autonomous Sentinel Guard Anomaly Scan
+// Scheduled task: Autonomous Sentinel Guard Anomaly Scan (Real Firestore Telemetry)
 async function runSentinelAnomalyScan() {
   if (!db) return;
+  if (await isMaintenanceModeActive({ db })) {
+    console.log("[Maintenance] Sentinel Guard anomaly scan paused (maintenance mode active).");
+    return;
+  }
   console.log("🛡️ Running Sentinel Guard anomaly check...");
   try {
+    const usersSnap = await db.collection("users").limit(200).get();
+    const phoneCounts: Record<string, number> = {};
+    const disposableDomains = new Set(["mailinator.com", "tempmail.com", "10minutemail.com", "guerrillamail.com", "trashmail.com"]);
+    let disposableEmailCount = 0;
+
+    usersSnap.docs.forEach((d) => {
+      const u = d.data() || {};
+      const emailDomain = typeof u.email === "string" ? u.email.split("@")[1]?.toLowerCase() : "";
+      if (emailDomain && disposableDomains.has(emailDomain)) disposableEmailCount++;
+      const phone = typeof (u.phone || u.phoneNumber) === "string" ? (u.phone || u.phoneNumber).replace(/\s+/g, "") : "";
+      if (phone.length > 5) {
+        phoneCounts[phone] = (phoneCounts[phone] || 0) + 1;
+      }
+    });
+
+    const duplicatePhoneClusters = Object.values(phoneCounts).filter((c) => c > 1).length;
+
     await db.collection("ai_agent_audit_logs").add({
       agentType: "sentinel_guard",
       action: "AUTONOMOUS_ANOMALY_SCAN",
-      details: "Scanned user registrations & IP telemetry over last window. All profiles cleared Sybil / disposable domain filters.",
+      details: `Scanned ${usersSnap.size} user accounts: ${duplicatePhoneClusters} duplicate phone cluster(s), ${disposableEmailCount} disposable email(s).`,
+      metrics: {
+        scannedUsers: usersSnap.size,
+        duplicatePhoneClusters,
+        disposableEmailCount,
+      },
       timestamp: new Date().toISOString(),
       status: "success",
       triggerSource: "autonomous_cron"
@@ -844,50 +974,62 @@ const startBackgroundSchedulers = () => {
 
   // 1. Run SMS processor every minute
   cron.schedule("* * * * *", async () => {
-    const locked = await acquireCronLock("sms_queue", 45000);
-    if (locked) await processSmsQueue();
+    await runWithSchedulerLease("sms_queue", 45000, async () => processSmsQueue());
   });
 
   // 2. Schedule: 00:30 every day for profitability aggregation
   cron.schedule("30 0 * * *", async () => {
-    const locked = await acquireCronLock("daily_aggregation", 300000);
-    if (locked) await runDailyAggregation();
+    await runWithSchedulerLease("daily_aggregation", 300000, async () => runDailyAggregation());
   });
 
   // 3. Schedule: 01:00 every day for driver payouts
   cron.schedule("0 1 * * *", async () => {
-    const locked = await acquireCronLock("driver_payouts", 300000);
-    if (locked) await runDriverPayoutOrchestration();
+    await runWithSchedulerLease("driver_payouts", 300000, async () => runDriverPayoutOrchestration());
   });
 
   // 4. Schedule: 02:00 every day for recurring sessions
   cron.schedule("0 2 * * *", async () => {
-    const locked = await acquireCronLock("recurring_sessions", 300000);
-    if (locked) await runConsultancyRecurringSessionCreator();
+    await runWithSchedulerLease("recurring_sessions", 300000, async () => runConsultancyRecurringSessionCreator());
   });
 
   // 5. Schedule: 02:30 every day for matching scores
   cron.schedule("30 2 * * *", async () => {
-    const locked = await acquireCronLock("match_scores", 300000);
-    if (locked) await runConsultancyScoreRecalculator();
+    await runWithSchedulerLease("match_scores", 300000, async () => runConsultancyScoreRecalculator());
   });
 
   // 6. 06:00 Daily Compliance Guardian Audit
   cron.schedule("0 6 * * *", async () => {
-    const locked = await acquireCronLock("compliance_audit", 300000);
-    if (locked) await runComplianceGuardianAudit();
+    await runWithSchedulerLease("compliance_audit", 300000, async () => runComplianceGuardianAudit());
   });
 
   // 7. Every 2 hours Sentinel Anomaly Scan
   cron.schedule("0 */2 * * *", async () => {
-    const locked = await acquireCronLock("sentinel_scan", 300000);
-    if (locked) await runSentinelAnomalyScan();
+    await runWithSchedulerLease("sentinel_scan", 300000, async () => runSentinelAnomalyScan());
+  });
+
+  // 8. Every 2 hours Continuous Refund Aggregate Drift Reconciliation (AT-PAY-07)
+  cron.schedule("15 */2 * * *", async () => {
+    await runWithSchedulerLease("refund_reconciliation", 180000, async () =>
+      reconcilePaymentRefundAggregates(db, getOptionalStripeClient())
+    );
+  });
+
+  // 9. Every 30 minutes Stale Stripe Checkout Intent Sweeper (AT-PAY-15)
+  cron.schedule("*/30 * * * *", async () => {
+    await runWithSchedulerLease("sweep_payment_intents", 120000, async () =>
+      sweepStaleCheckoutIntents({ db, stripeClient: getOptionalStripeClient() })
+    );
   });
 };
 
 // Decoupled Matching Engine Cycle Execution
-async function runMatchingCycle() {
+async function runMatchingCycle(leaseCtx?: { isFenced: () => boolean }) {
   if (!db) return;
+  if (leaseCtx?.isFenced()) return;
+  if (await isMaintenanceModeActive({ db })) {
+    console.log("[Maintenance] Matching cycle paused (maintenance mode active).");
+    return;
+  }
   try {
     console.log("Polling trader_notifications...");
       
@@ -935,6 +1077,7 @@ async function runMatchingCycle() {
           .get();
 
         for (const rideDoc of pendingRidesSnapshot.docs) {
+          if (leaseCtx?.isFenced()) break;
           const ride = rideDoc.data();
           const pickupLat = ride.pickupLat; 
           const pickupLng = ride.pickupLng;
@@ -1055,6 +1198,7 @@ async function runMatchingCycle() {
           .get();
 
         for (const rideDoc of expiredOffersSnapshot.docs) {
+          if (leaseCtx?.isFenced()) break;
           const ride = rideDoc.data();
           if (new Date(ride.offerExpiresAt).getTime() < Date.now()) {
             console.log(`Offer for Ride ${rideDoc.id} expired. Auto-declining for driver ${ride.assignedDriverId}`);
@@ -1081,6 +1225,7 @@ async function runMatchingCycle() {
       
       // Original matching logic...
       for (const doc of snapshot.docs) {
+        if (leaseCtx?.isFenced()) break;
         const notification = doc.data();
         console.log("New emergency job notification:", notification);
         
@@ -1251,10 +1396,9 @@ const startMatchingSystem = async () => {
   }
   console.log("Starting server-side matching system loop...");
   setInterval(async () => {
-    const locked = await acquireCronLock("matching_system", 8000);
-    if (locked) {
-      await runMatchingCycle();
-    }
+    await runWithSchedulerLease("matching_system", 12000, async (leaseCtx) => {
+      await runMatchingCycle(leaseCtx);
+    });
   }, 10000);
 };
 
@@ -1271,86 +1415,20 @@ function getStripe(): Stripe {
   return stripeClient;
 }
 
+function getOptionalStripeClient(): Stripe | undefined {
+  try {
+    return getStripe();
+  } catch {
+    return undefined;
+  }
+}
+
 // --- Authentication Middlewares ---
 async function verifyTokenSafely(token: string) {
-  try {
-    return await admin.auth().verifyIdToken(token, true);
-  } catch (err: any) {
-    if (
-      err?.message?.includes("identitytoolkit.googleapis.com") ||
-      err?.code === "auth/internal-error" ||
-      err?.message?.includes("SERVICE_DISABLED") ||
-      err?.message?.includes("accessNotConfigured") ||
-      err?.message?.includes("has not been used in project")
-    ) {
-      if (process.env.NODE_ENV === "production" && process.env.ALLOW_DEGRADED_AUTH !== "true") {
-        console.error("[Auth] Identity Toolkit unavailable; refusing unverified token without revocation checks in production.");
-        throw new UnauthorizedError("Authentication service temporarily unavailable. Please retry.");
-      }
-      console.warn("[Auth Warning] Identity Toolkit API service unavailable; validating signature and cross-checking user revocation in database.");
-      const decodedToken = await admin.auth().verifyIdToken(token, false);
-
-      // 1. Attempt checking user record via Admin SDK if accessible
-      try {
-        const userRecord = await admin.auth().getUser(decodedToken.uid);
-        if (userRecord.disabled) {
-          throw new UnauthorizedError("Account has been disabled or banned.");
-        }
-        if (userRecord.tokensValidAfterTime) {
-          const validSinceSec = Math.floor(new Date(userRecord.tokensValidAfterTime).getTime() / 1000);
-          if (decodedToken.auth_time < validSinceSec) {
-            throw new UnauthorizedError("Authentication token has been revoked.");
-          }
-        }
-      } catch (authErr: any) {
-        if (authErr instanceof UnauthorizedError) {
-          throw authErr;
-        }
-        if (authErr?.code === "auth/user-disabled") {
-          throw new UnauthorizedError("Account has been disabled or banned.");
-        }
-        // If Identity Toolkit lookup errors (e.g. Identity Toolkit API is disabled in GCP project),
-        // fall through to Firestore user security status below without re-throwing the API error.
-      }
-
-      // 2. Database verification: ensure account is not suspended, banned, disabled, or revoked in Firestore
-      const targetDb = db || (admin.apps.length > 0 ? admin.firestore() : null);
-      if (targetDb) {
-        try {
-          const userDoc = await targetDb.collection("users").doc(decodedToken.uid).get();
-          if (userDoc.exists) {
-            const userData = userDoc.data() || {};
-            if (
-              userData.disabled === true ||
-              userData.isSuspended === true ||
-              userData.isBanned === true ||
-              userData.banned === true ||
-              userData.status === "banned" ||
-              userData.status === "suspended"
-            ) {
-              throw new UnauthorizedError("Account has been suspended, banned, or disabled.");
-            }
-            if (userData.tokensRevokedAt && decodedToken.auth_time) {
-              const revokedTimestamp = typeof userData.tokensRevokedAt.toMillis === "function"
-                ? Math.floor(userData.tokensRevokedAt.toMillis() / 1000)
-                : Math.floor(new Date(userData.tokensRevokedAt).getTime() / 1000);
-              if (decodedToken.auth_time < revokedTimestamp) {
-                throw new UnauthorizedError("Authentication token has been revoked.");
-              }
-            }
-          }
-        } catch (dbErr: any) {
-          if (dbErr instanceof UnauthorizedError) {
-            throw dbErr;
-          }
-          console.warn("[Auth Fallback Warning] Database user status check encountered issue:", dbErr?.message || dbErr);
-        }
-      }
-
-      return decodedToken;
-    }
-    throw err;
-  }
+  return verifyFirebaseIdTokenWithRevocation(token, {
+    adminAuth: admin.auth(),
+    getDb: () => db || (admin.apps.length > 0 ? admin.firestore() : null),
+  });
 }
 
 /**
@@ -1429,6 +1507,26 @@ const requireAdmin = async (req: express.Request, res: express.Response, next: e
       return res.status(403).json({ error: "Forbidden: requires admin privileges" });
     }
 
+    // AT-ADMIN-AUTH-01: Resolve explicit admin capability tier (support_readonly | financial_operator | super_admin)
+    let userDocData: Record<string, any> | null = null;
+    if (db && decodedToken?.uid) {
+      try {
+        const userSnap = await db.collection("users").doc(decodedToken.uid).get();
+        if (userSnap.exists) {
+          userDocData = userSnap.data() || null;
+        }
+      } catch {
+        // Non-blocking fallback to token claims
+      }
+    }
+    const adminTier = resolveAdminCapabilityTier(decodedToken, userDocData);
+    (req as any).adminTier = adminTier;
+    (req as any).adminActor = {
+      uid: decodedToken.uid,
+      email: decodedToken.email || userDocData?.email || "",
+      tier: adminTier,
+    } as AdminActor;
+
     // Auto-migrate verified admin by applying custom claim for future requests if missing
     if (decodedToken.admin !== true || decodedToken.isAdmin !== true) {
       try {
@@ -1438,6 +1536,7 @@ const requireAdmin = async (req: express.Request, res: express.Response, next: e
           ...currentClaims,
           admin: true,
           isAdmin: true,
+          adminTier,
         });
       } catch (claimErr) {
         // Non-blocking if identity toolkit is disabled
@@ -1449,6 +1548,22 @@ const requireAdmin = async (req: express.Request, res: express.Response, next: e
     console.error("Admin check err:", error);
     return res.status(500).json({ error: "Internal server error during admin validation" });
   }
+};
+
+const requireAdminTier = (requiredTier: AdminCapabilityTier, actionLabel?: string) => {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    try {
+      const actor: AdminActor = (req as any).adminActor || {
+        uid: (req as any).user?.uid,
+        email: (req as any).user?.email,
+        tier: (req as any).adminTier || "support_readonly",
+      };
+      assertAdminCapability(actor, requiredTier, actionLabel);
+      next();
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  };
 };
 
 const timingSafeEqualStr = (a: string, b: string) => {
@@ -1572,15 +1687,22 @@ async function startServer() {
       "media-src 'self' data: blob: https:",
       "connect-src 'self' https://*.googleapis.com https://*.google.com https://*.firebaseio.com https://api.stripe.com https://*.cloudfunctions.net https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app wss://*.firebaseio.com https://api.postcodes.io",
       "frame-src 'self' https://js.stripe.com https://accounts.google.com https://*.firebaseapp.com https://*.google.com",
-      "frame-ancestors 'self' https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://*.google.com https://ai.studio https://studio.google.com",
+      "frame-ancestors 'self' https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://*.google.com https://ai.studio https://*.ai.studio https://studio.google.com https://*.googleusercontent.com https://*.usercontent.goog",
       "object-src 'none'",
       "base-uri 'self'",
     ].join('; ');
 
     res.setHeader("Content-Security-Policy", csp);
 
-    // 3. Clickjacking Protection fallback for legacy clients
-    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    // 3. Clickjacking Protection fallback for legacy clients in standalone production
+    // Skip X-Frame-Options in development / AI Studio preview containers where embedded framing is governed by CSP frame-ancestors.
+    const isAiStudioContainer = Boolean(
+      process.env.APPLET_ID ||
+      (process.env.K_SERVICE && process.env.K_SERVICE.startsWith("ais-"))
+    );
+    if (process.env.NODE_ENV === "production" && !isAiStudioContainer) {
+      res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    }
 
     // 4. MIME-type sniffing defense
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -1614,10 +1736,12 @@ async function startServer() {
     return (req as any).user?.uid || normalizeIpForRateLimiting(req.ip || req.socket.remoteAddress);
   };
 
+  // Distributed Firestore-backed rate limiters for multi-instance Cloud Run consistency (AT-ADMIN-OPS-06)
   const aiLimiter = rateLimit({
     windowMs: 1 * 60 * 1000,
     max: 50,
     keyGenerator: limitKeyGenerator,
+    store: new FirestoreRateLimitStore({ prefix: "ai", windowMs: 60_000, getDb: () => db }),
     validate: false,
     message: { error: "Too many AI requests, please try again after a minute" },
   });
@@ -1626,14 +1750,18 @@ async function startServer() {
     windowMs: 1 * 60 * 1000,
     max: 50,
     keyGenerator: limitKeyGenerator,
+    store: new FirestoreRateLimitStore({ prefix: "payment", windowMs: 60_000, getDb: () => db }),
     validate: false,
     message: { error: "Too many payment requests, please try again after a minute" },
   });
+
+  const paymentAttemptAbuseLimiter = AbuseDefenseEngine.createMiddleware("PAYMENT_ATTEMPT");
 
   const postcodeLimiter = rateLimit({
     windowMs: 1 * 60 * 1000,
     max: 30,
     keyGenerator: limitKeyGenerator,
+    store: new FirestoreRateLimitStore({ prefix: "postcode", windowMs: 60_000, getDb: () => db }),
     validate: false,
     message: { error: "Too many postcode lookups, please try again after a minute" },
   });
@@ -1644,6 +1772,7 @@ async function startServer() {
     windowMs: 15 * 60 * 1000,
     max: 5,
     keyGenerator: limitKeyGenerator,
+    store: new FirestoreRateLimitStore({ prefix: "handshake", windowMs: 15 * 60_000, getDb: () => db }),
     validate: false,
     message: { error: "Too many escrow release attempts. Please wait 15 minutes." },
   });
@@ -1652,6 +1781,7 @@ async function startServer() {
     windowMs: 1 * 60 * 1000,
     max: 10,
     keyGenerator: limitKeyGenerator,
+    store: new FirestoreRateLimitStore({ prefix: "review", windowMs: 60_000, getDb: () => db }),
     validate: false,
     message: { error: "Too many review submissions, please try again shortly" },
   });
@@ -1660,6 +1790,7 @@ async function startServer() {
     windowMs: 1 * 60 * 1000,
     max: 1000, // Bounded capacity for rapid navigation, polling, and iframe reloading
     keyGenerator: limitKeyGenerator,
+    store: new FirestoreRateLimitStore({ prefix: "general", windowMs: 60_000, getDb: () => db }),
     validate: false,
     message: { error: "Too many requests, please try again after a minute" },
   });
@@ -2064,6 +2195,26 @@ async function startServer() {
                   type: "mediation_stake",
                   createdAt: admin.firestore.FieldValue.serverTimestamp()
                 });
+                const { ownerIds, traderIds } = getJobParticipantIds(jobData);
+                const counterpartIds = [...new Set([...ownerIds, ...traderIds])].filter(
+                  (uid) => uid && uid !== userId
+                );
+                for (const counterpartUid of counterpartIds) {
+                  tx.set(
+                    db.collection("notifications").doc(`med_stake_sess_${meta.jobId}_${session.id}_${counterpartUid}`),
+                    {
+                      userId: counterpartUid,
+                      title: "Dispute Mediation Stake Confirmed",
+                      message: `A £25.00 mediation stake has been confirmed for "${jobData.title || `Job #${meta.jobId}`}". The dispute is queued for arbitration.`,
+                      type: "status",
+                      read: false,
+                      jobId: meta.jobId,
+                      link: `/job/${meta.jobId}`,
+                      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    },
+                    { merge: true }
+                  );
+                }
               });
             }
             if (meta?.type === 'boost' && meta?.jobId && db) {
@@ -2150,8 +2301,66 @@ async function startServer() {
                 }, { merge: true });
               });
             }
+            if (meta?.type === 'taxi_trip' && meta?.rideId && db) {
+              await fulfillTaxiTripCheckout({
+                db,
+                event,
+                session,
+                intent,
+                eventRef,
+                claimToken,
+              });
+            }
+            if (meta?.type === 'fee_settlement' && db) {
+              await fulfillDriverFeeSettlementWebhook({
+                db,
+                event,
+                session,
+                intent,
+                eventRef,
+                claimToken,
+              });
+            }
+          }
+        await transitionCheckoutIntentState({
+          db,
+          intentId: session.metadata.intentId,
+          nextStatus: "completed",
+          eventId: event.id,
+          sessionId: session.id,
+          paymentIntentId: typeof session.payment_intent === "string"
+            ? session.payment_intent
+            : typeof (session.payment_intent as any)?.id === "string"
+              ? (session.payment_intent as any).id
+              : undefined,
+          eventRef,
+          claimToken,
+          ownsClaimFn: ownsStripeWebhookClaim,
+        });
+      }
+      if (event.type === "checkout.session.expired") {
+        const session = event.data.object as Stripe.Checkout.Session;
+        const intentId = typeof session.metadata?.intentId === "string" ? session.metadata.intentId.trim() : "";
+        let resolvedIntentId = intentId;
+        if (!resolvedIntentId && session.id && db) {
+          const matchedIntent = await db.collection("payment_intents").where("checkoutSessionId", "==", session.id).limit(1).get();
+          if (!matchedIntent.empty) {
+            resolvedIntentId = matchedIntent.docs[0].id;
           }
         }
+        if (resolvedIntentId && db) {
+          await transitionCheckoutIntentState({
+            db,
+            intentId: resolvedIntentId,
+            nextStatus: "expired",
+            eventId: event.id,
+            sessionId: session.id,
+            eventRef,
+            claimToken,
+            ownsClaimFn: ownsStripeWebhookClaim,
+          });
+        }
+      }
       // Reconcile each individual Stripe refund against the original completed ledger entry.
       if (event.type === "charge.refunded" || event.type === "refund.updated") {
         // charge.refunded can arrive while an individual refund is still pending.
@@ -2231,11 +2440,15 @@ async function startServer() {
             reconciledAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         }
       }
-      // Mediation stake payment lifecycle is server-authoritative and validates the reserved attempt.
-      if (event.type === "payment_intent.succeeded" || event.type === "payment_intent.payment_failed") {
+      // Mediation stake & general Checkout intent terminal transition handling
+      if (
+        event.type === "payment_intent.succeeded" ||
+        event.type === "payment_intent.payment_failed" ||
+        event.type === "payment_intent.canceled"
+      ) {
         const pi = event.data.object as Stripe.PaymentIntent;
         const meta = pi.metadata || {};
-        if (meta.type === "mediation_stake") {
+        if (meta.type === "mediation_stake" && event.type !== "payment_intent.canceled") {
           const isSuccess = event.type === "payment_intent.succeeded";
           if (!meta.jobId || !meta.paymentAttemptId || !meta.userId || pi.currency !== "gbp" || pi.amount !== 2500) {
             await db.runTransaction(async (tx: any) => {
@@ -2251,6 +2464,38 @@ async function startServer() {
           } else {
             await recordMediationStakePaymentFailure(db, { jobId: meta.jobId, userId: meta.userId, attemptId: meta.paymentAttemptId, paymentIntentId: pi.id, paymentIntentStatus: pi.status, lastPaymentError: pi.last_payment_error?.message || "Payment attempt failed", serverTimestamp: () => admin.firestore.FieldValue.serverTimestamp() });
             await db.collection("failed_payments").doc(`fail_${event.id}`).set({ paymentIntentId: pi.id, lastError: pi.last_payment_error?.message || "Failed", status: "failed", createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          }
+        } else if (
+          (event.type === "payment_intent.payment_failed" || event.type === "payment_intent.canceled") &&
+          db
+        ) {
+          let resolvedIntentId = typeof meta.intentId === "string" ? meta.intentId.trim() : "";
+          if (!resolvedIntentId && pi.id) {
+            const matchedIntent = await db.collection("payment_intents").where("paymentIntentId", "==", pi.id).limit(1).get();
+            if (!matchedIntent.empty) resolvedIntentId = matchedIntent.docs[0].id;
+          }
+          if (resolvedIntentId) {
+            await transitionCheckoutIntentState({
+              db,
+              intentId: resolvedIntentId,
+              nextStatus: "failed",
+              eventId: event.id,
+              paymentIntentId: pi.id,
+              failureReason:
+                pi.last_payment_error?.message ||
+                (event.type === "payment_intent.canceled" ? "Payment intent canceled" : "Payment attempt failed"),
+              eventRef,
+              claimToken,
+              ownsClaimFn: ownsStripeWebhookClaim,
+            });
+          }
+          if (event.type === "payment_intent.payment_failed") {
+            await db.collection("failed_payments").doc(`fail_${event.id}`).set({
+              paymentIntentId: pi.id,
+              lastError: pi.last_payment_error?.message || "Failed",
+              status: "failed",
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
           }
         }
       }
@@ -2312,6 +2557,27 @@ async function startServer() {
         }
       }
 
+      // Chargeback & card dispute lifecycle (AT-PAY-16)
+      if (isStripeChargebackEventType(event.type)) {
+        if (!ownsStripeWebhookClaim((await eventRef.get()).data() || {}, claimToken)) {
+          throw new Error("Webhook claim lost before chargeback processing.");
+        }
+        await processStripeChargebackEvent(db, event as any);
+      }
+
+      // Stripe Connect capability / payouts_enabled synchronization (AT-PAY-10)
+      if (event.type === "account.updated") {
+        await reconcileStripeAccountUpdatedWebhook({
+          db,
+          eventId: event.id,
+          eventCreated: Number(event.created || 0),
+          account: event.data.object as Stripe.Account,
+          eventRef,
+          claimToken,
+          ownsClaimFn: ownsStripeWebhookClaim,
+        });
+      }
+
       // Completion is fenced: an expired worker cannot complete a successor's claim.
       const completionResult = await markStripeEventCompleted(db, event.id, assignedWorkerId, claimToken);
       if (!completionResult.success) {
@@ -2337,14 +2603,28 @@ async function startServer() {
     }
   });
 
-  app.use("/api/gemini/call", express.json({ limit: "10mb" }));
-  app.use(express.json({ limit: "1mb" }));
+  // AT-ADMIN-OPS-07: Do NOT mount 10MB JSON parser before auth/rate-limiting on /api/gemini/call.
+  // Skip the default 1MB parser for /api/gemini/call so requireAuth + aiLimiter execute first on that route.
+  const defaultJsonParser = express.json({ limit: "1mb" });
+  const geminiJsonParser = express.json({ limit: "10mb" });
+  app.use((req, res, next) => {
+    if (req.path === "/api/gemini/call") {
+      return next();
+    }
+    return defaultJsonParser(req, res, next);
+  });
 
   // API Routes
   app.get("/api/health", (req, res) => {
     if (!isApplicationReady) {
       if (bootstrapError) {
-        console.warn("[/api/health] Degraded readiness notice:", bootstrapError);
+        const isExpectedCredentialBoundary =
+          bootstrapError.includes("PERMISSION_DENIED") ||
+          bootstrapError.includes("UNAUTHENTICATED") ||
+          bootstrapError.includes("Could not load the default credentials");
+        if (!isExpectedCredentialBoundary) {
+          console.warn("[/api/health] Degraded readiness notice:", bootstrapError);
+        }
       }
       return res.status(200).json({
         status: "degraded",
@@ -2355,6 +2635,109 @@ async function startServer() {
     }
     res.json({ status: "ok", ready: true, bootstrapReady: true, message: "TradeQuote UK API is running and ready" });
   });
+
+  app.get("/api/maintenance/status", async (req, res) => {
+    const maintenanceMode = await isMaintenanceModeActive({ db });
+    res.json({ maintenanceMode });
+  });
+
+  app.post("/api/admin/maintenance", requireAdmin, requireAdminTier("super_admin", "toggling maintenance mode"), async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service unavailable");
+      const maintenanceMode = req.body?.maintenanceMode;
+      if (typeof maintenanceMode !== "boolean") {
+        throw new BadRequestError("maintenanceMode boolean is required.");
+      }
+      const adminUser = (req as any).user;
+      await db.collection("platform_config").doc("global").set({
+        maintenanceMode,
+        maintenanceModeStartedAt: maintenanceMode ? admin.firestore.FieldValue.serverTimestamp() : null,
+        maintenanceModeUpdatedBy: adminUser?.email || adminUser?.uid || "Admin",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: adminUser?.uid || null,
+      }, { merge: true });
+      invalidateMaintenanceCache(maintenanceMode);
+
+      await db.collection("admin_audit_logs").add({
+        action: "toggle_maintenance",
+        targetId: "global",
+        targetType: "config",
+        details: `Turned maintenance mode ${maintenanceMode ? "ON" : "OFF"}`,
+        adminUid: adminUser?.uid || null,
+        adminEmail: adminUser?.email || null,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      res.json({ success: true, maintenanceMode });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // Append-only server-authoritative admin audit logging (AT-ADMIN-AUDIT-01)
+  app.post("/api/admin/audit-logs", requireAdmin, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service unavailable");
+      const adminUser = (req as any).user;
+      const action = String(req.body?.action || "").trim();
+      const targetId = String(req.body?.targetId || "").trim();
+      const targetType = String(req.body?.targetType || "").trim();
+      const details = String(req.body?.details || "").trim();
+      if (!action || !targetId || !targetType) {
+        throw new BadRequestError("action, targetId, and targetType are required.");
+      }
+      const docRef = db.collection("audit_logs").doc();
+      await docRef.set({
+        id: docRef.id,
+        adminId: adminUser?.uid || null,
+        adminEmail: adminUser?.email || null,
+        action: action.slice(0, 120),
+        targetId: targetId.slice(0, 200),
+        targetType: targetType.slice(0, 80),
+        details: details.slice(0, 2000),
+        ipAddress: req.ip || null,
+        immutable: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      res.status(201).json({ success: true, id: docRef.id });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/login-audit", requireAdmin, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service unavailable");
+      const adminUser = (req as any).user;
+      const docRef = db.collection("admin_login_audits").doc();
+      await docRef.set({
+        id: docRef.id,
+        adminUid: adminUser?.uid || null,
+        adminEmail: adminUser?.email || String(req.body?.adminEmail || ""),
+        timeZone: String(req.body?.timeZone || "UTC").slice(0, 80),
+        userAgent: String(req.headers["user-agent"] || req.body?.userAgent || "").slice(0, 500),
+        platform: String(req.body?.platform || "").slice(0, 120),
+        ipAddress: req.ip || String(req.body?.clientIp || "").slice(0, 100),
+        pinVerified: Boolean(req.body?.pinVerified),
+        status: String(req.body?.status || "VERIFIED_UNLOCK").slice(0, 60),
+        immutable: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      res.status(201).json({ success: true, id: docRef.id });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // Global Maintenance / Emergency Stop Gate (AT-ADMIN-OPS-01)
+  app.use(
+    "/api",
+    createMaintenanceEmergencyStopMiddleware({
+      getDb: () => db,
+      verifyTokenFn: verifyTokenSafely,
+      checkIsAdminFn: checkIsAdmin,
+    })
+  );
 
   // Free membership selection is server-authoritative; clients cannot write subscription entitlements.
   app.post("/api/select-free-tier", requireAuth, paymentLimiter, async (req, res) => {
@@ -2447,7 +2830,7 @@ async function startServer() {
   });
 
   // Stripe Checkout Session (Server-Authoritative Pricing & Stripe Connect Routing)
-  app.post("/api/create-checkout-session", requireAuth, paymentLimiter, async (req, res) => {
+  app.post("/api/create-checkout-session", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
       const { successUrl, cancelUrl } = req.body;
@@ -2665,33 +3048,10 @@ async function startServer() {
         return res.json({ url: finalSuccessUrl.replace("{CHECKOUT_SESSION_ID}", "mock_session_success") });
       }
 
-      // Real Stripe Flow
+      // Real Stripe Flow (AT-PAY-24: transactional customerId reservation)
       let customerId: string | undefined;
       if (userId && db) {
-        try {
-          const userDoc = await db.collection("users").doc(userId).get();
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            if (userData?.stripeCustomerId) {
-              customerId = userData.stripeCustomerId;
-            } else if (userData?.email) {
-              const customer = await stripe.customers.create({
-                email: userData.email,
-                metadata: { firebaseUid: userId }
-              });
-              customerId = customer.id;
-              await db.collection("users").doc(userId).set({ stripeCustomerId: customerId }, { merge: true });
-            } else {
-              const customer = await stripe.customers.create({
-                metadata: { firebaseUid: userId }
-              });
-              customerId = customer.id;
-              await db.collection("users").doc(userId).set({ stripeCustomerId: customerId }, { merge: true });
-            }
-          }
-        } catch (e) {
-          console.warn("Failed to sync Stripe customer:", e);
-        }
+        customerId = await ensureStripeCustomerIdForUser({ db, stripe, userId });
       }
 
       const sessionOptions: any = {
@@ -2743,7 +3103,7 @@ async function startServer() {
   });
 
   // Stripe Setup Session (Save Card)
-  app.post("/api/create-setup-session", requireAuth, paymentLimiter, async (req, res) => {
+  app.post("/api/create-setup-session", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
       const { successUrl, cancelUrl } = req.body;
@@ -2765,23 +3125,11 @@ async function startServer() {
         return res.json({ url: finalSuccessUrl });
       }
 
-      let customerId: string | undefined;
-      if (userId && db) {
-        const userDoc = await db.collection("users").doc(userId).get();
-        if (userDoc.exists) {
-          const userData = userDoc.data();
-          if (userData?.stripeCustomerId) {
-            customerId = userData.stripeCustomerId;
-          } else {
-            const customer = await stripe.customers.create({
-              email: userData?.email,
-              metadata: { firebaseUid: userId }
-            });
-            customerId = customer.id;
-            await db.collection("users").doc(userId).set({ stripeCustomerId: customerId }, { merge: true });
-          }
-        }
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable" });
       }
+
+      const customerId = await ensureStripeCustomerIdForUser({ db, stripe, userId });
 
       if (!customerId) {
         return res.status(400).json({ error: "Could not identify or create Stripe customer." });
@@ -2890,7 +3238,7 @@ async function startServer() {
   });
 
   // Stripe Customer Portal Session (Manage subscriptions, cancel, update cards, invoices)
-  app.post("/api/create-customer-portal-session", requireAuth, paymentLimiter, async (req, res) => {
+  app.post("/api/create-customer-portal-session", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
       const appUrl = getAuthoritativeAppUrl();
@@ -2898,7 +3246,7 @@ async function startServer() {
       const finalReturnUrl = sanitizeRedirectUrl(returnUrl, appUrl, `/billing`);
 
       if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const userDoc = await db.collection("users").doc(authUid).get();
@@ -2913,7 +3261,10 @@ async function startServer() {
       try {
         stripe = getStripe();
       } catch (e) {
-        return res.json({ url: finalReturnUrl });
+        return res.status(503).json({
+          error: "Billing portal is currently unavailable: Stripe gateway is unconfigured.",
+          code: "STRIPE_UNCONFIGURED"
+        });
       }
 
       if (!customerId) {
@@ -2925,21 +3276,29 @@ async function startServer() {
         return_url: finalReturnUrl,
       });
 
+      if (!portalSession?.url) {
+        return res.status(502).json({
+          error: "Stripe did not return a billing portal URL. Please retry or contact support."
+        });
+      }
+
       res.json({ url: portalSession.url });
     } catch (error: any) {
       console.error("Customer Portal Session Error:", error);
-      res.status(500).json({ error: error.message || "Failed to create portal session" });
+      const stripeStatus = Number(error?.statusCode);
+      const status = stripeStatus >= 400 && stripeStatus < 500 ? 400 : 502;
+      res.status(status).json({ error: error.message || "Failed to create Stripe billing portal session" });
     }
   });
 
   // Cancel Subscription at Next Renewal Date (Cancel at Period End)
-  app.post("/api/cancel-subscription", requireAuth, paymentLimiter, async (req, res) => {
+  app.post("/api/cancel-subscription", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
-      const { subscriptionType = "tier" } = req.body; // 'tier' | 'exclusive_leads' | 'video_pro'
+      const { subscriptionType: requestedType = "tier", subscriptionId: requestedSubscriptionId } = req.body || {};
 
       if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const userDoc = await db.collection("users").doc(authUid).get();
@@ -2948,53 +3307,48 @@ async function startServer() {
       }
 
       const userData = userDoc.data() || {};
-      if (!["tier", "landlord", "exclusive_leads", "video_pro", "gotham_saas", "driver_gold"].includes(subscriptionType)) {
-        return res.status(400).json({ error: "Unsupported subscription type." });
-      }
-      let subId: string | undefined;
+      const verifiedTarget = resolveVerifiedSubscriptionTarget({
+        userData,
+        requestedType,
+        requestedSubscriptionId,
+        action: "cancel",
+      });
+      const subscriptionType = verifiedTarget.subscriptionType;
+      const subId = verifiedTarget.subscriptionId;
+
       let fieldUpdates: any = {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       };
 
       if (subscriptionType === "landlord") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.homeownerCancelAtPeriodEnd = true;
         if (userData.homeownerCurrentPeriodEnd) fieldUpdates.homeownerCurrentPeriodEnd = userData.homeownerCurrentPeriodEnd;
       } else if (subscriptionType === "exclusive_leads") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         const currentEnd = userData.exclusiveCurrentPeriodEnd;
         fieldUpdates.exclusiveCancelAtPeriodEnd = true;
         if (currentEnd) fieldUpdates.exclusiveCurrentPeriodEnd = currentEnd;
       } else if (subscriptionType === "video_pro") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         const currentEnd = userData.videoProCurrentPeriodEnd;
         fieldUpdates.videoProCancelAtPeriodEnd = true;
         if (currentEnd) fieldUpdates.videoProCurrentPeriodEnd = currentEnd;
       } else if (subscriptionType === "gotham_saas") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.gothamCancelAtPeriodEnd = true;
         const currentEnd = userData.gothamCurrentPeriodEnd || userData.currentPeriodEnd;
         if (currentEnd) {
           fieldUpdates.gothamCurrentPeriodEnd = currentEnd;
         }
       } else if (subscriptionType === "driver_gold") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         const currentEnd = userData.driverCurrentPeriodEnd || userData.currentPeriodEnd;
         fieldUpdates.driverCancelAtPeriodEnd = true;
         if (currentEnd) {
           fieldUpdates.driverCurrentPeriodEnd = currentEnd;
         }
       } else {
-        // Default membership tier
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         const currentEnd = userData.currentPeriodEnd;
         fieldUpdates.cancelAtPeriodEnd = true;
         if (currentEnd) fieldUpdates.currentPeriodEnd = currentEnd;
       }
 
-      if (!subId) {
-        return res.status(409).json({ error: "No Stripe subscription is linked to this account for the selected product." });
-      }
       const hasMockSubscriptionId = isMockSubscriptionId(subId);
       const isExplicitMockSubscription = isExplicitMockSubscriptionAllowed(
         subId,
@@ -3009,8 +3363,6 @@ async function startServer() {
       try {
         stripe = getStripe();
       } catch (e) {
-        // Only explicitly marked mock subscriptions in a non-production mock-enabled
-        // environment may bypass Stripe. Real subscriptions never receive false success.
         if (!isExplicitMockSubscription) {
           return res.status(503).json({ error: "Stripe is unavailable; cancellation was not changed." });
         }
@@ -3025,7 +3377,15 @@ async function startServer() {
       }
 
       if (!isExplicitMockSubscription) {
-        // Call Stripe API to set cancel_at_period_end = true
+        const liveSub = await stripe.subscriptions.retrieve(subId);
+        const liveCustomer = typeof liveSub.customer === "string" ? liveSub.customer : liveSub.customer?.id;
+        if (userData.stripeCustomerId && liveCustomer && liveCustomer !== userData.stripeCustomerId) {
+          return res.status(403).json({ error: "Forbidden: Stripe subscription customer does not match the caller account." });
+        }
+        if (liveSub.status === "canceled") {
+          return res.status(409).json({ error: "Subscription is already canceled in Stripe." });
+        }
+
         const updatedSub = await stripe.subscriptions.update(subId, {
           cancel_at_period_end: true
         });
@@ -3062,18 +3422,18 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error("Cancel Subscription Error:", error);
-      res.status(500).json({ error: error.message || "Failed to schedule cancellation" });
+      sendHttpError(res, error, req);
     }
   });
 
   // Reactivate / Resume Subscription Before Period End
-  app.post("/api/reactivate-subscription", requireAuth, paymentLimiter, async (req, res) => {
+  app.post("/api/reactivate-subscription", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
-      const { subscriptionType = "tier" } = req.body; // 'tier' | 'exclusive_leads' | 'video_pro'
+      const { subscriptionType: requestedType = "tier", subscriptionId: requestedSubscriptionId } = req.body || {};
 
       if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const userDoc = await db.collection("users").doc(authUid).get();
@@ -3082,37 +3442,33 @@ async function startServer() {
       }
 
       const userData = userDoc.data() || {};
-      if (!["tier", "exclusive_leads", "video_pro", "gotham_saas", "driver_gold"].includes(subscriptionType)) {
-        return res.status(400).json({ error: "Unsupported subscription type." });
-      }
-      let subId: string | undefined;
+      const verifiedTarget = resolveVerifiedSubscriptionTarget({
+        userData,
+        requestedType,
+        requestedSubscriptionId,
+        action: "reactivate",
+      });
+      const subscriptionType = verifiedTarget.subscriptionType;
+      const subId = verifiedTarget.subscriptionId;
+
       let fieldUpdates: any = {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       };
 
       if (subscriptionType === "landlord") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.homeownerCancelAtPeriodEnd = false;
       } else if (subscriptionType === "exclusive_leads") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.exclusiveCancelAtPeriodEnd = false;
       } else if (subscriptionType === "video_pro") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.videoProCancelAtPeriodEnd = false;
       } else if (subscriptionType === "gotham_saas") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.gothamCancelAtPeriodEnd = false;
       } else if (subscriptionType === "driver_gold") {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.driverCancelAtPeriodEnd = false;
       } else {
-        subId = getSubscriptionIdForProduct(userData, subscriptionType);
         fieldUpdates.cancelAtPeriodEnd = false;
       }
 
-      if (!subId) {
-        return res.status(409).json({ error: "No Stripe subscription is linked to this account for the selected product." });
-      }
       const hasMockSubscriptionId = isMockSubscriptionId(subId);
       const isExplicitMockSubscription = isExplicitMockSubscriptionAllowed(
         subId,
@@ -3127,8 +3483,6 @@ async function startServer() {
       try {
         stripe = getStripe();
       } catch (e) {
-        // Only explicitly marked mock subscriptions in a non-production mock-enabled
-        // environment may bypass Stripe. Real subscriptions never receive false success.
         if (!isExplicitMockSubscription) {
           return res.status(503).json({ error: "Stripe is unavailable; reactivation was not changed." });
         }
@@ -3142,6 +3496,14 @@ async function startServer() {
       }
 
       if (!isExplicitMockSubscription) {
+        const liveSub = await stripe.subscriptions.retrieve(subId);
+        const liveCustomer = typeof liveSub.customer === "string" ? liveSub.customer : liveSub.customer?.id;
+        if (userData.stripeCustomerId && liveCustomer && liveCustomer !== userData.stripeCustomerId) {
+          return res.status(403).json({ error: "Forbidden: Stripe subscription customer does not match the caller account." });
+        }
+        if (liveSub.status === "canceled") {
+          return res.status(409).json({ error: "Subscription has already ended in Stripe and cannot be reactivated." });
+        }
         await stripe.subscriptions.update(subId, {
           cancel_at_period_end: false
         });
@@ -3156,12 +3518,12 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error("Reactivate Subscription Error:", error);
-      res.status(500).json({ error: error.message || "Failed to reactivate subscription" });
+      sendHttpError(res, error, req);
     }
   });
 
   // Dispute Mediation Stake Stripe PaymentIntent (£25.00); never simulate payment success.
-  app.post("/api/disputes/create-stake-intent", requireAuth, paymentLimiter, async (req, res) => {
+  app.post("/api/disputes/create-stake-intent", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     const authUid = (req as any).user.uid;
     const { jobId, disputeReason, technicalFaultReport, isPropertyDamage = false, photos = [] } = req.body || {};
     if (!jobId || typeof jobId !== "string") return res.status(400).json({ error: "jobId is required" });
@@ -3187,7 +3549,7 @@ async function startServer() {
   });
 
   // =========================================================================
-  // ADVERTISEMENTS SERVER-AUTHORITATIVE MANAGEMENT (H2 Remediated)
+  // ADVERTISEMENTS SERVER-AUTHORITATIVE MANAGEMENT (H2 + Batch 7 Remediated)
   // =========================================================================
 
   // Server-Authoritative Toggle Active (Pause / Resume)
@@ -3196,190 +3558,199 @@ async function startServer() {
       const { id } = req.params;
       const authUid = (req as any).user.uid;
       const isAdminUser = await checkIsAdmin((req as any).user);
-
-      if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
-      }
-
-      const adRef = db.collection("advertisements").doc(id);
-      const adDoc = await adRef.get();
-
-      if (!adDoc.exists) {
-        return res.status(404).json({ error: "Advertisement not found" });
-      }
-
-      const adData = adDoc.data() || {};
-      const isOwner = adData.advertiserUid === authUid || adData.advertiserId === authUid;
-
-      if (!isOwner && !isAdminUser) {
-        return res.status(403).json({ error: "Unauthorized: You do not own this advertisement" });
-      }
-
-      const nextActive = !adData.isActive;
-
-      // If activating, verify approval status and balance if prepaid
-      if (nextActive && !isAdminUser) {
-        if (adData.approvalStatus && adData.approvalStatus !== "approved") {
-          return res.status(400).json({ error: "Cannot activate an unapproved campaign" });
-        }
-        if (adData.billingCycle === "prepaid" && typeof adData.prepaidBalance === "number" && adData.prepaidBalance <= 0) {
-          return res.status(400).json({ error: "Cannot activate campaign with zero prepaid balance. Please top up first." });
-        }
-      }
-
-      await adRef.update({
-        isActive: nextActive,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      const result = await toggleAdActiveCommand({
+        db,
+        authUid,
+        isAdminUser,
+        adId: id,
       });
-
-      return res.json({ success: true, isActive: nextActive });
+      return res.json(result);
     } catch (err: any) {
       console.error("Toggle ad active status error:", err);
-      return res.status(500).json({ error: "Failed to update advertisement status" });
+      return sendHttpError(res, err, req);
     }
   });
 
-  // Server-Authoritative Ad Top-Up from User Ad Wallet
-  app.post("/api/ads/:id/topup", requireAuth, paymentLimiter, async (req, res) => {
+  // Server-Authoritative Ad Top-Up from User Ad Wallet (preserves paused state unless resumeAfterTopup=true)
+  app.post("/api/ads/:id/topup", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const { id } = req.params;
       const authUid = (req as any).user.uid;
-      const { amount } = req.body;
-      const topupAmount = Math.max(10, Math.min(5000, Number(amount) || 50));
-
-      if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
-      }
-
-      const adRef = db.collection("advertisements").doc(id);
-      const userRef = db.collection("users").doc(authUid);
-
-      await db.runTransaction(async (transaction) => {
-        const adDoc = await transaction.get(adRef);
-        if (!adDoc.exists) {
-          throw new Error("Advertisement not found");
-        }
-        const adData = adDoc.data() || {};
-        if (adData.advertiserUid !== authUid && adData.advertiserId !== authUid) {
-          throw new Error("Unauthorized: You do not own this advertisement");
-        }
-
-        const userDoc = await transaction.get(userRef);
-        const userData = userDoc.data() || {};
-        const currentWallet = Number(userData.adWalletBalance || 0);
-
-        if (currentWallet < topupAmount) {
-          throw new Error(`Insufficient wallet balance (£${currentWallet.toFixed(2)}). Please top up your ad wallet first.`);
-        }
-
-        // Deduct from user wallet, credit ad balance
-        transaction.update(userRef, {
-          adWalletBalance: admin.firestore.FieldValue.increment(-topupAmount),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        transaction.update(adRef, {
-          prepaidBalance: admin.firestore.FieldValue.increment(topupAmount),
-          totalBudget: admin.firestore.FieldValue.increment(topupAmount),
-          isActive: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      const { amount, resumeAfterTopup } = req.body || {};
+      const result = await topUpAdCampaignCommand({
+        db,
+        authUid,
+        adId: id,
+        amount,
+        resumeAfterTopup: resumeAfterTopup === true,
       });
-
-      return res.json({ success: true, topupAmount });
+      return res.json(result);
     } catch (err: any) {
       console.error("Ad topup error:", err);
-      return res.status(400).json({ error: err.message || "Failed to top up advertisement" });
+      return sendHttpError(res, err, req);
     }
   });
 
-  // Server-Authoritative Banner Campaign Creation
+  // Server-Authoritative Banner Campaign Creation (£2.00/day canonical + pending_review moderation)
   app.post("/api/ads/create-banner", requireAuth, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
-      const { headline, durationDays, targetCategories } = req.body;
-
-      if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
-      }
-
-      const days = Math.max(1, Math.min(365, Number(durationDays) || 7));
-      const DAILY_RATE = 4.99;
-      const totalCost = Number((days * DAILY_RATE).toFixed(2));
-
-      const userRef = db.collection("users").doc(authUid);
-      let createdAdId = "";
-
-      await db.runTransaction(async (transaction) => {
-        const userDoc = await transaction.get(userRef);
-        if (!userDoc.exists) {
-          throw new Error("User profile not found");
-        }
-        const userData = userDoc.data() || {};
-        const currentWallet = Number(userData.adWalletBalance || 0);
-
-        if (currentWallet < totalCost) {
-          throw new Error(`Insufficient ad wallet balance (£${currentWallet.toFixed(2)}). Total cost is £${totalCost.toFixed(2)}. Please top up your wallet.`);
-        }
-
-        transaction.update(userRef, {
-          adWalletBalance: admin.firestore.FieldValue.increment(-totalCost),
-          adSpendTotal: admin.firestore.FieldValue.increment(totalCost),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        const startDate = new Date();
-        const endDate = new Date(startDate.getTime() + days * 24 * 60 * 60 * 1000);
-        const businessTitle = userData.businessName || userData.name || "Verified Trade Specialist";
-        const cleanHeadline = (typeof headline === "string" && headline.trim()) ? headline.trim().slice(0, 100) : (userData.trade || "Expert Quality Guaranteed");
-
-        const newAdRef = db.collection("advertisements").doc();
-        createdAdId = newAdRef.id;
-
-        transaction.set(newAdRef, {
-          type: "trader_promo",
-          title: businessTitle,
-          description: cleanHeadline,
-          bgColor: "bg-slate-900",
-          iconName: "Star",
-          url: `/profile/${authUid}`,
-          targetRole: "homeowner",
-          targetCategories: Array.isArray(targetCategories) ? targetCategories : [userData.trade || "all", "all"],
-          advertiserId: authUid,
-          advertiserUid: authUid,
-          advertiserName: businessTitle,
-          imageUrl: userData.avatarUrl || "",
-          isTraderAd: true,
-          badgeLabel: "FEATURED PRO",
-          perkText: userData.isAvailableForEmergency ? "⚡ 24/7 Response Guaranteed" : "⭐ Verified Pro",
-          dailyRate: DAILY_RATE,
-          durationDays: days,
-          totalCost,
-          isActive: true,
-          status: "active",
-          approvalStatus: "approved",
-          clicks: 0,
-          bannerClicks: 0,
-          searchFeedClicks: 0,
-          impressions: 0,
-          startDate: startDate.toISOString(),
-          endDate: endDate.toISOString(),
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      const { headline, durationDays, targetCategories } = req.body || {};
+      const result = await createBannerAdCommand({
+        db,
+        authUid,
+        headline,
+        durationDays,
+        targetCategories,
       });
-
-      return res.json({ success: true, adId: createdAdId, totalCost });
+      return res.json(result);
     } catch (err: any) {
       console.error("Create banner campaign error:", err);
-      return res.status(400).json({ error: err.message || "Failed to create banner campaign" });
+      return sendHttpError(res, err, req);
+    }
+  });
+
+  // Server-Authoritative CPC Campaign Creation (AT-ADS-05, AT-ADS-13)
+  app.post("/api/ads/create-cpc", requireAuth, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const authUid = (req as any).user.uid;
+      const result = await createCpcCampaignCommand({
+        db,
+        authUid,
+        ...(req.body || {}),
+      });
+      return res.status(201).json(result);
+    } catch (err: any) {
+      console.error("Create CPC campaign error:", err);
+      return sendHttpError(res, err, req);
+    }
+  });
+
+  // Server-Authoritative Smart Auto Top-Up Settings (AT-ADS-05)
+  app.post("/api/ads/:id/auto-topup-settings", requireAuth, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { id } = req.params;
+      const authUid = (req as any).user.uid;
+      const { autoTopUpEnabled, autoTopUpThreshold, autoTopUpAmount, autoTopUpMaxMonthlyCapGbp, lowBalanceAlertsEnabled } = req.body || {};
+      const result = await updateAdAutoTopUpSettingsCommand({
+        db,
+        authUid,
+        adId: id,
+        autoTopUpEnabled: Boolean(autoTopUpEnabled),
+        autoTopUpThreshold,
+        autoTopUpAmount,
+        autoTopUpMaxMonthlyCapGbp,
+        lowBalanceAlertsEnabled,
+      });
+      return res.json(result);
+    } catch (err: any) {
+      console.error("Update ad auto top-up settings error:", err);
+      return sendHttpError(res, err, req);
+    }
+  });
+
+  // Server-Authoritative Scheduled / On-Demand Smart Auto Top-Up Execution (AT-ADS-05)
+  app.post("/api/ads/:id/process-auto-topup", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { id } = req.params;
+      const authUid = (req as any).user.uid;
+      const isAdminUser = await checkIsAdmin((req as any).user);
+      const adSnap = await db.collection("advertisements").doc(id).get();
+      if (!adSnap.exists) throw new NotFoundError("Advertisement not found");
+      const adData = adSnap.data() || {};
+      if (!isAdminUser && adData.advertiserUid !== authUid && adData.advertiserId !== authUid) {
+        throw new ForbiddenError("Unauthorized to process auto top-up for this advertisement");
+      }
+      let stripeClient: any = null;
+      try {
+        stripeClient = getStripe();
+      } catch {
+        stripeClient = null;
+      }
+      const result = await processAdAutoTopUpCommand({ db, adId: id, stripeClient });
+      return res.json(result);
+    } catch (err: any) {
+      console.error("Process ad auto top-up error:", err);
+      return sendHttpError(res, err, req);
+    }
+  });
+
+  // Admin Moderation Endpoint for Advertisements (Approve / Reject)
+  app.post("/api/ads/:id/moderate", requireAdmin, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { id } = req.params;
+      const adminUid = (req as any).user.uid;
+      const { decision, reason } = req.body || {};
+      const result = await moderateAdCommand({
+        db,
+        adminUid,
+        adId: id,
+        decision,
+        reason,
+      });
+      return res.json(result);
+    } catch (err: any) {
+      console.error("Moderate ad error:", err);
+      return sendHttpError(res, err, req);
+    }
+  });
+
+  // Server-Authoritative Sponsored CPC Click & Impression Tracker (AT-ADS-11)
+  app.post("/api/ads/:id/track", generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { id } = req.params;
+      const { eventType = "click", placement = "banner_ad" } = req.body || {};
+      let viewerUid: string | null = null;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        try {
+          const decoded = await verifyTokenSafely(authHeader.split("Bearer ")[1]);
+          viewerUid = decoded?.uid || null;
+        } catch {
+          viewerUid = null;
+        }
+      }
+      const rawIp = String(req.headers["x-forwarded-for"] || req.ip || "unknown").split(",")[0].trim();
+      const rawUa = String(req.headers["user-agent"] || "unknown").slice(0, 120);
+      const viewerFingerprint = crypto.createHash("sha256").update(`${rawIp}|${rawUa}`).digest("hex").slice(0, 24);
+      const result = await trackSponsoredAdEventCommand({
+        db,
+        adId: id,
+        eventType: eventType === "impression" ? "impression" : "click",
+        placement: placement === "search_feed" ? "search_feed" : "banner_ad",
+        viewerUid,
+        viewerFingerprint,
+      });
+      return res.json(result);
+    } catch (err: any) {
+      console.error("Track ad event error:", err);
+      return sendHttpError(res, err, req);
+    }
+  });
+
+  // Admin Public Ads Backfill Sync (AT-ADS-13, AT-PROJ-03)
+  app.post("/api/admin/sync-public-ads", requireAdmin, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable" });
+      }
+      const result = await backfillPublicAds(db);
+      return res.json({ success: true, ...result });
+    } catch (err: any) {
+      console.error("Sync Public Ads Error:", err);
+      return sendHttpError(res, err, req);
     }
   });
 
   // In-memory cache for live demand zones (15s TTL) to prevent excessive database read spikes
   let demandZonesCache: { timestamp: number; zones: any[] } | null = null;
 
-  app.get("/api/rides/demand-zones", async (req, res) => {
+  app.get("/api/rides/demand-zones", generalLimiter, async (req, res) => {
     try {
       if (!db) {
         return res.json({ success: true, zones: [] });
@@ -3572,7 +3943,7 @@ async function startServer() {
   });
 
   // Server-Authoritative Direct-to-Driver Taxi Payment (V8.3 Task 35-C Recipient Integrity)
-  app.post("/api/rides/create-trip-payment", requireAuth, async (req, res) => {
+  app.post("/api/rides/create-trip-payment", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       if (!db) {
         return res.status(503).json({ error: "Database backend unavailable" });
@@ -3600,14 +3971,94 @@ async function startServer() {
         appUrl,
       });
 
-      res.json({ url: result.url });
+      res.json({
+        url: result.url,
+        intentId: result.intentId,
+        reused: result.reused === true,
+        effectiveBaseFare: result.effectiveBaseFare,
+        sanitizedTip: result.sanitizedTip,
+        totalAmount: result.totalAmount,
+      });
     } catch (error: any) {
       console.error("Trip Payment Creation Error:", error);
       sendHttpError(res, error, req);
     }
   });
+
+  app.post("/api/rides/transition", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const result = await executeTransitionRideCommand({
+        db,
+        caller,
+        rideId: req.body?.rideId,
+        action: req.body?.action,
+        paidWaitSeconds: req.body?.paidWaitSeconds,
+        currentStopIndex: req.body?.currentStopIndex,
+        earlyCompletionReason: req.body?.earlyCompletionReason,
+      });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Ride Transition Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/rides/complete", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const result = await executeCompleteRideCommand({
+        db,
+        caller,
+        rideId: req.body?.rideId,
+        action: req.body?.action,
+        paidWaitSeconds: req.body?.paidWaitSeconds,
+        cashCollected: req.body?.cashCollected,
+        forceComplete: req.body?.forceComplete === true,
+        forceCompleteReason: req.body?.forceCompleteReason,
+        earlyCompletionReason: req.body?.earlyCompletionReason,
+        paymentUrl: req.body?.paymentUrl,
+        abandonmentFee: req.body?.abandonmentFee,
+      });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Ride Completion Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/rides/cancel", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const result = await executeCancelRideCommand({
+        db,
+        caller,
+        rideId: req.body?.rideId,
+        cancelledBy: req.body?.cancelledBy,
+      });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Ride Cancel Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/driver/metrics/heartbeat", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const result = await recordDriverOnlineHeartbeat({ db, caller });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Driver Metrics Heartbeat Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
   
-  app.post("/api/driver/stripe-payout/:driverId", requireAuth, async (req, res) => {
+  app.post("/api/driver/stripe-payout/:driverId", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const { driverId } = req.params;
       const { amount } = req.body; // Optional amount
@@ -3691,8 +4142,43 @@ async function startServer() {
 
           await domainEvents.dispatch("DRIVER_PAYOUT_INITIATED", payout.id, driverId, {
             amount: payoutAmount,
-            currency: 'gbp'
+            currency: 'gbp',
+            initiatedByUid: user.uid,
+            initiatedByEmail: user.email || "",
+            isAdminOverride: user.uid !== driverId,
           }, idempotencyKey, db);
+
+          // AT-ADMIN-AUDIT-02: Persist initiating admin context for manual admin-triggered payouts
+          if (user.uid !== driverId) {
+            const nowIso = new Date().toISOString();
+            const auditReason = typeof req.body?.reason === "string" && req.body.reason.trim()
+              ? req.body.reason.trim()
+              : "Admin manual driver Stripe payout";
+            await db.collection("driver_payout_batches").doc(`manual_${payout.id}`).set({
+              batchId: `manual_${payout.id}`,
+              payoutId: payout.id,
+              driverId,
+              stripeAccountId,
+              amountPence: payoutAmount,
+              currency: "gbp",
+              initiatedByUid: user.uid,
+              initiatedByEmail: user.email || "",
+              triggerSource: "manual_admin",
+              reason: auditReason,
+              initiatedAt: nowIso,
+              status: "completed",
+            });
+            await db.collection("admin_audit_logs").add({
+              action: "MANUAL_DRIVER_STRIPE_PAYOUT",
+              adminUid: user.uid,
+              adminEmail: user.email || "",
+              targetDriverId: driverId,
+              payoutId: payout.id,
+              amountPence: payoutAmount,
+              reason: auditReason,
+              timestamp: nowIso,
+            });
+          }
 
           return { success: true, payout };
         }
@@ -3757,7 +4243,7 @@ async function startServer() {
   app.post("/api/admin/sync-public-job-cards", requireAdmin, async (req, res) => {
     try {
       if (!db) {
-        return res.json({ success: true, message: "In-memory mock sync completed", total: 0, synced: 0 });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const result = await backfillPublicJobCards(db);
@@ -3774,7 +4260,7 @@ async function startServer() {
       const user = (req as any).user;
 
       if (!db) {
-        return res.json({ success: true, id });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const jobDoc = await db.collection("jobs").doc(id).get();
@@ -3789,7 +4275,10 @@ async function startServer() {
         throw new ForbiddenError("Unauthorized to sync this job projection.");
       }
 
-      const isActive = ["posted", "quoting", "in_bidding", "open"].includes(data.status) && !data.clientDeleted;
+      const isActive =
+        ["posted", "quoting", "in_bidding", "open"].includes(String(data.status || "").toLowerCase()) &&
+        !data.clientDeleted &&
+        !isDirectJob(data);
       if (isActive) {
         const publicCard = sanitizeJobToPublicCard(id, data);
         await db.collection("public_job_cards").doc(id).set(publicCard, { merge: true });
@@ -3810,7 +4299,7 @@ async function startServer() {
   app.post("/api/admin/sync-public-properties", requireAdmin, async (req, res) => {
     try {
       if (!db) {
-        return res.json({ success: true, message: "In-memory mock sync completed", total: 0, synced: 0 });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const result = await backfillPublicProperties(db);
@@ -3825,7 +4314,7 @@ async function startServer() {
   // cannot be bypassed by writing directly to Firestore from a client.
   app.post("/api/properties", requireAuth, async (req, res) => {
     try {
-      if (!db) throw new BadRequestError("Database service unavailable");
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
       const userId = String((req as any).user?.uid || "");
       if (!userId) throw new ForbiddenError("Authenticated user is required.");
 
@@ -3833,7 +4322,8 @@ async function startServer() {
       const allowedFields = [
         "name", "address", "postcode", "city", "propertyType", "status",
         "contactName", "contactPhone", "accessInstructions", "era", "heatingType",
-        "boilerInfo", "roofCondition", "epcRating", "gasSafetyExpiry", "eicrExpiry"
+        "boilerInfo", "roofCondition", "epcRating", "gasSafetyExpiry", "eicrExpiry",
+        "totalAreaSqFt", "unitCount", "photos"
       ];
       const protectedFields = [
         "id", "ownerId", "userId", "homeownerId", "landlordId", "tenantId",
@@ -3868,6 +4358,8 @@ async function startServer() {
         city: typeof body.city === "string" ? body.city.slice(0, 100) : address.city,
         propertyType: body.propertyType.trim(),
         status: "active",
+        isPublicPassport: false,
+        publicConsent: false,
         ownerId: userId,
         userId,
         homeownerId: userId,
@@ -3876,6 +4368,26 @@ async function startServer() {
       };
       for (const key of ["contactName", "contactPhone", "accessInstructions", "era", "heatingType", "roofCondition", "epcRating", "gasSafetyExpiry", "eicrExpiry"]) {
         if (typeof body[key] === "string") propertyData[key] = body[key].slice(0, key === "accessInstructions" ? 2000 : 200);
+      }
+      if (body.totalAreaSqFt !== undefined && body.totalAreaSqFt !== "") {
+        const parsedArea = Number(body.totalAreaSqFt);
+        if (!Number.isFinite(parsedArea) || parsedArea <= 0 || parsedArea > 1_000_000) {
+          throw new BadRequestError("totalAreaSqFt must be a positive number.");
+        }
+        propertyData.totalAreaSqFt = Math.round(parsedArea);
+      }
+      if (body.unitCount !== undefined && body.unitCount !== "") {
+        const parsedUnits = Number(body.unitCount);
+        if (!Number.isInteger(parsedUnits) || parsedUnits < 1 || parsedUnits > 5000) {
+          throw new BadRequestError("unitCount must be an integer between 1 and 5000.");
+        }
+        propertyData.unitCount = parsedUnits;
+      }
+      if (Array.isArray(body.photos)) {
+        const safePhotos = body.photos
+          .filter((p: unknown): p is string => typeof p === "string" && (p.startsWith("https://") || p.startsWith("data:image/")) && p.length <= 200_000)
+          .slice(0, 8);
+        propertyData.photos = safePhotos;
       }
       if (body.boilerInfo && typeof body.boilerInfo === "object" && !Array.isArray(body.boilerInfo)) {
         propertyData.boilerInfo = {
@@ -3886,8 +4398,29 @@ async function startServer() {
         };
       }
 
+      // AT-PROP-07: Deterministic SHA-256 hash of canonical creation payload bound to Idempotency-Key
+      const canonicalForHash = {
+        name: propertyData.name,
+        address: propertyData.address,
+        postcode: propertyData.postcode,
+        city: propertyData.city,
+        propertyType: propertyData.propertyType,
+        totalAreaSqFt: propertyData.totalAreaSqFt ?? null,
+        unitCount: propertyData.unitCount ?? null,
+        photosCount: Array.isArray(propertyData.photos) ? propertyData.photos.length : 0,
+        epcRating: propertyData.epcRating ?? null,
+        roofCondition: propertyData.roofCondition ?? null,
+      };
+      const payloadHash = crypto
+        .createHash("sha256")
+        .update(JSON.stringify(canonicalForHash))
+        .digest("hex");
+
       const rawKey = String(req.headers["idempotency-key"] || "");
       const idempotencyKey = /^[A-Za-z0-9_-]{12,100}$/.test(rawKey) ? rawKey : "";
+      if (rawKey && !idempotencyKey) {
+        throw new BadRequestError("Invalid Idempotency-Key header format.");
+      }
       const propertyRef = db.collection("properties").doc();
       const userRef = db.collection("users").doc(userId);
       const usageRef = db.collection("gotham_property_usage").doc(userId);
@@ -3898,6 +4431,9 @@ async function startServer() {
         const previousRequest = await requestRef.get();
         if (previousRequest.exists) {
           const previous = previousRequest.data() || {};
+          if (previous.payloadHash && previous.payloadHash !== payloadHash) {
+            throw new ConflictError("Idempotency-Key was already used with a different property payload.");
+          }
           const previousPropertyId = String(previous.propertyId || "");
           if (!previousPropertyId) throw new Error("Property creation idempotency record is invalid.");
           return res.status(200).json({ success: true, id: previousPropertyId, duplicate: true });
@@ -3953,6 +4489,9 @@ async function startServer() {
         ]);
         if (requestSnap?.exists) {
           const prior = requestSnap.data() || {};
+          if (prior.payloadHash && prior.payloadHash !== payloadHash) {
+            throw new ConflictError("Idempotency-Key was already used with a different property payload.");
+          }
           return { id: String(prior.propertyId || ""), duplicate: true };
         }
         const profile = userSnap.exists ? (userSnap.data() || {}) : {};
@@ -4011,6 +4550,7 @@ async function startServer() {
           tx.create(requestRef, {
             userId,
             propertyId: propertyRef.id,
+            payloadHash,
             createdAt: admin.firestore.FieldValue.serverTimestamp()
           });
         }
@@ -4193,26 +4733,34 @@ async function startServer() {
       if (matches.size !== 1) return res.status(404).json({ error: "Invalid or expired transfer code." });
       const propertyDoc = matches.docs[0];
       const property = propertyDoc.data() || {};
-      if (property.transferExpiresAt) {
-        const expiry = new Date(property.transferExpiresAt).getTime();
-        if (!Number.isFinite(expiry) || expiry < Date.now()) {
-          return res.status(410).json({ error: "This transfer code has expired or is invalid." });
-        }
+      // AT-PASS-06: Require an explicit valid future expiration timestamp on pending transfer codes
+      const rawExpiry = property.transferExpiresAt || property.expiresAt;
+      if (!rawExpiry) {
+        return res.status(410).json({ error: "This transfer code has expired or is missing an expiration timestamp." });
       }
+      const expiry = new Date(rawExpiry).getTime();
+      if (!Number.isFinite(expiry) || expiry <= Date.now()) {
+        return res.status(410).json({ error: "This transfer code has expired or is invalid." });
+      }
+      // AT-PASS-05: Never fabricate synthetic defaults ("C", "Standard", "Good") when attributes are missing
       res.json({
         success: true,
+        expiresAt: new Date(expiry).toISOString(),
         property: {
           id: propertyDoc.id,
           name: property.name || "Residential Property",
-          propertyType: property.propertyType || "Residential",
+          propertyType: property.propertyType || null,
           address: {
             line1: property.address?.line1 || "",
             postcode: property.address?.postcode || property.postcode || "",
             city: property.address?.city || property.city || ""
           },
-          epcRating: property.epcRating || "C",
-          boilerInfo: { brand: property.boilerInfo?.brand || "Standard" },
-          roofCondition: property.roofCondition || "Good"
+          epcRating: property.epcRating || null,
+          boilerInfo: property.boilerInfo?.brand
+            ? { brand: property.boilerInfo.brand, model: property.boilerInfo.model || null }
+            : null,
+          roofCondition: property.roofCondition || null,
+          transferExpiresAt: new Date(expiry).toISOString()
         }
       });
     } catch (error: any) {
@@ -4286,11 +4834,14 @@ async function startServer() {
         const propertyDoc = matches.docs[0];
         const propertyRef = propertyDoc.ref;
         const property = propertyDoc.data() || {};
-        if (property.transferExpiresAt) {
-          const expiry = new Date(property.transferExpiresAt).getTime();
-          if (!Number.isFinite(expiry) || expiry < Date.now()) {
-            throw new ForbiddenError("This property transfer code has expired or is invalid.");
-          }
+        // AT-PASS-06: Reject missing or expired transfer expiration timestamps server-side
+        const rawExpiry = property.transferExpiresAt || property.expiresAt;
+        if (!rawExpiry) {
+          throw new ForbiddenError("This property transfer code is missing an expiration timestamp and cannot be claimed.");
+        }
+        const expiry = new Date(rawExpiry).getTime();
+        if (!Number.isFinite(expiry) || expiry <= Date.now()) {
+          throw new ForbiddenError("This property transfer code has expired or is invalid.");
         }
         if (property.transferTargetEmail) {
           const expectedEmail = String(property.transferTargetEmail).trim().toLowerCase();
@@ -4377,27 +4928,15 @@ async function startServer() {
           newCount = quotaDecision.nextUsage;
         }
 
-        const history = Array.isArray(property.transferHistory) ? property.transferHistory : [];
-        tx.update(propertyRef, {
-          ownerId: userId,
-          userId,
-          homeownerId: userId,
-          transferStatus: "completed",
-          transferCode: null,
-          transferExpiresAt: null,
-          transferClaimedAt: new Date().toISOString(),
-          transferClaimedByUid: userId,
-          previousOwnersCount: Number(property.previousOwnersCount || 0) + 1,
-          transferHistory: [...history, {
-            transferredAt: new Date().toISOString(),
+        tx.update(
+          propertyRef,
+          buildClaimPropertyTransferUpdate({
+            property,
+            newOwnerId: userId,
+            newOwnerEmail: user.email || null,
             transferCode: code,
-            fromOwnerUid: previousOwnerId,
-            toOwnerUid: userId,
-            toOwnerEmail: user.email || null,
-            propertyName: property.name || "Property"
-          }],
-          updatedAt: new Date().toISOString()
-        });
+          })
+        );
         if (previousCount !== null) tx.set(previousUsageRef, {
           userId: previousOwnerId, propertyCount: previousCount,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -4421,37 +4960,343 @@ async function startServer() {
     }
   });
 
+  // AT-PASS-02 & AT-PASS-07: Canonical Public QR Passport & Buyer Pack Snapshot Endpoint
+  app.get("/api/properties/:id/public-passport", generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable" });
+      }
+      const propertyId = String(req.params.id || "").trim();
+      if (!propertyId) throw new BadRequestError("Property ID is required.");
+
+      const propDoc = await db.collection("properties").doc(propertyId).get();
+      if (!propDoc.exists) {
+        throw new NotFoundError("Property passport not found.");
+      }
+      const propData = propDoc.data() || {};
+
+      // Allow authenticated owner/admin to preview even before public consent; otherwise require explicit publicConsent === true
+      let isOwnerOrAdmin = false;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        try {
+          const decoded = await verifyTokenSafely(authHeader.split("Bearer ")[1]);
+          if (decoded?.uid) {
+            const ownerMatch = propData.ownerId === decoded.uid || propData.userId === decoded.uid || propData.landlordId === decoded.uid;
+            isOwnerOrAdmin = ownerMatch || (await checkIsAdmin(decoded));
+          }
+        } catch {
+          isOwnerOrAdmin = false;
+        }
+      }
+
+      const isConsentedPublic = isPropertyEligibleForPublicPassport(propData);
+      if (!isConsentedPublic && !isOwnerOrAdmin) {
+        return res.status(403).json({ error: "This property passport is private or public sharing consent has not been granted." });
+      }
+
+      const [passportSnap, publicPropSnap] = await Promise.all([
+        db.collection("property_passports").doc(propertyId).get(),
+        db.collection("public_properties").doc(propertyId).get(),
+      ]);
+
+      const canonicalPassport = passportSnap.exists ? (passportSnap.data() || null) : null;
+      const sanitizedProperty = publicPropSnap.exists
+        ? { id: propertyId, ...(publicPropSnap.data() || {}) }
+        : sanitizePropertyToPublicPassport(propertyId, propData);
+
+      // Load completed public jobs associated with this property without exposing private homeowner PII
+      let completedJobs: any[] = [];
+      try {
+        const jobsSnap = await db.collection("public_job_cards").where("propertyId", "==", propertyId).limit(50).get();
+        completedJobs = jobsSnap.docs
+          .map((d: any) => ({ id: d.id, ...(d.data() || {}) }))
+          .filter((j: any) => String(j.status || "").toLowerCase() === "completed");
+      } catch {
+        completedJobs = [];
+      }
+
+      return res.json({
+        success: true,
+        property: sanitizedProperty,
+        canonicalPassport,
+        provenance: canonicalPassport
+          ? {
+              snapshotId: canonicalPassport.snapshotId || canonicalPassport.latestSnapshotId || canonicalPassport.id || propertyId,
+              schemaVersion: canonicalPassport.schemaVersion || "v8.2-passport-v1",
+              pipelineVersion: canonicalPassport.pipelineVersion || "v8.2.0",
+              contentHash: canonicalPassport.contentHash || canonicalPassport.provenance?.contentHash || null,
+              generatedAt: canonicalPassport.generatedAt || canonicalPassport.updatedAt || null,
+              evidenceCount: Array.isArray(canonicalPassport.provenance?.evidenceIds)
+                ? canonicalPassport.provenance.evidenceIds.length
+                : 0,
+            }
+          : null,
+        completedJobs,
+      });
+    } catch (error: any) {
+      console.error("Get Public Property Passport Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
   app.post("/api/properties/:id/sync-public-passport", requireAuth, async (req, res) => {
     try {
       const { id } = req.params;
       const user = (req as any).user;
 
       if (!db) {
-        return res.json({ success: true, id });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
-      const propDoc = await db.collection("properties").doc(id).get();
+      const propRef = db.collection("properties").doc(id);
+      const propDoc = await propRef.get();
       if (!propDoc.exists) {
         throw new NotFoundError("Property not found");
       }
 
-      const data = propDoc.data()!;
-      const isOwner = data.ownerId === user.uid || data.userId === user.uid || data.landlordId === user.uid;
+      const existing = propDoc.data()!;
+      const isOwner = existing.ownerId === user.uid || existing.userId === user.uid || existing.landlordId === user.uid;
       const isAdmin = await checkIsAdmin(user);
       if (!isOwner && !isAdmin) {
         throw new ForbiddenError("Unauthorized to sync this property passport projection.");
       }
 
-      if (data.isPublicPassport !== false && data.status !== "archived") {
-        const publicPassport = sanitizePropertyToPublicPassport(id, data);
+      // Allow owner/admin to explicitly toggle public sharing consent atomically in this endpoint
+      const body = req.body || {};
+      const nextIsPublic = typeof body.isPublicPassport === "boolean" ? body.isPublicPassport : existing.isPublicPassport === true;
+      const nextConsent = typeof body.publicConsent === "boolean" ? body.publicConsent : existing.publicConsent === true;
+
+      const updatedData = {
+        ...existing,
+        isPublicPassport: nextIsPublic,
+        publicConsent: nextConsent,
+      };
+
+      if (typeof body.isPublicPassport === "boolean" || typeof body.publicConsent === "boolean") {
+        await propRef.update({
+          isPublicPassport: nextIsPublic,
+          publicConsent: nextConsent,
+          publicConsentUpdatedAt: new Date().toISOString(),
+          publicConsentUpdatedBy: user.uid,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
+      // AT-PASS-07 & AT-PROP-08: Require explicit affirmative isPublicPassport === true && publicConsent === true
+      const published = isPropertyEligibleForPublicPassport(updatedData);
+      if (published) {
+        const publicPassport = sanitizePropertyToPublicPassport(id, updatedData);
         await db.collection("public_properties").doc(id).set(publicPassport, { merge: true });
       } else {
         await db.collection("public_properties").doc(id).delete();
       }
 
-      res.json({ success: true, id, status: data.status });
+      res.json({
+        success: true,
+        id,
+        status: (updatedData as Record<string, any>).status || "active",
+        published,
+        isPublicPassport: nextIsPublic,
+        publicConsent: nextConsent,
+      });
     } catch (error: any) {
       console.error("Sync Single Public Property Passport Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-TENANT-02: Server-authoritative tenant issue creation deriving landlordOwnerId from authoritative property doc
+  app.post("/api/tenant-issues", generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable" });
+      }
+      const body = req.body || {};
+      const tenantName = typeof body.tenantName === "string" ? body.tenantName.trim().slice(0, 120) : "";
+      const tenantPhone = typeof body.tenantPhone === "string" ? body.tenantPhone.trim().slice(0, 40) : "";
+      const tenantEmail = typeof body.tenantEmail === "string" ? body.tenantEmail.trim().toLowerCase().slice(0, 160) : "";
+      const flatUnit = typeof body.flatUnit === "string" ? body.flatUnit.trim().slice(0, 60) : "";
+      const category = typeof body.category === "string" && body.category.trim() ? body.category.trim().slice(0, 80) : "General Maintenance";
+      const urgency = ["emergency", "urgent", "routine"].includes(String(body.urgency || "").toLowerCase())
+        ? String(body.urgency).toLowerCase()
+        : "urgent";
+      const title = typeof body.title === "string" ? body.title.trim().slice(0, 160) : "";
+      const description = typeof body.description === "string" ? body.description.trim().slice(0, 3000) : "";
+      const rawPropertyId = typeof body.propertyId === "string" ? body.propertyId.trim().slice(0, 128) : "";
+      const manualAddress = typeof body.manualAddress === "string" ? body.manualAddress.trim().slice(0, 240) : "";
+
+      if (!tenantName || !title || !description) {
+        throw new BadRequestError("Tenant name, issue title, and description are required.");
+      }
+
+      // Reject forged client ownership/lifecycle overrides
+      if (body.landlordOwnerId !== undefined && body.landlordOwnerId !== null && body.landlordOwnerId !== "") {
+        throw new BadRequestError("landlordOwnerId is derived server-side from the authoritative property record.");
+      }
+
+      let reporterUid: string | null = null;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        try {
+          const decoded = await verifyTokenSafely(authHeader.split("Bearer ")[1]);
+          reporterUid = decoded?.uid || null;
+        } catch {
+          reporterUid = null;
+        }
+      }
+
+      let authoritativePropertyId = "manual";
+      let authoritativeLandlordId: string | null = null;
+      let propertyName = manualAddress || "Home Property";
+      let address = manualAddress || "UK Address";
+      let postcode = "";
+
+      if (rawPropertyId && rawPropertyId !== "manual") {
+        const propDoc = await db.collection("properties").doc(rawPropertyId).get();
+        if (!propDoc.exists) {
+          throw new NotFoundError("Referenced property was not found.");
+        }
+        const propData = propDoc.data() || {};
+        authoritativePropertyId = propDoc.id;
+        authoritativeLandlordId = String(propData.ownerId || propData.userId || propData.landlordId || "") || null;
+        propertyName = String(propData.name || propertyName).slice(0, 160);
+        address = String(propData.address?.line1 || address).slice(0, 200);
+        postcode = String(propData.address?.postcode || propData.postcode || "").slice(0, 20);
+      }
+
+      const nowIso = new Date().toISOString();
+      const docRef = await db.collection("tenant_issues").add({
+        propertyId: authoritativePropertyId,
+        propertyName,
+        address,
+        postcode,
+        landlordOwnerId: authoritativeLandlordId,
+        reporterUid,
+        tenantName,
+        tenantPhone,
+        tenantEmail,
+        flatUnit,
+        category,
+        urgency,
+        title,
+        description,
+        status: "open",
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      if (authoritativeLandlordId) {
+        try {
+          await db.collection("notifications").add({
+            userId: authoritativeLandlordId,
+            title: `New ${urgency.toUpperCase()} Tenant Repair Report`,
+            message: `${tenantName} reported "${title}" at ${propertyName}.`,
+            type: "tenant_issue",
+            propertyId: authoritativePropertyId,
+            issueId: docRef.id,
+            link: "/portfolio",
+            read: false,
+            createdAt: nowIso,
+          });
+        } catch {
+          // Non-fatal
+        }
+      }
+
+      return res.status(201).json({
+        success: true,
+        id: docRef.id,
+        propertyId: authoritativePropertyId,
+        status: "open",
+      });
+    } catch (error: any) {
+      console.error("Create Tenant Issue Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-PROFILE-02: Server-authoritative Profile Coach acknowledgment & dismissal persistence
+  app.get("/api/profile/coach/state", requireAuth, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const uid = String((req as any).user?.uid || "");
+      const stateSnap = await db.collection("users").doc(uid).collection("profile_coach_state").doc("current").get();
+      const data = stateSnap.exists ? (stateSnap.data() || {}) : {};
+      return res.json({
+        success: true,
+        acknowledgedSuggestionIds: Array.isArray(data.acknowledgedSuggestionIds) ? data.acknowledgedSuggestionIds : [],
+        dismissedSuggestionIds: Array.isArray(data.dismissedSuggestionIds) ? data.dismissedSuggestionIds : [],
+        lastNotifiedAt: data.lastNotifiedAt || null,
+        lastAuditedAt: data.lastAuditedAt || null,
+      });
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/profile/coach/acknowledge", requireAuth, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const uid = String((req as any).user?.uid || "");
+      const { suggestionId, action = "acknowledge", auditSummary } = req.body || {};
+      const cleanId = typeof suggestionId === "string" ? suggestionId.trim().slice(0, 120) : "";
+      if (!cleanId && action !== "record_audit") {
+        throw new BadRequestError("suggestionId is required.");
+      }
+
+      const stateRef = db.collection("users").doc(uid).collection("profile_coach_state").doc("current");
+      const nowIso = new Date().toISOString();
+      let nextState: any = null;
+
+      await db.runTransaction(async (tx: any) => {
+        const snap = await tx.get(stateRef);
+        const existing = snap.exists ? (snap.data() || {}) : {};
+        const ackSet = new Set<string>(Array.isArray(existing.acknowledgedSuggestionIds) ? existing.acknowledgedSuggestionIds : []);
+        const dismissSet = new Set<string>(Array.isArray(existing.dismissedSuggestionIds) ? existing.dismissedSuggestionIds : []);
+
+        if (cleanId) {
+          ackSet.add(cleanId);
+          if (action === "dismiss") {
+            dismissSet.add(cleanId);
+          }
+        }
+
+        nextState = {
+          acknowledgedSuggestionIds: Array.from(ackSet).slice(0, 200),
+          dismissedSuggestionIds: Array.from(dismissSet).slice(0, 200),
+          lastAuditedAt: action === "record_audit" ? nowIso : (existing.lastAuditedAt || nowIso),
+          lastAuditSummary: typeof auditSummary === "string" ? auditSummary.slice(0, 300) : (existing.lastAuditSummary || null),
+          updatedAt: nowIso,
+        };
+        tx.set(stateRef, nextState, { merge: true });
+      });
+
+      return res.json({ success: true, ...nextState });
+    } catch (error: any) {
+      console.error("Profile Coach Acknowledge Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-ACCOUNT-03: Atomic Admin Trader Verification & Public Discovery Sync
+  app.post("/api/admin/traders/:uid/verify", requireAdmin, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const targetUid = String(req.params.uid || "").trim();
+      const adminUser = (req as any).user;
+      const { status, reason } = req.body || {};
+      const result = await verifyTraderAccountWithProjection({
+        db,
+        adminUid: adminUser.uid,
+        adminEmail: adminUser.email || undefined,
+        targetUid,
+        verificationStatus: status,
+        reason: typeof reason === "string" ? reason.slice(0, 300) : undefined,
+      });
+      return res.json(result);
+    } catch (error: any) {
+      console.error("Admin Verify Trader Error:", error);
       sendHttpError(res, error, req);
     }
   });
@@ -4461,8 +5306,8 @@ async function startServer() {
   // Ensures direct money routing to providers: Platform NEVER holds client funds.
   // =========================================================================
 
-  // 1. Create or Resume Stripe Connect Express Onboarding
-  app.post("/api/stripe/create-connect-account", requireAuth, async (req, res) => {
+  // 1. Create or Resume Stripe Connect Express Onboarding (AT-PAY-19, AT-PAY-20, AT-STRIPE-CONNECT-01)
+  app.post("/api/stripe/create-connect-account", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
       if (!db) throw new BadRequestError("Database not connected");
@@ -4470,6 +5315,9 @@ async function startServer() {
       const userDoc = await db.collection("users").doc(authUid).get();
       if (!userDoc.exists) throw new NotFoundError("User profile not found");
       const userData = userDoc.data() || {};
+
+      // Enforce payout-eligible provider/driver role before initializing Connect onboarding
+      assertPayoutEligibleRole(userData);
 
       const appUrl = getAuthoritativeAppUrl();
       let stripe;
@@ -4498,28 +5346,12 @@ async function startServer() {
         });
       }
 
-      let accountId = userData.stripeAccountId;
-      if (!accountId || accountId.startsWith("acct_mock_")) {
-        const account = await stripe.accounts.create({
-          type: "express",
-          country: "GB",
-          email: userData.email,
-          capabilities: {
-            card_payments: { requested: true },
-            transfers: { requested: true },
-          },
-          business_type: "individual",
-          metadata: {
-            firebaseUid: authUid,
-            role: userData.role || "trader",
-          }
-        });
-        accountId = account.id;
-        await db.collection("users").doc(authUid).set({
-          stripeAccountId: accountId,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-      }
+      const { accountId } = await ensureStripeAccountForProvider({
+        db,
+        stripe,
+        authUid,
+        userData,
+      });
 
       const accountLink = await stripe.accountLinks.create({
         account: accountId,
@@ -4627,8 +5459,8 @@ async function startServer() {
     }
   });
 
-  // 3. Create Login Link to Stripe Express Dashboard
-  app.post("/api/stripe/create-login-link", requireAuth, async (req, res) => {
+  // 3. Create Login Link to Stripe Express Dashboard (AT-PAY-22, AT-PAY-23)
+  app.post("/api/stripe/create-login-link", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
       if (!db) throw new BadRequestError("Database not connected");
@@ -4719,198 +5551,177 @@ async function startServer() {
     }
   });
 
-  // 5. Unified Provider Payout Request (Traders & Drivers)
-  app.post("/api/stripe/request-payout", requireAuth, async (req, res) => {
+  // 5. Unified Provider Payout Request (Traders & Drivers — AT-PAY-09 Idempotent + Locked)
+  app.post("/api/stripe/request-payout", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const authUid = (req as any).user.uid;
-      const { amount } = req.body; // Optional amount in GBP
-      if (!db) throw new BadRequestError("Database not connected");
+      const { amount, idempotencyKey: bodyIdempotencyKey } = req.body || {};
+      const headerIdempotencyKey =
+        req.header("Idempotency-Key") ||
+        req.header("x-idempotency-key") ||
+        (typeof bodyIdempotencyKey === "string" ? bodyIdempotencyKey : "");
 
-      const userDoc = await db.collection("users").doc(authUid).get();
-      if (!userDoc.exists) throw new NotFoundError("User not found");
+      const isMockDisallowed =
+        process.env.NODE_ENV === "production" || process.env.ALLOW_MOCK_PAYMENTS !== "true";
+      const stripe = getOptionalStripeClient();
 
-      const stripeAccountId = userDoc.data()?.stripeAccountId;
-      if (!stripeAccountId) throw new BadRequestError("No Stripe account connected");
-
-      const isMockDisallowed = process.env.NODE_ENV === 'production' || process.env.ALLOW_MOCK_PAYMENTS !== 'true';
-
-      if (stripeAccountId.startsWith("acct_mock_")) {
-        if (isMockDisallowed) {
-          return res.status(400).json({ error: "Payouts cannot be requested for mock Stripe accounts in live environments." });
-        }
-        return res.json({ success: true, mock: true, payout: { id: `po_mock_${Date.now()}`, amount: (amount || 50) * 100 } });
-      }
-
-      let stripe;
-      try {
-        stripe = getStripe();
-      } catch (e) {
-        if (isMockDisallowed) {
-          return res.status(503).json({ error: "Stripe payout service is unavailable: Gateway is unconfigured." });
-        }
-        return res.json({ success: true, mock: true, payout: { id: `po_mock_${Date.now()}`, amount: (amount || 50) * 100 } });
-      }
-
-      const balance = await stripe.balance.retrieve({
-        stripeAccount: stripeAccountId,
+      const result = await executeProviderPayoutCommand({
+        db,
+        stripe,
+        authUid,
+        idempotencyKey: headerIdempotencyKey,
+        amountGbp: amount,
+        isMockDisallowed,
       });
 
-      const available = balance.available.find(b => b.currency === 'gbp')?.amount || 0;
-      if (available <= 0) {
-        throw new BadRequestError("No available balance for payout");
-      }
-
-      const payoutAmount = amount ? Math.round(Number(amount) * 100) : available;
-      if (payoutAmount > available) {
-        throw new BadRequestError(`Requested payout (${(payoutAmount / 100).toFixed(2)}) exceeds available balance (${(available / 100).toFixed(2)})`);
-      }
-
-      const payout = await stripe.payouts.create({
-        amount: payoutAmount,
-        currency: 'gbp',
-      }, {
-        stripeAccount: stripeAccountId,
-      });
-
-      await domainEvents.dispatch("PROVIDER_PAYOUT_INITIATED", payout.id, authUid, {
-        amount: payoutAmount,
-        currency: 'gbp'
-      }, undefined, db);
-
-      res.json({ success: true, payout });
+      return res.json(result);
     } catch (error: any) {
       console.error("Provider Payout Error:", error);
+      if (error?.status === 503) {
+        return res.status(503).json({ error: error.message });
+      }
       sendHttpError(res, error, req);
     }
   });
 
-  // Manual Driver Payouts Trigger (Admin)
-  app.post("/api/admin/trigger-payouts", requireAdmin, async (req, res) => {
+  // Manual Driver Payouts Trigger (Admin: financial_operator+ with audit context & optional dual-control gate)
+  app.post("/api/admin/trigger-payouts", requireAdmin, requireAdminTier("financial_operator", "triggering driver payouts"), async (req, res) => {
     try {
-      const result = await runDriverPayoutOrchestration();
+      const actor: AdminActor = (req as any).adminActor;
+      const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "Manual admin driver payout batch";
+      const approvalRequestId = typeof req.body?.approvalRequestId === "string" ? req.body.approvalRequestId.trim() : "";
+      const estimatedAmountGbp = Number(req.body?.estimatedAmountGbp) || 0;
+      const requireDualControl =
+        req.body?.requireDualControl === true || estimatedAmountGbp >= DUAL_CONTROL_THRESHOLD_GBP;
+
+      if (requireDualControl) {
+        await consumeDualControlApproval(db, approvalRequestId, "manual_driver_payout_batch", actor);
+      }
+
+      const result = await runDriverPayoutOrchestration({
+        uid: actor.uid,
+        email: actor.email,
+        triggerSource: approvalRequestId ? "approval_execution" : "manual_admin",
+        reason,
+        approvalRequestId: approvalRequestId || undefined,
+      });
       if (!result?.success) {
-         return res.status(500).json(result);
+        return res.status(500).json(result);
       }
       res.json(result);
     } catch (err: any) {
       console.error("Manual payout orchestration failed:", err);
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, req);
     }
   });
 
-  // Manual Trigger for Consultancy Scheduled Jobs (Admin)
-  app.post("/api/admin/trigger-consultancy-jobs", requireAdmin, async (req, res) => {
+  // Manual Trigger for Consultancy Scheduled Jobs (AT-CONS-SCHED-01: real workers & visible error propagation)
+  app.post("/api/admin/trigger-consultancy-jobs", requireAdmin, requireAdminTier("financial_operator", "triggering consultancy jobs"), async (req, res) => {
     try {
-      await runConsultancyRecurringSessionCreator();
-      await runConsultancyScoreRecalculator();
-      res.json({ success: true, message: "Consultancy background jobs triggered successfully." });
+      const recurringSessions = await runConsultancyRecurringSessionCreator();
+      const matchScores = await runConsultancyScoreRecalculator();
+
+      const allErrors = [...(recurringSessions.errors || []), ...(matchScores.errors || [])];
+      const bothFailed = recurringSessions.status === "failed" && matchScores.status === "failed";
+      const anyFailedOrPartial =
+        recurringSessions.status === "failed" ||
+        matchScores.status === "failed" ||
+        recurringSessions.status === "partial" ||
+        matchScores.status === "partial";
+      const bothSkipped = recurringSessions.status === "skipped" && matchScores.status === "skipped";
+
+      const httpStatus = bothFailed ? 500 : anyFailedOrPartial ? 207 : 200;
+      res.status(httpStatus).json({
+        success: !bothFailed && !anyFailedOrPartial && !bothSkipped,
+        status: bothFailed ? "failed" : anyFailedOrPartial ? "partial" : bothSkipped ? "skipped" : "executed",
+        recurringSessions,
+        matchScores,
+        errors: allErrors,
+        timestamp: new Date().toISOString(),
+      });
     } catch (err: any) {
       console.error("Consultancy background jobs failed:", err);
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, req);
     }
   });
 
-  // Platform Fee Settlement Route
-  app.post("/api/driver/settle-fees", requireAuth, async (req, res) => {
+  // Platform Fee Settlement Route (AT-RIDE-PAY-07: strict DB-authoritative balance & webhook ledger settlement)
+  app.post("/api/driver/settle-fees", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
-      const driverId = (req as any).user.uid; // Always derive strictly from verified token
-      const { amount } = req.body;
-      
-      let pendingPlatformFees = amount || 9.75;
-
-      if (db) {
-        try {
-          const driverDoc = await db.collection("users").doc(driverId).get();
-          if (driverDoc.exists) {
-            pendingPlatformFees = driverDoc.data()?.pendingPlatformFees || pendingPlatformFees;
-          }
-        } catch (dbErr) {
-          console.warn("Could not query DB inside /api/driver/settle-fees. Falling back to body amount:", dbErr);
-        }
+      if (!db) {
+        return res.status(503).json({ error: "Database backend unavailable for fee settlement." });
       }
-      
-      if (pendingPlatformFees <= 0) {
-        return res.status(400).json({ error: "No fees to settle" });
-      }
-
+      const driverId = (req as any).user.uid;
       const appUrl = getAuthoritativeAppUrl();
 
       let stripe;
       try {
         stripe = getStripe();
-      } catch (e) {
-        if (process.env.NODE_ENV === 'production' || process.env.ALLOW_MOCK_PAYMENTS !== 'true') {
-          console.error("Stripe is not configured in production. Refusing mock fee settlement bypass.");
-          return res.status(503).json({ error: "Fee settlement is currently unavailable: Stripe gateway is unconfigured." });
-        }
-        // Stripe not connected/configured, redirect direct to success path in Sandbox Mode
-        console.log("Stripe not connected. Directing to sandbox platform fee success pathway.");
-        const sandboxUrl = sanitizeRedirectUrl(`/platform-fee-success?sandbox=true&amount=${pendingPlatformFees}`, appUrl, `/platform-fee-success`);
-        return res.json({ url: sandboxUrl });
+      } catch {
+        return res.status(503).json({
+          error: "Fee settlement is currently unavailable: Stripe gateway is unconfigured.",
+        });
       }
 
-      const finalSuccessUrl = sanitizeRedirectUrl(`/platform-fee-success?amount=${pendingPlatformFees}`, appUrl, `/platform-fee-success`);
-      const finalCancelUrl = sanitizeRedirectUrl(`/driver-dashboard`, appUrl, `/driver-dashboard`);
-
-      const session = await stripe.checkout.sessions.create({
-        mode: 'payment',
-        payment_method_types: ['card'],
-        line_items: [{
-          price_data: {
-            currency: 'gbp',
-            product_data: {
-              name: `Platform Fees Settlement`,
-              description: "Settlement for accumulated cash trip commissions."
-            },
-            unit_amount: Math.round(pendingPlatformFees * 100),
-          },
-          quantity: 1,
-        }],
-        metadata: {
-          driverId,
-          type: 'fee_settlement'
-        },
-        success_url: finalSuccessUrl,
-        cancel_url: finalCancelUrl,
+      const result = await createDriverFeeSettlementCheckout({
+        db,
+        driverId,
+        stripeClient: stripe,
+        appUrl,
       });
 
-      res.json({ url: session.url });
+      res.json({ url: result.url, sessionId: result.sessionId, intentId: result.intentId });
     } catch (error: any) {
       console.error("Fee Settlement Error:", error);
-      res.status(500).json({ error: error.message });
+      sendHttpError(res, error, req);
     }
   });
 
-  // Manual / Sandbox Confirmation of Fee Settlement
-  app.post("/api/driver/confirm-fee-settlement", requireAuth, async (req, res) => {
+  // Authoritative Stripe Webhook Fee Settlement Status Lookup (replaces redirect-URL settlement)
+  app.get("/api/driver/fee-settlement-status", requireAuth, async (req, res) => {
     try {
-      const driverId = (req as any).user.uid; // Strictly derive driverId from verified token
-      
-      if (process.env.NODE_ENV === 'production' || process.env.ALLOW_MOCK_PAYMENTS !== 'true') {
-        return res.status(403).json({ error: "Direct settlement confirmation is only permitted in sandbox test environments." });
-      }
-
       if (!db) {
-        console.log(`Database is not connected. Returning safe sandbox completion for driver ${driverId}`);
-        return res.json({ success: true, settledAmount: null, sandboxFallback: true });
+        return res.status(503).json({ error: "Database backend unavailable" });
       }
-      
-      const driverRef = db.collection("users").doc(driverId);
-      const driverDoc = await driverRef.get();
-      if (!driverDoc.exists) return res.status(404).json({ error: "Driver not found" });
+      const caller = (req as any).user;
+      const sessionId = String(req.query?.session_id || "").trim();
+      if (!sessionId) {
+        return res.status(400).json({ error: "Missing session_id query parameter." });
+      }
 
-      const pendingFees = driverDoc.data()?.pendingPlatformFees || 0;
-      
-      await driverRef.update({
-        pendingPlatformFees: 0
+      const settlementSnap = await db.collection("driver_fee_settlements").doc(sessionId).get();
+      if (settlementSnap.exists) {
+        const data = settlementSnap.data() || {};
+        if (data.driverId !== caller.uid && caller.isAdmin !== true && caller.admin !== true) {
+          return res.status(403).json({ error: "Forbidden: Settlement does not belong to this driver." });
+        }
+        return res.json({
+          settled: true,
+          status: "settled",
+          settledAmount: Number(data.settledAmount || 0),
+          sessionId,
+        });
+      }
+
+      const driverSnap = await db.collection("users").doc(caller.uid).get();
+      const pendingPlatformFees = driverSnap.exists ? Number(driverSnap.data()?.pendingPlatformFees || 0) : null;
+      return res.json({
+        settled: false,
+        status: "pending",
+        pendingPlatformFees,
+        sessionId,
       });
-
-      console.log(`Driver ${driverId} settled £${pendingFees} in platform fees (confirmed via server)`);
-      res.json({ success: true, settledAmount: pendingFees });
     } catch (error: any) {
-      console.error("Confirm Fee Settlement Error:", error);
-      res.status(500).json({ error: error.message });
+      console.error("Fee Settlement Status Error:", error);
+      sendHttpError(res, error, req);
     }
+  });
+
+  // Legacy URL-redirect settlement endpoint locked down — fees settle strictly via signed Stripe webhooks
+  app.post("/api/driver/confirm-fee-settlement", requireAuth, async (_req, res) => {
+    return res.status(403).json({
+      error: "Direct settlement confirmation is disabled; platform fee settlements are reconciled strictly via signed Stripe webhooks.",
+    });
   });
 
   // Server-Authoritative Milestone Release Route & QR Handshake (V6 Hardened)
@@ -5095,6 +5906,47 @@ async function startServer() {
     }
   });
 
+  // Milestone Work Submission & Homeowner Review / Approval Workflow (AT-CJ-MILESTONE-01)
+  app.post("/api/milestones/submit-work", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const authUser = (req as any).user;
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { jobId, quoteId, milestoneId, deliverableNotes, deliverablePhotos } = req.body || {};
+      const result = await PaymentLedgerEngine.submitMilestoneWork(db, {
+        jobId,
+        quoteId,
+        milestoneId,
+        authUid: authUser.uid,
+        deliverableNotes,
+        deliverablePhotos,
+      });
+      return res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/milestones/review-work", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const authUser = (req as any).user;
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { jobId, quoteId, milestoneId, decision, revisionReason } = req.body || {};
+      const isAdmin = await checkIsAdmin(authUser);
+      const result = await PaymentLedgerEngine.reviewMilestoneWork(db, {
+        jobId,
+        quoteId,
+        milestoneId,
+        authUid: authUser.uid,
+        decision,
+        revisionReason,
+        isAdmin,
+      });
+      return res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
   // Server-Authoritative Review Submission & Rating Aggregation (PL-01 & Task 4.4 Hardened)
   app.post("/api/reviews/submit", requireAuth, reviewLimiter, async (req, res) => {
     try {
@@ -5206,6 +6058,7 @@ async function startServer() {
         if (type === "tradesperson_review") {
           transaction.update(jobRef, {
             hasReview: true,
+            hasHomeownerReview: true,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
         } else {
@@ -5214,42 +6067,46 @@ async function startServer() {
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
         }
+
+        // 4. Write reviewee notification atomically inside the same transaction (AT-CJ-REVIEW-04)
+        const reviewNotifRef = firestoreDb.collection("notifications").doc(`review_${reviewDocId}_${revieweeId}`);
+        if (isLowRating) {
+          const delayDays = 3 + Math.floor(Math.random() * 5);
+          const visibleAt = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000);
+          transaction.set(reviewNotifRef, {
+            userId: revieweeId,
+            title: "Trust & Fairness Update",
+            message: "The Trust & Fairness engine is conducting a standard quality review of a recent interaction. This process ensures platform balance and takes 14 days.",
+            type: "system",
+            read: false,
+            visibleAt: admin.firestore.Timestamp.fromDate(visibleAt),
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            link: `/jobs/${jobId}`
+          });
+        } else {
+          transaction.set(reviewNotifRef, {
+            userId: revieweeId,
+            title: "New Review Received! ⭐",
+            message: `You received a ${numRating}-star review for your recent job.`,
+            type: "system",
+            read: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            link: `/jobs/${jobId}`
+          });
+        }
       });
 
-      // 4. Handle Notifications
-      if (isLowRating) {
-        // Delayed notification fuzzing (3-7 days)
-        const delayDays = 3 + Math.floor(Math.random() * 5);
-        const visibleAt = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000);
-
-        await firestoreDb.collection("notifications").add({
-          userId: revieweeId,
-          title: "Trust & Fairness Update",
-          message: "The Trust & Fairness engine is conducting a standard quality review of a recent interaction. This process ensures platform balance and takes 14 days.",
-          type: "system",
-          read: false,
-          visibleAt: admin.firestore.Timestamp.fromDate(visibleAt),
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          link: `/jobs/${jobId}`
-        });
-      } else {
-        await firestoreDb.collection("notifications").add({
-          userId: revieweeId,
-          title: "New Review Received! ⭐",
-          message: `You received a ${numRating}-star review for your recent job.`,
-          type: "system",
-          read: false,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          link: `/jobs/${jobId}`
-        });
+      // Non-fatal post-commit domain event dispatch so committed reviews never trigger API failure
+      try {
+        await domainEvents.dispatch("REVIEW_SUBMITTED", reviewRef.id, reviewerId, {
+          jobId,
+          revieweeId,
+          rating: numRating,
+          isLowRating
+        }, reviewRef.id, firestoreDb);
+      } catch (eventErr) {
+        console.warn("[/api/reviews/submit] Non-fatal post-commit domain event notice:", eventErr);
       }
-
-      await domainEvents.dispatch("REVIEW_SUBMITTED", reviewRef.id, reviewerId, {
-        jobId,
-        revieweeId,
-        rating: numRating,
-        isLowRating
-      }, undefined, firestoreDb);
 
       res.json({
         success: true,
@@ -5391,6 +6248,8 @@ async function startServer() {
             },
           },
           idempotencyKey: idempotencyKey || `job_${commandType.toLowerCase()}_${jobId}_${identity.uid}`,
+          strictTraderProfileRequired: commandType === "StartJob",
+          stripe: commandType === "CancelJob" ? getOptionalStripeClient() : undefined,
         });
 
         res.status(200).json({
@@ -5412,6 +6271,34 @@ async function startServer() {
   app.post("/api/jobs/:jobId/complete", requireAuth, handleJobLifecycleRoute("CompleteJob"));
   app.post("/api/jobs/:jobId/cancel", requireAuth, handleJobLifecycleRoute("CancelJob"));
   app.post("/api/jobs/:jobId/dispute", requireAuth, handleJobLifecycleRoute("RaiseJobDispute"));
+
+  // Server-Authoritative Job Edit with Atomic Public Card Projection Sync (AT-CJ-JOB-07)
+  app.post("/api/jobs/:jobId/update", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const { jobId } = req.params;
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+
+      const result = await executeUpdateJobCommand({
+        db,
+        identity,
+        jobId,
+        rawPayload: req.body || {},
+      });
+
+      return res.json({
+        success: true,
+        ...result,
+      });
+    } catch (error: any) {
+      console.error("Job Update Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
 
   // Server-Authoritative Canonical CreateJob Command Route (Task 2)
   app.post("/api/jobs/create", requireAuth, async (req, res) => {
@@ -5759,20 +6646,13 @@ async function startServer() {
         return res.json(cached.data);
       }
 
-      const encoded = encodeURIComponent(formattedPostcode);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-      let response: Response;
-      try {
-        response = await fetch(`https://api.postcodes.io/postcodes/${encoded}`, {
-          signal: controller.signal
-        });
-      } finally {
-        clearTimeout(timeoutId);
-      }
-
-      const data = await response.json();
+      // AT-POSTCODE-01: Single AbortController timeout covering fetch + response.json() body consumption
+      const { status: upstreamStatus, ok: upstreamOk, data } = await fetchPostcodeWithTimeout(
+        formattedPostcode,
+        fetch,
+        5000
+      );
+      const response = { status: upstreamStatus, ok: upstreamOk };
       const isSuccess = response.ok && data && (data.status === 200 || data.result);
       const isNotFound = response.status === 404 || (data && data.status === 404);
 
@@ -6122,8 +7002,8 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     "suggestNewCategories"
   ]);
 
-  // Secure Gemini API Service Call Proxy
-  app.post("/api/gemini/call", express.json({ limit: "10mb" }), requireAuth, aiLimiter, async (req, res) => {
+  // Secure Gemini API Service Call Proxy (AT-ADMIN-OPS-07: requireAuth + aiLimiter run BEFORE 10MB body parser)
+  app.post("/api/gemini/call", requireAuth, aiLimiter, geminiJsonParser, async (req, res) => {
     try {
       const { functionName, args } = req.body;
       if (!functionName) {
@@ -6142,52 +7022,90 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         return res.status(403).json({ error: `Function '${functionName}' requires administrator privileges` });
       }
 
+      if (functionName === "callTradeBot") {
+        const [userMessage, history, userContext] = Array.isArray(args) ? args : [];
+        const authUser = (req as any).user;
+        const authoritativeRole = authUser?.isAdmin ? "admin" : (authUser?.role || "homeowner");
+        const result = await geminiServer.callTradeBot(userMessage, history, userContext, { authoritativeRole });
+        return res.json(result);
+      }
+
       const result = await targetFunc(...(args || []));
       res.json(result);
     } catch (error: any) {
       console.error(`Gemini Server Execution Error for ${req.body?.functionName}:`, error);
-      res.status(500).json({ error: error.message || "Failed to execute Gemini function" });
+      const isValidationError = typeof error?.message === "string" && error.message.startsWith("Invalid TradeBot request:");
+      res.status(isValidationError ? 400 : 500).json({ error: error.message || "Failed to execute Gemini function" });
     }
   });
 
   // High-Performance SSE Token Streaming Endpoint (<100-200ms TTFB)
   app.post("/api/gemini/stream", requireAuth, aiLimiter, async (req, res) => {
-    // Configure SSE Headers
+    const { task, args } = req.body || {};
+
+    if (task !== "callTradeBotStream" && task !== "streamDiagnostic") {
+      return res.status(400).json({ error: `Unknown streaming task: ${String(task || "")}` });
+    }
+
+    if (task === "streamDiagnostic" && !(req as any).user?.isAdmin) {
+      return res.status(403).json({ error: "streamDiagnostic requires administrator privileges" });
+    }
+
+    if (task === "callTradeBotStream") {
+      const [rawUserMessage] = Array.isArray(args) ? args : [];
+      if (typeof rawUserMessage !== "string" || !rawUserMessage.trim()) {
+        return res.status(400).json({ error: "Invalid TradeBot request: message cannot be empty." });
+      }
+      if (rawUserMessage.trim().length > 1500) {
+        return res.status(400).json({ error: "Invalid TradeBot request: message exceeds 1500 characters." });
+      }
+    }
+
+    // Configure SSE Headers after validation succeeds
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
     if (res.flushHeaders) res.flushHeaders();
 
-    const { task, args } = req.body || {};
+    const abortController = new AbortController();
+    const handleClientClose = () => {
+      abortController.abort();
+    };
+    req.on("close", handleClientClose);
 
     try {
       if (task === "callTradeBotStream") {
-        const [userMessage, history, userContext] = args || [];
-        const generator = geminiServer.callTradeBotStream(userMessage, history, userContext);
+        const [userMessage, history, userContext] = Array.isArray(args) ? args : [];
+        const authUser = (req as any).user;
+        const authoritativeRole = authUser?.isAdmin ? "admin" : (authUser?.role || "homeowner");
+        const generator = geminiServer.callTradeBotStream(userMessage, history, userContext, {
+          authoritativeRole,
+          abortSignal: abortController.signal
+        });
         for await (const event of generator) {
+          if (abortController.signal.aborted || res.writableEnded) break;
           res.write(`data: ${JSON.stringify(event)}\n\n`);
         }
       } else if (task === "streamDiagnostic") {
-        if (!(req as any).user?.isAdmin) {
-          res.write(`data: ${JSON.stringify({ type: "error", error: "streamDiagnostic requires administrator privileges" })}\n\n`);
-          res.write("data: [DONE]\n\n");
-          return res.end();
-        }
-        const [prompt, systemInstruction] = args || [];
+        const [prompt, systemInstruction] = Array.isArray(args) ? args : [];
         const generator = geminiServer.streamGeminiDiagnostic(prompt, systemInstruction);
         for await (const event of generator) {
+          if (abortController.signal.aborted || res.writableEnded) break;
           res.write(`data: ${JSON.stringify(event)}\n\n`);
         }
-      } else {
-        res.write(`data: ${JSON.stringify({ type: "error", error: `Unknown streaming task: ${task}` })}\n\n`);
       }
     } catch (error: any) {
       console.error(`Gemini Streaming Server Error [${task}]:`, error);
-      res.write(`data: ${JSON.stringify({ type: "error", error: error.message || "Streaming failed" })}\n\n`);
+      if (!abortController.signal.aborted && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: "error", error: error.message || "Streaming failed" })}\n\n`);
+      }
     } finally {
-      res.write("data: [DONE]\n\n");
-      res.end();
+      req.off("close", handleClientClose);
+      if (!res.writableEnded) {
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
     }
   });
 
@@ -6222,47 +7140,165 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
+  // Server-Mediated Unmatched Search / Demand-Gap Telemetry Endpoint (Admin-only reads in Firestore)
+  app.post("/api/telemetry/unmatched-search", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ recorded: false, reason: "database_unavailable" });
+      }
+      const rawQuery = typeof req.body?.query === "string" ? req.body.query.trim().toLowerCase() : "";
+      if (rawQuery.length < 3 || rawQuery.length > 200 || /^\d+$/.test(rawQuery)) {
+        return res.status(400).json({ recorded: false, error: "Invalid telemetry query" });
+      }
+
+      const slug = rawQuery.replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, "_").substring(0, 50);
+      if (!slug || slug.length < 3) {
+        return res.status(400).json({ recorded: false, error: "Invalid telemetry slug" });
+      }
+
+      const allowedSources = new Set(["search_bar", "ai_bot", "post_job"]);
+      const allowedGapTypes = new Set(["unmatched_category", "no_traders_found"]);
+      const source = allowedSources.has(req.body?.source) ? req.body.source : "search_bar";
+      const gapType = allowedGapTypes.has(req.body?.gapType) ? req.body.gapType : "unmatched_category";
+      const postcodeArea = typeof req.body?.postcodeArea === "string"
+        ? req.body.postcodeArea.trim().toUpperCase().replace(/[^A-Z0-9 ]/g, "").split(" ")[0].slice(0, 6)
+        : "";
+      const suggestedCategory = typeof req.body?.category === "string"
+        ? req.body.category.trim().slice(0, 80)
+        : "";
+
+      const docRef = db.collection("unmatched_search_telemetry").doc(slug);
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(docRef);
+        if (snap.exists) {
+          tx.update(docRef, {
+            searchCount: admin.firestore.FieldValue.increment(1),
+            lastSearchedAt: admin.firestore.FieldValue.serverTimestamp(),
+            ...(postcodeArea ? { postcodeArea } : {}),
+            source,
+            gapType
+          });
+        } else {
+          tx.set(docRef, {
+            id: slug,
+            query: rawQuery,
+            normalizedQuery: slug,
+            searchCount: 1,
+            lastSearchedAt: admin.firestore.FieldValue.serverTimestamp(),
+            postcodeArea,
+            status: "unmatched",
+            source,
+            gapType,
+            suggestedCategory,
+            userId: (req as any).user?.uid || ""
+          });
+        }
+      });
+
+      return res.json({ recorded: true, id: slug });
+    } catch (e: any) {
+      console.warn("[Telemetry] Failed to record unmatched search:", e?.message || e);
+      return res.status(500).json({ recorded: false, error: "Failed to record demand telemetry" });
+    }
+  });
+
   // --- AI Agent Ecosystem Endpoints ---
   app.post("/api/admin/agents/scan", requireAdmin, async (req, res) => {
     try {
-      const { agentType, payload } = req.body;
+      const { agentType, payload } = req.body || {};
+      if (!db) {
+        return res.status(503).json({
+          success: false,
+          status: "unavailable",
+          error: "Service Unavailable: Firestore telemetry database is required for live agent scans.",
+        });
+      }
+
       let result: any = {};
 
       switch (agentType) {
-        case "materials_arbitrage":
-          result = await geminiServer.runServerMaterialsArbitrage(payload?.region || "Greater Manchester");
+        case "materials_arbitrage": {
+          const jobsSnap = await db.collection("jobs").limit(30).get();
+          const observedDemandSignals = jobsSnap.docs.map((d) => {
+            const j = d.data() || {};
+            return {
+              category: j.category,
+              title: j.title,
+              postcode: j.postcode,
+              budget: j.budget || j.agreedPrice || null,
+            };
+          });
+          result = await geminiServer.runServerMaterialsArbitrage(
+            payload?.region || "Greater Manchester",
+            observedDemandSignals
+          );
           break;
-        case "trader_churn":
-          result = await geminiServer.runServerTraderChurnPredictor(payload?.sampleTraders || []);
+        }
+        case "trader_churn": {
+          let liveTraders = Array.isArray(payload?.sampleTraders) && payload.sampleTraders.length > 0
+            ? payload.sampleTraders
+            : [];
+          if (liveTraders.length === 0) {
+            const tradersSnap = await db.collection("users").where("role", "==", "tradesperson").limit(30).get();
+            liveTraders = tradersSnap.docs.map((d) => {
+              const u = d.data() || {};
+              return {
+                id: d.id,
+                name: u.name || u.businessName || "Tradesperson",
+                tradeCategory: u.primaryTrade || u.category || (Array.isArray(u.trades) ? u.trades[0] : "General"),
+                cityLocation: u.city || u.postcode || "UK",
+                rating: u.rating ?? null,
+                completedJobs: u.completedJobs ?? 0,
+                verified: Boolean(u.idVerified || u.verifiedTrader),
+                lastActiveAt: u.lastActiveAt || u.updatedAt || null,
+              };
+            });
+          }
+          result = await geminiServer.runServerTraderChurnPredictor(liveTraders);
           break;
-        case "demand_surge":
-          result = await geminiServer.runServerDemandSurgePredictor(payload?.region || "UK Wide", payload?.weatherCondition || "Sub-Zero Freeze & Frost Alert");
+        }
+        case "demand_surge": {
+          const jobsSnap = await db.collection("jobs").limit(50).get();
+          const platformDemandSignals = jobsSnap.docs.map((d) => {
+            const j = d.data() || {};
+            return {
+              category: j.category,
+              urgency: j.urgency || (j.isEmergency ? "emergency" : "standard"),
+              postcode: j.postcode,
+              status: j.status,
+            };
+          });
+          result = await geminiServer.runServerDemandSurgePredictor(
+            payload?.region || "UK Wide",
+            payload?.weatherCondition || "Sub-Zero Freeze & Frost Alert",
+            platformDemandSignals
+          );
           break;
+        }
         default:
           return res.status(400).json({ error: `Unknown agentType: ${agentType}` });
       }
 
-      // Record to audit logs in Firestore
-      if (db) {
-        try {
-          await db.collection("ai_agent_audit_logs").add({
-            agentType,
-            action: "SCAN_COMPLETED",
-            details: `Autonomous scan completed for ${agentType}`,
-            summary: result.executiveSummary || result.recommendedInterventionSummary || result.activeWeatherAlert || "Scan completed",
-            timestamp: new Date().toISOString(),
-            status: "success",
-            triggerSource: "admin_portal"
-          });
-        } catch (logErr) {
-          console.warn("Audit log write error:", logErr);
-        }
-      }
+      await db.collection("ai_agent_audit_logs").add({
+        agentType,
+        action: "SCAN_COMPLETED",
+        details: `Live telemetry scan completed for ${agentType}`,
+        summary: result.executiveSummary || result.recommendedInterventionSummary || result.activeWeatherAlert || "Scan completed",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        triggerSource: "admin_portal"
+      }).catch((logErr) => console.warn("Audit log write error:", logErr));
 
       res.json({ success: true, agentType, data: result });
     } catch (error: any) {
+      const msg = error?.message || "Failed to execute agent scan";
+      const isUnavailable = /GEMINI_API_KEY|API_KEY|PERMISSION_DENIED|ACCESS_DENIED|unavailable/i.test(msg);
       console.error("AI Agent Scan API Error:", error);
-      res.status(500).json({ error: error.message || "Failed to execute agent scan" });
+      res.status(isUnavailable ? 503 : 500).json({
+        success: false,
+        status: isUnavailable ? "unavailable" : "error",
+        error: msg,
+      });
     }
   });
 
@@ -6373,35 +7409,137 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // Admin Security & Misuse Email Alert Dispatcher
+  // Admin Security & Misuse Email Alert Dispatcher (Real Transport + Queue Persistence)
   app.post("/api/admin/send-email-alert", requireAdmin, async (req, res) => {
     try {
-      const { to, subject, html, breachId, severity, breachType } = req.body;
-      const recipient = to || process.env.ADMIN_ALERT_EMAIL || "admin@tradequote.uk";
-      console.log(`🚨 [EMAIL ALERT DISPATCH] Recipient: ${recipient} | Severity: ${severity} | Breach: ${breachType}`);
-      
-      // If db is available, log to email_queue
-      if (db) {
-        await db.collection("email_queue").add({
-          to: recipient,
-          subject: subject || "🚨 Security Alert Flagged",
-          html: html || "",
+      const { to, subject, html, breachId, severity, breachType } = req.body || {};
+      const recipient = to || process.env.ADMIN_ALERT_EMAIL || "";
+      const result = await dispatchTransactionalEmail({
+        db,
+        to: recipient,
+        subject: subject || "🚨 Security Alert Flagged",
+        html: html || "",
+        metadata: {
           breachId: breachId || null,
           severity: severity || "HIGH",
           breachType: breachType || "anomaly",
-          status: "delivered",
-          sentAt: new Date().toISOString()
-        }).catch(err => console.warn("Could not write to email_queue:", err));
+        },
+      });
+
+      if (!result.delivered) {
+        const statusCode =
+          result.status === "unconfigured"
+            ? 503
+            : result.provider === "none" && result.status === "failed"
+            ? 400
+            : 502;
+        return res.status(statusCode).json({
+          success: false,
+          delivered: false,
+          status: result.status,
+          provider: result.provider,
+          queueId: result.queueId,
+          error: result.error,
+          timestamp: result.timestamp,
+        });
       }
 
       res.json({
         success: true,
-        message: `Email alert dispatched to ${recipient}`,
-        timestamp: new Date().toISOString()
+        delivered: true,
+        status: result.status,
+        provider: result.provider,
+        queueId: result.queueId,
+        providerMessageId: result.providerMessageId,
+        message: `Email alert delivered to ${recipient}`,
+        timestamp: result.timestamp,
       });
     } catch (error: any) {
       console.error("Error in /api/admin/send-email-alert:", error);
-      res.status(500).json({ error: error.message || "Failed to dispatch email alert" });
+      res.status(500).json({ success: false, delivered: false, error: error.message || "Failed to dispatch email alert" });
+    }
+  });
+
+  // Durable Staff Invitations (Expiring SHA-256 Token + Real Email Dispatch)
+  app.post("/api/admin/invitations", requireAdmin, async (req, res) => {
+    try {
+      const caller = (req as any).user || {};
+      const result = await createAndDispatchStaffInvitation({
+        db,
+        email: req.body?.email,
+        permissions: req.body?.permissions,
+        invitedByUid: caller.uid,
+        invitedByEmail: caller.email,
+        appOrigin: getAuthoritativeAppUrl(),
+      });
+
+      if (db) {
+        await db.collection("admin_audit_logs").add({
+          action: "send_invitation",
+          targetId: result.invitationId,
+          targetType: "invitation",
+          details: `Staff invitation for ${result.email} (${result.status} / ${result.deliveryStatus})`,
+          adminId: caller.uid,
+          adminEmail: caller.email || null,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+      }
+
+      if (!result.success) {
+        const httpCode = result.deliveryStatus === "unconfigured" ? 503 : 502;
+        return res.status(httpCode).json(result);
+      }
+
+      res.status(201).json(result);
+    } catch (err: any) {
+      if (err instanceof StaffInvitationError) {
+        return res.status(err.statusCode).json({ success: false, error: err.message });
+      }
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/invitations/:invitationId/accept", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user || {};
+      const accepted = await acceptStaffInvitationToken({
+        db,
+        invitationId: req.params.invitationId,
+        token: req.body?.token,
+        callerUid: caller.uid,
+        callerEmail: caller.email,
+        emailVerified: caller.email_verified === true,
+      });
+
+      try {
+        const userRecord = await admin.auth().getUser(caller.uid);
+        await admin.auth().setCustomUserClaims(caller.uid, {
+          ...(userRecord.customClaims || {}),
+          admin: true,
+          isAdmin: true,
+        });
+      } catch {
+        // Non-blocking if Identity Toolkit unavailable in local tests
+      }
+
+      if (db) {
+        await db.collection("admin_audit_logs").add({
+          action: "accept_invitation",
+          targetId: accepted.invitationId,
+          targetType: "invitation",
+          details: `Staff invitation accepted by ${caller.email}`,
+          adminId: caller.uid,
+          adminEmail: caller.email || null,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        }).catch(() => {});
+      }
+
+      res.json({ success: true, ...accepted });
+    } catch (err: any) {
+      if (err instanceof StaffInvitationError) {
+        return res.status(err.statusCode).json({ success: false, error: err.message });
+      }
+      sendHttpError(res, err, req);
     }
   });
 
@@ -6540,8 +7678,19 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // Server-Authoritative Push Token Registration (Task 35-D Hardened)
-  // Strictly binds token to authenticated caller's profile
+  const getFirebaseMessagingClient = () => {
+    try {
+      if (admin.apps.length > 0 && typeof admin.messaging === "function") {
+        return admin.messaging();
+      }
+    } catch {
+      // Unconfigured FCM environment — strict gate handles honestly
+    }
+    return null;
+  };
+
+  // Server-Authoritative Push Token Registration (Task 35-D + AT-CJ-NOTIF-05)
+  // Strictly binds per-installation deviceId token to authenticated caller's subcollection
   app.post("/api/notifications/register-token", requireAuth, async (req, res) => {
     try {
       const caller = (req as any).user;
@@ -6561,6 +7710,60 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       sendHttpError(res, error, req);
     }
   });
+
+  // AT-CJ-NOTIF-05: Per-device push token unregistration on logout / account switch
+  app.post("/api/notifications/unregister-token", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await unregisterAuthoritativePushToken(db, caller, req.body || {});
+      res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.delete("/api/notifications/push-token/:deviceId", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await unregisterAuthoritativePushToken(db, caller, {
+        deviceId: req.params.deviceId,
+      });
+      res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-CJ-NOTIF-06: Authoritative multi-device FCM chat push dispatch behind strict config gate
+  const handleAuthoritativeChatPush = async (req: express.Request, res: express.Response) => {
+    try {
+      const caller = (req as any).user;
+      const result = await sendAuthoritativeChatPush(
+        db,
+        getFirebaseMessagingClient(),
+        caller,
+        req.body || {}
+      );
+      res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  };
+
+  app.post(
+    "/api/notifications/send-chat-push",
+    requireAuth,
+    AbuseDefenseEngine.createMiddleware("NOTIFICATION_SEND"),
+    handleAuthoritativeChatPush
+  );
+
+  // Backwards-compatible alias used by Ride/Dispatch chat push callers (same auth + rate-limit + relationship checks)
+  app.post(
+    "/api/chat-push",
+    requireAuth,
+    AbuseDefenseEngine.createMiddleware("NOTIFICATION_SEND"),
+    handleAuthoritativeChatPush
+  );
 
   // Server-Authoritative Lead Distribution & Matching Alert Dispatch (H3 Hardened)
   // Homeowner job posting leads are authoritatively matched and dispatched server-side
@@ -6592,39 +7795,44 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         const postcode = jobData.postcode || req.body.postcode || "";
         const urgency = jobData.urgency || req.body.urgency || "standard";
         const isEmergency = urgency === "emergency" || jobData.isEmergency === true;
+        const jobLat = typeof jobData.lat === "number" ? jobData.lat : Number(jobData.latitude ?? jobData.coordinates?.lat);
+        const jobLng = typeof jobData.lng === "number" ? jobData.lng : Number(jobData.longitude ?? jobData.coordinates?.lng);
 
-        // Query matching tradespeople from users/public_profiles
+        // Query candidate tradespeople from users (AT-LEAD-01: strict category + geo proximity on ALL jobs including emergency)
         let matchedTradersSnapshot;
         try {
           matchedTradersSnapshot = await db.collection("users")
             .where("role", "==", "tradesperson")
-            .limit(30)
+            .limit(150)
             .get();
         } catch (err) {
           console.error("Error querying tradespeople for distribution:", err);
           return res.json({ success: true, notifiedCount: 0 });
         }
 
+        const eligibleRecipients = filterEligibleLeadRecipients(
+          matchedTradersSnapshot.docs.map((d: any) => ({ id: d.id, data: d.data() || {} })),
+          {
+            jobId,
+            ownerId,
+            callerUid,
+            category,
+            postcode,
+            lat: Number.isFinite(jobLat) ? jobLat : null,
+            lng: Number.isFinite(jobLng) ? jobLng : null,
+            isEmergency,
+          },
+          20
+        );
+
         let notifiedCount = 0;
         const batch = db.batch();
 
-        for (const traderDoc of matchedTradersSnapshot.docs) {
-          const trader = traderDoc.data();
-          if (trader.uid === callerUid) continue; // Don't notify self
-
-          const trades = trader.trades || [];
-          const traderPostcode = (trader.postcode || "").toUpperCase().split(" ")[0];
-          const targetPostcode = (postcode || "").toUpperCase().split(" ")[0];
-
-          // Match category
-          const matchesCategory = trades.includes(category) || category === "All" || category === "General";
-          const matchesArea = !traderPostcode || !targetPostcode || traderPostcode.slice(0, 2) === targetPostcode.slice(0, 2) || isEmergency;
-
-          if (!matchesCategory && !isEmergency) continue;
-
+        for (const recipient of eligibleRecipients) {
+          const trader = recipient.data;
           const notifRef = db.collection("notifications").doc();
           batch.set(notifRef, {
-            userId: traderDoc.id,
+            userId: recipient.id,
             senderId: callerUid,
             type: "new_job_lead",
             title: isEmergency ? `🚨 Emergency ${category} Lead in ${postcode || "your area"}` : `New ${category} lead in ${postcode || "your area"}`,
@@ -6638,12 +7846,12 @@ Limit your response to just the text of the tip. Do not use quotes.`;
             visibleAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          // If emergency and trader has verified phone, enqueue server-controlled SMS
+          // If emergency and trader has phone, enqueue server-controlled SMS
           if (isEmergency && trader.phone) {
             const smsRef = db.collection("sms_queue").doc();
             batch.set(smsRef, {
               to: trader.phone,
-              toUserId: traderDoc.id,
+              toUserId: recipient.id,
               jobId,
               body: `EMERGENCY ALERT: New ${category} job near you in ${postcode}. Open TradeOS to claim.`,
               status: "pending",
@@ -6653,11 +7861,29 @@ Limit your response to just the text of the tip. Do not use quotes.`;
           }
 
           notifiedCount++;
-          if (notifiedCount >= 20) break; // Cap batch size
         }
 
         if (notifiedCount > 0) {
           await batch.commit();
+          // AT-CJ-NOTIF-06: Dispatch multi-device FCM push alerts behind strict provider config gate
+          const messagingClient = getFirebaseMessagingClient();
+          const fcmTargets = eligibleRecipients.slice(0, 25);
+          await Promise.allSettled(
+            fcmTargets.map((recipient) =>
+              dispatchAuthoritativeFcmPush(db, messagingClient, {
+                recipientId: recipient.id,
+                title: isEmergency ? `Emergency ${category} Job Nearby` : `New ${category} Job Match`,
+                body: `A new ${category} job in ${postcode || "your area"} is ready for quotes.`,
+                channelId: isEmergency ? "emergency_leads" : "job_leads",
+                eventType: isEmergency ? "emergency_lead" : "job_lead",
+                data: {
+                  jobId,
+                  category: String(category),
+                  type: isEmergency ? "emergency_lead" : "job_lead",
+                },
+              })
+            )
+          );
         }
 
         // Update job with timestamp
@@ -6677,100 +7903,121 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   );
 
-  // Cloud Scheduler / Cloud Run Job Decoupled Cron Trigger Endpoints (Task 5.4)
+  // Server-Authoritative Manual Invoice Creation (AT-CJ-INVOICE-06)
+  app.post("/api/invoices/create", requireAuth, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service is not initialized.");
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+      const result = await createManualInvoiceCommand({
+        db,
+        identity,
+        rawBody: req.body,
+      });
+      res.status(201).json({ success: true, id: result.id, invoice: result.invoice });
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative Instant Match Accept / Decline Command (AT-MATCH-08 / AT-CJ-SEC-START-01)
+  app.post("/api/instant-match/respond", requireAuth, async (req, res) => {
+    try {
+      const callerUid = (req as any).user?.uid;
+      if (!callerUid) throw new UnauthorizedError("Authentication token is missing.");
+      if (!db) throw new BadRequestError("Database service is not initialized.");
+
+      const attemptId = String(req.body?.attemptId || "").trim();
+      const action = req.body?.action === "decline" ? "decline" : req.body?.action === "accept" ? "accept" : null;
+      if (!attemptId || !action) {
+        throw new BadRequestError("attemptId and valid action ('accept' or 'decline') are required.");
+      }
+
+      const result = await respondToInstantMatchAttempt({
+        db,
+        uid: callerUid,
+        attemptId,
+        action,
+      });
+      res.json({ success: true, ...result });
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Cloud Scheduler / Cloud Run Job Decoupled Cron Trigger Endpoints (Leased + Fenced + Honest Execution Accounting AT-ADMIN-OPS-05)
   app.post("/api/cron/:jobName", requireCronOrAdmin, async (req, res) => {
     const { jobName } = req.params;
     try {
-      let result: any = { executed: false };
+      let outcome: { acquired: boolean; fencedOut: boolean; reason?: string; result?: any };
+      let canonicalJob = jobName;
+
       switch (jobName) {
-        case "sms-queue": {
-          const locked = await acquireCronLock("sms_queue", 45000);
-          if (locked) {
-            await processSmsQueue();
-            result = { executed: true, job: "sms_queue" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired by another instance" };
-          }
+        case "sms-queue":
+          canonicalJob = "sms_queue";
+          outcome = await runWithSchedulerLease("sms_queue", 45000, async () => processSmsQueue());
           break;
-        }
-        case "daily-aggregation": {
-          const locked = await acquireCronLock("daily_aggregation", 300000);
-          if (locked) {
-            await runDailyAggregation();
-            result = { executed: true, job: "daily_aggregation" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "daily-aggregation":
+          canonicalJob = "daily_aggregation";
+          outcome = await runWithSchedulerLease("daily_aggregation", 300000, async () => runDailyAggregation());
           break;
-        }
-        case "driver-payouts": {
-          const locked = await acquireCronLock("driver_payouts", 300000);
-          if (locked) {
-            const payoutResult = await runDriverPayoutOrchestration();
-            result = { executed: true, job: "driver_payouts", details: payoutResult };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "driver-payouts":
+          canonicalJob = "driver_payouts";
+          outcome = await runWithSchedulerLease("driver_payouts", 300000, async () => runDriverPayoutOrchestration());
           break;
-        }
-        case "recurring-sessions": {
-          const locked = await acquireCronLock("recurring_sessions", 300000);
-          if (locked) {
-            await runConsultancyRecurringSessionCreator();
-            result = { executed: true, job: "recurring_sessions" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "recurring-sessions":
+          canonicalJob = "recurring_sessions";
+          outcome = await runWithSchedulerLease("recurring_sessions", 300000, async () => runConsultancyRecurringSessionCreator());
           break;
-        }
-        case "match-scores": {
-          const locked = await acquireCronLock("match_scores", 300000);
-          if (locked) {
-            await runConsultancyScoreRecalculator();
-            result = { executed: true, job: "match_scores" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "match-scores":
+          canonicalJob = "match_scores";
+          outcome = await runWithSchedulerLease("match_scores", 300000, async () => runConsultancyScoreRecalculator());
           break;
-        }
-        case "compliance-audit": {
-          const locked = await acquireCronLock("compliance_audit", 300000);
-          if (locked) {
-            await runComplianceGuardianAudit();
-            result = { executed: true, job: "compliance_audit" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "compliance-audit":
+          canonicalJob = "compliance_audit";
+          outcome = await runWithSchedulerLease("compliance_audit", 300000, async () => runComplianceGuardianAudit());
           break;
-        }
-        case "sentinel-scan": {
-          const locked = await acquireCronLock("sentinel_scan", 300000);
-          if (locked) {
-            await runSentinelAnomalyScan();
-            result = { executed: true, job: "sentinel_scan" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "sentinel-scan":
+          canonicalJob = "sentinel_scan";
+          outcome = await runWithSchedulerLease("sentinel_scan", 300000, async () => runSentinelAnomalyScan());
           break;
-        }
-        case "matching-system": {
-          const locked = await acquireCronLock("matching_system", 8000);
-          if (locked) {
-            await runMatchingCycle();
-            result = { executed: true, job: "matching_system" };
-          } else {
-            result = { executed: false, reason: "Lock already acquired" };
-          }
+        case "matching-system":
+          canonicalJob = "matching_system";
+          outcome = await runWithSchedulerLease("matching_system", 12000, async (ctx) => runMatchingCycle(ctx));
           break;
-        }
+        case "refund-reconciliation":
+          canonicalJob = "refund_reconciliation";
+          outcome = await runWithSchedulerLease("refund_reconciliation", 180000, async () =>
+            reconcilePaymentRefundAggregates(db, getOptionalStripeClient())
+          );
+          break;
+        case "sweep-payment-intents":
+          canonicalJob = "sweep_payment_intents";
+          outcome = await runWithSchedulerLease("sweep_payment_intents", 120000, async () =>
+            sweepStaleCheckoutIntents({ db, stripeClient: getOptionalStripeClient() })
+          );
+          break;
         default:
           return res.status(404).json({ error: `Unknown cron job '${jobName}'` });
       }
 
-      res.json({ success: true, ...result, timestamp: new Date().toISOString() });
+      const dispatch = buildCronDispatchResponse(canonicalJob, outcome);
+      return res.status(dispatch.httpStatus).json(dispatch.body);
     } catch (error: any) {
       console.error(`Error in /api/cron/${jobName}:`, error);
-      res.status(500).json({ error: error.message || "Failed to execute cron job" });
+      res.status(500).json({
+        success: false,
+        executed: false,
+        job: jobName,
+        status: "failed",
+        executedCount: 0,
+        skippedCount: 0,
+        failedCount: 1,
+        errors: [error?.message || "Failed to execute cron job"],
+        timestamp: new Date().toISOString(),
+      });
     }
   });
 
@@ -6795,15 +8042,136 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Endpoint
+  // FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Endpoint (with full FIN-05 collector/evaluator audit)
   app.get("/api/admin/financial-reconciliation/report", requireAdmin, async (req, res) => {
     try {
       const caller = (req as any).user;
-      const report = await generateFinancialReconciliationReport(db, req.query, {
-        uid: caller.uid,
-        isAdmin: true,
-      });
+      const includeAudit = req.query.includeAudit !== "false";
+      const report = await generateFinancialReconciliationReport(
+        db,
+        req.query as any,
+        {
+          uid: caller.uid,
+          isAdmin: true,
+        },
+        {
+          stripeClient: getOptionalStripeClient(),
+          includeAudit,
+        }
+      );
       res.json({ success: true, ...report });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/financial-reconciliation/audit", requireAdmin, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const report = await generateFinancialReconciliationReport(
+        db,
+        { ...(req.body || {}), includeAudit: true },
+        { uid: caller.uid, isAdmin: true },
+        { stripeClient: getOptionalStripeClient(), includeAudit: true }
+      );
+      res.json({ success: true, ...report });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/financial-reconciliation/resolve", requireAdmin, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await executeReconciliationOperatorAction({
+        db,
+        stripeClient: getOptionalStripeClient(),
+        caller: { uid: caller.uid, email: caller.email, isAdmin: true },
+        action: req.body?.action,
+        jobId: req.body?.jobId,
+        quoteId: req.body?.quoteId,
+        milestoneId: req.body?.milestoneId,
+        idempotencyKey: req.body?.idempotencyKey,
+        findingCode: req.body?.findingCode,
+        entityId: req.body?.entityId,
+        note: req.body?.note,
+      });
+      res.json(result);
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-ADMIN-CTRL-01, AT-ACCOUNT-01, AT-VER-09: Unified Account Suspension, Deletion & Reinstatement
+  app.post("/api/admin/users/:userId/suspend", requireAdmin, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await suspendOrDeleteAccount({
+        db,
+        authClient: admin.auth(),
+        adminUid: caller.uid,
+        adminEmail: caller.email,
+        targetUid: req.params.userId,
+        reason: req.body?.reason || "Administrative suspension",
+        mode: "suspend",
+      });
+      res.json(result);
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/users/:userId/reinstate", requireAdmin, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await reinstateSuspendedAccount({
+        db,
+        authClient: admin.auth(),
+        adminUid: caller.uid,
+        adminEmail: caller.email,
+        targetUid: req.params.userId,
+        reason: req.body?.reason || "Administrative reinstatement",
+      });
+      res.json(result);
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  const handleAdminDeleteUser = async (req: express.Request, res: express.Response) => {
+    try {
+      const caller = (req as any).user;
+      const result = await suspendOrDeleteAccount({
+        db,
+        authClient: admin.auth(),
+        adminUid: caller.uid,
+        adminEmail: caller.email,
+        targetUid: req.params.userId,
+        reason: req.body?.reason || "Administrative account deletion",
+        mode: "delete",
+      });
+      res.json(result);
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  };
+  app.delete("/api/admin/users/:userId", requireAdmin, handleAdminDeleteUser);
+  app.post("/api/admin/users/:userId/delete", requireAdmin, handleAdminDeleteUser);
+
+  // AT-ADMIN-CONFIG-01: Atomic Versioned Pricing & Commission Config Publisher
+  app.post("/api/admin/pricing-config/publish", requireAdmin, requireAdminTier("super_admin", "publishing platform pricing configuration"), async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await publishPlatformPricingConfigAtomic({
+        db,
+        adminUid: caller.uid,
+        adminEmail: caller.email,
+        tempConfig: req.body?.tempConfig,
+        feeTiers: req.body?.feeTiers,
+        businessTiers: req.body?.businessTiers,
+        paidAddons: req.body?.paidAddons,
+      });
+      res.json(result);
     } catch (err: any) {
       sendHttpError(res, err, req);
     }
@@ -6816,22 +8184,21 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   // Register task handlers for the async queue
   registerIntelligenceTaskHandlers();
 
-  // Trigger Asynchronous Job Intelligence Analysis
+  // Trigger Asynchronous Job Intelligence Analysis (AT-INTEL-JOB-01: dynamic content/version idempotency hash)
   app.post("/api/intelligence/jobs/:jobId/analyze", requireAuth, async (req, res) => {
     try {
       const { jobId } = req.params;
       const user = (req as any).user;
 
-      let jobData: any = null;
-      if (db) {
-        const jobDoc = await db.collection("jobs").doc(jobId).get();
-        if (!jobDoc.exists) {
-          return res.status(404).json({ error: `Job ${jobId} not found` });
-        }
-        jobData = { jobId, ...jobDoc.data() };
-      } else {
-        jobData = { jobId, title: req.body.title || "Job Title", description: req.body.description || "Job Description" };
+      if (!db) {
+        return res.status(503).json({ error: "Service Unavailable: Firestore database not initialized." });
       }
+
+      const jobDoc = await db.collection("jobs").doc(jobId).get();
+      if (!jobDoc.exists) {
+        return res.status(404).json({ error: `Job ${jobId} not found` });
+      }
+      const jobData: any = { jobId, ...jobDoc.data() };
 
       // Assert authorization: owner, assigned trader, or admin
       const isOwner = jobData.homeownerId === user.uid || jobData.userId === user.uid;
@@ -6841,13 +8208,14 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         return res.status(403).json({ error: "Forbidden: insufficient permissions to analyze this job" });
       }
 
-      const idempotencyKey = buildIdempotencyKey(jobId, "JOB_ANALYSIS_COMPLETED", "v1");
+      const contentVersionHash = computeJobAnalysisVersionHash(jobData);
+      const idempotencyKey = buildIdempotencyKey(jobId, "JOB_ANALYSIS_COMPLETED", contentVersionHash);
       const task = await intelligenceTaskQueue.enqueueTaskAsync(
         "job_extraction",
         "job",
         jobId,
         idempotencyKey,
-        { job: jobData }
+        { job: jobData, contentVersionHash }
       );
 
       res.status(202).json({
@@ -6855,6 +8223,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         message: "Intelligence extraction task enqueued",
         taskId: task.taskId,
         idempotencyKey: task.idempotencyKey,
+        contentVersionHash,
         status: task.status,
       });
     } catch (err: any) {
@@ -6869,16 +8238,14 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       const user = (req as any).user;
 
       if (db) {
+        const isAdminUser = await checkIsAdmin(user);
         const jobDoc = await db.collection("jobs").doc(jobId).get();
-        if (jobDoc.exists) {
-          const jd = jobDoc.data() || {};
-          const isOwner = jd.homeownerId === user.uid || jd.userId === user.uid;
-          const isAssigned = jd.assignedTraderId === user.uid;
-          const isAdminUser = await checkIsAdmin(user);
-          if (!isOwner && !isAssigned && !isAdminUser) {
-            return res.status(403).json({ error: "Forbidden: unauthorized to read job intelligence" });
-          }
-        }
+        assertCanReadJobIntelligence({
+          jobExists: jobDoc.exists,
+          jobData: jobDoc.exists ? (jobDoc.data() || {}) : null,
+          userUid: user?.uid,
+          isAdminUser,
+        });
 
         const intelDoc = await db.collection("intelligence_jobs").doc(jobId).get();
         if (!intelDoc.exists) {
@@ -6893,24 +8260,39 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // Trigger Asynchronous Property Intelligence Roll-up (Admin Only)
+  // Trigger Asynchronous Property Intelligence Roll-up (Admin Only — AT-INTEL-PROP-01: strict lineage & 404 on missing property)
   app.post("/api/intelligence/properties/:propertyId/rollup", requireAdmin, async (req, res) => {
     try {
       const { propertyId } = req.params;
 
-      let propData: any = { propertyId };
-      let historicalJobs: any[] = [];
-
-      if (db) {
-        const propDoc = await db.collection("properties").doc(propertyId).get();
-        if (propDoc.exists) {
-          propData = { propertyId, ...propDoc.data() };
-        }
-        const jobsSnap = await db.collection("intelligence_jobs").get();
-        historicalJobs = jobsSnap.docs.map((d) => d.data());
+      if (!db) {
+        return res.status(503).json({ error: "Service Unavailable: Firestore database not initialized." });
       }
 
-      const idempotencyKey = buildIdempotencyKey(propertyId, "PROPERTY_ROLLUP_COMPLETED", "v1");
+      const propDoc = await db.collection("properties").doc(propertyId).get();
+      if (!propDoc.exists) {
+        return res.status(404).json({ error: `Target property '${propertyId}' not found.` });
+      }
+      const propData: any = { propertyId, ...propDoc.data() };
+
+      // Strictly scope historical jobs to this target property's lineage ONLY
+      const jobsSnap = await db
+        .collection("intelligence_jobs")
+        .where("propertyId", "==", propertyId)
+        .get();
+      const historicalJobs = jobsSnap.docs
+        .map((d) => d.data())
+        .filter((j: any) => j && j.propertyId === propertyId);
+
+      const lineageVersionHash = `pv_${computeSha256(
+        JSON.stringify({
+          propertyId,
+          updatedAt: propData.updatedAt || "",
+          jobIds: historicalJobs.map((j: any) => j.jobId || "").sort(),
+        })
+      ).slice(0, 16)}`;
+
+      const idempotencyKey = buildIdempotencyKey(propertyId, "PROPERTY_ROLLUP_COMPLETED", lineageVersionHash);
       const task = await intelligenceTaskQueue.enqueueTaskAsync(
         "property_rollup",
         "property",
@@ -6924,6 +8306,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         message: "Property rollup task enqueued",
         taskId: task.taskId,
         idempotencyKey: task.idempotencyKey,
+        scopedJobCount: historicalJobs.length,
         status: task.status,
       });
     } catch (err: any) {
@@ -7005,32 +8388,36 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // Admin Quality Review & Human Correction
+  // Admin Quality Review & Human Correction (AT-INTEL-QUALITY-01: fail-closed atomic commit of review + audit event)
   app.post("/api/intelligence/quality/review", requireAdmin, async (req, res) => {
     try {
-      const user = (req as any).user;
-      const { targetCollection, targetId, action, reason, originalCandidate, correctedResult } = req.body;
-
-      const reviewOutcome = qualityReviewService.applyReview({
-        targetCollection,
-        targetId,
-        action,
-        reviewerId: user.uid || "admin",
-        reason,
-        originalCandidate,
-        correctedResult,
-      });
-
-      if (db) {
-        await immutableIntelligenceStore.persistQualityReview({
-          db,
-          review: reviewOutcome.review,
-          auditEvent: reviewOutcome.auditEvent,
+      if (!db) {
+        return res.status(503).json({
+          error: "Service Unavailable: Firestore database required to atomically persist quality review and audit log.",
         });
       }
 
+      const user = (req as any).user;
+      const { targetCollection, targetId, targetVersionId, action, reason, originalCandidate, correctedResult } = req.body || {};
+
+      // Atomically persists BOTH intelligence_quality review doc and immutable intelligence_events audit log
+      const reviewOutcome = await qualityReviewService.applyAndPersistReview(
+        {
+          targetCollection,
+          targetId,
+          targetVersionId,
+          action,
+          reviewerId: user.uid || "admin",
+          reason,
+          originalCandidate,
+          correctedResult,
+        },
+        db
+      );
+
       res.json({
         success: true,
+        persistedAtomically: true,
         review: reviewOutcome.review,
         auditEventId: reviewOutcome.auditEvent.eventId,
       });
@@ -7039,10 +8426,10 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // Controlled Historical Backfill (Admin Only, Dry Run By Default)
+  // Controlled Historical Backfill (Admin Only, Strict Boolean dryRun + Closed Collection Allowlist)
   app.post("/api/intelligence/backfill", requireAdmin, async (req, res) => {
     try {
-      const { batchSize = 50, dryRun = true, maxCostUsd = 5.0, cursor, collection, targetTaskType, tenantId } = req.body;
+      const validated = parseAdminBackfillOptions(req.body || {});
 
       if (!db) {
         return res.status(503).json({
@@ -7050,22 +8437,17 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         });
       }
 
-      const progress = await controlledBackfillEngine.executeFirestoreBackfill(db, {
-        batchSize,
-        dryRun,
-        maxCostUsd,
-        cursor,
-        collection,
-        targetTaskType,
-        tenantId,
-      });
+      const progress = await controlledBackfillEngine.executeFirestoreBackfill(db, validated);
 
       res.json({
         success: true,
-        mode: dryRun ? "DRY_RUN" : "LIVE_BACKFILL",
+        mode: validated.dryRun ? "DRY_RUN" : "LIVE_BACKFILL",
         progress,
       });
     } catch (err: any) {
+      if (err instanceof BackfillValidationError) {
+        return res.status(400).json({ success: false, error: err.message });
+      }
       sendHttpError(res, err, req);
     }
   });
@@ -7227,15 +8609,33 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   app.post("/api/intelligence/data-classification/register", requireAuth, async (req, res) => {
     try {
       const user = (req as any).user;
-      const body = req.body || {};
+      const {
+        classificationId,
+        recordType,
+        recordId,
+        category,
+        sensitivity,
+        restrictions,
+        provenanceRef,
+        rightsRef,
+        archiveRef,
+      } = req.body || {};
 
-      if (!body.recordType || !body.recordId || !body.category || !body.provenanceRef) {
+      if (!recordType || !recordId || !category || !provenanceRef) {
         return res.status(400).json({ error: "Missing required fields: recordType, recordId, category, provenanceRef" });
       }
 
       const tenantId = user.uid;
       const record = await dataClassificationEligibilityService.registerClassification({
-        ...body,
+        classificationId,
+        recordType,
+        recordId,
+        category,
+        sensitivity,
+        restrictions,
+        provenanceRef,
+        rightsRef,
+        archiveRef,
         tenantId,
         recordedBy: user.uid,
       });
@@ -7266,6 +8666,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       }
 
       const tenantId = user.uid;
+      // AT-INTEL-CLASS-01: Public HTTP routes must NEVER honor caller-supplied isInternalAi flags
       const decision = await dataClassificationEligibilityService.evaluateEligibility({
         tenantId,
         recordType,
@@ -7274,7 +8675,8 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         classificationId,
         context: {
           callerUid: user.uid,
-          isInternalAi: req.body?.isInternalAi === true,
+          isInternalAi: false,
+          executionChannel: "public_api",
         },
       });
 
@@ -7332,9 +8734,23 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   app.post("/api/intelligence/ai-controls/register", requireAuth, async (req, res) => {
     try {
       const user = (req as any).user;
-      const body = req.body || {};
+      const {
+        controlId,
+        recordType,
+        recordId,
+        scope,
+        purposes,
+        trainingConsent,
+        modelTiersAllowed,
+        restrictions,
+        provenanceRef,
+        rightsRef,
+        classificationRef,
+        archiveRef,
+        reConsentCeremony,
+      } = req.body || {};
 
-      if (!body.recordType || !body.recordId || !body.provenanceRef) {
+      if (!recordType || !recordId || !provenanceRef) {
         return res.status(400).json({ error: "Missing required fields: recordType, recordId, provenanceRef" });
       }
 
@@ -7344,7 +8760,19 @@ Limit your response to just the text of the tip. Do not use quotes.`;
 
       const tenantId = user.uid;
       const record = await aiTrainingUsageControlsService.registerAiUsageControls({
-        ...body,
+        controlId,
+        recordType,
+        recordId,
+        scope,
+        purposes,
+        trainingConsent,
+        modelTiersAllowed,
+        restrictions,
+        provenanceRef,
+        rightsRef,
+        classificationRef,
+        archiveRef,
+        reConsentCeremony,
         tenantId,
         recordedBy: user.uid,
       });
@@ -7379,6 +8807,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       }
 
       const tenantId = user.uid;
+      // AT-INTEL-CLASS-01: Public HTTP routes must NEVER honor caller-supplied isInternalAi flags
       const decision = await aiTrainingUsageControlsService.evaluateAiUsageEligibility({
         tenantId,
         recordType,
@@ -7388,7 +8817,8 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         targetModelTier,
         context: {
           callerUid: user.uid,
-          isInternalAi: req.body?.isInternalAi === true,
+          isInternalAi: false,
+          executionChannel: "public_api",
         },
       });
 
@@ -7589,9 +9019,13 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // Orchestrate lifecycle rights revocation
+  // Orchestrate lifecycle rights revocation (AT-INTEL-LIFECYCLE-01: fail closed 503/404 on missing targets)
   app.post("/api/intelligence/data-lifecycle/revoke", requireAuth, async (req, res) => {
     try {
+      if (!db) {
+        return res.status(503).json({ error: "Service Unavailable: Firestore database not initialized." });
+      }
+
       const user = (req as any).user;
       const { rightsId, controlId, provenanceNodeId, reason } = req.body || {};
 
@@ -7599,9 +9033,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         return res.status(400).json({ error: "Missing required 'reason' field" });
       }
 
-      if (db) {
-        dataRetentionService.setFirestoreDb(db);
-      }
+      dataRetentionService.setFirestoreDb(db);
 
       const result = await dataRetentionService.revokeDataLifecycleRights({
         tenantId: user.uid,
@@ -7617,12 +9049,374 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         result,
       });
     } catch (err: any) {
+      if (err instanceof DataRetentionNotFoundError) {
+        return res.status(404).json({ error: err.message });
+      }
       if (err instanceof DataRetentionSecurityError) {
         return res.status(403).json({ error: err.message });
       }
       if (err instanceof DataRetentionValidationError) {
         return res.status(400).json({ error: err.message });
       }
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // ==========================================
+  // BATCH 13 — OUTREACH QUEUE, TELEMETRY, PARTNER LEADS, ECOSYSTEM STATS & FIELD OWNERSHIP GUARDS
+  // ==========================================
+
+  // AT-OUTREACH-02: Durable server outbound outreach queue
+  app.post("/api/admin/outreach/enqueue", requireAdmin, generalLimiter, async (req, res) => {
+    try {
+      const adminUser = (req as any).user;
+      const record = await enqueueOutreachMessageCommand({
+        db,
+        adminUid: adminUser.uid,
+        adminEmail: adminUser.email || null,
+        leadId: req.body?.leadId,
+        businessName: req.body?.businessName,
+        channel: req.body?.channel,
+        recipient: req.body?.recipient,
+        subject: req.body?.subject,
+        body: req.body?.body,
+        campaignName: req.body?.campaignName,
+      });
+      res.status(202).json({ success: true, record });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.get("/api/admin/outreach/queue", requireAdmin, async (req, res) => {
+    try {
+      const limitNum = Number(req.query.limit) || 50;
+      const items = await listOutreachQueueCommand(db, limitNum);
+      res.json({ success: true, items });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-FIRESTORE-SEARCH-01: Authenticated, rate-limited, schema-bounded search telemetry endpoint
+  app.post("/api/telemetry/search-log", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Telemetry database unavailable." });
+      }
+      const caller = (req as any).user;
+      const rawQuery = typeof req.body?.query === "string" ? req.body.query.trim().toLowerCase() : "";
+      const rawCategory = typeof req.body?.category === "string" ? req.body.category.trim().slice(0, 80) : undefined;
+      if (rawQuery.length < 2 || rawQuery.length > 120) {
+        return res.status(400).json({ error: "Search query must be between 2 and 120 characters." });
+      }
+
+      const payload: Record<string, any> = {
+        query: rawQuery,
+        userId: caller.uid,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      if (rawCategory) payload.category = rawCategory;
+
+      const docRef = await db.collection("search_logs").add(payload);
+      res.status(201).json({ success: true, id: docRef.id });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-LEAD-02: Server-verified partner lead attribution endpoint (prevents forged client lead writes)
+  app.post("/api/partner-leads", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Service Unavailable: database not initialized." });
+      }
+      const caller = (req as any).user;
+      const campaignId = typeof req.body?.campaignId === "string" ? req.body.campaignId.trim() : "";
+      if (!campaignId) {
+        return res.status(400).json({ error: "campaignId is required." });
+      }
+
+      const campaignRef = db.collection("campaigns").doc(campaignId);
+      const userRef = db.collection("users").doc(caller.uid);
+      const leadRef = db.collection("leads").doc();
+      const safeData =
+        req.body?.data && typeof req.body.data === "object" && !Array.isArray(req.body.data)
+          ? Object.fromEntries(Object.entries(req.body.data).slice(0, 20))
+          : {};
+
+      let attributedLeadId = "";
+      await db.runTransaction(async (tx: any) => {
+        const [campaignSnap, userSnap] = await Promise.all([tx.get(campaignRef), tx.get(userRef)]);
+        if (!campaignSnap.exists) {
+          throw new NotFoundError("Partner campaign not found.");
+        }
+        const campaignData = campaignSnap.data() || {};
+        if (campaignData.status !== "active") {
+          throw new BadRequestError("Partner campaign is not currently active.");
+        }
+
+        const authoritativePartnerId = String(campaignData.partnerId || "").trim();
+        if (!authoritativePartnerId) {
+          throw new BadRequestError("Campaign has no verified partner attribution.");
+        }
+        const userData = userSnap.exists ? userSnap.data() || {} : {};
+        const authoritativeRole = String(userData.role || "homeowner");
+
+        tx.set(leadRef, {
+          partnerId: authoritativePartnerId,
+          campaignId,
+          userId: caller.uid,
+          userRole: authoritativeRole,
+          status: "new",
+          data: safeData,
+          verifiedByServer: true,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        tx.update(campaignRef, {
+          leads: admin.firestore.FieldValue.increment(1),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        attributedLeadId = leadRef.id;
+      });
+
+      res.status(201).json({ success: true, leadId: attributedLeadId });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/partner-campaigns/:campaignId/click", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Service Unavailable: database not initialized." });
+      }
+      const campaignId = String(req.params.campaignId || "").trim();
+      if (!campaignId) return res.status(400).json({ error: "campaignId is required." });
+
+      const campaignRef = db.collection("campaigns").doc(campaignId);
+      await db.runTransaction(async (tx: any) => {
+        const snap = await tx.get(campaignRef);
+        if (!snap.exists) {
+          throw new NotFoundError("Partner campaign not found.");
+        }
+        const data = snap.data() || {};
+        if (data.status !== "active") {
+          throw new BadRequestError("Partner campaign is not active.");
+        }
+        tx.update(campaignRef, {
+          clicks: admin.firestore.FieldValue.increment(1),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+
+      res.json({ success: true, campaignId });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-ECOSYSTEM-01: Real aggregated Firestore platform metrics for Ecosystem AI Strategist
+  app.get("/api/admin/ecosystem/stats", requireAdmin, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Service Unavailable: database not initialized." });
+      }
+
+      const [usersCountSnap, jobsCountSnap, campaignsSnap, leadsCountSnap, recentJobsSnap] = await Promise.all([
+        db.collection("users").count().get(),
+        db.collection("jobs").count().get(),
+        db.collection("campaigns").where("status", "==", "active").count().get(),
+        db.collection("leads").count().get(),
+        db.collection("jobs").orderBy("createdAt", "desc").limit(200).get().catch(() => db.collection("jobs").limit(200).get()),
+      ]);
+
+      const categoryCounts = new Map<string, number>();
+      for (const d of recentJobsSnap.docs || []) {
+        const cat = String(d.data()?.category || "").trim();
+        if (cat) categoryCounts.set(cat, (categoryCounts.get(cat) || 0) + 1);
+      }
+      const topCategories = Array.from(categoryCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([cat]) => cat);
+
+      res.json({
+        success: true,
+        stats: {
+          totalUsers: usersCountSnap.data().count || 0,
+          totalJobs: jobsCountSnap.data().count || 0,
+          activeCampaigns: campaignsSnap.data().count || 0,
+          totalLeads: leadsCountSnap.data().count || 0,
+          topCategories,
+          sampledJobsCount: (recentJobsSnap.docs || []).length,
+          aggregatedAt: new Date().toISOString(),
+        },
+      });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-ADMIN-AUTH-01: Dual-Control Approval Workflow Routes
+  app.get("/api/admin/approvals", requireAdmin, async (req, res) => {
+    try {
+      if (!db) throw new ServiceUnavailableError("Database unavailable.");
+      const snap = await db.collection("admin_approval_requests").limit(50).get();
+      const approvals = (snap.docs || []).map((d: any) => ({ id: d.id, ...d.data() }));
+      res.json({ success: true, approvals, currentAdminTier: (req as any).adminTier });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/approvals", requireAdmin, requireAdminTier("financial_operator", "creating dual-control approval requests"), async (req, res) => {
+    try {
+      const actor: AdminActor = (req as any).adminActor;
+      const result = await createDualControlApprovalRequest(db, actor, req.body || {});
+      res.status(201).json({ success: true, ...result });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/admin/approvals/:requestId/review", requireAdmin, requireAdminTier("financial_operator", "reviewing dual-control approval requests"), async (req, res) => {
+    try {
+      const actor: AdminActor = (req as any).adminActor;
+      const { decision, reviewNote } = req.body || {};
+      const result = await reviewDualControlApprovalRequest(
+        db,
+        actor,
+        req.params.requestId,
+        decision,
+        reviewNote
+      );
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-ADMIN-CTRL-04: Bounded Server Admin Broadcast Fan-Out Queue
+  app.post("/api/admin/broadcasts", requireAdmin, requireAdminTier("financial_operator", "dispatching platform broadcasts"), async (req, res) => {
+    try {
+      const actor: AdminActor = (req as any).adminActor;
+      const result = await enqueueAdminBroadcastCommand(db, actor, req.body || {}, process.env);
+      res.status(result.status === "partial_failure" ? 207 : 201).json({ success: true, ...result });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.get("/api/admin/broadcasts", requireAdmin, async (req, res) => {
+    try {
+      if (!db) throw new ServiceUnavailableError("Database unavailable.");
+      const snap = await db.collection("broadcast_fanout_jobs").limit(50).get();
+      const jobs = (snap.docs || []).map((d: any) => ({ id: d.id, ...d.data() }));
+      res.json({ success: true, jobs });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-ADMIN-CTRL-06: Unified Operational Health & Incident Snapshot
+  app.get("/api/admin/operational-health", requireAdmin, async (req, res) => {
+    try {
+      const snapshot = await getOperationalHealthSnapshot(db);
+      res.json({ success: true, health: snapshot });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-ADMIN-CONFIG-02: Versioned Platform Feature Flags Control Plane
+  app.get("/api/admin/feature-flags", requireAdmin, async (req, res) => {
+    try {
+      const data = await listFeatureFlagsCommand(db);
+      res.json({ success: true, ...data });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.put("/api/admin/feature-flags/:flagKey", requireAdmin, requireAdminTier("super_admin", "updating feature flags"), async (req, res) => {
+    try {
+      const actor: AdminActor = (req as any).adminActor;
+      const record = await upsertFeatureFlagCommand(db, actor, req.params.flagKey, req.body || {});
+      res.json({ success: true, flag: record });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-CJ-CHAT-03: In-context Chat Report / Block Participant APIs
+  app.get("/api/chat/blocks", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const data = await listUserChatBlocksCommand(db, caller.uid);
+      res.json({ success: true, ...data });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.post("/api/chat/report-block", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await reportOrBlockChatParticipantCommand(
+        db,
+        { uid: caller.uid, email: caller.email },
+        req.body || {}
+      );
+      res.status(201).json({ success: true, ...result });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.delete("/api/chat/blocks/:targetUserId", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await unblockChatParticipantCommand(db, caller.uid, req.params.targetUserId);
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // AT-FIELD-01: Ownership-immutable update endpoints for field_agents and dispatch_routes
+  app.patch("/api/field-agents/:id", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const isAdminUser = await checkIsAdmin(caller);
+      const result = await updateFieldEntityWithOwnershipGuard({
+        db,
+        collectionName: "field_agents",
+        entityId: req.params.id,
+        callerUid: caller.uid,
+        isAdmin: isAdminUser,
+        updates: req.body || {},
+      });
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  app.patch("/api/dispatch-routes/:id", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const isAdminUser = await checkIsAdmin(caller);
+      const result = await updateFieldEntityWithOwnershipGuard({
+        db,
+        collectionName: "dispatch_routes",
+        entityId: req.params.id,
+        callerUid: caller.uid,
+        isAdmin: isAdminUser,
+        updates: req.body || {},
+      });
+      res.json({ success: true, ...result });
+    } catch (err: any) {
       sendHttpError(res, err, req);
     }
   });
@@ -7726,6 +9520,33 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
+  // AT-MOBILE-03: Server-served parameterized mobile deep-link manifests validated against placeholders
+  app.get("/.well-known/assetlinks.json", (_req, res) => {
+    const result = buildAndroidAssetLinksPayload(process.env);
+    if (!result.configured || !result.payload) {
+      return res.status(503).json({
+        error: result.reason || "Android App Links signing identity is not configured.",
+        code: "ANDROID_ASSETLINKS_UNCONFIGURED",
+      });
+    }
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.status(200).json(result.payload);
+  });
+
+  app.get("/.well-known/apple-app-site-association", (_req, res) => {
+    const result = buildAppleAppSiteAssociationPayload(process.env);
+    if (!result.configured || !result.payload) {
+      return res.status(503).json({
+        error: result.reason || "iOS Universal Links Team ID is not configured.",
+        code: "IOS_AASA_UNCONFIGURED",
+      });
+    }
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.status(200).json(result.payload);
+  });
+
   // Fallback 404 JSON handler for unmatched /api/* routes to prevent HTML index.html responses
   app.all("/api/*", (req, res) => {
     res.status(404).json({ error: `API endpoint not found: ${req.method} ${req.path}` });
@@ -7811,6 +9632,7 @@ export async function bootstrap() {
     queue: intelligenceTaskQueue,
     registerHandlers: registerIntelligenceTaskHandlers,
     startWorker: () => {
+      intelligenceTaskQueue.setMaintenanceCheck(() => isMaintenanceModeActive({ db }));
       intelligenceTaskQueue.startWorker(5000);
     },
     startSyncWorkers: (firestoreDb) => {
@@ -7819,6 +9641,7 @@ export async function bootstrap() {
       startCategoryRegistrySyncWorker(firestoreDb);
       startPublicJobCardsSync(firestoreDb);
       startPublicPropertiesSync(firestoreDb);
+      startPublicAdsSync(firestoreDb);
     },
     startBackgroundSchedulers: () => startBackgroundSchedulers(),
     startMatchingSystem: () => startMatchingSystem(),
@@ -7840,7 +9663,17 @@ export async function bootstrap() {
 // Authoritative bootstrap startup
 bootstrap().catch((err) => {
   const errMsg = err?.message || String(err);
-  console.warn("[Bootstrap] Background intelligence worker bootstrap notice (client SPA ingress active):", errMsg);
+  const isExpectedCredentialBoundary =
+    errMsg.includes("PERMISSION_DENIED") ||
+    errMsg.includes("UNAUTHENTICATED") ||
+    errMsg.includes("Could not load the default credentials");
+  if (isExpectedCredentialBoundary) {
+    console.log(
+      "[Bootstrap] Admin SDK runtime credentials unavailable for external Firebase project; running fail-closed in client SPA ingress mode (background workers paused)."
+    );
+  } else {
+    console.warn("[Bootstrap] Background intelligence worker bootstrap notice (client SPA ingress active):", errMsg);
+  }
   // Bind port 3000 for platform health probes, diagnostic ingress, and client UI serving
   // (workers, sync, and schedulers remain unstarted).
   console.log("[Bootstrap] Starting HTTP server on port 3000 for client serving & API ingress...");

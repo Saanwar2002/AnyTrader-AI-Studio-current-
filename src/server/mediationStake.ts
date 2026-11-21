@@ -101,6 +101,26 @@ export async function confirmMediationStakePayment(db: any, input: {
       stakePaymentId: input.paymentIntentId, stakePaymentStatus: "succeeded",
       status: "pending_arbitration", paidAt: input.serverTimestamp()
     }, disputedAt: input.serverTimestamp() });
+
+    const { ownerIds, traderIds } = getJobParticipantIds(job);
+    const counterpartIds = [...new Set([...ownerIds, ...traderIds])].filter(
+      (uid) => uid && uid !== input.userId
+    );
+    for (const counterpartUid of counterpartIds) {
+      const notifRef = db.collection("notifications").doc(
+        `med_stake_${input.jobId}_${input.paymentIntentId}_${counterpartUid}`
+      );
+      tx.set(notifRef, {
+        userId: counterpartUid,
+        title: "Dispute Mediation Stake Confirmed",
+        message: `A £25.00 mediation stake has been lodged for "${job.title || `Job #${input.jobId}`}". The dispute is now in arbitration review.`,
+        type: "status",
+        read: false,
+        jobId: input.jobId,
+        link: `/job/${input.jobId}`,
+        createdAt: input.serverTimestamp(),
+      }, { merge: true });
+    }
   });
 }
 

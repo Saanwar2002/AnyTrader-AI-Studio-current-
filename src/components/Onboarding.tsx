@@ -29,6 +29,7 @@ export default function Onboarding() {
   const [isPetFriendly, setIsPetFriendly] = useState<boolean>(false);
   const [permissions, setPermissions] = useState<string[]>([]);
   const [invitationId, setInvitationId] = useState<string | null>(null);
+  const [inviteToken, setInviteToken] = useState<string | null>(null);
   const [name, setName] = useState(user?.displayName || "");
   const [phone, setPhone] = useState("");
   const [postcode, setPostcode] = useState("");
@@ -124,6 +125,38 @@ export default function Onboarding() {
         return;
       }
 
+      const urlInviteId = searchParams.get("id");
+      const urlInviteToken = searchParams.get("token");
+      if (urlInviteId && urlInviteToken) {
+        try {
+          const authToken = await user.getIdToken();
+          const acceptRes = await fetch(`/api/admin/invitations/${encodeURIComponent(urlInviteId)}/accept`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${authToken}`,
+            },
+            body: JSON.stringify({ token: urlInviteToken }),
+          });
+          if (acceptRes.ok) {
+            const accepted = await acceptRes.json();
+            await user.getIdToken(true);
+            setHasAdminClaim(true);
+            setRole("admin");
+            setPermissions(accepted.permissions || []);
+            setInvitationId(urlInviteId);
+            setInviteToken(urlInviteToken);
+            setCheckingInvite(false);
+            return;
+          } else {
+            const errJson = await acceptRes.json().catch(() => ({} as any));
+            setError(errJson?.error || "Staff invitation link could not be verified or has expired.");
+          }
+        } catch (tokenErr: any) {
+          console.warn("[Onboarding] Invitation token acceptance error:", tokenErr?.message || tokenErr);
+        }
+      }
+
       try {
         const userEmail = (user.email || "").toLowerCase();
         const q = query(
@@ -132,13 +165,18 @@ export default function Onboarding() {
           where("status", "==", "pending")
         );
         const snapshot = await getDocs(q);
-        
-        if (!snapshot.empty) {
-          const invite = snapshot.docs[0].data();
+        const nowMs = Date.now();
+        const activeDoc = snapshot.docs.find((d) => {
+          const data = d.data();
+          return !data.expiresAt || Date.parse(data.expiresAt) > nowMs;
+        });
+
+        if (activeDoc) {
+          const invite = activeDoc.data();
           setHasAdminClaim(true);
           setRole("admin");
           setPermissions(invite.permissions || []);
-          setInvitationId(snapshot.docs[0].id);
+          setInvitationId(activeDoc.id);
         }
       } catch (err: any) {
         // Non-blocking: absence of invitation permissions or pending records should proceed smoothly
@@ -153,7 +191,7 @@ export default function Onboarding() {
     };
 
     checkInvitation();
-  }, [user]);
+  }, [user, searchParams]);
 
   const handleSubmit = async () => {
     console.log("handleSubmit called. State:", { user: !!user, role, name, postcode, phone });
@@ -199,48 +237,29 @@ export default function Onboarding() {
         return;
       }
 
-      // 3. Duplicate Profile Detection (Name + Postcode)
-      try {
-        setLoading(true);
-        const duplicateQuery = query(
-          collection(db, "users"),
-          where("name", "==", name),
-          where("postcode", "==", postcode.toUpperCase().replace(/\s/g, ""))
-        );
-        const duplicateSnap = await getDocs(duplicateQuery);
-        if (!duplicateSnap.empty && duplicateSnap.docs[0].id !== user.uid) {
-          setError("An account with this name and postcode already exists. If you've lost access, please contact support.");
+      // 3. Postcode Restriction Check (runs unconditionally; duplicate checks are server-side in /api/account/bootstrap-profile)
+      if (platformConfig?.onboardingRestrictionsEnabled) {
+        const allowedPostcodes = platformConfig.allowedPostcodes || [];
+        const userClean = postcode.toUpperCase().replace(/\s/g, "");
+        
+        const isAllowed = allowedPostcodes.some((p: string) => {
+          const allowed = p.toUpperCase().replace(/\s/g, "");
+          
+          // Area Level: If allowed is just letters (e.g. "B", "HD"), match any postcode starting with it
+          if (/^[A-Z]+$/.test(allowed)) {
+            return userClean.startsWith(allowed);
+          }
+          
+          // District Level: Match the outward code exactly (e.g. "B1" matches "B1 1AA" but not "B10 1AA")
+          const userOutward = userClean.length > 3 ? userClean.slice(0, -3) : userClean;
+          return userOutward === allowed || userClean === allowed;
+        });
+        
+        if (!isAllowed) {
+          setError("Sorry, we are not currently accepting registrations in your area. Please check back later.");
           setLoading(false);
           return;
         }
-
-        // 4. Restriction check
-        if (platformConfig?.onboardingRestrictionsEnabled) {
-          const allowedPostcodes = platformConfig.allowedPostcodes || [];
-          const userClean = postcode.toUpperCase().replace(/\s/g, "");
-          
-          const isAllowed = allowedPostcodes.some((p: string) => {
-            const allowed = p.toUpperCase().replace(/\s/g, "");
-            
-            // Area Level: If allowed is just letters (e.g. "B", "HD"), match any postcode starting with it
-            if (/^[A-Z]+$/.test(allowed)) {
-              return userClean.startsWith(allowed);
-            }
-            
-            // District Level: Match the outward code exactly (e.g. "B1" matches "B1 1AA" but not "B10 1AA")
-            // In UK postcodes, the outward code is everything except the last 3 characters
-            const userOutward = userClean.length > 3 ? userClean.slice(0, -3) : userClean;
-            return userOutward === allowed || userClean === allowed;
-          });
-          
-          if (!isAllowed) {
-            setError("Sorry, we are not currently accepting registrations in your area. Please check back later.");
-            setLoading(false);
-            return;
-          }
-        }
-      } catch (e) {
-        console.error("Error checking duplicates:", e);
       }
     }
 
@@ -315,44 +334,19 @@ export default function Onboarding() {
       
       const finalPermissions = finalRole === "admin" ? ["manage_users", "manage_jobs", "manage_disputes", "view_logs", "manage_team"] : permissions;
 
-      // Check for referral
-      let referrerUid: string | null = null;
-      let appliedAffiliateCode: string | null = null;
-      const refCode = searchParams.get("ref");
-      
-      const checkReferral = async (codeToTest: string) => {
-        if (!codeToTest) return false;
-        
-        // 1. Check Affiliates / Influencers first
-        const affiliateQ = query(collection(db, "affiliates"), where("code", "==", codeToTest.toLowerCase()));
-        const affiliateSnap = await getDocs(affiliateQ);
-        if (!affiliateSnap.empty) {
-          appliedAffiliateCode = affiliateSnap.docs[0].id;
-          return true;
-        }
+      // AT-REF-02: Capture raw referral/affiliate code only; authoritative lookup & verification
+      // runs server-side inside POST /api/account/bootstrap-profile (never query users from client).
+      const referrerUid: string | null = null;
+      const appliedAffiliateCode: string | null = null;
+      let rawReferralCode: string | null = searchParams.get("ref")?.trim() || null;
 
-        // 2. Check traditional user-to-user referrals
-        const q = query(collection(db, "users"), where("referralCode", "==", codeToTest));
-        const snapshot = await getDocs(q);
-        if (!snapshot.empty) {
-          referrerUid = snapshot.docs[0].id;
-          return true;
-        }
-        return false;
-      };
-
-      let foundRef = false;
-      if (refCode) {
-        foundRef = await checkReferral(refCode);
-      }
-      
-      if (!foundRef) {
+      if (!rawReferralCode) {
         const storedRef = localStorage.getItem("anytrader_referral");
         if (storedRef) {
           try {
             const parsed = JSON.parse(storedRef);
-            if (parsed.expiresAt > Date.now()) {
-              foundRef = await checkReferral(parsed.code);
+            if (parsed.expiresAt > Date.now() && typeof parsed.code === "string" && parsed.code.trim()) {
+              rawReferralCode = parsed.code.trim();
             } else {
               localStorage.removeItem("anytrader_referral");
             }
@@ -377,27 +371,8 @@ export default function Onboarding() {
       // Generate Member ID
       const { memberId, memberSequence } = await generateMemberId(isBusiness ? "business" : "homeowner");
 
-      // Fraud Detection: Check for existing accounts with same Device ID or IP
-      let accountFlags: string[] = [];
-      try {
-        if (deviceId) {
-          const deviceQuery = query(collection(db, "users"), where("deviceId", "==", deviceId));
-          const deviceSnap = await getDocs(deviceQuery);
-          if (deviceSnap.size > 0) {
-            accountFlags.push(`Duplicate Device ID found (${deviceSnap.size} other accounts)`);
-          }
-        }
-
-        if (detectedIp !== "0.0.0.0") {
-          const ipQuery = query(collection(db, "users"), where("ipAddress", "==", detectedIp));
-          const ipSnap = await getDocs(ipQuery);
-          if (ipSnap.size > 2) {
-            accountFlags.push(`High risk IP address (${ipSnap.size} other accounts)`);
-          }
-        }
-      } catch (err) {
-        console.warn("Fraud detection error", err);
-      }
+      // Fraud/duplicate checks run authoritatively server-side inside /api/account/bootstrap-profile
+      const accountFlags: string[] = [];
 
       // Derive canonical identity model fields
       const effectiveRole = (finalRole || role || "homeowner") as string;
@@ -408,7 +383,13 @@ export default function Onboarding() {
       const canonicalCapabilities = (isAuthorizedAdmin && effectiveRole === "admin")
         ? ["homeowner", "landlord", "estate_agent", "property_manager", "tradesperson", "contractor", "consultant", "fleet_driver"]
         : (effectiveRole === "business"
-            ? ["contractor", "tradesperson", "homeowner", ...(businessLayer === "properties" ? ["landlord", "property_manager", "estate_agent"] : (businessLayer === "consultancy" ? ["consultant"] : []))]
+            ? ((businessLayer as string) === "field_services" || (businessLayer as string) === "trades"
+                ? ["contractor", "tradesperson", "homeowner"]
+                : businessLayer === "properties"
+                ? ["homeowner", "landlord", "property_manager", "estate_agent"]
+                : businessLayer === "consultancy"
+                ? ["homeowner", "consultant"]
+                : ["homeowner"])
             : (effectiveRole === "fleet_driver" ? ["fleet_driver", "homeowner"] : (effectiveRole === "tradesperson" ? ["tradesperson", "homeowner"] : ["homeowner"])));
 
       const profile = {
@@ -488,8 +469,9 @@ export default function Onboarding() {
             businessCategory: role === "business" ? businessCategory : null,
             vehicleCategories: finalRole === "fleet_driver" ? vehicleCategories : null,
             isPetFriendly: finalRole === "fleet_driver" ? isPetFriendly : false,
-            referrerUid: referrerUid || null,
-            affiliateCode: appliedAffiliateCode || null,
+            referralCode: rawReferralCode || null,
+            referrerUid: null,
+            affiliateCode: null,
           }),
         });
 
@@ -525,8 +507,35 @@ export default function Onboarding() {
       }
 
       if (!profileSavedServerSide) {
-        console.log("[Onboarding] Writing user profile doc directly via Firebase Client SDK, uid:", user.uid);
-        await setDoc(doc(db, "users", user.uid), profile, { merge: true });
+        console.log("[Onboarding] Writing allowlisted user profile doc directly via Firebase Client SDK, uid:", user.uid);
+        const normalizedRole = String(finalRole || "");
+        const safeClientRole =
+          normalizedRole === "business" || normalizedRole === "tradesperson" || normalizedRole === "fleet_driver"
+            ? normalizedRole
+            : "homeowner";
+        const clientFallbackProfile = {
+          uid: user.uid,
+          email: user.email || "",
+          isAnonymous: Boolean(user.isAnonymous),
+          name: profile.name,
+          phone: profile.phone,
+          role: safeClientRole,
+          businessLayer: profile.businessLayer,
+          businessCategory: profile.businessCategory,
+          category: profile.category,
+          primaryTrade: profile.primaryTrade,
+          postcode: profile.postcode,
+          city: profile.city,
+          county: profile.county,
+          trades: profile.trades,
+          subcategories: profile.subcategories,
+          vehicleCategories: profile.vehicleCategories,
+          isPetFriendly: profile.isPetFriendly,
+          referralCode: profile.referralCode,
+          verificationDocs: profile.verificationDocs,
+          createdAt: serverTimestamp(),
+        };
+        await setDoc(doc(db, "users", user.uid), clientFallbackProfile, { merge: true });
       }
 
       // Sync non-PII public profile for trader discovery
@@ -564,13 +573,20 @@ export default function Onboarding() {
       });
       console.log("Verification docs check skipped or finished");
 
-      if (invitationId) {
-        console.log("Updating invitation");
-        await updateDoc(doc(db, "invitations", invitationId), {
-          status: "accepted",
-          acceptedAt: serverTimestamp()
-        });
-        console.log("Invitation updated");
+      if (invitationId && inviteToken) {
+        try {
+          const idToken = await user.getIdToken();
+          await fetch(`/api/admin/invitations/${encodeURIComponent(invitationId)}/accept`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({ token: inviteToken }),
+          });
+        } catch (invErr) {
+          console.warn("Server invitation acceptance check failed:", invErr);
+        }
       }
 
       if (appliedAffiliateCode) {

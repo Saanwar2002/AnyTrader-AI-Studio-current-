@@ -20,6 +20,7 @@ export default function PublicPropertyPassportView() {
   const navigate = useNavigate();
 
   const [property, setProperty] = useState<any | null>(null);
+  const [provenance, setProvenance] = useState<any | null>(null);
   const [completedJobs, setCompletedJobs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -41,24 +42,17 @@ export default function PublicPropertyPassportView() {
       setLoading(true);
       setError(null);
       try {
-        // Fetch from sanitized public projection collection first
-        const publicDocRef = doc(db, "public_properties", activeId);
-        let snapshot = await getDoc(publicDocRef);
-
-        // Fallback to private properties collection if accessible by authenticated owner
-        if (!snapshot.exists()) {
-          const privateDocRef = doc(db, "properties", activeId);
-          snapshot = await getDoc(privateDocRef);
-        }
-
-        if (!snapshot.exists()) {
-          setError("Property passport record not found or link is private.");
+        // AT-PASS-02: Load strictly from the canonical server-projected public passport endpoint
+        const res = await fetch(`/api/properties/${encodeURIComponent(activeId)}/public-passport`);
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok || !payload.property) {
+          setError(payload.error || "Property passport record not found or public sharing is not enabled.");
           setLoading(false);
           return;
         }
 
-        const propData = { id: snapshot.id, ...snapshot.data() };
-        setProperty(propData);
+        setProperty(payload.property);
+        setProvenance(payload.provenance || null);
 
         // Load public completed jobs for this property
         try {
@@ -140,12 +134,15 @@ export default function PublicPropertyPassportView() {
   };
 
   const handleShareWhatsApp = () => {
+    const epcText = property.epcRating ? `Grade ${property.epcRating}` : "Unverified / Not recorded";
     const msg = `🏡 *AnyTrader Verified Property Passport*\n` +
       `Property: *${property.name || property.address?.line1 || "UK Residence"}*\n` +
       `Asset Health Score: *${health.totalScore}/100 (Grade ${health.grade})*\n` +
-      `EPC: Grade ${property.epcRating || 'C'} | Gas Safe: ${health.isGasCompliant ? 'Verified Valid' : 'Due'}\n\n` +
+      `EPC: ${epcText} | Gas Safe: ${health.isGasCompliant ? 'Verified Valid' : 'Unverified / Due'}\n\n` +
       `View complete verified maintenance log, appliance specs & compliance records:\n${passportUrl}`;
-    window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, "_blank", "noopener,noreferrer");
+    const url = `https://wa.me/?text=${encodeURIComponent(msg)}`;
+    navigator.clipboard?.writeText(url).catch(() => {});
+    toast.success("WhatsApp share message prepared.");
   };
 
   return (
@@ -220,11 +217,24 @@ export default function PublicPropertyPassportView() {
             </div>
           </div>
 
+          {/* Canonical Snapshot Provenance Strip */}
+          {provenance && (
+            <div className="p-3 bg-slate-50 rounded-xl border border-black flex flex-wrap items-center justify-between gap-2 text-[11px] text-black">
+              <span className="font-black">
+                Canonical Passport Snapshot: <span className="font-mono">{provenance.snapshotId || "unindexed"}</span>
+              </span>
+              <span className="font-semibold">
+                Pipeline: {provenance.pipelineVersion || "public-projection"} • Evidence Records: {provenance.evidenceCount ?? 0}
+                {provenance.contentHash ? ` • Hash: ${String(provenance.contentHash).slice(0, 12)}` : ""}
+              </span>
+            </div>
+          )}
+
           {/* Quick Metrics Bar */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-4 border-t border-slate-200">
             <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
               <p className="text-[10px] uppercase font-extrabold text-slate-500">EPC Energy Grade</p>
-              <p className="text-base font-black text-blue-600">Grade {property.epcRating || "C"}</p>
+              <p className="text-base font-black text-blue-600">{property.epcRating ? `Grade ${property.epcRating}` : "Unverified / Not recorded"}</p>
             </div>
 
             <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
@@ -233,7 +243,7 @@ export default function PublicPropertyPassportView() {
                 {health.isGasCompliant ? (
                   <span className="text-emerald-700 font-black">✓ Certified Valid</span>
                 ) : (
-                  <span className="text-amber-700 font-black">⚠ Renewal Due</span>
+                  <span className="text-amber-700 font-black">⚠ Unverified / Due</span>
                 )}
               </p>
             </div>
@@ -241,7 +251,9 @@ export default function PublicPropertyPassportView() {
             <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
               <p className="text-[10px] uppercase font-extrabold text-slate-500">Boiler & Heating</p>
               <p className="text-sm font-bold text-slate-900 truncate">
-                {property.boilerInfo?.brand || "Standard"} ({property.boilerInfo?.age || "5"} yrs)
+                {property.boilerInfo?.brand
+                  ? `${property.boilerInfo.brand}${property.boilerInfo?.age ? ` (${property.boilerInfo.age} yrs)` : ""}`
+                  : "Unverified / Not recorded"}
               </p>
             </div>
 
@@ -377,7 +389,7 @@ export default function PublicPropertyPassportView() {
                   </div>
                   <h4 className="font-black text-slate-900 text-sm">EPC Energy Performance</h4>
                   <p className="text-xs text-slate-600">
-                    Rating: <strong className="text-blue-600">Grade {property.epcRating || "C"}</strong>
+                    Rating: <strong className="text-blue-600">{property.epcRating ? `Grade ${property.epcRating}` : "Unverified / Not recorded"}</strong>
                   </p>
                   <p className="text-[11px] text-slate-500">
                     Standard UK Domestic Energy Performance Certificate.
@@ -413,8 +425,10 @@ export default function PublicPropertyPassportView() {
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 text-xs">
                 <div className="p-4 bg-slate-50 border border-black rounded-2xl space-y-1">
                   <p className="text-[10px] font-black uppercase text-slate-500">Heating / Boiler Spec</p>
-                  <p className="font-black text-slate-900 text-sm">{property.boilerInfo?.brand || "Standard"} {property.boilerInfo?.model || ""}</p>
-                  <p className="text-slate-600">Age: {property.boilerInfo?.age || "5"} Years</p>
+                  <p className="font-black text-slate-900 text-sm">
+                    {property.boilerInfo?.brand ? `${property.boilerInfo.brand} ${property.boilerInfo?.model || ""}`.trim() : "Unverified / Not recorded"}
+                  </p>
+                  <p className="text-slate-600">Age: {property.boilerInfo?.age ? `${property.boilerInfo.age} Years` : "Unverified / Not recorded"}</p>
                   {property.boilerInfo?.lastServiced && (
                     <p className="text-slate-600">Last Serviced: {property.boilerInfo.lastServiced}</p>
                   )}
@@ -422,20 +436,20 @@ export default function PublicPropertyPassportView() {
 
                 <div className="p-4 bg-slate-50 border border-black rounded-2xl space-y-1">
                   <p className="text-[10px] font-black uppercase text-slate-500">Roof & Gutters</p>
-                  <p className="font-black text-slate-900 text-sm">{property.roofCondition || "Good Condition"}</p>
-                  <p className="text-slate-600">Standard Domestic Pitch / Slate</p>
+                  <p className="font-black text-slate-900 text-sm">{property.roofCondition || "Unverified / Not recorded"}</p>
+                  <p className="text-slate-600">Recorded roof assessment status</p>
                 </div>
 
                 <div className="p-4 bg-slate-50 border border-black rounded-2xl space-y-1">
                   <p className="text-[10px] font-black uppercase text-slate-500">Mains Water Stopcock</p>
-                  <p className="font-black text-slate-900 text-sm">{property.componentRegistry?.stopcockLocation || "Under Kitchen Sink"}</p>
-                  <p className="text-slate-600">Standard UK 15mm/22mm Isolator</p>
+                  <p className="font-black text-slate-900 text-sm">{property.componentRegistry?.stopcockLocation || "Unverified / Not recorded"}</p>
+                  <p className="text-slate-600">Mains water isolation valve location</p>
                 </div>
 
                 <div className="p-4 bg-slate-50 border border-black rounded-2xl space-y-1">
                   <p className="text-[10px] font-black uppercase text-slate-500">Consumer Unit (Fuseboard)</p>
-                  <p className="font-black text-slate-900 text-sm">{property.componentRegistry?.fuseboardLocation || "Hallway Cupboard / Under Stairs"}</p>
-                  <p className="text-slate-600">RCD / Circuit Protected</p>
+                  <p className="font-black text-slate-900 text-sm">{property.componentRegistry?.fuseboardLocation || "Unverified / Not recorded"}</p>
+                  <p className="text-slate-600">Main electrical distribution board</p>
                 </div>
 
                 {property.componentRegistry?.paintCodes && (
@@ -593,6 +607,7 @@ export default function PublicPropertyPassportView() {
         <BuyerPackModal
           property={property}
           completedJobs={completedJobs}
+          provenance={provenance}
           onClose={() => setShowBuyerPack(false)}
         />
       )}

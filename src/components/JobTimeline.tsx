@@ -57,48 +57,134 @@ export default function JobTimeline() {
   if (loading) return <div className="py-12 flex justify-center"><Clock className="animate-spin" /></div>;
   if (!job) return <div className="py-12 text-center">Job not found.</div>;
 
+  const status = String(job.status || "open").toLowerCase();
+  const isBiddingOpen = ["open", "posted", "quoted", "quoting", "in_bidding"].includes(status);
+  const quoteCount = Math.max(quotes.length, Number(job.quoteCount || job.quotesCount || 0));
+  const paymentStatus = String(job.paymentStatus || "").toLowerCase();
+  const isPaid = job.isPaid === true || paymentStatus === "paid" || paymentStatus === "handshake_complete";
+  const isEscrowFunded = paymentStatus === "funded" || paymentStatus === "escrowed";
+  const paymentSummaryLabel = isPaid
+    ? "Payment settled & released."
+    : isEscrowFunded
+    ? "Escrow funded — awaiting work completion / release."
+    : paymentStatus === "refunded"
+    ? "Payment refunded."
+    : ["failed", "reconciliation_required"].includes(paymentStatus)
+    ? "Payment under reconciliation review."
+    : "Payment pending completion / milestone release.";
+
   const steps: TimelineStep[] = [
     {
-      id: 'posted',
-      title: 'Job Posted',
-      description: 'Your job is live and visible to verified local tradespeople.',
+      id: "posted",
+      title: "Job Open",
+      description: "Your job is live and visible to verified local tradespeople.",
       icon: Rocket,
-      status: job.status === 'posted' ? 'active' : 'completed'
+      status: isBiddingOpen && quoteCount === 0 ? "active" : "completed",
     },
     {
-      id: 'quotes',
-      title: 'Quotes Received',
-      description: 'Tradespeople have submitted quotes for your review.',
+      id: "quotes",
+      title: "Quotes Received",
+      description:
+        quoteCount > 0
+          ? `${quoteCount} quote${quoteCount === 1 ? "" : "s"} submitted for your review.`
+          : "Tradespeople can submit quotes for your review.",
       icon: FileText,
-      status: job.status === 'posted' && quotes.length > 0 ? 'active' : (job.status !== 'posted' ? 'completed' : 'pending')
+      status: isBiddingOpen
+        ? quoteCount > 0
+          ? "active"
+          : "pending"
+        : status === "cancelled" && quoteCount === 0
+        ? "pending"
+        : "completed",
     },
     {
-      id: 'accepted',
-      title: 'Quote Accepted',
-      description: 'You have accepted a quote. Secure payment is next.',
+      id: "accepted",
+      title: "Quote Accepted",
+      description: "You have accepted a quote. Escrow funding & scheduling are next.",
       icon: CheckCircle2,
-      status: job.status === 'accepted' ? 'active' : (['in_progress', 'completed'].includes(job.status) ? 'completed' : 'pending')
+      status:
+        status === "accepted"
+          ? "active"
+          : ["in_progress", "completed", "disputed"].includes(status)
+          ? "completed"
+          : "pending",
     },
     {
-      id: 'in_progress',
-      title: 'Work In Progress',
-      description: 'The tradesperson is working on your job. Fast payment unlocks upon completion.',
+      id: "in_progress",
+      title: "Work In Progress",
+      description: "The tradesperson is working on your job. Milestone/final payment unlocks on approval.",
       icon: Wrench,
-      status: job.status === 'in_progress' ? 'active' : (job.status === 'completed' ? 'completed' : 'pending')
+      status:
+        status === "in_progress"
+          ? "active"
+          : ["completed", "disputed"].includes(status)
+          ? "completed"
+          : "pending",
     },
     {
-      id: 'completed',
-      title: 'Job Completed',
-      description: 'Work is done! Your funds have been released and you can leave a review.',
+      id: "completed",
+      title:
+        status === "cancelled"
+          ? "Job Cancelled"
+          : status === "disputed"
+          ? "Dispute Under Arbitration"
+          : "Job Completed",
+      description:
+        status === "cancelled"
+          ? job.cancellationReason || "This job was cancelled."
+          : status === "disputed"
+          ? job.disputeReason || "This job is locked in dispute mediation."
+          : `Work is done! ${paymentSummaryLabel}`,
       icon: CheckCircle2,
-      status: job.status === 'completed' ? 'active' : 'pending'
-    }
+      status:
+        status === "completed"
+          ? "completed"
+          : status === "cancelled" || status === "disputed"
+          ? "active"
+          : "pending",
+    },
   ];
 
-  const progress = job.status === 'completed' ? 100 : 
-                   job.status === 'in_progress' ? 75 :
-                   job.status === 'accepted' ? 50 :
-                   quotes.length > 0 ? 25 : 0;
+  const progress =
+    status === "completed"
+      ? 100
+      : status === "in_progress" || status === "disputed"
+      ? 75
+      : status === "accepted"
+      ? 50
+      : quoteCount > 0
+      ? 25
+      : status === "cancelled"
+      ? 100
+      : 10;
+
+  const createdDateRaw = job.createdAt?.seconds
+    ? new Date(job.createdAt.seconds * 1000)
+    : job.createdAt
+    ? new Date(job.createdAt)
+    : new Date();
+  const createdDateStr = !isNaN(createdDateRaw.getTime())
+    ? createdDateRaw.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })
+    : "Recently";
+
+  const statusHeadline =
+    status === "open" || status === "posted"
+      ? quoteCount > 0
+        ? "Quotes Received"
+        : "Job Open"
+      : status === "quoted" || status === "quoting" || status === "in_bidding"
+      ? "Quotes Received"
+      : status === "accepted"
+      ? "Quote Accepted"
+      : status === "in_progress"
+      ? "Work In Progress"
+      : status === "completed"
+      ? "Job Completed"
+      : status === "cancelled"
+      ? "Job Cancelled"
+      : status === "disputed"
+      ? "Dispute Review"
+      : status.replace(/_/g, " ");
 
   return (
     <div className="max-w-2xl mx-auto bg-slate-50 min-h-screen pb-20">
@@ -120,13 +206,10 @@ export default function JobTimeline() {
         <div className="bg-white rounded-3xl p-6 border border-black shadow-sm space-y-6">
           <div className="flex justify-between items-start">
             <div className="space-y-1">
-              <h2 className="text-2xl font-bold text-slate-900 capitalize">
-                {job.status === 'posted' ? 'Job Posted' : 
-                 job.status === 'accepted' ? 'Quote Accepted' :
-                 job.status === 'in_progress' ? 'Work In Progress' :
-                 job.status === 'completed' ? 'Job Completed' : 'Job Status'}
+              <h2 className="text-2xl font-bold text-black capitalize">
+                {statusHeadline}
               </h2>
-              <p className="text-slate-500 text-sm">Posted {new Date(job.createdAt?.seconds * 1000 || Date.now()).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
+              <p className="text-slate-600 text-sm">Posted {createdDateStr}</p>
             </div>
             <div className="relative w-16 h-16">
               <svg className="w-full h-full transform -rotate-90">

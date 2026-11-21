@@ -12,8 +12,29 @@ export interface CalendarEventParams {
 }
 
 // In-memory token store for security (H-02: Never persist OAuth bearer tokens in localStorage)
+// AT-CJ-CALENDAR-01: Scoped strictly to active Firebase session UID
 let inMemoryAccessToken: string | null = null;
 let inMemoryTokenExpiry: number | null = null;
+let inMemoryTokenOwnerUid: string | null = null;
+let activeSessionUid: string | null = null;
+
+/**
+ * Binds Google Calendar token cache to the current authenticated Firebase UID.
+ * Clears and best-effort revokes any prior user's bearer token immediately on UID change or logout.
+ */
+export function bindGoogleCalendarSessionUid(uid: string | null): void {
+  const normalizedUid = uid || null;
+  if (normalizedUid !== activeSessionUid) {
+    if (inMemoryAccessToken && (!normalizedUid || inMemoryTokenOwnerUid !== normalizedUid)) {
+      disconnectGoogleCalendar();
+    }
+    activeSessionUid = normalizedUid;
+  }
+}
+
+export function getBoundGoogleCalendarSessionUid(): string | null {
+  return activeSessionUid;
+}
 
 /**
  * Dynamically loads the Google Identity Services (GIS) client script if not already present.
@@ -44,16 +65,25 @@ export function ensureGsiLoaded(): Promise<boolean> {
 }
 
 /**
- * Retrieves a non-expired stored Google Calendar access token from memory.
+ * Retrieves a non-expired stored Google Calendar access token from memory for the active UID.
  */
-export function getStoredAccessToken(): string | null {
+export function getStoredAccessToken(expectedUid: string | null = activeSessionUid): string | null {
   if (!inMemoryAccessToken || !inMemoryTokenExpiry) return null;
+
+  const normalizedExpected = expectedUid ?? activeSessionUid ?? null;
+  if (inMemoryTokenOwnerUid !== null && normalizedExpected !== inMemoryTokenOwnerUid) {
+    // Owner UID mismatch — fail closed and purge stale token immediately
+    inMemoryAccessToken = null;
+    inMemoryTokenExpiry = null;
+    inMemoryTokenOwnerUid = null;
+    return null;
+  }
 
   const now = Date.now();
   if (now >= inMemoryTokenExpiry) {
-    // Token expired
     inMemoryAccessToken = null;
     inMemoryTokenExpiry = null;
+    inMemoryTokenOwnerUid = null;
     return null;
   }
 
@@ -61,24 +91,42 @@ export function getStoredAccessToken(): string | null {
 }
 
 /**
- * Saves access token in memory with expiration timestamp.
+ * Saves access token in memory with expiration timestamp and owner UID binding.
  */
-export function setStoredAccessToken(token: string, expiresInSeconds: number = 3600) {
+export function setStoredAccessToken(
+  token: string,
+  expiresInSeconds: number = 3600,
+  ownerUid: string | null = activeSessionUid
+) {
   const expiryTime = Date.now() + (expiresInSeconds - 60) * 1000; // 1 min buffer
   inMemoryAccessToken = token;
   inMemoryTokenExpiry = expiryTime;
+  inMemoryTokenOwnerUid = ownerUid ?? activeSessionUid ?? null;
 }
 
 /**
- * Clears in-memory Google Calendar access credentials.
+ * Clears and best-effort revokes in-memory Google Calendar access credentials.
  */
 export function disconnectGoogleCalendar(): void {
+  const tokenToRevoke = inMemoryAccessToken;
   inMemoryAccessToken = null;
   inMemoryTokenExpiry = null;
+  inMemoryTokenOwnerUid = null;
+
+  if (tokenToRevoke && typeof window !== "undefined") {
+    try {
+      const revoke = (window as any).google?.accounts?.oauth2?.revoke;
+      if (typeof revoke === "function") {
+        revoke(tokenToRevoke, () => {});
+      }
+    } catch {
+      // Non-fatal if GIS script is not loaded in this context
+    }
+  }
 }
 
 /**
- * Checks if a valid, non-expired Google Calendar access token is stored.
+ * Checks if a valid, non-expired Google Calendar access token is stored for the active UID.
  */
 export function isGoogleCalendarConnected(): boolean {
   return getStoredAccessToken() !== null;

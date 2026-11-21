@@ -129,6 +129,7 @@ export function validatePaymentTransition(from: PaymentLedgerStatus, to: Payment
 // -------------------------------------------------------------
 export type RideStatus =
   | "draft"
+  | "pending"
   | "requested"
   | "searching"
   | "offered"
@@ -136,24 +137,33 @@ export type RideStatus =
   | "arriving"
   | "arrived"
   | "in_progress"
+  | "awaiting_payment"
+  | "awaiting_cash_confirm"
+  | "cash_confirmed"
+  | "rider_abandoned"
   | "completed"
   | "cancelled";
 
 export const VALID_RIDE_TRANSITIONS: Record<string, readonly string[]> = {
-  draft: ["searching", "requested", "cancelled"],
-  requested: ["searching", "offered", "cancelled"],
-  searching: ["offered", "cancelled"],
-  offered: ["accepted", "searching", "cancelled"],
-  accepted: ["arriving", "arrived", "cancelled"],
+  draft: ["pending", "searching", "requested", "cancelled"],
+  pending: ["searching", "offered", "accepted", "cancelled"],
+  requested: ["pending", "searching", "offered", "accepted", "cancelled"],
+  searching: ["pending", "offered", "accepted", "cancelled"],
+  offered: ["pending", "accepted", "searching", "cancelled"],
+  accepted: ["arriving", "arrived", "in_progress", "cancelled"],
   arriving: ["arrived", "in_progress", "cancelled"],
-  arrived: ["in_progress", "cancelled"],
-  in_progress: ["completed", "cancelled"],
+  arrived: ["in_progress", "rider_abandoned", "cancelled"],
+  in_progress: ["awaiting_payment", "awaiting_cash_confirm", "cash_confirmed", "rider_abandoned", "completed", "cancelled"],
+  awaiting_payment: ["awaiting_cash_confirm", "completed", "cancelled"],
+  awaiting_cash_confirm: ["cash_confirmed", "completed"],
+  cash_confirmed: ["completed"],
+  rider_abandoned: ["awaiting_payment", "completed"],
   completed: [], // Terminal
   cancelled: [], // Terminal
 };
 
 export function canTransitionRide(from: RideStatus, to: RideStatus): boolean {
-  const normFrom = from === "requested" ? "searching" : from;
+  const normFrom = from === "requested" || from === "pending" ? "searching" : from;
   return (VALID_RIDE_TRANSITIONS[normFrom] as readonly string[])?.includes(to) ?? false;
 }
 

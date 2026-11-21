@@ -5,6 +5,7 @@ import { motion } from "motion/react";
 import { PoundSterling, Receipt, CreditCard, ChevronRight, ArrowUpRight, ArrowDownRight, Wallet, Loader2, FileSpreadsheet, Check } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 import { exportRideReceiptsToSheets } from "@/src/services/googleSheetsService";
+import { resolveRideFinancialSummary } from "@/src/lib/rideEarningsDisplay";
 
 export default function BillingTab() {
   const { user } = useAuth();
@@ -19,16 +20,19 @@ export default function BillingTab() {
     setIsExportingSheets(true);
     setExportError(null);
 
-    const formattedRides = rides.map(r => ({
-      dateTime: r.createdAt?.toDate ? new Date(r.createdAt.toDate()).toISOString() : new Date().toISOString(),
-      rideRef: r.id || 'RIDE-REF',
-      pickup: r.pickup || 'Pickup',
-      dropoff: r.destination || r.dropoff || 'Dropoff',
-      fare: parseFloat(r.totalFare) || 0,
-      tip: parseFloat(r.tipAmount) || 0,
-      total: (parseFloat(r.totalFare) || 0) + (parseFloat(r.tipAmount) || 0),
-      driverOrPassenger: "Passenger",
-    }));
+    const formattedRides = rides.map((r) => {
+      const summary = resolveRideFinancialSummary(r);
+      return {
+        dateTime: r.createdAt?.toDate ? new Date(r.createdAt.toDate()).toISOString() : new Date().toISOString(),
+        rideRef: r.id || 'RIDE-REF',
+        pickup: r.pickupAddress || r.pickup || 'Pickup',
+        dropoff: r.dropoffAddress || r.destination || r.dropoff || 'Dropoff',
+        fare: summary.baseFare,
+        tip: summary.tipAmount,
+        total: summary.totalFarePaid,
+        driverOrPassenger: "Passenger",
+      };
+    });
 
     const res = await exportRideReceiptsToSheets(formattedRides);
     setIsExportingSheets(false);
@@ -57,7 +61,17 @@ export default function BillingTab() {
     return () => unsub();
   }, [user]);
 
-  const totalSpent = rides.reduce((acc, r) => acc + (parseFloat(r.totalFare) || 0), 0);
+  const billingTotals = rides.reduce(
+    (acc, r) => {
+      const summary = resolveRideFinancialSummary(r);
+      return {
+        totalSpent: acc.totalSpent + summary.totalFarePaid,
+        driverShare: acc.driverShare + summary.driverEarnings,
+        platformShare: acc.platformShare + summary.platformFee,
+      };
+    },
+    { totalSpent: 0, driverShare: 0, platformShare: 0 }
+  );
 
   if (loading) {
      return (
@@ -73,16 +87,16 @@ export default function BillingTab() {
       <div className="bg-card px-4 py-8 border-b border-border-main text-center space-y-2">
         <p className="text-[10px] font-black uppercase tracking-[0.2em] text-text-muted">Total Balance Spent</p>
         <h1 className="text-5xl font-black tracking-tighter text-text-main">
-          £{totalSpent.toFixed(2)}
+          £{billingTotals.totalSpent.toFixed(2)}
         </h1>
         <div className="flex items-center justify-center gap-4 mt-4">
            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 text-emerald-700 rounded-full border border-emerald-100">
               <ArrowUpRight className="w-3.5 h-3.5" />
-              <span className="text-xs font-black">£{(totalSpent * 0.8).toFixed(2)} Driver</span>
+              <span className="text-xs font-black">£{billingTotals.driverShare.toFixed(2)} Driver</span>
            </div>
            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 text-indigo-700 rounded-full border border-indigo-100">
               <ArrowDownRight className="w-3.5 h-3.5" />
-              <span className="text-xs font-black">£{(totalSpent * 0.2).toFixed(2)} Priority</span>
+              <span className="text-xs font-black">£{billingTotals.platformShare.toFixed(2)} Platform</span>
            </div>
         </div>
       </div>
@@ -138,7 +152,7 @@ export default function BillingTab() {
                     </p>
                   </div>
                   <div className="text-right">
-                    <p className="text-sm font-black text-text-main">£{(parseFloat(ride.totalFare) || 0).toFixed(2)}</p>
+                    <p className="text-sm font-black text-text-main">£{resolveRideFinancialSummary(ride).totalFarePaid.toFixed(2)}</p>
                     <div className="flex items-center gap-1 justify-end">
                        <div className="w-1.5 h-1.5 rounded-full bg-trust" />
                        <span className="text-[9px] font-black text-trust uppercase">Paid</span>

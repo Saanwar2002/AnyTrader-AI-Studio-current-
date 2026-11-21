@@ -11,25 +11,30 @@ service firebase.storage {
     function isAdmin() {
       return isSignedIn() && (
         ('admin' in request.auth.token && request.auth.token.admin == true) ||
-        ('role' in request.auth.token && (request.auth.token.role == 'admin' || request.auth.token.role == 'ecosystem_manager')) ||
-        firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/admins/$(request.auth.uid)) ||
-        firestore.exists(/databases/(default)/documents/admins/$(request.auth.uid))
+        ('isAdmin' in request.auth.token && request.auth.token.isAdmin == true) ||
+        firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/admins/$(request.auth.uid))
       );
+    }
+    function isSafeImageMimeType() {
+      return request.resource.contentType.matches('image/(jpeg|jpg|png|webp|gif|heic|heif|avif)');
     }
     function isValidImage() {
       return request.resource.size <= 10 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*');
+        && isSafeImageMimeType();
     }
     function isValidMedia() {
       return request.resource.size <= 25 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*|audio/.*|video/.*|application/pdf');
+        && (
+          isSafeImageMimeType() ||
+          request.resource.contentType.matches('audio/.*|video/.*|application/pdf')
+        );
     }
     function isValidVideo() {
       return request.resource.size <= 50 * 1024 * 1024
         && request.resource.contentType.matches('video/.*');
     }
 
-    // --- Job Ownership & Participation Helpers ---
+    // --- Job Ownership & Participation Helpers (Bound to Named Production DB) ---
     function isJobOwnerInNamedDb(jobId) {
       return firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/jobs/$(jobId)) &&
         (
@@ -41,22 +46,10 @@ service firebase.storage {
         );
     }
 
-    function isJobOwnerInDefaultDb(jobId) {
-      return firestore.exists(/databases/(default)/documents/jobs/$(jobId)) &&
-        (
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('homeownerId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('userId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('ownerId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('posterId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('customerId', '') == request.auth.uid
-        );
-    }
-
     function isJobOwnerById(jobId) {
       return isSignedIn() && (
         request.auth.uid == jobId ||
-        isJobOwnerInNamedDb(jobId) ||
-        isJobOwnerInDefaultDb(jobId)
+        isJobOwnerInNamedDb(jobId)
       );
     }
 
@@ -72,55 +65,46 @@ service firebase.storage {
         );
     }
 
-    function isJobTradespersonInDefaultDb(jobId) {
-      return firestore.exists(/databases/(default)/documents/jobs/$(jobId)) &&
-        (
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('acceptedTradespersonId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('acceptedTraderId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('assignedTraderId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('tradespersonId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('traderId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('targetTradespersonId', '') == request.auth.uid
-        );
-    }
-
     function isJobTradespersonById(jobId) {
-      return isSignedIn() && (
-        isJobTradespersonInNamedDb(jobId) ||
-        isJobTradespersonInDefaultDb(jobId)
-      );
+      return isSignedIn() && isJobTradespersonInNamedDb(jobId);
     }
 
     function isJobParticipant(jobId) {
       return isJobOwnerById(jobId) || isJobTradespersonById(jobId) || isAdmin();
     }
 
-    // --- Property Participant Helper ---
-    function isPropertyParticipantInNamedDb(propertyId) {
+    // --- Property Ownership & Tenant Helpers (Bound to Named Production DB) ---
+    function isPropertyOwnerOrManagerInNamedDb(propertyId) {
       return firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)) &&
         (
           firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('ownerId', '') == request.auth.uid ||
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('userId', '') == request.auth.uid ||
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('homeownerId', '') == request.auth.uid ||
           firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('landlordId', '') == request.auth.uid ||
-          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('tenantId', '') == request.auth.uid ||
-          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('userId', '') == request.auth.uid
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('managerId', '') == request.auth.uid ||
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('propertyManagerId', '') == request.auth.uid
         );
     }
 
-    function isPropertyParticipantInDefaultDb(propertyId) {
-      return firestore.exists(/databases/(default)/documents/properties/$(propertyId)) &&
+    function isPropertyTenantInNamedDb(propertyId) {
+      return firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)) &&
         (
-          firestore.get(/databases/(default)/documents/properties/$(propertyId)).data.get('ownerId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/properties/$(propertyId)).data.get('landlordId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/properties/$(propertyId)).data.get('tenantId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/properties/$(propertyId)).data.get('userId', '') == request.auth.uid
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('tenantId', '') == request.auth.uid ||
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)).data.get('tenantIds', []).hasAny([request.auth.uid])
         );
     }
 
-    function isPropertyParticipant(propertyId) {
+    function isPropertyOwnerOrAdmin(propertyId) {
       return isSignedIn() && (
-        request.auth.uid == propertyId ||
-        isPropertyParticipantInNamedDb(propertyId) ||
-        isPropertyParticipantInDefaultDb(propertyId) ||
+        isPropertyOwnerOrManagerInNamedDb(propertyId) ||
+        isAdmin()
+      );
+    }
+
+    function isPropertyTenantIssueParticipant(propertyId) {
+      return isSignedIn() && (
+        isPropertyOwnerOrManagerInNamedDb(propertyId) ||
+        isPropertyTenantInNamedDb(propertyId) ||
         isAdmin()
       );
     }
@@ -134,18 +118,9 @@ service firebase.storage {
         );
     }
 
-    function isChatParticipantInDefaultDb(conversationId) {
-      return firestore.exists(/databases/(default)/documents/conversations/$(conversationId)) &&
-        (
-          firestore.get(/databases/(default)/documents/conversations/$(conversationId)).data.get('participants', []).hasAny([request.auth.uid]) ||
-          firestore.get(/databases/(default)/documents/conversations/$(conversationId)).data.get('participantIds', []).hasAny([request.auth.uid])
-        );
-    }
-
     function isChatParticipant(conversationId) {
       return isSignedIn() && (
         isChatParticipantInNamedDb(conversationId) ||
-        isChatParticipantInDefaultDb(conversationId) ||
         isAdmin()
       );
     }
@@ -163,22 +138,9 @@ service firebase.storage {
         );
     }
 
-    function isDisputeParticipantInDefaultDb(jobId) {
-      return firestore.exists(/databases/(default)/documents/jobs/$(jobId)) &&
-        (
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('homeownerId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('userId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('customerUid', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('assignedTraderId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('acceptedTradespersonId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/jobs/$(jobId)).data.get('traderId', '') == request.auth.uid
-        );
-    }
-
     function isDisputeParticipant(jobId) {
       return isSignedIn() && (
         isDisputeParticipantInNamedDb(jobId) ||
-        isDisputeParticipantInDefaultDb(jobId) ||
         isAdmin()
       );
     }
@@ -207,34 +169,10 @@ service firebase.storage {
       );
     }
 
-    function isRideParticipantInDefaultDb(rideId) {
-      return (
-        (
-          firestore.exists(/databases/(default)/documents/rides/$(rideId)) &&
-          (
-            firestore.get(/databases/(default)/documents/rides/$(rideId)).data.get('passengerId', '') == request.auth.uid ||
-            firestore.get(/databases/(default)/documents/rides/$(rideId)).data.get('riderId', '') == request.auth.uid ||
-            firestore.get(/databases/(default)/documents/rides/$(rideId)).data.get('driverId', '') == request.auth.uid ||
-            firestore.get(/databases/(default)/documents/rides/$(rideId)).data.get('assignedDriverId', '') == request.auth.uid
-          )
-        ) ||
-        (
-          firestore.exists(/databases/(default)/documents/ride_requests/$(rideId)) &&
-          (
-            firestore.get(/databases/(default)/documents/ride_requests/$(rideId)).data.get('passengerId', '') == request.auth.uid ||
-            firestore.get(/databases/(default)/documents/ride_requests/$(rideId)).data.get('riderId', '') == request.auth.uid ||
-            firestore.get(/databases/(default)/documents/ride_requests/$(rideId)).data.get('driverId', '') == request.auth.uid ||
-            firestore.get(/databases/(default)/documents/ride_requests/$(rideId)).data.get('assignedDriverId', '') == request.auth.uid
-          )
-        )
-      );
-    }
-
     function isRideParticipant(rideId) {
       return isSignedIn() && (
         isAdmin() ||
-        isRideParticipantInNamedDb(rideId) ||
-        isRideParticipantInDefaultDb(rideId)
+        isRideParticipantInNamedDb(rideId)
       );
     }
 
@@ -247,18 +185,9 @@ service firebase.storage {
         );
     }
 
-    function isVehicleParticipantInDefaultDb(vehicleId) {
-      return firestore.exists(/databases/(default)/documents/vehicles/$(vehicleId)) &&
-        (
-          firestore.get(/databases/(default)/documents/vehicles/$(vehicleId)).data.get('driverId', '') == request.auth.uid ||
-          firestore.get(/databases/(default)/documents/vehicles/$(vehicleId)).data.get('ownerId', '') == request.auth.uid
-        );
-    }
-
     function isVehicleParticipant(vehicleId) {
       return isSignedIn() && (
         isVehicleParticipantInNamedDb(vehicleId) ||
-        isVehicleParticipantInDefaultDb(vehicleId) ||
         isAdmin()
       );
     }
@@ -280,10 +209,20 @@ service firebase.storage {
       allow write: if isSignedIn() && (isJobOwnerById(jobId) || isAdmin()) && isValidMedia();
     }
 
-    // 3. Property Media (Passport documents, EPC certificates, CP12/EICR compliance, condition photos)
+    // 3. Property Media (Private Passport docs, EPC, CP12/EICR, condition photos)
+    // Restricted strictly to property owners, landlords, assigned managers, and admins.
+    // Tenants are confined strictly to tenant-issue evidence subpaths.
+    match /properties/{propertyId}/tenant-issues/{allPaths=**} {
+      allow read: if isPropertyTenantIssueParticipant(propertyId);
+      allow write: if isPropertyTenantIssueParticipant(propertyId) && isValidMedia();
+    }
+    match /properties/{propertyId}/tenant_issues/{allPaths=**} {
+      allow read: if isPropertyTenantIssueParticipant(propertyId);
+      allow write: if isPropertyTenantIssueParticipant(propertyId) && isValidMedia();
+    }
     match /properties/{propertyId}/{allPaths=**} {
-      allow read: if isPropertyParticipant(propertyId);
-      allow write: if (isPropertyParticipant(propertyId) || isAdmin()) && isValidMedia();
+      allow read: if isPropertyOwnerOrAdmin(propertyId);
+      allow write: if isPropertyOwnerOrAdmin(propertyId) && isValidMedia();
     }
 
     // 4. Public User Profiles (Public Avatars, Portfolio showcase items)

@@ -71,40 +71,45 @@ describe("FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Sui
     mockDb = {
       collection: (colName: string) => {
         if (colName === "payment_ledger") {
-          return {
-            where: (field: string, op: string, val: any) => {
-              const filtered = ledgerDocs.filter((d) => d.data[field] === val);
-              return {
-                limit: (lim: number) => ({
-                  get: async () => ({
-                    docs: filtered.slice(0, lim).map((d) => ({
-                      id: d.id,
-                      data: () => ({ ...d.data }),
-                    })),
-                  }),
-                }),
+          const buildQuery = (rows: any[], cursorId?: string) => {
+            const ordered = [...rows].sort((a, b) => a.id.localeCompare(b.id));
+            const startIdx = cursorId ? ordered.findIndex((d) => d.id === cursorId) + 1 : 0;
+            const sliced = startIdx > 0 ? ordered.slice(startIdx) : ordered;
+            return {
+              orderBy: () => buildQuery(rows, cursorId),
+              startAfter: (c: any) => buildQuery(rows, typeof c === "string" ? c : c?.id),
+              limit: (lim: number) => ({
                 get: async () => ({
-                  docs: filtered.map((d) => ({
+                  docs: sliced.slice(0, lim).map((d) => ({
                     id: d.id,
                     data: () => ({ ...d.data }),
                   })),
                 }),
-              };
-            },
-            limit: (lim: number) => ({
+              }),
               get: async () => ({
-                docs: ledgerDocs.slice(0, lim).map((d) => ({
+                docs: sliced.map((d) => ({
                   id: d.id,
                   data: () => ({ ...d.data }),
                 })),
               }),
+            };
+          };
+          return {
+            doc: (id: string) => ({
+              get: async () => {
+                const found = ledgerDocs.find((d) => d.id === id);
+                return {
+                  id,
+                  exists: Boolean(found),
+                  data: () => (found ? { ...found.data } : undefined),
+                };
+              },
             }),
-            get: async () => ({
-              docs: ledgerDocs.map((d) => ({
-                id: d.id,
-                data: () => ({ ...d.data }),
-              })),
-            }),
+            where: (field: string, _op: string, val: any) => {
+              const filtered = ledgerDocs.filter((d) => d.data[field] === val);
+              return buildQuery(filtered);
+            },
+            ...buildQuery(ledgerDocs),
           };
         }
         throw new Error(`Collection ${colName} not mocked`);
@@ -148,6 +153,12 @@ describe("FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Sui
       expect(() => validateReconciliationReportParams({ offset: "abc" })).toThrow(BadRequestError);
     });
 
+    it("validates offset bounds and cursor parameters", () => {
+      expect(() => validateReconciliationReportParams({ offset: 501 })).toThrow(BadRequestError);
+      const withCursor = validateReconciliationReportParams({ cursor: "ledg_v8_reconciled", limit: 2 });
+      expect(withCursor.cursor).toBe("ledg_v8_reconciled");
+    });
+
     it("validates and normalizes statusFilter parameter", () => {
       const valid = validateReconciliationReportParams({ statusFilter: "COMPLETED " });
       expect(valid.statusFilter).toBe("completed");
@@ -169,21 +180,25 @@ describe("FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Sui
       expect(sanitized.formattedAmount).toBe("£500.00");
       expect(sanitized.platformFeePence).toBe(6000);
       expect(sanitized.netPayoutPence).toBe(44000);
+      expect(sanitized.feeVerificationStatus).toBe("verified");
       expect(sanitized.stripeTransferIdMasked).toBe("tr_s...7890");
     });
 
-    it("normalizes V7 transitional ledger records", () => {
+    it("normalizes V7 transitional ledger records without fabricating missing 12% fees", () => {
       const raw = ledgerDocs[2].data;
       const sanitized = sanitizeAndClassifyLedgerRecord("ledg_v7_transitional", raw);
 
       expect(sanitized.schemaVariant).toBe("v7_transitional");
       expect(sanitized.amountPence).toBe(15000);
       expect(sanitized.formattedAmount).toBe("£150.00");
-      expect(sanitized.platformFeePence).toBe(1800);
-      expect(sanitized.netPayoutPence).toBe(13200);
+      expect(sanitized.platformFeePence).toBeNull();
+      expect(sanitized.netPayoutPence).toBeNull();
+      expect(sanitized.feeVerificationStatus).toBe("unknown");
+      expect(sanitized.formattedPlatformFee).toBe("Unknown / Unverified");
+      expect(sanitized.formattedNetPayout).toBe("Unknown / Unverified");
     });
 
-    it("normalizes V6 legacy float-amount ledger records", () => {
+    it("normalizes V6 legacy float-amount ledger records with unknown fee/payout markers", () => {
       const raw = ledgerDocs[3].data;
       const sanitized = sanitizeAndClassifyLedgerRecord("ledg_v6_legacy", raw);
 
@@ -191,11 +206,14 @@ describe("FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Sui
       expect(sanitized.reconciliationStatus).toBe("legacy_unstructured");
       expect(sanitized.amountPence).toBe(10000);
       expect(sanitized.formattedAmount).toBe("£100.00");
+      expect(sanitized.platformFeePence).toBeNull();
+      expect(sanitized.netPayoutPence).toBeNull();
+      expect(sanitized.feeVerificationStatus).toBe("unknown");
     });
   });
 
-  describe("4. Summary Aggregation & Read-Only Invariant", () => {
-    it("computes report summary totals accurately without mutating database state", async () => {
+  describe("4. Summary Aggregation, Deterministic Cursor Pagination & Read-Only Invariant", () => {
+    it("computes report summary totals including unknownFeeCount without mutating database state", async () => {
       const adminCaller = { uid: "admin_super_user", isAdmin: true };
       const report = await generateFinancialReconciliationReport(mockDb, {}, adminCaller);
 
@@ -203,7 +221,28 @@ describe("FIN-05: Bounded Read-Only Operator Financial Reconciliation Report Sui
       expect(report.summary.reconciledCount).toBe(1);
       expect(report.summary.failedCount).toBe(1);
       expect(report.summary.legacyCount).toBe(2);
+      expect(report.summary.unknownFeeCount).toBe(2);
       expect(report.isReadOnly).toBe(true);
+    });
+
+    it("paginates deterministically using cursor and nextCursor", async () => {
+      const adminCaller = { uid: "admin_super_user", isAdmin: true };
+      const page1 = await generateFinancialReconciliationReport(mockDb, { limit: 2 }, adminCaller);
+
+      expect(page1.recordsCount).toBe(2);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.nextCursor).toBe(page1.records[1].ledgerId);
+      expect(page1.records.map((r) => r.ledgerId)).toEqual(["ledg_v6_legacy", "ledg_v7_transitional"]);
+
+      const page2 = await generateFinancialReconciliationReport(
+        mockDb,
+        { limit: 2, cursor: page1.nextCursor! },
+        adminCaller
+      );
+      expect(page2.recordsCount).toBe(2);
+      expect(page2.hasMore).toBe(false);
+      expect(page2.nextCursor).toBeNull();
+      expect(page2.records.map((r) => r.ledgerId)).toEqual(["ledg_v8_failed", "ledg_v8_reconciled"]);
     });
   });
 });

@@ -30,6 +30,13 @@ import { buildIdempotencyKey } from './provenance';
 import { JobSourceInput } from './jobIntelligence';
 import { intelligenceTaskQueue } from './intelligenceTaskQueue';
 import { TaskType } from './types';
+import {
+  parseAdminBackfillOptions,
+  PERMITTED_BACKFILL_COLLECTIONS,
+  BackfillValidationError,
+} from './backfillOptions';
+
+export { PERMITTED_BACKFILL_COLLECTIONS, BackfillValidationError, parseAdminBackfillOptions };
 
 export const HARD_MAX_BATCH_SIZE = 500;
 export const HARD_MAX_COST_USD = 100.0;
@@ -209,6 +216,21 @@ export class ControlledBackfillEngine {
     firestoreDb: any,
     options: BackfillOptions
   ): Promise<BackfillProgress> {
+    if (options.dryRun !== undefined && typeof options.dryRun !== 'boolean') {
+      throw new BackfillValidationError(
+        `Invalid 'dryRun' parameter: expected strict boolean (true or false), received ${typeof options.dryRun}`
+      );
+    }
+    if (
+      options.collection !== undefined &&
+      (typeof options.collection !== 'string' ||
+        !(PERMITTED_BACKFILL_COLLECTIONS as readonly string[]).includes(options.collection))
+    ) {
+      throw new BackfillValidationError(
+        `Invalid 'collection' parameter: '${String(options.collection)}' is not in permitted allowlist (${PERMITTED_BACKFILL_COLLECTIONS.join(', ')})`
+      );
+    }
+
     const {
       batchSize: rawBatchSize = 100,
       dryRun = true,

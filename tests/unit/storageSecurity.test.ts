@@ -31,14 +31,22 @@ describe("Firebase Storage Security Rules Remediation Test Suite", () => {
       expect(publicMediaBlock).toMatch(/allow\s+write\s*:\s*if\s+isSignedIn\(\)\s*&&/);
     });
 
-    it("PROTECTS property media with recursive wildcard matching", () => {
+    it("PROTECTS private property media strictly for owners, managers, and admins (AT-STOR-05)", () => {
+      expect(rulesContent).toContain("match /properties/{propertyId}/tenant-issues/{allPaths=**}");
+      expect(rulesContent).toContain("match /properties/{propertyId}/tenant_issues/{allPaths=**}");
       expect(rulesContent).toContain("match /properties/{propertyId}/{allPaths=**}");
       const propertiesMatch = rulesContent.match(/match \/properties\/\{propertyId\}\/\{allPaths=\*\*\} \{([\s\S]*?)\}/);
       expect(propertiesMatch).toBeTruthy();
       const propertiesBlock = propertiesMatch![1];
 
       expect(propertiesBlock).not.toContain("allow read: if true");
-      expect(propertiesBlock).toContain("isPropertyParticipant(propertyId)");
+      expect(propertiesBlock).toContain("isPropertyOwnerOrAdmin(propertyId)");
+      expect(propertiesBlock).toContain("isValidMedia()");
+    });
+
+    it("BINDS all Firestore cross-service checks exclusively to the named production database (AT-STOR-04)", () => {
+      expect(rulesContent).not.toContain("/databases/(default)/documents/");
+      expect(rulesContent).toContain("/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/");
     });
 
     it("DEFINES fallback default deny rule on all other paths", () => {
@@ -367,6 +375,81 @@ describe("Firebase Storage Security Rules Remediation Test Suite", () => {
       expect(evaluateCanAccessIntelligenceRaw(homeownerReq)).toBe(false);
       expect(evaluateCanAccessIntelligenceRaw(traderReq)).toBe(false);
       expect(evaluateCanAccessIntelligenceRaw(adminReq)).toBe(true);
+    });
+
+    // Requirement 11 (AT-STOR-05): Confine tenant uploads to tenant-issues and block private property docs
+    it("REQUIREMENT 11 (AT-STOR-05): ISOLATES private property media from tenants and confines tenants to tenant-issues folders", () => {
+      const evaluatePropertyOwnerOrManager = (req: StorageRequestContext, propertyId: string) => {
+        if (!evaluateIsSignedIn(req)) return false;
+        const prop = mockDb.properties[propertyId];
+        if (!prop) return false;
+        const uid = req.auth!.uid;
+        return (
+          prop.ownerId === uid ||
+          prop.userId === uid ||
+          prop.homeownerId === uid ||
+          prop.landlordId === uid ||
+          prop.managerId === uid ||
+          prop.propertyManagerId === uid
+        );
+      };
+
+      const evaluatePropertyTenant = (req: StorageRequestContext, propertyId: string) => {
+        if (!evaluateIsSignedIn(req)) return false;
+        const prop = mockDb.properties[propertyId];
+        if (!prop) return false;
+        return prop.tenantId === req.auth!.uid;
+      };
+
+      const evaluateCanReadPropertyPath = (req: StorageRequestContext, storagePath: string) => {
+        const tenantIssueMatch = storagePath.match(/^properties\/([^/]+)\/(tenant-issues|tenant_issues)\/(.+)$/);
+        if (tenantIssueMatch) {
+          const propId = tenantIssueMatch[1];
+          return (
+            evaluatePropertyOwnerOrManager(req, propId) ||
+            evaluatePropertyTenant(req, propId) ||
+            evaluateIsAdmin(req)
+          );
+        }
+        const generalMatch = storagePath.match(/^properties\/([^/]+)\/(.+)$/);
+        if (!generalMatch) return false;
+        const propId = generalMatch[1];
+        return evaluatePropertyOwnerOrManager(req, propId) || evaluateIsAdmin(req);
+      };
+
+      const evaluateCanWritePropertyPath = (req: StorageRequestContext, storagePath: string) => {
+        return evaluateCanReadPropertyPath(req, storagePath) && evaluateIsValidMedia(req);
+      };
+
+      const landlordReq: StorageRequestContext = {
+        auth: { uid: "landlord-luke" },
+        resource: { size: 1024 * 1024, contentType: "application/pdf" },
+      };
+      const tenantReq: StorageRequestContext = {
+        auth: { uid: "tenant-tina" },
+        resource: { size: 1024 * 1024, contentType: "image/jpeg" },
+      };
+      const uidSpoofReq: StorageRequestContext = {
+        auth: { uid: "prop-1" },
+        resource: { size: 1024 * 1024, contentType: "image/jpeg" },
+      };
+
+      // Landlord can read/write private property docs & tenant issues
+      expect(evaluateCanReadPropertyPath(landlordReq, "properties/prop-1/epc/cert.pdf")).toBe(true);
+      expect(evaluateCanWritePropertyPath(landlordReq, "properties/prop-1/epc/cert.pdf")).toBe(true);
+
+      // Tenant CANNOT read/write private passport/compliance docs, even within valid media constraints
+      expect(evaluateCanReadPropertyPath(tenantReq, "properties/prop-1/epc/cert.pdf")).toBe(false);
+      expect(evaluateCanWritePropertyPath(tenantReq, "properties/prop-1/epc/cert.pdf")).toBe(false);
+      expect(evaluateCanReadPropertyPath(tenantReq, "properties/prop-1/passport/title-deed.pdf")).toBe(false);
+
+      // Tenant CAN read/write strictly inside tenant-issues / tenant_issues
+      expect(evaluateCanWritePropertyPath(tenantReq, "properties/prop-1/tenant-issues/damp.jpg")).toBe(true);
+      expect(evaluateCanWritePropertyPath(tenantReq, "properties/prop-1/tenant_issues/boiler-leak.jpg")).toBe(true);
+
+      // Spoofing uid == propertyId no longer grants access
+      expect(evaluateCanReadPropertyPath(uidSpoofReq, "properties/prop-1/epc/cert.pdf")).toBe(false);
+      expect(evaluateCanWritePropertyPath(uidSpoofReq, "properties/prop-1/tenant-issues/fake.jpg")).toBe(false);
     });
   });
 });

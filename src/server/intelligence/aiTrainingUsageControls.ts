@@ -160,6 +160,11 @@ export interface RegisterAiUsageControlsInput {
   classificationRef?: AiUsageClassificationRef;
   archiveRef?: AiUsageArchiveRef;
   recordedBy?: string;
+  reConsentCeremony?: {
+    confirmed: boolean;
+    ceremonyId: string;
+    confirmedBy?: string;
+  };
 }
 
 export interface EvaluateAiUsageRequest {
@@ -172,6 +177,7 @@ export interface EvaluateAiUsageRequest {
   context?: {
     callerUid?: string;
     isInternalAi?: boolean;
+    executionChannel?: 'public_api' | 'internal_worker' | 'trusted_server';
     clientRole?: string;
   };
 }
@@ -410,62 +416,96 @@ export class AiTrainingUsageControlsService {
     };
 
     const now = new Date().toISOString();
-
-    const partialRecord = {
-      controlId,
-      tenantId: input.tenantId,
-      recordType: input.recordType,
-      recordId: input.recordId,
-      scope,
-      purposes: finalPurposes,
-      trainingConsent,
-      modelTiersAllowed: input.modelTiersAllowed || [],
-      restrictions: input.restrictions || [],
-      status: 'active' as const,
-      version: 1,
-      provenanceRef: input.provenanceRef,
-      rightsRef: input.rightsRef,
-      classificationRef: input.classificationRef,
-      archiveRef: input.archiveRef,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    const contentHash = computeAiControlContentHash(partialRecord);
-
-    const record: AiUsageControlRecord = {
-      ...partialRecord,
-      contentHash,
-    };
-
-    const cleanedRecord = cleanUndefinedValues(record);
     const db = this.getDb();
-
-    // Check existing
     const docRef = db.collection('ai_usage_controls').doc(controlId);
-    const existingSnap = await docRef.get();
 
-    if (existingSnap.exists) {
-      const existingData = existingSnap.data() as AiUsageControlRecord;
-      cleanedRecord.version = (existingData.version || 1) + 1;
-      cleanedRecord.createdAt = existingData.createdAt || now;
-      cleanedRecord.contentHash = computeAiControlContentHash(cleanedRecord);
-    }
+    const hasValidReConsentCeremony = Boolean(
+      input.reConsentCeremony?.confirmed === true &&
+        typeof input.reConsentCeremony.ceremonyId === 'string' &&
+        input.reConsentCeremony.ceremonyId.trim() !== '' &&
+        (!input.reConsentCeremony.confirmedBy || input.reConsentCeremony.confirmedBy === input.tenantId)
+    );
 
-    await docRef.set(cleanedRecord);
+    return db.runTransaction(async (tx: any) => {
+      const existingSnap = await tx.get(docRef);
 
-    // Append to history snapshot
-    const historyId = `aicontrolh_${computeSha256(`${input.tenantId}:${controlId}:${cleanedRecord.version}:${now}`).substring(0, 24)}`;
-    const historyRecord = cleanUndefinedValues({
-      historyId,
-      ...cleanedRecord,
-      recordedBy: input.recordedBy || input.tenantId,
-      snapshotTimestamp: now,
+      let nextVersion = 1;
+      let createdAt = now;
+      let resolvedTrainingConsent: AiTrainingConsentStatus = trainingConsent;
+      const resolvedPurposes: Record<AiUsagePurpose, PurposePermission> = { ...finalPurposes };
+
+      if (existingSnap.exists) {
+        const existingData = existingSnap.data() as AiUsageControlRecord;
+        if (existingData.tenantId !== input.tenantId) {
+          throw new AiUsageControlsSecurityError(
+            `Cross-tenant update attempt: caller ${input.tenantId} != owner ${existingData.tenantId}`
+          );
+        }
+
+        if (existingData.status === 'revoked' && !hasValidReConsentCeremony) {
+          throw new AiUsageControlsSecurityError(
+            `Cannot reactivate revoked AI usage control record '${controlId}' without an authorized re-consent ceremony`
+          );
+        }
+
+        if (!hasValidReConsentCeremony) {
+          if (
+            (existingData.trainingConsent === 'opt_out' || existingData.trainingConsent === 'revoked') &&
+            resolvedTrainingConsent !== 'opt_out' &&
+            resolvedTrainingConsent !== 'revoked'
+          ) {
+            resolvedTrainingConsent = existingData.trainingConsent;
+          }
+
+          for (const purpose of AI_USAGE_PURPOSES) {
+            if (existingData.purposes?.[purpose] === 'denied') {
+              resolvedPurposes[purpose] = 'denied';
+            }
+          }
+        }
+
+        nextVersion = (existingData.version || 1) + 1;
+        createdAt = existingData.createdAt || now;
+      }
+
+      const partialRecord: AiUsageControlRecord = {
+        controlId,
+        tenantId: input.tenantId,
+        recordType: input.recordType,
+        recordId: input.recordId,
+        scope,
+        purposes: resolvedPurposes,
+        trainingConsent: resolvedTrainingConsent,
+        modelTiersAllowed: input.modelTiersAllowed || [],
+        restrictions: input.restrictions || [],
+        status: 'active',
+        version: nextVersion,
+        provenanceRef: input.provenanceRef,
+        rightsRef: input.rightsRef,
+        classificationRef: input.classificationRef,
+        archiveRef: input.archiveRef,
+        contentHash: '',
+        createdAt,
+        updatedAt: now,
+      };
+
+      partialRecord.contentHash = computeAiControlContentHash(partialRecord);
+      const cleanedRecord = cleanUndefinedValues(partialRecord);
+
+      const historyId = `aicontrolh_${computeSha256(`${input.tenantId}:${controlId}:${cleanedRecord.version}:${now}`).substring(0, 24)}`;
+      const historyRecord = cleanUndefinedValues({
+        historyId,
+        ...cleanedRecord,
+        recordedBy: input.recordedBy || input.tenantId,
+        reConsentCeremonyId: hasValidReConsentCeremony ? input.reConsentCeremony?.ceremonyId : undefined,
+        snapshotTimestamp: now,
+      });
+
+      await tx.set(docRef, cleanedRecord);
+      await tx.set(db.collection('ai_usage_controls_history').doc(historyId), historyRecord);
+
+      return cleanedRecord;
     });
-
-    await db.collection('ai_usage_controls_history').doc(historyId).set(historyRecord);
-
-    return cleanedRecord;
   }
 
   /**
@@ -650,6 +690,11 @@ export class AiTrainingUsageControlsService {
             recordId: request.recordId,
             requestedPurpose: request.requestedPurpose as any,
             classificationId: controlRecord.classificationRef.classificationId,
+            context: {
+              callerUid: request.context?.callerUid,
+              executionChannel: request.context?.executionChannel,
+              isInternalAi: false,
+            },
           });
           classificationValid = classDecision.eligible === true;
           if (!classificationValid) {
@@ -668,6 +713,11 @@ export class AiTrainingUsageControlsService {
           recordId: request.recordId,
           requestedPurpose: request.requestedPurpose as any,
           classificationId: controlRecord.classificationRef.classificationId,
+          context: {
+            callerUid: request.context?.callerUid,
+            executionChannel: request.context?.executionChannel,
+            isInternalAi: false,
+          },
         });
         classificationValid = classDecision.eligible === true;
         if (!classificationValid) {
@@ -775,53 +825,55 @@ export class AiTrainingUsageControlsService {
 
     const db = this.getDb();
     const docRef = db.collection('ai_usage_controls').doc(controlId);
-    const snap = await docRef.get();
 
-    if (!snap.exists) {
-      throw new AiUsageControlsValidationError(`AI control record ${controlId} not found`);
-    }
+    return db.runTransaction(async (tx: any) => {
+      const snap = await tx.get(docRef);
 
-    const record = snap.data() as AiUsageControlRecord;
-    if (record.tenantId !== tenantId) {
-      throw new AiUsageControlsSecurityError(
-        `Tenant mismatch during revocation: caller ${tenantId} != owner ${record.tenantId}`
-      );
-    }
+      if (!snap.exists) {
+        throw new AiUsageControlsValidationError(`AI control record ${controlId} not found`);
+      }
 
-    const now = new Date().toISOString();
-    const updatedRecord: AiUsageControlRecord = {
-      ...record,
-      status: 'revoked',
-      version: record.version + 1,
-      trainingConsent: 'revoked',
-      purposes: {
-        internal_ai_use: 'denied',
-        external_ai_training: 'denied',
-        third_party_sharing: 'denied',
-        commercial_licensing: 'denied',
-        export: 'denied',
-      },
-      revokedAt: now,
-      revocationReason: reason,
-      updatedAt: now,
-    };
+      const record = snap.data() as AiUsageControlRecord;
+      if (record.tenantId !== tenantId) {
+        throw new AiUsageControlsSecurityError(
+          `Tenant mismatch during revocation: caller ${tenantId} != owner ${record.tenantId}`
+        );
+      }
 
-    updatedRecord.contentHash = computeAiControlContentHash(updatedRecord);
-    const cleaned = cleanUndefinedValues(updatedRecord);
+      const now = new Date().toISOString();
+      const updatedRecord: AiUsageControlRecord = {
+        ...record,
+        status: 'revoked',
+        version: record.version + 1,
+        trainingConsent: 'revoked',
+        purposes: {
+          internal_ai_use: 'denied',
+          external_ai_training: 'denied',
+          third_party_sharing: 'denied',
+          commercial_licensing: 'denied',
+          export: 'denied',
+        },
+        revokedAt: now,
+        revocationReason: reason,
+        updatedAt: now,
+      };
 
-    await docRef.set(cleaned);
+      updatedRecord.contentHash = computeAiControlContentHash(updatedRecord);
+      const cleaned = cleanUndefinedValues(updatedRecord);
 
-    const historyId = `aicontrolh_${computeSha256(`${tenantId}:${controlId}:${cleaned.version}:${now}`).substring(0, 24)}`;
-    const historyRecord = cleanUndefinedValues({
-      historyId,
-      ...cleaned,
-      recordedBy: updatedBy || tenantId,
-      snapshotTimestamp: now,
+      const historyId = `aicontrolh_${computeSha256(`${tenantId}:${controlId}:${cleaned.version}:${now}`).substring(0, 24)}`;
+      const historyRecord = cleanUndefinedValues({
+        historyId,
+        ...cleaned,
+        recordedBy: updatedBy || tenantId,
+        snapshotTimestamp: now,
+      });
+
+      await tx.set(docRef, cleaned);
+      await tx.set(db.collection('ai_usage_controls_history').doc(historyId), historyRecord);
+
+      return cleaned;
     });
-
-    await db.collection('ai_usage_controls_history').doc(historyId).set(historyRecord);
-
-    return cleaned;
   }
 }
 

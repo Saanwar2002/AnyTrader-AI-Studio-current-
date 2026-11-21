@@ -18,8 +18,8 @@ interface AdminTraderChurnTabProps {
 
 export default function AdminTraderChurnTab({ users = [], onShowNotice }: AdminTraderChurnTabProps) {
   const [profiles, setProfiles] = useState<TraderChurnRiskProfile[]>([]);
-  const [healthScore, setHealthScore] = useState<number>(78);
-  const [highRiskCount, setHighRiskCount] = useState<number>(2);
+  const [healthScore, setHealthScore] = useState<number | null>(null);
+  const [highRiskCount, setHighRiskCount] = useState<number>(0);
   const [summary, setSummary] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(false);
   const [executingId, setExecutingId] = useState<string | null>(null);
@@ -30,12 +30,18 @@ export default function AdminTraderChurnTab({ users = [], onShowNotice }: AdminT
     try {
       const data = await runTraderChurnPredictorScan(users);
       setProfiles(data.profiles || []);
-      setHealthScore(data.overallRetentionHealthScore || 78);
-      setHighRiskCount(data.highRiskCount || 0);
+      setHealthScore(
+        typeof data.overallRetentionHealthScore === "number" ? data.overallRetentionHealthScore : null
+      );
+      setHighRiskCount(typeof data.highRiskCount === "number" ? data.highRiskCount : 0);
       setSummary(data.recommendedInterventionSummary || "");
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Failed to fetch trader churn data:", err);
-      onShowNotice?.("Failed to run trader churn analysis", "error");
+      setProfiles([]);
+      setHealthScore(null);
+      setHighRiskCount(0);
+      setSummary("");
+      onShowNotice?.(err?.message || "Failed to run trader churn analysis", "error");
     } finally {
       setLoading(false);
     }
@@ -109,8 +115,12 @@ export default function AdminTraderChurnTab({ users = [], onShowNotice }: AdminT
         <div className="bg-white p-5 rounded-3xl border border-black shadow-sm flex items-center justify-between">
           <div className="space-y-1">
             <span className="text-[11px] font-bold text-slate-500 uppercase">Network Retention Score</span>
-            <p className="text-2xl font-black text-slate-900">{healthScore} / 100</p>
-            <span className="text-[10px] font-bold text-emerald-700">✓ Healthy Trade Engagement</span>
+            <p className="text-2xl font-black text-slate-900">
+              {healthScore !== null ? `${healthScore} / 100` : "—"}
+            </p>
+            <span className="text-[10px] font-bold text-emerald-700">
+              {healthScore !== null ? (healthScore >= 70 ? "Healthy Trade Engagement" : "Intervention Recommended") : "Awaiting Live Telemetry Scan"}
+            </span>
           </div>
           <div className="p-3 bg-emerald-50 rounded-2xl border border-emerald-200">
             <ShieldCheck className="w-6 h-6 text-emerald-600" />
@@ -121,7 +131,9 @@ export default function AdminTraderChurnTab({ users = [], onShowNotice }: AdminT
           <div className="space-y-1">
             <span className="text-[11px] font-bold text-slate-500 uppercase">At-Risk Contractors</span>
             <p className="text-2xl font-black text-rose-600">{highRiskCount} Tradespeople</p>
-            <span className="text-[10px] font-bold text-rose-700">Requires Proactive Intervention</span>
+            <span className="text-[10px] font-bold text-rose-700">
+              {highRiskCount > 0 ? "Requires Proactive Intervention" : "No Flagged High-Risk Accounts"}
+            </span>
           </div>
           <div className="p-3 bg-rose-50 rounded-2xl border border-rose-200">
             <AlertTriangle className="w-6 h-6 text-rose-600" />
@@ -130,9 +142,9 @@ export default function AdminTraderChurnTab({ users = [], onShowNotice }: AdminT
 
         <div className="bg-white p-5 rounded-3xl border border-black shadow-sm flex items-center justify-between">
           <div className="space-y-1">
-            <span className="text-[11px] font-bold text-slate-500 uppercase">Est. Commission Protected</span>
-            <p className="text-2xl font-black text-indigo-600">£420.00 / mo</p>
-            <span className="text-[10px] font-bold text-indigo-700">Recoverable GMV</span>
+            <span className="text-[11px] font-bold text-slate-500 uppercase">Flagged Churn Profiles</span>
+            <p className="text-2xl font-black text-indigo-600">{profiles.length} Profiles</p>
+            <span className="text-[10px] font-bold text-indigo-700">Evaluated from Live Telemetry</span>
           </div>
           <div className="p-3 bg-indigo-50 rounded-2xl border border-indigo-200">
             <DollarSign className="w-6 h-6 text-indigo-600" />

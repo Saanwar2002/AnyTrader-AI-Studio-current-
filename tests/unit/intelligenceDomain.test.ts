@@ -796,6 +796,14 @@ describe('V8.1 Structured Intelligence Foundation', () => {
         category: 'Plumbing',
       });
 
+      await testDb.collection('properties').doc('prop_701').set({
+        id: 'prop_701',
+        ownerId: 'owner_701',
+        propertyType: 'Terraced House',
+        epcRating: 'C',
+        constructionYear: 1985,
+      });
+
       const { propertyIntelligence, event } = await propertyIntelligenceService.aggregatePropertyIntelligence(
         {
           propertyId: 'prop_701',
@@ -1448,6 +1456,11 @@ describe('V8.1 Structured Intelligence Foundation', () => {
     }, 15000);
 
     it('derives Property Intelligence with version metadata and currentVersionId pointer', async () => {
+      await testDb.collection('properties').doc('prop_999').set({
+        id: 'prop_999',
+        ownerId: 'owner_999',
+        propertyType: 'Semi-Detached',
+      });
       const ev = await evidenceRegistry.register('property', 'prop_999', 'document', 'props/prop_999/doc', 'Roof tiles cracked and leaking damp.', {}, true);
       const result = await propertyIntelligenceService.aggregatePropertyIntelligence(
         { propertyId: 'prop_999' },

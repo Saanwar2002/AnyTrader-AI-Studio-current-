@@ -174,20 +174,31 @@ export function ClaimPropertyPassportModal({ initialCode = "", onClose, onSucces
 
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-2 border-t border-slate-200 text-xs">
                     <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                      <p className="text-[10px] font-extrabold uppercase text-slate-400">EPC Rating</p>
-                      <p className="font-black text-blue-600 text-sm">Grade {verifiedProperty.epcRating || "C"}</p>
+                      <p className="text-[10px] font-extrabold uppercase text-slate-500">EPC Rating</p>
+                      <p className="font-black text-blue-600 text-sm">
+                        {verifiedProperty.epcRating ? `Grade ${verifiedProperty.epcRating}` : "Unverified / Not recorded"}
+                      </p>
                     </div>
 
                     <div className="p-2.5 bg-white rounded-xl border border-slate-200">
-                      <p className="text-[10px] font-extrabold uppercase text-slate-400">Boiler</p>
-                      <p className="font-bold text-slate-900 truncate">{verifiedProperty.boilerInfo?.brand || "Standard"}</p>
+                      <p className="text-[10px] font-extrabold uppercase text-slate-500">Boiler</p>
+                      <p className="font-bold text-black truncate">
+                        {verifiedProperty.boilerInfo?.brand || "Unverified / Not recorded"}
+                      </p>
                     </div>
 
                     <div className="p-2.5 bg-white rounded-xl border border-slate-200 col-span-2 sm:col-span-1">
-                      <p className="text-[10px] font-extrabold uppercase text-slate-400">Roof Condition</p>
-                      <p className="font-bold text-slate-900">{verifiedProperty.roofCondition || "Good"}</p>
+                      <p className="text-[10px] font-extrabold uppercase text-slate-500">Roof Condition</p>
+                      <p className="font-bold text-black">
+                        {verifiedProperty.roofCondition || "Unverified / Not recorded"}
+                      </p>
                     </div>
                   </div>
+                  {verifiedProperty.transferExpiresAt && (
+                    <p className="text-[11px] font-bold text-slate-700 pt-1">
+                      Transfer code valid until: {new Date(verifiedProperty.transferExpiresAt).toLocaleString("en-GB")}
+                    </p>
+                  )}
                 </div>
 
                 {/* Authentication Check */}

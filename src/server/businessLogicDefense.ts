@@ -87,7 +87,7 @@ export class BusinessLogicDefense {
     }
 
     // Invariant 5: Escrow Funding Proof
-    const validFundedStatuses = ["funded", "work_submitted"];
+    const validFundedStatuses = ["funded", "in_progress", "submitted", "approved", "work_submitted"];
     if (!validFundedStatuses.includes(milestone.status) && milestone.escrowFunded !== true) {
       throw new BadRequestError(
         `Business-logic violation: Escrow must be actively funded before release. Current status is '${milestone.status}'.`

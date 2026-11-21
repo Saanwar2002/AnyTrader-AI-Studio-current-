@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, updateDoc, deleteDoc } from "firebase/firestore";
+import { collection, onSnapshot, doc, updateDoc, deleteDoc, query, limit } from "firebase/firestore";
 import { db } from "../../firebase";
 import { 
   Search, UserCircle, Shield, AlertTriangle, CheckCircle, 
@@ -13,8 +13,8 @@ export default function RidersList() {
   const [searchTerm, setSearchTerm] = useState("");
 
   useEffect(() => {
-    // Listen to users
-    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+    // Listen to users (bounded AT-ADMIN-CTRL-05)
+    const unsubUsers = onSnapshot(query(collection(db, "users"), limit(100)), (snapshot) => {
       const allUsers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
       // Filter for riders (role rider/passenger, or homeowner from AnyTrader, or starts with R-)
       const riders = allUsers.filter(u => 

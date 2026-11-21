@@ -23,10 +23,20 @@ import Stripe from "stripe";
 import { createHash } from "node:crypto";
 import admin from "firebase-admin";
 
+export interface PayoutInitiatorContext {
+  uid: string;
+  email?: string;
+  triggerSource?: "manual_admin" | "cron" | "approval_execution";
+  reason?: string;
+  approvalRequestId?: string;
+  initiatedAt?: string;
+}
+
 export interface DriverPayoutOrchestrationOptions {
   db: any;
   stripeClient?: Stripe | null;
   dryRun?: boolean;
+  initiatedBy?: PayoutInitiatorContext;
   logger?: {
     log: (...args: any[]) => void;
     warn: (...args: any[]) => void;
@@ -46,11 +56,13 @@ export interface PayoutDetail {
 
 export interface DriverPayoutOrchestrationResult {
   success: boolean;
+  batchId?: string;
   processedCount: number;
   totalDisbursed: number;
   skippedCount: number;
   failedCount: number;
   details: PayoutDetail[];
+  initiatedBy?: PayoutInitiatorContext;
   error?: string;
 }
 
@@ -76,19 +88,78 @@ function parseMillis(ts: any): number {
 export async function executeDriverPayoutOrchestrationCommand(
   options: DriverPayoutOrchestrationOptions
 ): Promise<DriverPayoutOrchestrationResult> {
-  const { db, stripeClient, dryRun = false, logger = console } = options;
+  const { db, stripeClient, dryRun = false, initiatedBy, logger = console } = options;
+  const startedAtIso = initiatedBy?.initiatedAt || new Date().toISOString();
+  const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
   if (!db) {
     return {
       success: false,
+      batchId,
       processedCount: 0,
       totalDisbursed: 0,
       skippedCount: 0,
       failedCount: 0,
       details: [],
+      initiatedBy,
       error: "Database backend unavailable",
     };
   }
+
+  const persistBatchAuditRecord = async (summary: {
+    status: "completed" | "empty" | "failed";
+    processedCount: number;
+    totalDisbursed: number;
+    skippedCount: number;
+    failedCount: number;
+    details: PayoutDetail[];
+    error?: string;
+  }) => {
+    if (!initiatedBy) return;
+    const completedAtIso = new Date().toISOString();
+    const record = {
+      batchId,
+      status: summary.status,
+      dryRun,
+      initiatedByUid: initiatedBy.uid,
+      initiatedByEmail: initiatedBy.email || "",
+      triggerSource: initiatedBy.triggerSource || "manual_admin",
+      reason: String(initiatedBy.reason || "").trim(),
+      approvalRequestId: initiatedBy.approvalRequestId || null,
+      initiatedAt: startedAtIso,
+      completedAt: completedAtIso,
+      processedCount: summary.processedCount,
+      totalDisbursed: summary.totalDisbursed,
+      skippedCount: summary.skippedCount,
+      failedCount: summary.failedCount,
+      details: summary.details.slice(0, 100),
+      ...(summary.error ? { error: summary.error } : {}),
+    };
+    try {
+      await db.collection("driver_payout_batches").doc(batchId).set(record);
+    } catch (batchErr: any) {
+      logger.warn("[Payout Orchestrator] Could not persist driver_payout_batches audit record:", batchErr?.message || batchErr);
+    }
+    try {
+      await db.collection("admin_audit_logs").add({
+        action: "MANUAL_DRIVER_PAYOUT_BATCH",
+        batchId,
+        adminUid: initiatedBy.uid,
+        adminEmail: initiatedBy.email || "",
+        triggerSource: initiatedBy.triggerSource || "manual_admin",
+        reason: String(initiatedBy.reason || "").trim(),
+        approvalRequestId: initiatedBy.approvalRequestId || null,
+        processedCount: summary.processedCount,
+        totalDisbursed: summary.totalDisbursed,
+        skippedCount: summary.skippedCount,
+        failedCount: summary.failedCount,
+        status: summary.status,
+        timestamp: completedAtIso,
+      });
+    } catch (auditErr: any) {
+      logger.warn("[Payout Orchestrator] Could not persist admin_audit_logs payout entry:", auditErr?.message || auditErr);
+    }
+  };
 
   logger.log("[Payout Orchestrator] Starting server-authoritative driver payout orchestration...");
 
@@ -109,7 +180,15 @@ export async function executeDriverPayoutOrchestrationCommand(
 
     if (ridesSnapshot.empty) {
       logger.log("[Payout Orchestrator] No pending completed rides awaiting payout.");
-      return { success: true, processedCount, totalDisbursed, skippedCount, failedCount, details };
+      await persistBatchAuditRecord({
+        status: "empty",
+        processedCount,
+        totalDisbursed,
+        skippedCount,
+        failedCount,
+        details,
+      });
+      return { success: true, batchId, processedCount, totalDisbursed, skippedCount, failedCount, details, initiatedBy };
     }
 
     for (const rideDoc of ridesSnapshot.docs) {
@@ -728,23 +807,44 @@ export async function executeDriverPayoutOrchestrationCommand(
     }
 
     logger.log(`[Payout Orchestrator] Orchestration completed. Processed: ${processedCount}, Disbursed: £${totalDisbursed.toFixed(2)}, Skipped: ${skippedCount}, Failed: ${failedCount}.`);
-    return {
-      success: true,
+    await persistBatchAuditRecord({
+      status: "completed",
       processedCount,
       totalDisbursed,
       skippedCount,
       failedCount,
       details,
+    });
+    return {
+      success: true,
+      batchId,
+      processedCount,
+      totalDisbursed,
+      skippedCount,
+      failedCount,
+      details,
+      initiatedBy,
     };
   } catch (orchestrationErr: any) {
     logger.error("[Payout Orchestrator] Fatal error during payout orchestration:", orchestrationErr.message);
-    return {
-      success: false,
+    await persistBatchAuditRecord({
+      status: "failed",
       processedCount,
       totalDisbursed,
       skippedCount,
       failedCount,
       details,
+      error: orchestrationErr.message,
+    });
+    return {
+      success: false,
+      batchId,
+      processedCount,
+      totalDisbursed,
+      skippedCount,
+      failedCount,
+      details,
+      initiatedBy,
       error: orchestrationErr.message,
     };
   }

@@ -2,6 +2,7 @@ import { db, sendNotification } from "@/src/firebase";
 import { collection, doc, setDoc, getDoc, getDocs, query, where, serverTimestamp } from "firebase/firestore";
 import { calculatePayoutBreakdown, normalizeTraderTier } from "./stripeIntegrationService";
 import { exportInvoicesToSheets } from "./googleSheetsService";
+import { evaluateVatEligibility } from "../lib/vatValidation";
 
 export interface InvoiceData {
   id?: string;
@@ -60,6 +61,51 @@ export function isProInvoiceUser(tradespersonProfile: any): boolean {
   );
 }
 
+export interface InvoiceSummaryMath {
+  laborAmount: number;
+  materialsAmount: number;
+  platformFee: number;
+  netLaborLine: number;
+  subtotal: number;
+  vatEligible: boolean;
+  vatNumber: string;
+  vatAmount: number;
+  totalAmount: number;
+}
+
+export function calculateInvoiceSummary(
+  acceptedQuote: any,
+  job: any,
+  tradespersonProfile: any
+): InvoiceSummaryMath {
+  const rawTier = tradespersonProfile?.tierId || tradespersonProfile?.tier || "payg";
+  const laborAmount = Math.round(Number(acceptedQuote?.amount || 0) * 100) / 100;
+  const materialsAmount = Math.round(Number(job?.materialsCost || acceptedQuote?.materialsCost || 0) * 100) / 100;
+  const payoutBreakdown = calculatePayoutBreakdown(laborAmount, rawTier);
+  const platformFee = Math.round(Number(payoutBreakdown.platformCommission || 0) * 100) / 100;
+  const netLaborLine =
+    platformFee > 0 && laborAmount >= platformFee
+      ? Math.round((laborAmount - platformFee) * 100) / 100
+      : laborAmount;
+  const subtotal = Math.round((laborAmount + materialsAmount) * 100) / 100;
+  const vatEvaluation = evaluateVatEligibility(tradespersonProfile);
+  const vatRate = vatEvaluation.eligible ? 0.20 : 0;
+  const vatAmount = Math.round(subtotal * vatRate * 100) / 100;
+  const totalAmount = Math.round((subtotal + vatAmount) * 100) / 100;
+
+  return {
+    laborAmount,
+    materialsAmount,
+    platformFee,
+    netLaborLine,
+    subtotal,
+    vatEligible: vatEvaluation.eligible,
+    vatNumber: vatEvaluation.vatNumber || "",
+    vatAmount,
+    totalAmount,
+  };
+}
+
 /**
  * Automatically creates or retrieves an official invoice when a job is completed.
  */
@@ -83,19 +129,11 @@ export async function createOrGetJobInvoice(
     console.warn("Error reading existing invoice, generating fresh:", err);
   }
 
-  // Determine tier & calculations
+  // Determine tier & calculations (rounded strictly to pence so line items === subtotal & total)
   const isPro = isProInvoiceUser(tradespersonProfile);
-  const rawTier = tradespersonProfile?.tierId || tradespersonProfile?.tier || "payg";
-  const payoutBreakdown = calculatePayoutBreakdown(acceptedQuote.amount || 0, rawTier);
-
-  const laborAmount = acceptedQuote.amount || 0;
-  const materialsAmount = job.materialsCost || acceptedQuote.materialsCost || 0;
-  const subtotal = laborAmount + materialsAmount;
-
-  // Calculate VAT if VAT registered
-  const vatRate = tradespersonProfile?.vatNumber ? 0.20 : 0;
-  const vatAmount = subtotal * vatRate;
-  const totalAmount = subtotal + vatAmount;
+  const summary = calculateInvoiceSummary(acceptedQuote, job, tradespersonProfile);
+  const { laborAmount, materialsAmount, platformFee, subtotal, vatAmount, totalAmount } = summary;
+  const vatEvaluation = { eligible: summary.vatEligible, vatNumber: summary.vatNumber };
 
   const invoiceNumber = `INV-${new Date().getFullYear()}-${jobId.slice(-6).toUpperCase()}`;
   const dueDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
@@ -113,7 +151,7 @@ export async function createOrGetJobInvoice(
     tradespersonId: acceptedQuote.tradespersonId,
     tradespersonName: tradespersonProfile?.name || tradespersonProfile?.businessName || "Tradesperson",
     tradespersonBusinessName: tradespersonProfile?.businessName || tradespersonProfile?.companyName || tradespersonProfile?.name || "Independent Tradesperson",
-    tradespersonVatNumber: tradespersonProfile?.vatNumber || "",
+    tradespersonVatNumber: vatEvaluation.eligible ? vatEvaluation.vatNumber : "",
     tradespersonLogoUrl: tradespersonProfile?.photoURL || tradespersonProfile?.logoUrl || "",
     tradespersonPhone: tradespersonProfile?.phone || tradespersonProfile?.phoneNumber || "",
     tradespersonBankDetails: isPro ? {
@@ -127,7 +165,7 @@ export async function createOrGetJobInvoice(
     dueDate,
     laborAmount,
     materialsAmount,
-    platformFee: payoutBreakdown.platformCommission,
+    platformFee,
     subtotal,
     vatAmount,
     totalAmount,
@@ -311,25 +349,45 @@ export async function downloadInvoicePDF(invoice: InvoiceData): Promise<void> {
   doc.setFont("helvetica", "normal");
   doc.setTextColor(30, 41, 59);
 
-  // Line 1: Labor
-  doc.text("Trade Labour & Professional Works", 20, y + 6);
-  doc.text(`£${invoice.laborAmount.toFixed(2)}`, 185, y + 6, { align: "right" });
+  // Recompute display figures consistently so printed lines + summary always sum identically
+  const materialsAmount = Math.round(Number(invoice.materialsAmount || 0) * 100) / 100;
+  const rawLaborAmount = Math.round(Number(invoice.laborAmount || 0) * 100) / 100;
+  const platformFee = Math.round(Number(invoice.platformFee || 0) * 100) / 100;
+  const expectedSubtotal = Math.round((rawLaborAmount + materialsAmount) * 100) / 100;
+  const subtotal = Math.round(Number(invoice.subtotal ?? expectedSubtotal) * 100) / 100;
+  const vatAmount = Math.round(Number(invoice.vatAmount || 0) * 100) / 100;
+  const totalAmount = Math.round((subtotal + vatAmount) * 100) / 100;
+  const showSplitCommission = platformFee > 0 && rawLaborAmount >= platformFee;
+  const netLaborLine = showSplitCommission
+    ? Math.round((rawLaborAmount - platformFee) * 100) / 100
+    : rawLaborAmount;
+
+  // Line 1: Labor (Net of Platform Allocation if itemized below)
+  doc.text(
+    showSplitCommission ? "Trade Labour & Professional Works (Net of Platform Fee)" : "Trade Labour & Professional Works",
+    20,
+    y + 6
+  );
+  doc.text(`£${netLaborLine.toFixed(2)}`, 185, y + 6, { align: "right" });
   doc.line(15, y + 9, 195, y + 9);
   y += 9;
 
   // Line 2: Materials (if any)
-  if (invoice.materialsAmount > 0) {
+  if (materialsAmount > 0) {
     doc.text("Materials & Parts Procurement", 20, y + 6);
-    doc.text(`£${invoice.materialsAmount.toFixed(2)}`, 185, y + 6, { align: "right" });
+    doc.text(`£${materialsAmount.toFixed(2)}`, 185, y + 6, { align: "right" });
     doc.line(15, y + 9, 195, y + 9);
     y += 9;
   }
 
-  // Line 3: AnyTrader Service Fee
-  doc.text("AnyTrader Platform Processing & Guarantee Service Fee", 20, y + 6);
-  doc.text(`£${invoice.platformFee.toFixed(2)}`, 185, y + 6, { align: "right" });
-  doc.line(15, y + 9, 195, y + 9);
-  y += 12;
+  // Line 3: AnyTrader Service Fee (strictly additive so netLaborLine + materialsAmount + platformFee === subtotal)
+  if (platformFee > 0) {
+    doc.text("AnyTrader Platform Processing & Guarantee Service Fee", 20, y + 6);
+    doc.text(`£${platformFee.toFixed(2)}`, 185, y + 6, { align: "right" });
+    doc.line(15, y + 9, 195, y + 9);
+    y += 9;
+  }
+  y += 3;
 
   // Totals Section (Right Aligned)
   const totalX = 130;
@@ -337,12 +395,12 @@ export async function downloadInvoicePDF(invoice: InvoiceData): Promise<void> {
   doc.setFont("helvetica", "normal");
   doc.setFontSize(9);
   doc.text("Subtotal:", totalX, y);
-  doc.text(`£${invoice.subtotal.toFixed(2)}`, 185, y, { align: "right" });
+  doc.text(`£${subtotal.toFixed(2)}`, 185, y, { align: "right" });
 
-  if (invoice.vatAmount > 0) {
+  if (vatAmount > 0) {
     y += 5;
     doc.text("VAT (20%):", totalX, y);
-    doc.text(`£${invoice.vatAmount.toFixed(2)}`, 185, y, { align: "right" });
+    doc.text(`£${vatAmount.toFixed(2)}`, 185, y, { align: "right" });
   }
 
   y += 7;
@@ -353,7 +411,7 @@ export async function downloadInvoicePDF(invoice: InvoiceData): Promise<void> {
   doc.setFontSize(11);
   doc.setTextColor(255, 255, 255);
   doc.text("TOTAL DUE:", totalX, y + 3);
-  doc.text(`£${invoice.totalAmount.toFixed(2)}`, 185, y + 3, { align: "right" });
+  doc.text(`£${totalAmount.toFixed(2)}`, 185, y + 3, { align: "right" });
 
   y += 20;
 

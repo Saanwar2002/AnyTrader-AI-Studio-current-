@@ -1,7 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
+
 /**
- * Pre-Production Readiness Invariant Checks for AnyTrader V6
- * Scans runtime environment, secret entropy, and database connectivity.
+ * Pre-Production Readiness Invariant Checks for AnyTrader V6+
+ * Scans runtime environment, secret entropy, named DB configuration,
+ * cron/SSO/Stripe webhook invariants, and database connectivity.
  */
+export const EXPECTED_PRODUCTION_DATABASE_ID = "ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a";
+
 export interface ProductionCheckResult {
   name: string;
   category: "SECURITY" | "FINANCIAL" | "DATABASE" | "CONFIG";
@@ -17,16 +23,35 @@ export interface ProductionAuditReport {
   checks: ProductionCheckResult[];
 }
 
+function resolveConfiguredDatabaseId(env: Record<string, string | undefined>): string | null {
+  if (env.FIRESTORE_DATABASE_ID && env.FIRESTORE_DATABASE_ID.trim()) {
+    return env.FIRESTORE_DATABASE_ID.trim();
+  }
+  try {
+    const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+    if (fs.existsSync(configPath)) {
+      const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      if (typeof parsed?.firestoreDatabaseId === "string" && parsed.firestoreDatabaseId.trim()) {
+        return parsed.firestoreDatabaseId.trim();
+      }
+    }
+  } catch {
+    // Fall through to null
+  }
+  return null;
+}
+
 export function runProductionChecks(env = process.env, dbInstance?: any): ProductionAuditReport {
   const isProd = env.NODE_ENV === "production";
   const checks: ProductionCheckResult[] = [];
 
-  // 1. Secret Entropy & Presence Checks
+  // 1. Secret Entropy & Presence Checks (AT-ADMIN-PROD-AUDIT-01: includes CRON_SECRET & JWT_SECRET SSO key)
   const sensitiveKeys = [
     { key: "STRIPE_SECRET_KEY", category: "FINANCIAL" as const, requiredInProd: true },
     { key: "STRIPE_WEBHOOK_SECRET", category: "FINANCIAL" as const, requiredInProd: true },
     { key: "GEMINI_API_KEY", category: "SECURITY" as const, requiredInProd: true },
-    { key: "JWT_SECRET", category: "SECURITY" as const, requiredInProd: false },
+    { key: "JWT_SECRET", category: "SECURITY" as const, requiredInProd: true },
+    { key: "CRON_SECRET", category: "SECURITY" as const, requiredInProd: true },
     { key: "APP_URL", category: "CONFIG" as const, requiredInProd: true },
     { key: "ALLOWED_ORIGINS", category: "CONFIG" as const, requiredInProd: true },
   ];
@@ -66,6 +91,24 @@ export function runProductionChecks(env = process.env, dbInstance?: any): Produc
     }
   }
 
+  // 1.5 Stripe Webhook Signing Secret Format Check
+  const webhookSecret = env.STRIPE_WEBHOOK_SECRET;
+  if (webhookSecret && !webhookSecret.startsWith("whsec_")) {
+    checks.push({
+      name: "Stripe Webhook Secret Format",
+      category: "FINANCIAL",
+      status: isProd ? "FAIL" : "WARN",
+      message: "STRIPE_WEBHOOK_SECRET must be a valid Stripe signing secret starting with 'whsec_'.",
+    });
+  } else if (webhookSecret) {
+    checks.push({
+      name: "Stripe Webhook Secret Format",
+      category: "FINANCIAL",
+      status: "PASS",
+      message: "STRIPE_WEBHOOK_SECRET matches expected Stripe signing secret prefix.",
+    });
+  }
+
   // 2. Mock Payments Production Gate
   if (isProd && env.ALLOW_MOCK_PAYMENTS === "true") {
     checks.push({
@@ -83,7 +126,26 @@ export function runProductionChecks(env = process.env, dbInstance?: any): Produc
     });
   }
 
-  // 2.5 HTTPS & CORS Check
+  // 2.5 Degraded Auth Production Gate (AT-CJ-AUTH-05)
+  if (env.ALLOW_DEGRADED_AUTH === "true") {
+    checks.push({
+      name: "Degraded Auth Gate",
+      category: "SECURITY",
+      status: isProd ? "FAIL" : "WARN",
+      message: isProd
+        ? "ALLOW_DEGRADED_AUTH must strictly be disabled ('false') in production environments."
+        : "ALLOW_DEGRADED_AUTH is enabled for non-production development.",
+    });
+  } else {
+    checks.push({
+      name: "Degraded Auth Gate",
+      category: "SECURITY",
+      status: "PASS",
+      message: "Degraded authentication fallback is disabled.",
+    });
+  }
+
+  // 2.6 HTTPS & CORS Check
   if (isProd) {
      if (env.APP_URL && !env.APP_URL.startsWith("https://")) {
         checks.push({
@@ -110,7 +172,32 @@ export function runProductionChecks(env = process.env, dbInstance?: any): Produc
      }
   }
 
-  // 3. Database Connectivity Check
+  // 3. Named Production Database Configuration Check (AT-ADMIN-PROD-AUDIT-01)
+  const configuredDbId = resolveConfiguredDatabaseId(env);
+  if (!configuredDbId || configuredDbId === "(default)") {
+    checks.push({
+      name: "Named Firestore Database Configuration",
+      category: "DATABASE",
+      status: isProd ? "FAIL" : "WARN",
+      message: `Firestore database ID is '${configuredDbId || "unset"}'; expected named production database '${EXPECTED_PRODUCTION_DATABASE_ID}'.`,
+    });
+  } else if (configuredDbId !== EXPECTED_PRODUCTION_DATABASE_ID) {
+    checks.push({
+      name: "Named Firestore Database Configuration",
+      category: "DATABASE",
+      status: isProd ? "FAIL" : "WARN",
+      message: `Configured Firestore database ID '${configuredDbId}' does not match expected '${EXPECTED_PRODUCTION_DATABASE_ID}'.`,
+    });
+  } else {
+    checks.push({
+      name: "Named Firestore Database Configuration",
+      category: "DATABASE",
+      status: "PASS",
+      message: `Named Firestore database '${configuredDbId}' verified.`,
+    });
+  }
+
+  // 4. Database Connectivity Check
   if (dbInstance) {
     checks.push({
       name: "Firestore Connectivity",
@@ -145,3 +232,4 @@ export function runProductionChecks(env = process.env, dbInstance?: any): Produc
     checks,
   };
 }
+

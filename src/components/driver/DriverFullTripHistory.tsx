@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { X, History, Car, ShieldCheck, ChevronDown, ChevronUp, MapPin, Navigation, User, CreditCard, Banknote, Search, Calendar as CalendarIcon } from 'lucide-react';
 import { cn } from "@/src/lib/utils";
+import { resolveRideFinancialSummary } from "@/src/lib/rideEarningsDisplay";
 
 interface FullTripHistoryProps {
   trips: any[];
@@ -107,9 +108,7 @@ export default function DriverFullTripHistory({ trips, onClose, loading }: FullT
               const tripDate = new Date(trip.completedAt?.seconds * 1000 || trip.createdAt?.seconds * 1000 || Date.now());
               const isExpandedCard = expandedTripId === trip.id;
               
-              const totalFare = trip.fareEstimate || trip.finalFare || 0;
-              const commission = totalFare * 0.12; // Example commission
-              const netFare = typeof trip.driverEarnings === 'number' ? trip.driverEarnings : (totalFare - commission);
+              const summary = resolveRideFinancialSummary(trip);
               const isCash = trip.paymentMethod === 'cash';
 
               return (
@@ -139,12 +138,12 @@ export default function DriverFullTripHistory({ trips, onClose, loading }: FullT
                     </div>
                     <div className="text-right flex flex-col items-end">
                       <p className="text-sm font-black text-[#00D26A]">
-                        £{totalFare.toFixed(2)}
+                        £{summary.driverEarnings.toFixed(2)}
                       </p>
                       <div className="flex items-center gap-1 justify-end mt-0.5">
                         <ShieldCheck className="w-2.5 h-2.5 text-[#00D26A]" />
                         <span className="text-[9px] font-black text-[#00D26A] uppercase">
-                          Paid
+                          Earned
                         </span>
                       </div>
                     </div>
@@ -212,21 +211,21 @@ export default function DriverFullTripHistory({ trips, onClose, loading }: FullT
                                <div className="space-y-1.5 text-xs">
                                   <div className="flex justify-between text-[#E4E4E7]">
                                      <span>Passenger Paid</span>
-                                     <span>£{totalFare.toFixed(2)}</span>
+                                     <span>£{summary.totalFarePaid.toFixed(2)}</span>
                                   </div>
                                   <div className="flex justify-between text-[#FF3B30]">
-                                     <span>Platform Fee (12%)</span>
-                                     <span>-£{commission.toFixed(2)}</span>
+                                     <span>Platform Fee ({summary.appliedCommissionPct}%)</span>
+                                     <span>-£{summary.platformFee.toFixed(2)}</span>
                                   </div>
-                                  {trip.tipAmount > 0 && (
+                                  {summary.tipAmount > 0 && (
                                      <div className="flex justify-between text-[#00D26A]">
-                                        <span>Tip</span>
-                                        <span>+£{trip.tipAmount.toFixed(2)}</span>
+                                        <span>Tip (100% yours)</span>
+                                        <span>+£{summary.tipAmount.toFixed(2)}</span>
                                      </div>
                                   )}
                                   <div className="border-t border-[#2C2C30] my-2 pt-2 flex justify-between font-bold text-white">
                                      <span>Net Earnings</span>
-                                     <span>£{(netFare + (trip.tipAmount || 0)).toFixed(2)}</span>
+                                     <span>£{summary.driverEarnings.toFixed(2)}</span>
                                   </div>
                                </div>
 

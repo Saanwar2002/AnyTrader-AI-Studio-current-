@@ -28,6 +28,10 @@ export function PropertyManager() {
   const [postcode, setPostcode] = useState("");
   const [city, setCity] = useState("");
   const [propertyType, setPropertyType] = useState("residential");
+  const [totalAreaSqFt, setTotalAreaSqFt] = useState("");
+  const [unitCount, setUnitCount] = useState("");
+  const [photos, setPhotos] = useState<string[]>([]);
+  const [savingProperty, setSavingProperty] = useState(false);
 
   useEffect(() => {
     if (!user) return;
@@ -70,6 +74,18 @@ export function PropertyManager() {
       }
     }
 
+    const parsedArea = totalAreaSqFt.trim() ? Number(totalAreaSqFt) : undefined;
+    const parsedUnits = unitCount.trim() ? Number(unitCount) : undefined;
+    if (parsedArea !== undefined && (!Number.isFinite(parsedArea) || parsedArea <= 0)) {
+      toast.error("Total area must be a positive number.");
+      return;
+    }
+    if (parsedUnits !== undefined && (!Number.isInteger(parsedUnits) || parsedUnits <= 0)) {
+      toast.error("Number of units must be a positive whole number.");
+      return;
+    }
+
+    setSavingProperty(true);
     try {
       if (editingPropertyId) {
         await updateDoc(doc(db, "properties", editingPropertyId), {
@@ -80,16 +96,24 @@ export function PropertyManager() {
           postcode: finalPostcode,
           city: finalCity,
           propertyType: propertyType,
+          totalAreaSqFt: parsedArea ?? null,
+          unitCount: parsedUnits ?? null,
+          photos,
           updatedAt: new Date().toISOString()
         });
+        toast.success("Property updated successfully.");
       } else {
         await createPropertyViaCommand(user, {
           name: propertyName,
           address: { line1: addressLine1, city: finalCity, postcode: finalPostcode, country: "UK" },
           postcode: finalPostcode,
           city: finalCity,
-          propertyType
+          propertyType,
+          ...(parsedArea !== undefined ? { totalAreaSqFt: parsedArea } : {}),
+          ...(parsedUnits !== undefined ? { unitCount: parsedUnits } : {}),
+          ...(photos.length > 0 ? { photos } : {})
         });
+        toast.success("Property added to your portfolio.");
       }
       setIsAdding(false);
       setEditingPropertyId(null);
@@ -99,9 +123,43 @@ export function PropertyManager() {
       setPostcode("");
       setCity("");
       setPropertyType("residential");
+      setTotalAreaSqFt("");
+      setUnitCount("");
+      setPhotos([]);
     } catch (error) {
       handleFirestoreError(error, editingPropertyId ? OperationType.UPDATE : OperationType.CREATE, "properties");
+    } finally {
+      setSavingProperty(false);
     }
+  };
+
+  const handlePhotoFilesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    const remainingSlots = Math.max(0, 8 - photos.length);
+    if (remainingSlots === 0) {
+      toast.error("Maximum of 8 property photos allowed.");
+      return;
+    }
+    files.slice(0, remainingSlots).forEach((file) => {
+      if (!file.type.startsWith("image/")) {
+        toast.error(`${file.name} is not a supported image file.`);
+        return;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        toast.error(`${file.name} exceeds the 2 MB photo limit.`);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        if (result) {
+          setPhotos((prev) => (prev.length < 8 ? [...prev, result] : prev));
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+    e.target.value = "";
   };
 
   const handleAddNewClick = () => {
@@ -111,6 +169,9 @@ export function PropertyManager() {
     setPostcode("");
     setCity("");
     setPropertyType("residential");
+    setTotalAreaSqFt("");
+    setUnitCount("");
+    setPhotos([]);
     setStep(1);
     setIsAdding(true);
   };
@@ -121,6 +182,9 @@ export function PropertyManager() {
     setPostcode(property.postcode || property.address?.postcode || "");
     setCity(property.city || property.address?.city || "");
     setPropertyType(property.propertyType || "residential");
+    setTotalAreaSqFt(property.totalAreaSqFt ? String(property.totalAreaSqFt) : "");
+    setUnitCount(property.unitCount ? String(property.unitCount) : "");
+    setPhotos(Array.isArray(property.photos) ? property.photos : []);
     setEditingPropertyId(property.id);
     setIsAdding(true);
     setStep(1);
@@ -291,18 +355,6 @@ export function PropertyManager() {
             </div>
 
             <div className="flex-1 overflow-y-auto flex flex-col">
-              {/* Progress Bar */}
-              <div className="px-6 pt-6 pb-2 shrink-0">
-                <div className="flex gap-2">
-                  {[1, 2, 3].map((s) => (
-                    <div key={s} className={cn("h-1 flex-1 rounded-full", s <= step ? "bg-slate-600" : "bg-slate-200")} />
-                  ))}
-                </div>
-                <div className="text-center text-sm font-medium text-slate-500 mt-2">
-                  Step {step} of 3
-                </div>
-              </div>
-
               {/* Form Content */}
               <form id="add-property-form" onSubmit={handleAddProperty} className="p-6 space-y-6 flex-1">
                 
@@ -394,24 +446,58 @@ export function PropertyManager() {
                 </div>
 
                 <div className="space-y-3 pt-2">
-                   <h3 className="text-[16px] font-bold text-slate-900">Property Details</h3>
+                   <h3 className="text-[16px] font-bold text-slate-900">Property Details (Optional)</h3>
                    <input 
-                     type="text" 
+                     type="number" 
+                     min="1"
+                     value={totalAreaSqFt}
+                     onChange={(e) => setTotalAreaSqFt(e.target.value)}
                      placeholder="Total Area (sq ft)" 
                      className="w-full px-4 py-3 rounded-xl border border-black bg-white shadow-sm placeholder:text-slate-400 text-[15px]" 
                    />
                    <input 
-                     type="text" 
+                     type="number" 
+                     min="1"
+                     step="1"
+                     value={unitCount}
+                     onChange={(e) => setUnitCount(e.target.value)}
                      placeholder="Number of Units" 
                      className="w-full px-4 py-3 rounded-xl border border-black bg-white shadow-sm placeholder:text-slate-400 text-[15px]" 
                    />
                 </div>
                 
-                <button type="button" className="w-full mt-2 border border-black rounded-xl py-8 flex flex-col items-center justify-center text-slate-500 hover:bg-slate-50 transition bg-white shadow-sm">
-                  <Camera className="w-8 h-8 text-slate-400 mb-2" strokeWidth={1.5} />
-                  <span className="font-semibold text-slate-800">Upload Photos</span>
-                  <p className="text-sm text-slate-500 mt-0.5">(Drag & Drop or Click)</p>
-                </button>
+                <div className="space-y-3">
+                  <label className="w-full mt-2 border border-black rounded-xl py-6 px-4 flex flex-col items-center justify-center text-slate-700 hover:bg-slate-50 transition bg-white shadow-sm cursor-pointer">
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={handlePhotoFilesChange}
+                      className="sr-only"
+                    />
+                    <Camera className="w-8 h-8 text-slate-500 mb-2" strokeWidth={1.5} />
+                    <span className="font-semibold text-black">Upload Property Photos</span>
+                    <p className="text-xs text-slate-600 mt-0.5">Up to 8 photos (max 2 MB each)</p>
+                  </label>
+
+                  {photos.length > 0 && (
+                    <div className="grid grid-cols-4 gap-2">
+                      {photos.map((photoUrl, idx) => (
+                        <div key={idx} className="relative rounded-xl overflow-hidden border border-black aspect-square bg-slate-100">
+                          <img src={photoUrl} alt={`Property preview ${idx + 1}`} className="w-full h-full object-cover" />
+                          <button
+                            type="button"
+                            onClick={() => setPhotos((prev) => prev.filter((_, i) => i !== idx))}
+                            aria-label={`Remove photo ${idx + 1}`}
+                            className="absolute top-1 right-1 bg-black/80 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-md hover:bg-red-600"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </form>
             </div>
 
@@ -420,16 +506,17 @@ export function PropertyManager() {
               <button 
                 type="button" 
                 onClick={() => setIsAdding(false)} 
-                className="flex-[0.4] py-3.5 font-semibold text-slate-500 hover:bg-slate-50 rounded-full transition"
+                className="flex-[0.4] py-3.5 font-semibold text-black hover:bg-slate-50 rounded-full transition"
               >
                 Cancel
               </button>
               <button 
                 type="submit" 
                 form="add-property-form"
-                className="flex-1 py-3.5 font-semibold text-white bg-blue-500 hover:bg-blue-600 active:bg-blue-700 rounded-full shadow-sm transition flex items-center justify-center gap-2"
+                disabled={savingProperty}
+                className="flex-1 py-3.5 font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 active:bg-blue-800 rounded-full shadow-sm transition flex items-center justify-center gap-2"
               >
-                Next Step
+                {savingProperty ? "Saving..." : (editingPropertyId ? "Update Property" : "Save Property")}
               </button>
             </div>
 

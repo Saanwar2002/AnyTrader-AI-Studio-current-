@@ -222,21 +222,22 @@ export default function MasterAdminLayout() {
 
     setLoadingMetrics(true);
 
-    const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+    // AT-ADMIN-CTRL-05: Use bounded queries (limit 100) rather than unbounded full-collection listeners
+    const unsubUsers = onSnapshot(query(collection(db, "users"), limit(100)), (snapshot) => {
       const users = snapshot.docs.map(d => d.data());
       setMetrics(prev => ({
         ...prev,
         totalUsers: users.length,
         totalTraders: users.filter(u => u.role === "tradesperson").length,
-        totalDrivers: users.filter(u => u.services?.includes("Taxi & Transport")).length
+        totalDrivers: users.filter(u => u.services?.includes("Taxi & Transport") || u.role === "driver").length
       }));
     }, (error) => handleFirestoreError(error, OperationType.GET, "users"));
 
-    const unsubJobs = onSnapshot(collection(db, "jobs"), (snapshot) => {
+    const unsubJobs = onSnapshot(query(collection(db, "jobs"), limit(100)), (snapshot) => {
       setMetrics(prev => ({ ...prev, totalJobs: snapshot.docs.length }));
     }, (error) => handleFirestoreError(error, OperationType.GET, "jobs"));
 
-    const unsubRides = onSnapshot(collection(db, "ride_requests"), (snapshot) => {
+    const unsubRides = onSnapshot(query(collection(db, "ride_requests"), limit(100)), (snapshot) => {
       setMetrics(prev => ({ ...prev, totalRides: snapshot.docs.length }));
     }, (error) => handleFirestoreError(error, OperationType.GET, "ride_requests"));
 

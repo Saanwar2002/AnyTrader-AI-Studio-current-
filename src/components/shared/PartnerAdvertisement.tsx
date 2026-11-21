@@ -10,8 +10,9 @@ import {
   collection, query, where, onSnapshot, doc, setDoc, updateDoc, increment, 
   addDoc, serverTimestamp 
 } from "firebase/firestore";
-import { db } from "../../firebase";
+import { db, auth } from "../../firebase";
 import { cn } from "../../lib/utils";
+import { openSafeExternalUrl } from "../../lib/safeExternalUrl";
 import { useAuth } from "../AuthProvider";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
@@ -377,10 +378,9 @@ export default function PartnerAdvertisement({
       console.warn("Advertising Config Notice:", error);
     });
 
-    // 3. Live advertisements query from Firestore (Traders, Trade Partners & Corporate Sponsors)
+    // 3. Live public advertisements projection query (non-sensitive public fields only)
     const adsQuery = query(
-      collection(db, "advertisements"),
-      where("approvalStatus", "==", "approved"),
+      collection(db, "public_ads"),
       where("isActive", "==", true)
     );
     const unsubs = onSnapshot(adsQuery, (snapshot) => {
@@ -390,10 +390,7 @@ export default function PartnerAdvertisement({
           const data = d.data() as any;
           return { id: d.id, ...data } as PartnerAdItem;
         })
-        // Filter out inactive ads
         .filter(ad => ad.isActive !== false)
-        // Filter out rejected ads
-        .filter(ad => ad.approvalStatus !== "rejected")
         // Placement check: banner_ad, both, or backward-compatible undefined
         .filter(ad => !ad.placement || ad.placement === "banner_ad" || ad.placement === "both")
         // Expiration check for day-based campaigns
@@ -404,13 +401,8 @@ export default function PartnerAdvertisement({
            }
            return true;
         })
-        // Prepaid budget check: if prepaid balance is <= 0, hide
-        .filter(ad => {
-          if (ad.billingCycle === "prepaid" && typeof ad.prepaidBalance === "number") {
-            return ad.prepaidBalance > 0;
-          }
-          return true;
-        })
+        // Sanitized budget availability flag from public_ads projection
+        .filter(ad => (ad as any).hasAvailableBudget !== false)
         // Target role filtering
         .filter(ad => !ad.targetRole || ad.targetRole === "all" || ad.targetRole === role)
         // Specific category filter when browsing a single trade category
@@ -421,7 +413,7 @@ export default function PartnerAdvertisement({
       
       setAdverts(activeAds);
     }, (error) => {
-      console.warn("Advertisements query notice:", error);
+      console.warn("Public advertisements query notice:", error);
     });
 
     return () => {
@@ -508,12 +500,22 @@ export default function PartnerAdvertisement({
   const handleAdClick = (clickedAd: PartnerAdItem, e?: React.MouseEvent) => {
     if (e) e.preventDefault();
 
-    // Track engagement counters for live database ads asynchronously in background (non-blocking)
+    // Track engagement & transactional CPC billing via server endpoint (non-blocking)
     if (clickedAd.id && !String(clickedAd.id).startsWith("homeowner-") && !String(clickedAd.id).startsWith("trade-") && !String(clickedAd.id).startsWith("default-") && !String(clickedAd.id).startsWith("seed-")) {
       (async () => {
         try {
-          const updateData = { clicks: increment(1), bannerClicks: increment(1) };
-          await updateDoc(doc(db, "advertisements", clickedAd.id), updateData);
+          const token = await auth.currentUser?.getIdToken().catch(() => null);
+          await fetch(`/api/ads/${encodeURIComponent(clickedAd.id)}/track`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({
+              eventType: "click",
+              placement: "banner_ad",
+            }),
+          });
         } catch (err) {
           console.warn("Failed to track ad click:", err);
         }
@@ -546,8 +548,8 @@ export default function PartnerAdvertisement({
 
     if (targetUrl.startsWith("/")) {
       navigate(targetUrl, { state: { initialProfile: resolvedTrader } });
-    } else if (targetUrl.startsWith("http")) {
-      window.open(targetUrl, "_blank", "noopener,noreferrer");
+    } else {
+      openSafeExternalUrl(targetUrl);
     }
   };
 

@@ -9,6 +9,12 @@
 
 import { BadRequestError, ForbiddenError, NotFoundError } from "./httpErrors.ts";
 import { normalizeTraderTier } from "../services/stripeIntegrationService.ts";
+import {
+  BANNER_AD_DAILY_RATE_GBP,
+  calculateBannerAdCostPence,
+  sanitizeAdWalletTopupGbp,
+  sanitizeBannerDurationDays,
+} from "../lib/adPricing.ts";
 
 export interface CatalogItem {
   id: string;
@@ -236,6 +242,12 @@ export async function getDynamicFirestoreConfigs(firestoreDb: any): Promise<{
   }
 }
 
+export function invalidateDynamicConfigCache(firestoreDb: any): void {
+  if (firestoreDb && typeof firestoreDb === "object") {
+    firestoreConfigCache.delete(firestoreDb);
+  }
+}
+
 /**
  * Resolves the server-authoritative line item and Stripe Connect routing
  * based strictly on validated server state. DISCARDS client-provided prices.
@@ -448,12 +460,38 @@ export async function resolveAuthoritativeLineItem(
   }
 
   // =========================================================================
-  // 3. AD WALLET TOPUP (Bounded Advertising Balance)
+  // 3. AD WALLET TOPUP & BANNER AD CHECKOUT (£2.00/day canonical rate)
   // =========================================================================
+  if ((metadata.type === "banner_ad" || metadata.type === "banner_promo") && !hasExplicitMembershipSelection) {
+    const safeDays = sanitizeBannerDurationDays(metadata.durationDays || body.durationDays);
+    const bannerCostPence = calculateBannerAdCostPence(safeDays);
+    return {
+      mode: "payment",
+      isClientMoney: false,
+      authoritativeAmountPence: bannerCostPence,
+      lineItem: {
+        price_data: {
+          currency: "gbp",
+          unit_amount: bannerCostPence,
+          product_data: {
+            name: `Banner Promotion (${safeDays} days)`,
+            description: `Flat £${BANNER_AD_DAILY_RATE_GBP.toFixed(2)}/day homepage & dashboard banner promotion (subject to moderation approval).`,
+          },
+        },
+        quantity: 1,
+      },
+      metadata: {
+        type: "banner_ad",
+        durationDays: String(safeDays),
+        dailyRate: BANNER_AD_DAILY_RATE_GBP.toFixed(2),
+        totalPence: String(bannerCostPence),
+        userId: authUid,
+      },
+    };
+  }
+
   if (metadata.type === "ad_wallet_topup" && !hasExplicitMembershipSelection) {
-    const rawTopup = Number(metadata.topupAmount || 25);
-    // Sanitize to valid integer bounds: min £10, max £5,000
-    const sanitizedPounds = Math.max(10, Math.min(5000, Math.round(rawTopup)));
+    const sanitizedPounds = Math.round(sanitizeAdWalletTopupGbp(metadata.topupAmount || 25));
     const topupPence = sanitizedPounds * 100;
 
     return {

@@ -22,6 +22,7 @@ import {
   assertFails,
   assertSucceeds,
 } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import {
   ref as clientStorageRef,
   getBytes as clientGetBytes,
@@ -152,7 +153,7 @@ describe('Task 16 — Durable Tier-B Raw Intelligence Storage Verification Suite
     const storageRules = fs.readFileSync(path.resolve(process.cwd(), 'storage.rules'), 'utf-8');
 
     try {
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: {
           rules: firestoreRules,

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { collection, query, where, orderBy, onSnapshot, doc } from "firebase/firestore";
 import { db } from "@/src/firebase";
 import { useAuth } from "../AuthProvider";
+import { resolveRideFinancialSummary } from "@/src/lib/rideEarningsDisplay";
 import { Clock, Car, ChevronDown, ChevronUp, CheckCircle2, Navigation, PoundSterling, X, MapPin, Zap, Search } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -193,11 +194,15 @@ export default function DriverJobs({ onClose }: { onClose?: () => void }) {
                 : '';
 
               const isExpanded = expandedJobId === job.id;
-              
-              const grossFare = job.fareEstimate || 0;
-              const commission = (grossFare * 0.12);
-              const driverEarnings = job.driverEarnings || (grossFare - commission);
               const isAbandoned = job.status === 'rider_abandoned';
+              const summary = resolveRideFinancialSummary(job, fareConfig);
+              const baseFareExclExtras = Math.max(
+                0,
+                summary.baseFare -
+                  (job.isPriority ? 3 : 0) -
+                  (isAbandoned ? 5 : 0) -
+                  (Number(job.surgeFixed) || 0)
+              );
 
               return (
                 <div 
@@ -224,7 +229,7 @@ export default function DriverJobs({ onClose }: { onClose?: () => void }) {
                       </div>
                       <div className="text-right flex flex-col items-end">
                         <p className="text-[10px] font-black uppercase text-[#00D26A] tracking-widest mb-0.5">Earned</p>
-                        <h4 className="font-black text-xl text-white">£{(job.finalFare ? (job.finalFare - (job.tipAmount || 0)) * (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0) + (job.tipAmount || 0) : driverEarnings + (job.tipAmount || 0)).toFixed(2)}</h4>
+                        <h4 className="font-black text-xl text-white">£{summary.driverEarnings.toFixed(2)}</h4>
                       </div>
                     </div>
                     
@@ -232,7 +237,7 @@ export default function DriverJobs({ onClose }: { onClose?: () => void }) {
                       <div className="mt-3 pt-3 border-t border-[#2C2C30] flex items-center justify-between">
                         <div className="flex gap-4">
                           <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#A1A1AA] tracking-wide">
-                            <PoundSterling className="w-3.5 h-3.5" /> Gross: £{(job.finalFare || grossFare)?.toFixed(2)}
+                            <PoundSterling className="w-3.5 h-3.5" /> Gross: £{summary.totalFarePaid.toFixed(2)}
                           </div>
                           <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#A1A1AA] tracking-wide">
                             <Navigation className="w-3.5 h-3.5" /> {job.distanceMiles?.toFixed(1) || "-"} mi
@@ -282,13 +287,13 @@ export default function DriverJobs({ onClose }: { onClose?: () => void }) {
                             <p className="text-[10px] font-black uppercase text-[#E4E4E7] tracking-widest mb-3 border-b border-[#333338] pb-2">Fare Breakdown</p>
                             <div className="space-y-2 mb-3">
                               <div className="flex justify-between text-xs text-[#A1A1AA]">
-                                <span>Gross Fare / Time & Distance:</span>
-                                <span className="text-white">£{((job.finalFare ? job.finalFare - (job.tipAmount || 0) : grossFare) - (job.isPriority ? 3 : 0) - (isAbandoned ? 5 : 0) - (job.surgeFixed || 0)).toFixed(2)}</span>
+                                <span>Base Fare / Time & Distance:</span>
+                                <span className="text-white">£{baseFareExclExtras.toFixed(2)}</span>
                               </div>
-                              {job.tipAmount > 0 && (
+                              {summary.tipAmount > 0 && (
                                 <div className="flex justify-between text-xs text-emerald-400">
                                   <span>Passenger Tip (100% yours):</span>
-                                  <span className="font-bold">+£{job.tipAmount.toFixed(2)}</span>
+                                  <span className="font-bold">+£{summary.tipAmount.toFixed(2)}</span>
                                 </div>
                               )}
                               {job.isPriority && (
@@ -300,7 +305,7 @@ export default function DriverJobs({ onClose }: { onClose?: () => void }) {
                               {job.surgeModel && (
                                 <div className="flex justify-between text-xs text-[#FF9500]">
                                   <span>Surge ({job.surgeModel === 'fixed' ? 'Fixed' : (job.surgeMultiplier || '1.4') + 'x'}):</span>
-                                  <span className="font-bold">+£{job.surgeModel === 'fixed' ? (job.surgeFixed || 2.0).toFixed(2) : ((job.fareEstimate || 38.50) - (job.baseCalc || 30)).toFixed(2)}</span>
+                                  <span className="font-bold">+£{job.surgeModel === 'fixed' ? (Number(job.surgeFixed || 2.0)).toFixed(2) : Math.max(0, (Number(job.fareEstimate || 0) - Number(job.baseCalc || 0))).toFixed(2)}</span>
                                 </div>
                               )}
                               {isAbandoned && (
@@ -311,14 +316,14 @@ export default function DriverJobs({ onClose }: { onClose?: () => void }) {
                               )}
                               
                               <div className="flex justify-between text-xs font-bold text-[#FF3B30] mt-2 pt-2 border-t border-[#333338]">
-                                <span>Platform Commission (12%):</span>
-                                <span>-£{((job.finalFare ? job.finalFare - (job.tipAmount || 0) : grossFare) * 0.12).toFixed(2)}</span>
+                                <span>Platform Commission ({summary.appliedCommissionPct}%):</span>
+                                <span>-£{summary.platformFee.toFixed(2)}</span>
                               </div>
                             </div>
                             
                             <div className="border-t-2 border-[#00D26A]/30 pt-3 mt-3 flex justify-between items-end">
                               <span className="text-xs font-black uppercase tracking-widest text-[#00D26A]">Net Earnings</span>
-                              <span className="text-xl font-black text-[#00D26A]">£{(job.finalFare ? (job.finalFare - (job.tipAmount || 0)) * (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0) + (job.tipAmount || 0) : driverEarnings + (job.tipAmount || 0)).toFixed(2)}</span>
+                              <span className="text-xl font-black text-[#00D26A]">£{summary.driverEarnings.toFixed(2)}</span>
                             </div>
                           </div>
                           

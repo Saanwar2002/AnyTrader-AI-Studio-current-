@@ -10,7 +10,7 @@
 import { z } from "zod";
 import crypto from "crypto";
 import type admin from "firebase-admin";
-import { BadRequestError, ForbiddenError, NotFoundError } from "./httpErrors.ts";
+import { BadRequestError, ForbiddenError, NotFoundError, ConflictError, UnauthorizedError, InternalServerError } from "./httpErrors.ts";
 import { CanonicalIdentity, requireCapability, hasCapability } from "./identity.ts";
 import { SERVER_OWNED_PROTECTED_KEYS } from "./authorization.ts";
 import { validateJobTransition, JobStatus } from "./stateMachine.ts";
@@ -399,6 +399,9 @@ export async function executeCreateJobCommand(
       createdByUid: identity.uid,
       status: initialStatus,
       quoteCount: 0,
+      hasReview: false,
+      hasHomeownerReview: false,
+      hasTradespersonReview: false,
       createdAt: nowIso,
       updatedAt: nowIso,
       postedDate: nowIso,
@@ -449,4 +452,123 @@ export async function executeCreateJobCommand(
     job: transactionResult.job,
     wasReplayed: transactionResult.replayed,
   };
+}
+
+const JOB_UPDATE_ALLOWED_FIELDS = [
+  "title",
+  "description",
+  "category",
+  "subCategory",
+  "subcategory",
+  "postcode",
+  "city",
+  "area",
+  "address",
+  "fullAddress",
+  "urgency",
+  "budget",
+  "estimateMin",
+  "estimateMax",
+  "preferredDate",
+  "estimatedCompletionTime",
+  "estimatedCompletionTimeUnit",
+  "propertyId",
+  "linkedPropertyId",
+  "propertyPassportId",
+  "assetId",
+  "assetName",
+  "photos",
+  "videos",
+  "documents",
+] as const;
+
+export async function executeUpdateJobCommand(options: {
+  db: any;
+  identity: CanonicalIdentity;
+  jobId: string;
+  rawPayload: Record<string, any>;
+}): Promise<{ jobId: string; job: Record<string, any>; publicCardSynced: boolean }> {
+  const { db, identity, jobId, rawPayload } = options;
+
+  if (!db) {
+    throw new InternalServerError("Database service unavailable.");
+  }
+  if (!jobId || typeof jobId !== "string") {
+    throw new BadRequestError("Valid jobId is required.");
+  }
+  if (!identity || !identity.uid) {
+    throw new UnauthorizedError("Authentication required.");
+  }
+
+  // Strip server-owned keys so edits cannot alter financial/lifecycle state
+  const safeUpdate: Record<string, any> = {};
+  for (const field of JOB_UPDATE_ALLOWED_FIELDS) {
+    if (rawPayload && rawPayload[field] !== undefined) {
+      safeUpdate[field] = rawPayload[field];
+    }
+  }
+  if (typeof safeUpdate.postcode === "string") {
+    safeUpdate.postcode = safeUpdate.postcode.trim().toUpperCase();
+  }
+  if (typeof safeUpdate.title === "string" && safeUpdate.title.trim().length < 3) {
+    throw new BadRequestError("Job title must be at least 3 characters.");
+  }
+  if (typeof safeUpdate.description === "string" && safeUpdate.description.trim().length < 10) {
+    throw new BadRequestError("Job description must be at least 10 characters.");
+  }
+
+  const nowIso = new Date().toISOString();
+  safeUpdate.updatedAt = nowIso;
+
+  const jobRef = db.collection("jobs").doc(jobId);
+  const publicCardRef = db.collection("public_job_cards").doc(jobId);
+
+  const result = await db.runTransaction(async (transaction: any) => {
+    const [jobSnap, publicCardSnap] = await Promise.all([
+      transaction.get(jobRef),
+      transaction.get(publicCardRef),
+    ]);
+    if (!jobSnap.exists) {
+      throw new NotFoundError(`Job '${jobId}' was not found.`);
+    }
+
+    const currentJob = jobSnap.data() || {};
+    const ownerId = currentJob.homeownerId || currentJob.userId || currentJob.ownerId;
+    const isAdmin = identity.accountType === "admin" || (identity as any).isAdmin === true;
+    if (identity.uid !== ownerId && !isAdmin) {
+      throw new ForbiddenError("Only the job owner or an administrator can edit this job.");
+    }
+
+    if (["completed", "cancelled", "disputed"].includes(String(currentJob.status || ""))) {
+      throw new ConflictError(`Cannot edit a job in '${currentJob.status}' status.`);
+    }
+
+    const mergedJob = {
+      ...currentJob,
+      ...safeUpdate,
+      id: jobId,
+    };
+
+    transaction.update(jobRef, safeUpdate);
+
+    const isActivePublic =
+      ["posted", "quoting", "in_bidding", "open", "quoted"].includes(String(mergedJob.status || "")) &&
+      !mergedJob.clientDeleted &&
+      !isDirectJob(mergedJob);
+
+    if (isActivePublic) {
+      const publicCard = sanitizeJobToPublicCard(jobId, mergedJob);
+      transaction.set(publicCardRef, publicCard, { merge: true });
+    } else if (publicCardSnap?.exists) {
+      transaction.delete(publicCardRef);
+    }
+
+    return {
+      jobId,
+      job: mergedJob,
+      publicCardSynced: true,
+    };
+  });
+
+  return result;
 }

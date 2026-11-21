@@ -86,12 +86,21 @@ export default function EmergencyJobWizard() {
   const targetTradespersonId = (location.state as any)?.targetTradespersonId;
   const targetTradespersonName = (location.state as any)?.targetTradespersonName;
   const targetTrades = (location.state as any)?.targetTrades;
+
+  const initialSearchParams = new URLSearchParams(location.search);
+  const rawParamCategory = initialSearchParams.get("category") || (location.state as any)?.category || "";
+  const rawParamDescription = initialSearchParams.get("description") || (location.state as any)?.description || "";
+  const matchedInitialCategory = rawParamCategory
+    ? (TRADE_CATEGORIES.find(c => c.name.toLowerCase() === rawParamCategory.trim().toLowerCase())?.name ||
+       TRADE_CATEGORIES.find(c => categoryMatchesSearch(c, rawParamCategory))?.name ||
+       "")
+    : "";
   
   const [step, setStep] = useState(1);
   const [addressInput, setAddressInput] = useState("");
   const [formData, setFormData] = useState({
-    category: "",
-    description: "",
+    category: matchedInitialCategory,
+    description: rawParamDescription,
     postcode: "",
     city: "",
     area: "",
@@ -102,7 +111,7 @@ export default function EmergencyJobWizard() {
     photos: [] as string[]
   });
 
-  const [searchQuery, setSearchQuery] = useState("");
+  const [searchQuery, setSearchQuery] = useState(matchedInitialCategory ? "" : rawParamCategory);
   const [error, setError] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);

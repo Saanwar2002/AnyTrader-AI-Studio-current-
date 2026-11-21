@@ -408,7 +408,12 @@ export default function AdminFlashDealsAndAiAnalyticsTab() {
               <span className="text-xs font-bold text-slate-500">queries</span>
             </div>
             <p className="text-xs text-slate-600 mt-1 flex items-center gap-1.5 font-medium">
-              <span className="text-blue-600 font-bold">99.4% autonomous success</span> • {agentsTelemetry.avgResponseTimeMs}ms avg
+              <span className="text-blue-600 font-bold">
+                {agentsTelemetry.totalInvocations > 0
+                  ? `${agentsTelemetry.successRate}% autonomous success`
+                  : "No invocations logged"}
+              </span>{" "}
+              • {agentsTelemetry.avgResponseTimeMs}ms avg
             </p>
           </div>
           <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] font-semibold text-slate-600">
@@ -459,12 +464,18 @@ export default function AdminFlashDealsAndAiAnalyticsTab() {
           <div>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl font-black text-black">
-                {deepScanResult ? `${deepScanResult.platformIntegrityScore}%` : "96%"}
+                {deepScanResult ? `${deepScanResult.platformIntegrityScore}%` : "Pending"}
               </span>
-              <span className="text-xs font-bold text-emerald-600 uppercase">Healthy</span>
+              <span className="text-xs font-bold text-emerald-600 uppercase">
+                {deepScanResult
+                  ? (deepScanResult.platformIntegrityScore >= 80 ? "Healthy" : "Attention")
+                  : "Not Scanned"}
+              </span>
             </div>
             <p className="text-xs text-slate-600 mt-1 font-medium">
-              Zero active system-level breach vectors detected.
+              {deepScanResult
+                ? deepScanResult.executiveSummary
+                : "Run Deep Security Scan to compute verified platform integrity score."}
             </p>
           </div>
           <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] font-semibold text-slate-600">

@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import RideChat from "../driver/RideChat";
 import { cn } from "@/src/lib/utils";
+import { openSafeExternalUrl } from "@/src/lib/safeExternalUrl";
 import { db, addDoc, collection, serverTimestamp, doc, updateDoc, arrayUnion, arrayRemove, onSnapshot, setDoc, increment, query, where, getDocs, orderBy, limit, deleteField, getDoc, runTransaction } from "@/src/firebase";
 import { playSound } from "@/src/lib/sound";
 import { useAuth } from "../AuthProvider";
@@ -2167,15 +2168,7 @@ export default function PassengerBooking() {
          setAssignedDriverInfo(null); 
          hasTriggeredTipModalRef.current = false;
          setShowTipModal(false);
-
-         // Also clear passenger fees on simulation to mimic driver side clearing
-         if (profile?.uid) {
-           await updateDoc(doc(db, "users", profile.uid), {
-             pendingCharges: 0,
-             cancellationCount: 0,
-             abandonmentStrikes: 0
-           });
-         }
+         // Outstanding balance / strikes are settled strictly server-side via Stripe webhook fulfillment
       }
       
       await updateDoc(doc(db, "ride_requests", currentRideId), updateData);
@@ -2187,26 +2180,37 @@ export default function PassengerBooking() {
 
   const handleAbandonSearch = async () => {
     setShowAbandonPrompt(false);
-    if (!currentRideId) return;
+    if (!currentRideId || !user) return;
 
     try {
-      await updateDoc(doc(db, "ride_requests", currentRideId), { 
-        status: "cancelled", 
-        cancelledBy: "passenger", 
-        cancellationFee: 0,
-        cancelledAt: serverTimestamp() 
+      const token = await user.getIdToken();
+      const res = await fetch("/api/rides/cancel", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          rideId: currentRideId,
+          cancelledBy: "passenger",
+        }),
       });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.error || "Failed to cancel ride.");
+      }
 
       clearBookingInputsAndState();
       toast.success("Ride cancelled.");
       navigate("/my-rides");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Cancel failed", err);
-      toast.error("Failed to cancel ride.");
+      toast.error(err?.message || "Failed to cancel ride.");
     }
   };
 
   const [showCancelPrompt, setShowCancelPrompt] = useState(false);
+  const [confirmingForceCashClear, setConfirmingForceCashClear] = useState(false);
   const [showAbandonPrompt, setShowAbandonPrompt] = useState(false);
   const [showDriverFoundOverlay, setShowDriverFoundOverlay] = useState(false);
   const [driverFoundCountdown, setDriverFoundCountdown] = useState(10);
@@ -2294,27 +2298,35 @@ export default function PassengerBooking() {
     }
 
     try {
-      await updateDoc(doc(db, "ride_requests", currentRideId), {
-        status: "cancelled",
-        cancelledBy: "passenger",
-        cancellationFee: fee,
-        cancelledAt: serverTimestamp()
+      if (!user) throw new Error("Authentication required");
+      const token = await user.getIdToken();
+      const res = await fetch("/api/rides/cancel", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          rideId: currentRideId,
+          cancelledBy: "passenger",
+        }),
       });
-      
-      if (fee > 0 && user) {
-        await updateDoc(doc(db, "users", user.uid), {
-           pendingCharges: increment(fee),
-           cancellationCount: increment(1)
-        });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to cancel ride.");
       }
 
       clearBookingInputsAndState();
       setShowCancelPrompt(false);
-      toast.success("Ride cancelled.");
+      toast.success(
+        Number(data.cancellationFee || 0) > 0
+          ? `Ride cancelled (£${Number(data.cancellationFee).toFixed(2)} fee applied).`
+          : "Ride cancelled."
+      );
       navigate("/my-rides");
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      toast.error("Failed to cancel ride.");
+      toast.error(err?.message || "Failed to cancel ride.");
     }
   };
 
@@ -3643,18 +3655,28 @@ export default function PassengerBooking() {
                             e.stopPropagation();
                             if (isClearingBalance || !user) return;
                             setIsClearingBalance(true);
-                            await new Promise(r => setTimeout(r, 1500));
                             try {
-                              await updateDoc(doc(db, "users", user.uid), {
-                                pendingCharges: 0,
-                                pendingChargesReason: deleteField(),
-                                cancellationCount: 0,
-                                abandonmentStrikes: 0
+                              const token = await user.getIdToken();
+                              const res = await fetch("/api/create-customer-portal-session", {
+                                method: "POST",
+                                headers: {
+                                  "Content-Type": "application/json",
+                                  Authorization: `Bearer ${token}`,
+                                },
+                                body: JSON.stringify({
+                                  returnUrl: `${window.location.origin}/book-ride`,
+                                }),
                               });
-                              toast.success(`Success! Outstanding balance of £${(profile.pendingCharges || 0).toFixed(2)} has been cleared. Thank you.`);
+                              const data = await res.json().catch(() => ({}));
+                              if (res.ok && data.url) {
+                                window.location.href = data.url;
+                                return;
+                              }
+                              toast.info("Please open Billing to add a payment card and settle your outstanding balance.");
+                              window.location.assign("/billing");
                             } catch (err) {
-                              console.error("Failed to clear balance:", err);
-                              toast.error("Failed to clear outstanding balance.");
+                              console.error("Failed to open billing portal:", err);
+                              toast.error("Unable to open secure payment portal right now. Please try via Billing.");
                             } finally {
                               setIsClearingBalance(false);
                             }
@@ -4698,7 +4720,9 @@ export default function PassengerBooking() {
                     disabled={assignedDriverInfo?.status !== "awaiting_payment"}
                     onClick={() => {
                        if (assignedDriverInfo?.status === "awaiting_payment" && assignedDriverInfo.paymentUrl) {
-                          window.open(assignedDriverInfo.paymentUrl, "_blank");
+                          if (!openSafeExternalUrl(assignedDriverInfo.paymentUrl)) {
+                            toast.error("Invalid payment link.");
+                          }
                        }
                     }}
                     className={cn(
@@ -4833,49 +4857,29 @@ export default function PassengerBooking() {
 
                          <button 
                             onClick={async () => {
-                               if (currentRideId) {
-                                  await updateDoc(doc(db, "ride_requests", currentRideId), {
-                                     status: "cash_confirmed"
-                                   });
-                                   
-                                   const finalAmountHandled = assignedDriverInfo?.reportedCashDiscrepancy || 0;
-                                   if (profile?.uid && finalAmountHandled > 0) {
-                                      try {
-                                         const freshSnap = await getDoc(doc(db, "ride_requests", currentRideId));
-                                         if (freshSnap.exists() && !freshSnap.data().pendingChargesApplied) {
-                                            await updateDoc(doc(db, "users", profile.uid), {
-                                               pendingCharges: increment(finalAmountHandled),
-                                               pendingChargesReason: "Unpaid cash trip remainder"
-                                            });
-                                            await updateDoc(doc(db, "ride_requests", currentRideId), {
-                                               status: "completed",
-                                               paymentMethod: "cash",
-                                               completedAt: serverTimestamp(),
-                                               finalFare: assignedDriverInfo?.fareEstimate || 0,
-                                               reportedCashCollected: assignedDriverInfo?.reportedCashCollected || 0,
-                                               reportedCashDiscrepancy: finalAmountHandled,
-                                               pendingChargesApplied: true
-                                            });
-                                            toast.success("Cash balance remainder recorded successfully!");
-                                         }
-                                      } catch (e) {
-                                         console.error("Failed to apply cash balance to rider profile:", e);
-                                      }
-                                   } else {
-                                      await updateDoc(doc(db, "ride_requests", currentRideId), {
-                                         status: "completed",
-                                         paymentMethod: "cash",
-                                         completedAt: serverTimestamp(),
-                                         finalFare: assignedDriverInfo?.fareEstimate || 0,
-                                         reportedCashCollected: assignedDriverInfo?.reportedCashCollected || 0,
-                                         reportedCashDiscrepancy: 0,
-                                         pendingChargesApplied: true
-                                      });
-                                   }
-                                   
-                                   await updateDoc(doc(db, "ride_requests", currentRideId), {
-                                      dummyCheckForCloseBracketHack: true
+                               if (!currentRideId || !user) return;
+                               try {
+                                  const token = await user.getIdToken();
+                                  const res = await fetch("/api/rides/complete", {
+                                     method: "POST",
+                                     headers: {
+                                        "Content-Type": "application/json",
+                                        Authorization: `Bearer ${token}`,
+                                     },
+                                     body: JSON.stringify({
+                                        rideId: currentRideId,
+                                        action: "cash_confirm_passenger",
+                                     }),
                                   });
+                                  const data = await res.json();
+                                  if (!res.ok) {
+                                     throw new Error(data?.error || "Failed to confirm cash payment");
+                                  }
+                                  setConfirmingForceCashClear(false);
+                                  toast.success("Cash balance remainder recorded successfully!");
+                               } catch (e: any) {
+                                  console.error("Failed to confirm cash payment:", e);
+                                  toast.error(e?.message || "Failed to confirm cash entry.");
                                }
                             }}
                             className="w-full bg-[#1e293b] text-white rounded-[16px] font-black text-[15px] h-[52px] shadow-lg hover:bg-black transition-all border border-black mb-2"
@@ -4885,30 +4889,40 @@ export default function PassengerBooking() {
 
                          <button 
                             onClick={async () => {
-                               if (currentRideId && confirm("Stuck on cash verification? Clicking this will immediately complete the ride and clear it. Proceed?")) {
-                                  const finalAmountHandled = assignedDriverInfo?.reportedCashDiscrepancy || 0;
-                                  
-                                  await updateDoc(doc(db, "ride_requests", currentRideId), {
-                                     status: "completed",
-                                     paymentMethod: "cash",
-                                     completedAt: serverTimestamp(),
-                                     finalFare: assignedDriverInfo?.fareEstimate || 0,
-                                     reportedCashCollected: assignedDriverInfo?.reportedCashCollected || 0
+                               if (!currentRideId || !user) return;
+                               if (!confirmingForceCashClear) {
+                                  setConfirmingForceCashClear(true);
+                                  return;
+                               }
+                               try {
+                                  const token = await user.getIdToken();
+                                  const res = await fetch("/api/rides/complete", {
+                                     method: "POST",
+                                     headers: {
+                                        "Content-Type": "application/json",
+                                        Authorization: `Bearer ${token}`,
+                                     },
+                                     body: JSON.stringify({
+                                        rideId: currentRideId,
+                                        action: "force_complete_passenger",
+                                     }),
                                   });
-                                  
-                                  if (profile?.uid && finalAmountHandled > 0) {
-                                     await updateDoc(doc(db, "users", profile.uid), {
-                                        pendingCharges: increment(finalAmountHandled),
-                                        pendingChargesReason: "Unpaid cash trip remainder"
-                                     });
+                                  const data = await res.json();
+                                  if (!res.ok) {
+                                     throw new Error(data?.error || "Failed to force-complete ride");
                                   }
-                                  
+                                  setConfirmingForceCashClear(false);
                                   toast.success("Ride force-completed and cleared successfully!");
+                               } catch (e: any) {
+                                  console.error("Force complete error:", e);
+                                  toast.error(e?.message || "Failed to clear ride.");
                                }
                             }}
                             className="w-full text-rose-600 hover:text-rose-800 font-extrabold text-[12px] py-2 text-center transition-all bg-rose-50 hover:bg-rose-100 rounded-xl mt-1.5 border border-rose-200/60"
                          >
-                            🚨 Stuck? Force Complete & Clear Ride
+                            {confirmingForceCashClear
+                               ? "Tap Again to Confirm Force Complete & Clear Ride"
+                               : "🚨 Stuck? Force Complete & Clear Ride"}
                          </button>
                       </motion.div>
                     </div>
@@ -5014,7 +5028,13 @@ export default function PassengerBooking() {
 
                 <div className="bg-surface rounded-3xl p-5 mb-6 border border-black shadow-sm flex flex-col items-center text-center">
                   <p className="text-[10px] font-black tracking-widest uppercase text-text-muted mb-2">Total Paid</p>
-                  <h2 className="text-5xl font-black text-text-main tracking-tighter">£{completedRideData.finalFare?.toFixed(2) || ((completedRideData.fareEstimate || fareConfig.baseFare) + (((completedRideData.paidWaitSeconds || 0) / 60) * fareConfig.waitRatePerMinute) + (completedRideData.tipAmount || 0) + (completedRideData.unpaidCancellationFeesOwed || completedRideData.cancellationFee || 0)).toFixed(2)}</h2>
+                  <h2 className="text-5xl font-black text-text-main tracking-tighter">£{(
+                    completedRideData.totalFarePaid ??
+                    (completedRideData.fareContractVersion === "v2_excl_tip" && completedRideData.finalFare !== undefined
+                      ? Number(completedRideData.finalFare) + Number(completedRideData.tipAmount || 0)
+                      : completedRideData.finalFare) ??
+                    ((completedRideData.fareEstimate || fareConfig.baseFare) + (((completedRideData.paidWaitSeconds || 0) / 60) * fareConfig.waitRatePerMinute) + (completedRideData.tipAmount || 0) + (completedRideData.unpaidCancellationFeesOwed || completedRideData.cancellationFee || 0))
+                  ).toFixed(2)}</h2>
                   <div className="flex gap-2 mt-3 items-center">
                     <p className="text-sm font-bold text-emerald-600 bg-emerald-50 px-3 py-1 rounded-md leading-none flex items-center">
                        <Check className="w-3.5 h-3.5 mr-1" />
@@ -5049,7 +5069,22 @@ export default function PassengerBooking() {
                 <div className="space-y-3 flex-1 mb-4">
                   <div className="flex justify-between text-sm font-bold text-text-muted">
                     <span>Base Fare & Distance</span>
-                    <span className="text-text-main">£{(completedRideData.finalFare ? completedRideData.finalFare - (completedRideData.tipAmount || 0) - (completedRideData.unpaidCancellationFeesOwed || completedRideData.cancellationFee || 0) - (completedRideData.isPriority ? 3 : 0) - (completedRideData.isPetFriendly ? 3 : 0) - (((completedRideData.paidWaitSeconds || 0) / 60) * fareConfig.waitRatePerMinute) : ((completedRideData.fareEstimate || fareConfig.baseFare) - (completedRideData.unpaidCancellationFeesOwed || completedRideData.cancellationFee || 0) - (completedRideData.isPriority ? 3 : 0) - (completedRideData.isPetFriendly ? 3 : 0))).toFixed(2)}</span>
+                    <span className="text-text-main">£{(() => {
+                      const isV2 = completedRideData.fareContractVersion === "v2_excl_tip" || completedRideData.totalFarePaid !== undefined;
+                      const basePlusExtras = completedRideData.finalFare !== undefined
+                        ? (isV2 ? Number(completedRideData.finalFare) : Number(completedRideData.finalFare) - (completedRideData.tipAmount || 0))
+                        : (completedRideData.fareEstimate || fareConfig.baseFare);
+                      const waitFee = completedRideData.finalFare !== undefined
+                        ? ((completedRideData.paidWaitSeconds || 0) / 60) * fareConfig.waitRatePerMinute
+                        : 0;
+                      const base =
+                        basePlusExtras -
+                        (completedRideData.unpaidCancellationFeesOwed || completedRideData.cancellationFee || 0) -
+                        (completedRideData.isPriority ? 3 : 0) -
+                        (completedRideData.isPetFriendly ? 3 : 0) -
+                        waitFee;
+                      return Math.max(0, base).toFixed(2);
+                    })()}</span>
                   </div>
                   {completedRideData.isPriority && (
                     <div className="flex justify-between text-sm font-bold text-blue-600">

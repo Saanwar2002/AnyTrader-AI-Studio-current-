@@ -18,6 +18,7 @@ import {
   assertSucceeds,
   RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import {
   doc,
   getDoc,
@@ -44,7 +45,7 @@ describe('V8.3 Task 28 — Firebase Emulator Evidence & Data Provenance Graph Su
 
   beforeAll(async () => {
     try {
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: {
           rules: firestoreRules,

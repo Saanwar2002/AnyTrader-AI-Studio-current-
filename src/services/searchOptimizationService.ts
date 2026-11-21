@@ -12,6 +12,7 @@ import {
   onSnapshot 
 } from "firebase/firestore";
 import { db, auth } from "../firebase";
+import { getApiUrl } from "../lib/apiUrl";
 import { registerDynamicSynonyms, SynonymMeta } from "../lib/fuzzyMatch";
 import { classifyUnmatchedSearchTerm, SynonymClassificationResult, syncCategoryRegistryWithServer } from "./gemini";
 import { categoryRegistry } from "./categoryRegistrySync";
@@ -139,7 +140,6 @@ export function initSearchOptimizationService(): () => void {
         });
         registerDynamicSynonyms(dynamicMap);
         categoryRegistry.syncSynonyms(dynamicMap);
-        syncCategoryRegistryWithServer(undefined, dynamicMap);
         notifyDynamicSynonymsUpdated();
       },
       (error) => {
@@ -160,7 +160,6 @@ export function initSearchOptimizationService(): () => void {
             });
             registerDynamicSynonyms(dynamicMap);
             categoryRegistry.syncSynonyms(dynamicMap);
-            syncCategoryRegistryWithServer(undefined, dynamicMap);
             notifyDynamicSynonymsUpdated();
           })
           .catch((err) => console.warn("[SearchOptimizationService] Failed to load synonyms:", err));
@@ -227,24 +226,28 @@ export function recordUnmatchedSearch(
         // Safe fallback if sessionStorage is restricted
       }
 
-      const docRef = doc(db, "unmatched_search_telemetry", slug);
-      await setDoc(
-        docRef,
-        {
-          id: slug,
+      const token = await auth.currentUser.getIdToken().catch(() => null);
+      if (!token) return;
+
+      const postcodeArea = (outwardPostcode || "").trim().toUpperCase().split(" ")[0] || "";
+      const response = await fetch(getApiUrl("/api/telemetry/unmatched-search"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({
           query: clean,
-          normalizedQuery: slug,
-          searchCount: increment(1),
-          lastSearchedAt: serverTimestamp(),
-          postcodeArea: (outwardPostcode || "").trim().toUpperCase().split(" ")[0] || "",
-          status: "unmatched",
+          postcodeArea,
           source: options?.source || "search_bar",
           gapType: options?.gapType || "unmatched_category",
-          suggestedCategory: options?.category || "",
-          userId: auth.currentUser.uid,
-        },
-        { merge: true }
-      );
+          category: options?.category || ""
+        })
+      });
+
+      if (!response.ok) {
+        console.warn("[SearchOptimizationService] Server telemetry endpoint returned", response.status);
+      }
     } catch (err) {
       console.warn("[SearchOptimizationService] Failed to record search telemetry:", err);
     }

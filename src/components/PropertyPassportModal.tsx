@@ -34,16 +34,20 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
   const [showBuyerPackModal, setShowBuyerPackModal] = useState(false);
   const [showQRModal, setShowQRModal] = useState(false);
 
-  // Passport state
-  const [epcRating, setEpcRating] = useState(property.epcRating || "C");
+  // Passport state (avoid fabricating unrecorded specs)
+  const [epcRating, setEpcRating] = useState(property.epcRating || "");
   const [gasSafetyExpiry, setGasSafetyExpiry] = useState(property.gasSafetyExpiry || "");
   const [eicrExpiry, setEicrExpiry] = useState(property.eicrExpiry || "");
   const [boilerBrand, setBoilerBrand] = useState(property.boilerInfo?.brand || "");
   const [boilerModel, setBoilerModel] = useState(property.boilerInfo?.model || "");
-  const [boilerAge, setBoilerAge] = useState(property.boilerInfo?.age || "5");
+  const [boilerAge, setBoilerAge] = useState(property.boilerInfo?.age ? String(property.boilerInfo.age) : "");
   const [boilerLastServiced, setBoilerLastServiced] = useState(property.boilerInfo?.lastServiced || "");
-  const [roofCondition, setRoofCondition] = useState(property.roofCondition || "Good");
+  const [roofCondition, setRoofCondition] = useState(property.roofCondition || "");
   const [insuranceProvider, setInsuranceProvider] = useState(property.insuranceProvider || "");
+  const [publicConsentEnabled, setPublicConsentEnabled] = useState(
+    Boolean(property.isPublicPassport === true && property.publicConsent === true)
+  );
+  const [syncingPublicConsent, setSyncingPublicConsent] = useState(false);
   
   // Component Registry state
   const [stopcockLocation, setStopcockLocation] = useState(property.componentRegistry?.stopcockLocation || "");
@@ -51,6 +55,40 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
   const [paintCodes, setPaintCodes] = useState(property.componentRegistry?.paintCodes || "");
 
   const [saving, setSaving] = useState(false);
+
+  const handleTogglePublicConsent = async (enabled: boolean) => {
+    if (!user || !property?.id) return;
+    setSyncingPublicConsent(true);
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch(`/api/properties/${encodeURIComponent(property.id)}/sync-public-passport`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          isPublicPassport: enabled,
+          publicConsent: enabled,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result.error || "Failed to update public passport sharing preference.");
+      }
+      setPublicConsentEnabled(enabled);
+      toast.success(
+        enabled
+          ? "Public QR Property Passport published with your explicit consent."
+          : "Public QR Property Passport unpublished and retracted."
+      );
+      if (onUpdated) onUpdated();
+    } catch (err: any) {
+      toast.error(err?.message || "Could not update public sharing consent.");
+    } finally {
+      setSyncingPublicConsent(false);
+    }
+  };
 
   // Load associated completed jobs for history & valuation impact
   useEffect(() => {
@@ -457,6 +495,7 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
                           onChange={(e) => setEpcRating(e.target.value)}
                           className="w-full p-2.5 rounded-xl border border-black bg-white text-xs font-bold"
                         >
+                          <option value="">Not recorded</option>
                           {['A', 'B', 'C', 'D', 'E', 'F', 'G'].map(r => (
                             <option key={r} value={r}>EPC Grade {r}</option>
                           ))}
@@ -470,6 +509,7 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
                           onChange={(e) => setRoofCondition(e.target.value)}
                           className="w-full p-2.5 rounded-xl border border-black bg-white text-xs font-bold"
                         >
+                          <option value="">Not recorded</option>
                           <option value="Excellent">Excellent</option>
                           <option value="Good">Good</option>
                           <option value="Fair">Fair</option>
@@ -573,36 +613,36 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                       <div className="p-3.5 bg-slate-50 border border-black rounded-2xl">
                         <p className="text-[10px] uppercase font-extrabold text-slate-500">EPC Energy Rating</p>
-                        <p className="text-xl font-black text-blue-600 mt-1">Grade {epcRating}</p>
+                        <p className="text-xl font-black text-blue-600 mt-1">{epcRating ? `Grade ${epcRating}` : "Unverified / Not recorded"}</p>
                       </div>
 
                       <div className="p-3.5 bg-slate-50 border border-black rounded-2xl">
                         <p className="text-[10px] uppercase font-extrabold text-slate-500">Roof Condition</p>
-                        <p className="text-sm font-black text-slate-900 mt-1">{roofCondition}</p>
+                        <p className="text-sm font-black text-slate-900 mt-1">{roofCondition || "Unverified / Not recorded"}</p>
                       </div>
 
                       <div className="p-3.5 bg-slate-50 border border-black rounded-2xl col-span-2 sm:col-span-1">
                         <p className="text-[10px] uppercase font-extrabold text-slate-500">Boiler System</p>
                         <p className="text-sm font-black text-slate-900 mt-1">
-                          {boilerBrand || "Not set"} {boilerModel ? `(${boilerModel})` : ""}
+                          {boilerBrand || "Unverified / Not recorded"} {boilerModel ? `(${boilerModel})` : ""}
                         </p>
                         <p className="text-[10px] text-slate-500 font-bold">{boilerAge ? `${boilerAge} yrs old` : ""}</p>
                       </div>
 
                       <div className="p-3.5 bg-slate-50 border border-black rounded-2xl col-span-2">
                         <p className="text-[10px] uppercase font-extrabold text-slate-500">Insurance & Warranty</p>
-                        <p className="text-sm font-black text-slate-900 mt-1">{insuranceProvider || "No active provider linked"}</p>
+                        <p className="text-sm font-black text-slate-900 mt-1">{insuranceProvider || "Unverified / Not recorded"}</p>
                       </div>
 
                       {/* Component Registry Display */}
                       <div className="p-3.5 bg-slate-50 border border-black rounded-2xl">
                         <p className="text-[10px] uppercase font-extrabold text-slate-500">Mains Stopcock</p>
-                        <p className="text-xs font-black text-slate-900 mt-1">{stopcockLocation || "Under sink"}</p>
+                        <p className="text-xs font-black text-slate-900 mt-1">{stopcockLocation || "Not recorded"}</p>
                       </div>
 
                       <div className="p-3.5 bg-slate-50 border border-black rounded-2xl">
                         <p className="text-[10px] uppercase font-extrabold text-slate-500">Fuseboard (Consumer Unit)</p>
-                        <p className="text-xs font-black text-slate-900 mt-1">{fuseboardLocation || "Hall cupboard"}</p>
+                        <p className="text-xs font-black text-slate-900 mt-1">{fuseboardLocation || "Not recorded"}</p>
                       </div>
 
                       {paintCodes && (
@@ -613,26 +653,51 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
                       )}
                     </div>
 
-                    {/* Public Buyer Listing & Conveyancing Banner */}
-                    <div className="p-4 bg-slate-50 border border-black rounded-2xl flex items-center justify-between gap-3">
-                      <div>
-                        <h5 className="text-xs font-black text-slate-900 flex items-center gap-1.5">
-                          <QrCode className="w-4 h-4 text-purple-600" />
-                          Public Buyer View & QR Badge
-                        </h5>
-                        <p className="text-[11px] text-slate-600 font-medium">
-                          Estate agent brochure QR badges, Rightmove embed code, and buyer digital twin preview.
-                        </p>
+                    {/* Public Buyer Listing & Explicit Consent Control */}
+                    <div className="p-4 bg-slate-50 border border-black rounded-2xl space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <h5 className="text-xs font-black text-black flex items-center gap-1.5">
+                            <QrCode className="w-4 h-4 text-purple-600" />
+                            Public Buyer View & QR Badge
+                          </h5>
+                          <p className="text-[11px] text-slate-700 font-medium">
+                            Explicit consent is required before publishing your sanitized Property Passport to public QR links.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={syncingPublicConsent}
+                          onClick={() => handleTogglePublicConsent(!publicConsentEnabled)}
+                          className={`px-3 py-2 rounded-xl text-xs font-black border border-black transition shrink-0 ${
+                            publicConsentEnabled
+                              ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                              : "bg-white text-black hover:bg-slate-100"
+                          }`}
+                        >
+                          {syncingPublicConsent
+                            ? "Updating..."
+                            : publicConsentEnabled
+                              ? "Public Sharing: ON"
+                              : "Enable Public QR Sharing"}
+                        </button>
                       </div>
-                      <a
-                        href={`/passport/view/${property.id}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs font-black flex items-center gap-1 shrink-0 shadow-sm transition"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                        Preview Buyer View
-                      </a>
+                      {publicConsentEnabled && (
+                        <div className="flex items-center justify-between pt-2 border-t border-slate-200">
+                          <span className="text-[11px] font-bold text-emerald-800">
+                            ✓ Public consent active — coarse property passport is live.
+                          </span>
+                          <a
+                            href={`/passport/view/${property.id}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs font-black flex items-center gap-1 shrink-0 shadow-sm transition"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                            Preview Buyer View
+                          </a>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

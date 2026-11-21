@@ -14,6 +14,7 @@ import {
   assertSucceeds,
   RulesTestEnvironment,
 } from "@firebase/rules-unit-testing";
+import { initializeNamedDbTestEnvironment } from "./helpers/namedDbEmulator";
 import {
   doc,
   getDoc,
@@ -43,7 +44,7 @@ describe("Comprehensive Firebase Security Rules Regression Suite (Firestore & St
 
   beforeAll(async () => {
     try {
-      testEnv = await initializeTestEnvironment({
+      testEnv = await initializeNamedDbTestEnvironment({
         projectId: PROJECT_ID,
         firestore: {
           rules: firestoreRules,
@@ -1906,7 +1907,12 @@ describe("Comprehensive Firebase Security Rules Regression Suite (Firestore & St
       const jobData = jobSnap.data()!;
       expect(jobData.status).toBe("accepted");
       expect(jobData.acceptedQuoteId).toBe(acceptedQuoteId);
-      expect(jobData.verificationPin).toBeDefined();
+      expect(jobData.verificationPin).toBeUndefined();
+      expect(jobData.hasVerificationPin).toBe(true);
+
+      const arrivalPinSnap = await db.collection("job_arrival_pins").doc(jobId).get();
+      expect(arrivalPinSnap.exists).toBe(true);
+      expect(arrivalPinSnap.data()?.verificationPin).toBeDefined();
 
       // Verify accepted quote state
       const acceptedQuoteSnap = await db.collection("jobs").doc(jobId).collection("quotes").doc(acceptedQuoteId).get();
@@ -2882,6 +2888,51 @@ describe("Comprehensive Firebase Security Rules Regression Suite (Firestore & St
         updateDoc(doc(aliceDb, "assets", "asset_alice_boiler"), {
           ownerId: "alice_asset_owner",
           name: "Worcester Bosch Boiler 2026",
+        })
+      );
+    });
+
+    it("97. AT-RIDE-PAY-09: driver_metrics denies all client writes while permitting owner/admin reads", async () => {
+      await testEnv.withSecurityRulesDisabled(async (context) => {
+        const adminDb = context.firestore();
+        await setDoc(doc(adminDb, "driver_metrics", "driver_metrics_owner"), {
+          driverId: "driver_metrics_owner",
+          date: "2026-11-20",
+          dailyEarnings: 42.5,
+          jobsDoneToday: 2,
+          onlineSecondsToday: 1200,
+        });
+      });
+
+      const ownerDb = testEnv.authenticatedContext("driver_metrics_owner").firestore();
+      const strangerDb = testEnv.authenticatedContext("stranger_driver").firestore();
+      const adminDb = testEnv
+        .authenticatedContext("platform_admin", {
+          admin: true,
+          firebase: { sign_in_provider: "password" },
+        })
+        .firestore();
+
+      // Owner and admin can read; stranger cannot
+      await assertSucceeds(getDoc(doc(ownerDb, "driver_metrics", "driver_metrics_owner")));
+      await assertSucceeds(getDoc(doc(adminDb, "driver_metrics", "driver_metrics_owner")));
+      await assertFails(getDoc(doc(strangerDb, "driver_metrics", "driver_metrics_owner")));
+
+      // Even the owning driver and admin client SDKs cannot forge direct metrics writes
+      await assertFails(
+        setDoc(doc(ownerDb, "driver_metrics", "driver_metrics_owner"), {
+          dailyEarnings: 9999,
+          jobsDoneToday: 100,
+        })
+      );
+      await assertFails(
+        updateDoc(doc(ownerDb, "driver_metrics", "driver_metrics_owner"), {
+          onlineSecondsToday: 0,
+        })
+      );
+      await assertFails(
+        updateDoc(doc(adminDb, "driver_metrics", "driver_metrics_owner"), {
+          dailyEarnings: 9999,
         })
       );
     });

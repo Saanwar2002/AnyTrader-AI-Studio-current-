@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { ChevronLeft, Shield, CheckCircle2, ChevronRight, Star, ExternalLink, ArrowRight, ShieldCheck } from "lucide-react";
 import { cn } from "@/src/lib/utils";
+import { openSafeExternalUrl } from "@/src/lib/safeExternalUrl";
 import { db, collection, getDocs, query, where, orderBy } from "@/src/firebase";
 import { useAuth } from "../AuthProvider";
 import { doc, updateDoc, serverTimestamp } from "firebase/firestore";
@@ -108,7 +109,7 @@ export default function InsuranceMarketplace({
             // A more complex integration would create a lead record here.
          } catch(e) {}
      }
-     window.open(partner.trackingUrl, '_blank', 'noopener,noreferrer');
+     openSafeExternalUrl(partner.trackingUrl);
   };
 
   return (

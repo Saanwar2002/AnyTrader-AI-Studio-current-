@@ -1,6 +1,7 @@
 import admin from 'firebase-admin';
 import Stripe from 'stripe';
 import { randomUUID } from 'crypto';
+import { evaluateInstantMatchCandidate } from './src/server/instantMatchEligibility.ts';
 
 let stripeClient: Stripe | null = null;
 function getStripeClient(): Stripe | null {
@@ -302,7 +303,13 @@ export function startInstantMatchEngine(db: admin.firestore.Firestore) {
   };
 }
 
-export async function createInstantMatchAttempt(db: any, matchRef: any, attemptNumber: number, trader: any, intervalSeconds: number): Promise<boolean> {
+export async function createInstantMatchAttempt(
+  db: any,
+  matchRef: any,
+  attemptNumber: number,
+  trader: { id: string; score?: number; scheduleSignalApplied?: boolean },
+  intervalSeconds: number
+): Promise<boolean> {
   const attemptRef = db.collection("instant_match_attempts").doc(matchRef.id + "_" + attemptNumber);
   const expiresAt = new Date(Date.now() + intervalSeconds * 1000);
   return db.runTransaction(async (tx: any) => {
@@ -312,144 +319,84 @@ export async function createInstantMatchAttempt(db: any, matchRef: any, attemptN
     if (latestMatch.status !== "searching" || Number(latestMatch.currentAttempt || 0) !== attemptNumber - 1) return false;
     tx.create(attemptRef, {
       id: attemptRef.id, instantMatchId: matchRef.id, attemptNumber, traderId: trader.id,
-      traderCompositeScore: Math.floor(Math.random() * 50) + 70, smartScheduleFitApplied: true,
+      traderCompositeScore: Number.isFinite(Number(trader.score)) ? Number(trader.score) : 0,
+      smartScheduleFitApplied: Boolean(trader.scheduleSignalApplied),
       status: "pending", createdAt: new Date().toISOString(), expiresAt: expiresAt.toISOString()
     });
     tx.update(matchRef, { currentAttempt: attemptNumber });
     return true;
   });
 }
-async function initiateNextAttempt(db: admin.firestore.Firestore, matchRef: admin.firestore.DocumentReference, match: any, attemptNumber: number) {
-  // 1. Get previously tried traders
-  const previouslyTriedSnap = await db.collection("instant_match_attempts").where("instantMatchId", "==", matchRef.id).get();
-  const triedTraderIds = previouslyTriedSnap.docs.map(d => d.data().traderId);
 
-  // 1.5 Fetch job to get category, text, and postcode
-  let jobCategory = null;
+export async function selectNextInstantMatchCandidate(
+  db: admin.firestore.Firestore | any,
+  match: any,
+  triedTraderIds: string[],
+  config: Record<string, any> = globalConfig
+): Promise<{ id: string; score: number; scheduleSignalApplied: boolean } | null> {
+  let jobCategory: string | null = null;
   let jobText = "";
   let jobPostcode = "";
-  if (match.jobId) {
+  if (match?.jobId) {
     const jobSnap = await db.collection("jobs").doc(match.jobId).get();
     if (jobSnap.exists) {
       const jobData = jobSnap.data();
-      jobCategory = jobData?.category;
+      jobCategory = jobData?.category || null;
       jobPostcode = jobData?.postcode || "";
       jobText = `${jobData?.title || ""} ${jobData?.description || ""}`.toLowerCase();
     }
   }
 
-  // 2. We could query users where role == 'tradesperson'
-  // For small-scale launch, we grab all tradespeople and filter in memory to ensure fallback
-  const allTradersSnap = await db.collection("users").where("role", "==", "tradesperson").get();
-  
-  let availableTraders = allTradersSnap.docs.filter(d => {
-    if (triedTraderIds.includes(d.id)) return false;
+  const [allTradersSnap, publicProfilesSnap] = await Promise.all([
+    db.collection("users").where("role", "==", "tradesperson").get(),
+    db.collection("public_profiles").get().catch(() => ({ docs: [] })),
+  ]);
 
-    const data = d.data();
-    
-    if (globalConfig.imRequireEmergencyToggle && !data.isAvailableForEmergency) {
-      return false;
-    }
+  const publicProfileById = new Map<string, Record<string, any>>();
+  for (const pDoc of publicProfilesSnap?.docs || []) {
+    const pData = typeof pDoc.data === "function" ? pDoc.data() : pDoc.data;
+    if (pData) publicProfileById.set(pDoc.id, pData);
+  }
+  const hasPublicProfilesProjection = publicProfileById.size > 0;
 
-    if (globalConfig.imRequireVerified && !data.isVerified) {
-      return false;
-    }
-    
-    // Category Matching
-    if (globalConfig.imRequireCategoryMatch && jobCategory) {
-      const traderCategories = data.trades || [];
-      if (!traderCategories.includes(jobCategory) && data.category !== jobCategory) {
-        return false;
-      }
-    }
+  const jobContext = { jobCategory, jobText, jobPostcode, triedTraderIds };
+  const rankedCandidates: Array<{ id: string; score: number; scheduleSignalApplied: boolean }> = [];
 
-    // Tag/Skill Matching
-    if (globalConfig.imRequireTagMatch && jobText) {
-      const tags = data.tags || [];
-      const hasMatch = tags.some((tag: string) => jobText.includes(tag.toLowerCase().trim()));
-      if (!hasMatch && tags.length > 0) {
-        return false;
-      }
+  for (const d of allTradersSnap.docs || []) {
+    const userData = typeof d.data === "function" ? d.data() : d.data;
+    const publicProfile = publicProfileById.get(d.id) || null;
+    const evaluation = evaluateInstantMatchCandidate(
+      d.id,
+      userData,
+      publicProfile,
+      config,
+      jobContext,
+      { requirePublicProjection: hasPublicProfilesProjection }
+    );
+    if (evaluation.eligible) {
+      rankedCandidates.push({
+        id: d.id,
+        score: evaluation.score,
+        scheduleSignalApplied: evaluation.scheduleSignalApplied,
+      });
     }
+  }
 
-    return true;
-  });
-  
-  if (availableTraders.length === 0) {
-    // No more traders!
+  if (rankedCandidates.length === 0) return null;
+  rankedCandidates.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  return rankedCandidates[0];
+}
+
+async function initiateNextAttempt(db: admin.firestore.Firestore, matchRef: admin.firestore.DocumentReference, match: any, attemptNumber: number) {
+  const previouslyTriedSnap = await db.collection("instant_match_attempts").where("instantMatchId", "==", matchRef.id).get();
+  const triedTraderIds = previouslyTriedSnap.docs.map(d => d.data().traderId);
+
+  const nextTrader = await selectNextInstantMatchCandidate(db, match, triedTraderIds, globalConfig);
+
+  if (!nextTrader) {
     await expireAndRefundInstantMatch(db, matchRef, getStripeClient(), "no_eligible_traders");
     return;
   }
 
-  // 3. Selection Criteria: Score-based Weighting
-  // Instead of strict sequential sorting, we assign points to each trader:
-  // - Emergency Toggle: +50 points
-  // - Verified Profile: +20 points
-  // - Category Match: +30 points
-  // - Skill/Tag Match: +5 points per matched tag
-  availableTraders.sort((a, b) => {
-    const aData = a.data();
-    const bData = b.data();
-    
-    // Compute scores
-    const getScore = (data: any) => {
-      let score = 0;
-      
-      if (data.isAvailableForEmergency) score += 50;
-      
-      if (data.isVerified) score += 20;
-      
-      const isCatMatch = (data.trades || []).includes(jobCategory) || data.category === jobCategory;
-      if (isCatMatch) score += 30;
-      
-      if (jobText) {
-        const tags = data.tags || [];
-        const matchedTags = tags.filter((tag: string) => tag && jobText.includes(tag.toLowerCase().trim())).length;
-        score += matchedTags * 5;
-      }
-      
-      // Video Credential Verification Signal Boost (+25 Points)
-      if (data.videoVerificationStatus === "verified" || data.videoVerificationUrl) {
-        score += 25;
-      }
-
-      // Proximity (Postcode Matching API)
-      if (jobPostcode && data.postcode) {
-        const tPost = data.postcode.trim().toUpperCase();
-        const jPost = jobPostcode.trim().toUpperCase();
-        if (tPost === jPost) {
-           score += 40; // Exact match = Very close
-        } else if (tPost.split(' ')[0] === jPost.split(' ')[0]) {
-           score += 15; // Outcode match = Same postal district
-        }
-      }
-
-      // Phase 12.4: Schedule Fit & AI Availability 
-      // If the trader is utilizing the AI Calendar actively, boost ranking
-      // (Mock check: any value of 0-20 points for schedule alignment).
-      // A tight travel route alignment + free local slot yields max +20 Points.
-      const smartScheduleFit = Math.floor(Math.random() * 20); // mock calculation
-      score += smartScheduleFit;
-      
-      // Optional: Premium Tier Boost (if applicable)
-      // e.g., 'Gold Elite', 'Platinum Enterprise'
-      const premiumTiers = ["Gold Elite", "Platinum Enterprise", "Silver Professional"];
-      if (data.tierId && premiumTiers.includes(data.tierId)) {
-        score += 15;
-      }
-      
-      return score;
-    };
-    
-    const scoreA = getScore(aData);
-    const scoreB = getScore(bData);
-    
-    // Sort descending by score
-    return scoreB - scoreA;
-  });
-
-  // Pick the top matched trader
-  const nextTrader = availableTraders[0];
-  
   await createInstantMatchAttempt(db, matchRef, attemptNumber, nextTrader, globalConfig.imAttemptIntervalSeconds ?? 60);
 }

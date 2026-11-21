@@ -12,6 +12,7 @@ import type {
   ReconciliationRefundSnapshot,
   ReconciliationTransferSnapshot,
   ReconciliationCaptureSnapshot,
+  ReconciliationConnectPayoutSnapshot,
 } from "./financialReconciliation.ts";
 
 interface FirestoreDocumentLike {
@@ -34,6 +35,7 @@ export interface FinancialReconciliationReadOnlyStripe {
   paymentIntents: { retrieve(id: string): Promise<any> };
   refunds: { list(params: { payment_intent: string; limit: number; starting_after?: string }): Promise<any> };
   transfers: { list(params: { limit: number; starting_after?: string }): Promise<any> };
+  payouts?: { list(params: { limit: number; starting_after?: string }, options?: { stripeAccount: string }): Promise<any> };
 }
 export interface FinancialReconciliationCollectorOptions {
   pageSize?: number;
@@ -49,6 +51,7 @@ export interface FinancialReconciliationCollectionCoverage {
   paymentIntentLookups: number;
   stripeRefundPages: number;
   stripeTransferPages: number;
+  stripeConnectPayoutPages?: number;
   complete: true;
 }
 export interface FinancialReconciliationCollectionResult {
@@ -101,6 +104,8 @@ function transferFingerprint(transfer: ReconciliationTransferSnapshot): string {
     amount: transfer.amount,
     currency: transfer.currency.toLowerCase(),
     destination: transfer.destination || null,
+    reversed: Boolean(transfer.reversed),
+    amountReversed: Number(transfer.amountReversed || 0),
     metadata: Object.keys(transfer.metadata || {}).sort().map(key => [key, transfer.metadata && transfer.metadata[key]]),
   });
 }
@@ -110,6 +115,8 @@ function transferSourceFingerprint(transfer: any): string {
     amount: typeof (transfer && transfer.amount) === "number" ? transfer.amount : Number.NaN,
     currency: String((transfer && transfer.currency) || "").toLowerCase(),
     destination: stripeObjectId(transfer && transfer.destination) || null,
+    reversed: Boolean(transfer && transfer.reversed),
+    amountReversed: typeof (transfer && transfer.amount_reversed) === "number" ? transfer.amount_reversed : 0,
     metadata: Object.keys(metadata).sort().map(key => [key, metadata[key]]),
   });
 }
@@ -397,12 +404,18 @@ export async function collectFinancialReconciliationSnapshot(
         transferMetadata.operationType === "ANYTRADER_ESCROW_RELEASE" ||
         transferMetadata.type === "orchestrated_driver_payout";
       if (!isAnyTraderTransfer) return;
+      const reversalData = Array.isArray(transfer.reversals?.data) ? transfer.reversals.data : [];
       const candidate: ReconciliationTransferSnapshot = {
         transferId,
         amount: numeric(transfer.amount),
         currency: String(transfer.currency || "").toLowerCase(),
         destination: stripeObjectId(transfer.destination),
         metadata: transferMetadata,
+        reversed: Boolean(transfer.reversed),
+        amountReversed: typeof transfer.amount_reversed === "number" ? transfer.amount_reversed : 0,
+        ...(reversalData.length > 0
+          ? { reversalIds: reversalData.map((r: any) => text(r?.id)).filter(Boolean) as string[] }
+          : {}),
       };
       const existing = transfersById.get(transferId);
       if (existing && transferFingerprint(existing) !== transferSourceFingerprint(transfer)) {
@@ -412,6 +425,47 @@ export async function collectFinancialReconciliationSnapshot(
     }
   );
   coverage.stripeTransferPages = transferPages;
+
+  const connectPayouts: ReconciliationConnectPayoutSnapshot[] = [];
+  if (stripe.payouts && typeof stripe.payouts.list === "function") {
+    const connectAccountIds = new Set<string>();
+    for (const p of payouts) {
+      if (p.destination && /^acct_[A-Za-z0-9]+$/.test(p.destination) && !p.destination.startsWith("acct_mock_")) {
+        connectAccountIds.add(p.destination);
+      }
+    }
+    for (const tr of transfersById.values()) {
+      if (tr.destination && /^acct_[A-Za-z0-9]+$/.test(tr.destination) && !tr.destination.startsWith("acct_mock_")) {
+        connectAccountIds.add(tr.destination);
+      }
+    }
+    let totalConnectPayoutPages = 0;
+    for (const acctId of [...connectAccountIds].sort()) {
+      const cpPages = await readStripePages(
+        (params) => stripe.payouts!.list(params, { stripeAccount: acctId }),
+        {},
+        stripePageSize,
+        stripeBudget,
+        "connect payouts for " + acctId,
+        (cp) => {
+          const payoutId = text(cp && cp.id);
+          if (!payoutId) return;
+          connectPayouts.push({
+            payoutId,
+            stripeAccountId: acctId,
+            amount: numeric(cp.amount),
+            currency: String(cp.currency || "").toLowerCase(),
+            status: text(cp.status) || "unknown",
+            ...(text(cp.failure_code) ? { failureCode: text(cp.failure_code) } : {}),
+            ...(text(cp.failure_message) ? { failureMessage: text(cp.failure_message) } : {}),
+            ...(typeof cp.arrival_date === "number" ? { arrivalDate: cp.arrival_date } : {}),
+          });
+        }
+      );
+      totalConnectPayoutPages += cpPages;
+    }
+    coverage.stripeConnectPayoutPages = totalConnectPayoutPages;
+  }
 
   const escrows: ReconciliationEscrowSnapshot[] = [];
   for (const [jobId, quoteDocs] of quoteDocsByJob) {
@@ -470,6 +524,7 @@ export async function collectFinancialReconciliationSnapshot(
       refunds: [...refundsById.values()],
       transfers: [...transfersById.values()],
       payouts,
+      ...(connectPayouts.length > 0 ? { connectPayouts } : {}),
       escrows,
       refundedTotals,
     },

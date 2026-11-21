@@ -206,3 +206,93 @@ export async function disputeJobViaCommand(options: DisputeJobOptions): Promise<
     idempotencyKey
   );
 }
+
+/**
+ * Authoritative Job Edit Adapter (AT-CJ-JOB-07)
+ * Updates the job and synchronizes public_job_cards atomically on the server.
+ */
+export async function updateJobViaCommand(options: {
+  user: User;
+  jobId: string;
+  payload: Record<string, any>;
+}): Promise<{ success: boolean; jobId: string; job: Record<string, any>; publicCardSynced: boolean }> {
+  const { user, jobId, payload } = options;
+  if (!user || !user.uid) {
+    throw new Error("Authentication required: you must be signed in to update a job.");
+  }
+  if (!jobId) {
+    throw new Error("Job ID is required.");
+  }
+  const token = await user.getIdToken();
+  const response = await fetch(getApiUrl(`/api/jobs/${encodeURIComponent(jobId)}/update`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `Job update failed with status ${response.status}`);
+  }
+  return data;
+}
+
+/**
+ * Submits milestone deliverables for homeowner review (AT-CJ-MILESTONE-01)
+ */
+export async function submitMilestoneWorkViaApi(options: {
+  user: User;
+  jobId: string;
+  quoteId: string;
+  milestoneId: string;
+  deliverableNotes: string;
+  deliverablePhotos?: string[];
+}): Promise<{ success: boolean; status: string; milestone: any }> {
+  const { user, jobId, quoteId, milestoneId, deliverableNotes, deliverablePhotos } = options;
+  if (!user || !user.uid) throw new Error("Authentication required.");
+  const token = await user.getIdToken();
+  const response = await fetch(getApiUrl("/api/milestones/submit-work"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ jobId, quoteId, milestoneId, deliverableNotes, deliverablePhotos }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || "Failed to submit milestone deliverables");
+  }
+  return data;
+}
+
+/**
+ * Homeowner review decision for submitted milestone work (AT-CJ-MILESTONE-01)
+ */
+export async function reviewMilestoneWorkViaApi(options: {
+  user: User;
+  jobId: string;
+  quoteId: string;
+  milestoneId: string;
+  decision: "approve" | "request_revision";
+  revisionReason?: string;
+}): Promise<{ success: boolean; status: string; milestone: any }> {
+  const { user, jobId, quoteId, milestoneId, decision, revisionReason } = options;
+  if (!user || !user.uid) throw new Error("Authentication required.");
+  const token = await user.getIdToken();
+  const response = await fetch(getApiUrl("/api/milestones/review-work"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ jobId, quoteId, milestoneId, decision, revisionReason }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || "Failed to review milestone deliverables");
+  }
+  return data;
+}

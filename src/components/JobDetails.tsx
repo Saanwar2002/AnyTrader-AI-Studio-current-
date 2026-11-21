@@ -40,7 +40,7 @@ import {
   getStripeOnboardingLink, 
   type PayoutBreakdown 
 } from "@/src/services/stripeIntegrationService";
-import { createOrGetJobInvoice, downloadInvoicePDF } from "@/src/services/invoiceService";
+import { createOrGetJobInvoice, downloadInvoicePDF, calculateInvoiceSummary } from "@/src/services/invoiceService";
 import { RECURRING_CATEGORIES } from "@/src/constants";
 import { format, addHours, parseISO } from 'date-fns';
 import { TrustPulse } from "./TrustPulse";
@@ -54,58 +54,30 @@ import {
   startJobViaCommand, 
   completeJobViaCommand, 
   cancelJobViaCommand, 
-  disputeJobViaCommand 
+  disputeJobViaCommand,
+  submitMilestoneWorkViaApi,
+  reviewMilestoneWorkViaApi
 } from "@/src/services/jobCommandService";
+import {
+  buildGoogleCalendarUrl,
+  buildOutlookCalendarUrl,
+  buildLondonIcsContent,
+} from "@/src/lib/calendarExport";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 
-// Helper to generate Google Calendar link
-const generateGoogleCalendarLink = (job: any, quote: any) => {
-  const title = encodeURIComponent(`Job: ${job.title}`);
-  const description = encodeURIComponent(`Job Details: ${job.description}\n\nQuote Amount: £${quote.amount}\nJob ID: ${job.id}`);
-  const location = encodeURIComponent(job.postcode || "");
-  
-  const startDate = quote.startDate || new Date().toISOString().split('T')[0];
-  const start = startDate.replace(/-/g, '') + 'T090000Z';
-  const end = startDate.replace(/-/g, '') + 'T170000Z'; // Default 9-5
-  
-  return `https://www.google.com/calendar/render?action=TEMPLATE&text=${title}&details=${description}&location=${location}&dates=${start}/${end}`;
-};
+// Helper to generate Google Calendar link (Europe/London)
+const generateGoogleCalendarLink = (job: any, quote: any) => buildGoogleCalendarUrl(job, quote);
 
-// Helper to generate Outlook Calendar link
-const generateOutlookCalendarLink = (job: any, quote: any) => {
-  const title = encodeURIComponent(`Job: ${job.title}`);
-  const description = encodeURIComponent(`Job Details: ${job.description}\n\nQuote Amount: £${quote.amount}\nJob ID: ${job.id}`);
-  const location = encodeURIComponent(job.postcode || "");
-  
-  const startDate = quote.startDate || new Date().toISOString().split('T')[0];
-  const start = startDate + 'T09:00:00Z';
-  const end = startDate + 'T17:00:00Z';
-  
-  return `https://outlook.live.com/calendar/0/deeplink/compose?subject=${title}&body=${description}&location=${location}&startdt=${start}&enddt=${end}`;
-};
+// Helper to generate Outlook Calendar link (Europe/London)
+const generateOutlookCalendarLink = (job: any, quote: any) => buildOutlookCalendarUrl(job, quote);
 
-// Helper to generate ICS file
+// Helper to generate RFC 5545 Europe/London ICS file
 const downloadICS = (job: any, quote: any) => {
-  const startDate = quote.startDate || new Date().toISOString().split('T')[0];
-  const start = startDate.replace(/-/g, '') + 'T090000Z';
-  const end = startDate.replace(/-/g, '') + 'T170000Z';
-  
-  const icsContent = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "BEGIN:VEVENT",
-    `DTSTART:${start}`,
-    `DTEND:${end}`,
-    `SUMMARY:Job: ${job.title}`,
-    `DESCRIPTION:Job Details: ${job.description}\\n\\nQuote Amount: £${quote.amount}\\nJob ID: ${job.id}`,
-    `LOCATION:${job.postcode || ""}`,
-    "END:VEVENT",
-    "END:VCALENDAR"
-  ].join("\n");
-
-  const blob = new Blob([icsContent], { type: 'text/calendar;charset=utf-8' });
-  const link = document.createElement('a');
+  const icsContent = buildLondonIcsContent(job, quote);
+  const blob = new Blob([icsContent], { type: "text/calendar;charset=utf-8" });
+  const link = document.createElement("a");
   link.href = window.URL.createObjectURL(blob);
-  link.setAttribute('download', `job_${job.id}.ics`);
+  link.setAttribute("download", `job_${job.id}.ics`);
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
@@ -247,6 +219,7 @@ export default function JobDetails() {
   const [showPinModal, setShowPinModal] = useState(false);
   const [enteredPin, setEnteredPin] = useState("");
   const [pinError, setPinError] = useState("");
+  const [homeownerArrivalPin, setHomeownerArrivalPin] = useState("");
   const [imElapsedSeconds, setImElapsedSeconds] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const acceptIdempotencyKeysRef = useRef<Record<string, string>>({});
@@ -299,6 +272,29 @@ const libraries: any[] = ['places', 'geometry'];
         if (jobDoc.exists()) {
           const data = jobDoc.data();
           setJob({ id: jobDoc.id, ...data });
+
+          // Load arrival PIN strictly for homeowner/owner or admin from job_arrival_pins (AT-CJ-SEC-START-01)
+          const isOwnerOrAdmin =
+            user?.uid === data.homeownerId ||
+            user?.uid === data.userId ||
+            user?.uid === data.ownerId ||
+            profile?.role === "admin" ||
+            (profile as any)?.isAdmin;
+          if (isOwnerOrAdmin) {
+            try {
+              const pinSnap = await getDoc(doc(db, "job_arrival_pins", id));
+              if (pinSnap.exists()) {
+                setHomeownerArrivalPin(String(pinSnap.data()?.verificationPin || ""));
+              } else if (data.verificationPin) {
+                setHomeownerArrivalPin(String(data.verificationPin));
+              }
+            } catch (pinReadErr) {
+              console.warn("Arrival PIN read skipped:", pinReadErr);
+              if (data.verificationPin) setHomeownerArrivalPin(String(data.verificationPin));
+            }
+          } else {
+            setHomeownerArrivalPin("");
+          }
 
           // Fetch homeowner profile once (only if owner or admin)
           if (data.homeownerId && fetchedHomeownerIdRef.current !== data.homeownerId) {
@@ -409,29 +405,14 @@ const libraries: any[] = ['places', 'geometry'];
     }
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const quotesData = snapshot.docs.map(doc => ({ id: doc.id, ref: doc.ref, ...doc.data() }));
-      
-      const fortyEightHoursAgo = Date.now() - 48 * 60 * 60 * 1000;
-      const validQuotes: any[] = [];
-      let deletedCount = 0;
+      const quotesData = snapshot.docs.map(doc => ({ id: doc.id, ref: doc.ref, ...doc.data() })) as any[];
+      setQuotes(quotesData);
 
-      for (const quote of quotesData as any[]) {
-        if (quote.status === "rejected") {
-           const rejectedTime = quote.rejectedAt?.seconds ? quote.rejectedAt.seconds * 1000 : 
-                              (quote.updatedAt?.seconds ? quote.updatedAt.seconds * 1000 : quote.createdAt?.seconds * 1000);
-           
-           if (rejectedTime && rejectedTime < fortyEightHoursAgo) {
-             deletedCount++;
-             continue; // Skip adding to state
-           }
-        }
-        validQuotes.push(quote);
-      }
-
-      setQuotes(validQuotes);
-      
-      // Auto-draft quote message if tradesperson has no quote yet
-      if (user?.uid !== job.homeownerId && profile?.role === "tradesperson" && validQuotes.length === 0 && !hasAutoDrafted && !quoteMessage) {
+      // Auto-draft quote message if tradesperson has no active quote yet
+      const hasActive = quotesData.some((qd: any) =>
+        qd.tradespersonId === user?.uid && !["withdrawn", "rejected"].includes(qd.status)
+      );
+      if (user?.uid !== job.homeownerId && profile?.role === "tradesperson" && !hasActive && !hasAutoDrafted && !quoteMessage) {
         setHasAutoDrafted(true);
         const autoDraft = async () => {
           setIsDraftingAI(true);
@@ -665,7 +646,10 @@ const libraries: any[] = ['places', 'geometry'];
         console.warn("Could not check quote limit, proceeding:", limitErr);
       }
       
-      const existingQuote = quotes.find(q => q.tradespersonId === user.uid);
+      // Ignore withdrawn or rejected historical quotes when evaluating active edit vs fresh submission (AT-CJ-QUOTE-UI-01)
+      const existingQuote = quotes.find(
+        (q) => q.tradespersonId === user.uid && !["withdrawn", "rejected"].includes(q.status)
+      );
       
       if (!existingQuote && limitData.allowed === false) {
         const limitMsg = limitData.error || `You have reached your monthly limit of ${limitData.limit} quotes. Please upgrade your tier to quote on more jobs.`;
@@ -867,13 +851,16 @@ const libraries: any[] = ['places', 'geometry'];
       })).catch(console.error);
       
       // Refresh local job and quotes state with authoritative server response
+      if (acceptResult.verificationPin) {
+        setHomeownerArrivalPin(String(acceptResult.verificationPin));
+      }
       setJob((prev: any) => ({
         ...prev,
         status: "accepted",
         acceptedTradespersonId: acceptResult.acceptedTradespersonId || quote.tradespersonId,
         scheduledDate: acceptResult.scheduledDate || quote.startDate || new Date().toISOString().split('T')[0],
         isConfirmedByTradesperson: acceptResult.isConfirmedByTradesperson ?? false,
-        verificationPin: acceptResult.verificationPin,
+        hasVerificationPin: true,
       }));
 
       setQuotes((prev) =>
@@ -972,6 +959,24 @@ const libraries: any[] = ['places', 'geometry'];
         reason: "Declined by homeowner",
       });
 
+      const wasActive = ["pending", "requoted", "requote_requested", "submitted"].includes(String(quote.status || ""));
+      setQuotes((prev) =>
+        prev.map((q) => (q.id === quote.id ? { ...q, status: "rejected", rejectedAt: new Date().toISOString() } : q))
+      );
+      if (wasActive) {
+        setJob((prev: any) => {
+          if (!prev) return prev;
+          const nextCount = Math.max(0, Number(prev.quoteCount ?? prev.quotesCount ?? 1) - 1);
+          return {
+            ...prev,
+            quoteCount: nextCount,
+            quotesCount: nextCount,
+            hasQuotes: nextCount > 0,
+            status: prev.status === "quoted" && nextCount === 0 ? "open" : prev.status,
+          };
+        });
+      }
+
       toast.success("Quote declined.");
 
       // Notify tradesperson
@@ -1029,7 +1034,8 @@ const libraries: any[] = ['places', 'geometry'];
 
   const handleStartJob = async () => {
     if (!id) return;
-    if (job.verificationPin) {
+    if (job.hasVerificationPin || job.verificationPin || job.status === "accepted") {
+      setPinError("");
       setShowPinModal(true);
       return;
     }
@@ -1039,6 +1045,7 @@ const libraries: any[] = ['places', 'geometry'];
   const confirmStartJob = async () => {
     if (!id || !user) return;
     setLoading(true);
+    setPinError("");
     try {
       await startJobViaCommand({
         user,
@@ -1056,8 +1063,11 @@ const libraries: any[] = ['places', 'geometry'];
         "status",
         `/job/${id}`
       );
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error starting job:", err);
+      const msg = err?.message || "Invalid PIN or start preconditions not met.";
+      setPinError(msg);
+      toast.error(msg);
     } finally {
       setLoading(false);
     }
@@ -1142,7 +1152,8 @@ const libraries: any[] = ['places', 'geometry'];
         ...prev, 
         status: "completed", 
         completedAt: new Date(), 
-        hasReview: false, 
+        hasReview: false,
+        hasHomeownerReview: false,
         hasTradespersonReview: false,
         paymentStatus: newPaymentStatus
       }));
@@ -1153,33 +1164,7 @@ const libraries: any[] = ['places', 'geometry'];
       const otherUserId = isHomeownerCall ? (acceptedQuote?.tradespersonId) : job.homeownerId;
       
       if (acceptedQuote) {
-        // Phantom Billing Calculation
-        const potentialFee = (acceptedQuote.amount || 0) * 0.15; // 15% Success Fee (PAYG rate)
-        
-        const tpRef = doc(db, "users", acceptedQuote.tradespersonId);
-        const tpUpdateData: any = {};
-
-        if (potentialFee > 0) {
-          tpUpdateData.phantomFeesSaved = increment(potentialFee);
-        }
-
-        tpUpdateData.totalJobsDone = increment(1);
-        if (acceptedQuote.amount && acceptedQuote.amount > 0) {
-          tpUpdateData.completedJobsRevenue = increment(acceptedQuote.amount);
-        }
-
-        if (job.isBoosted && job.urgency === 'emergency') {
-          tpUpdateData.boostedEmergencyJobsDone = increment(1);
-        }
-
-        try {
-          if (Object.keys(tpUpdateData).length > 0) {
-            await updateDoc(tpRef, tpUpdateData);
-          }
-        } catch (tpErr) {
-          console.error("Error updating tradesperson profile:", tpErr);
-        }
-
+        // Trader completion & savings metrics are updated transactionally on the server in CompleteJob (AT-CJ-COMPLETE-01).
         // Automated Free & Pro Invoicing System
         try {
           const tpProf = tradespersonProfiles[acceptedQuote.tradespersonId] || profile;
@@ -1322,10 +1307,80 @@ const libraries: any[] = ['places', 'geometry'];
     }
   };
 
+  const [confirmReleaseMilestoneId, setConfirmReleaseMilestoneId] = useState<string | null>(null);
+  const [submittingMilestoneId, setSubmittingMilestoneId] = useState<string | null>(null);
+  const [milestoneDeliverableNotes, setMilestoneDeliverableNotes] = useState<string>("");
+  const [reviewingRevisionMilestoneId, setReviewingRevisionMilestoneId] = useState<string | null>(null);
+  const [milestoneRevisionReason, setMilestoneRevisionReason] = useState<string>("");
+
+  const handleSubmitMilestoneDeliverable = async (quote: any, milestone: any) => {
+    if (!user || !id) return;
+    if (milestoneDeliverableNotes.trim().length < 3) {
+      toast.error("Please enter short work summary notes before submitting.");
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      await submitMilestoneWorkViaApi({
+        user,
+        jobId: id,
+        quoteId: quote.id,
+        milestoneId: milestone.id,
+        deliverableNotes: milestoneDeliverableNotes.trim(),
+      });
+      toast.success("Milestone deliverables submitted for homeowner review.");
+      setSubmittingMilestoneId(null);
+      setMilestoneDeliverableNotes("");
+    } catch (err: any) {
+      console.error("Milestone Deliverable Submit Error:", err);
+      toast.error(err?.message || "Failed to submit milestone deliverables.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleReviewMilestoneDeliverable = async (
+    quote: any,
+    milestone: any,
+    decision: "approve" | "request_revision"
+  ) => {
+    if (!user || !id) return;
+    if (decision === "request_revision" && milestoneRevisionReason.trim().length < 3) {
+      toast.error("Please provide a short reason explaining the requested revision.");
+      return;
+    }
+    setIsProcessing(true);
+    try {
+      await reviewMilestoneWorkViaApi({
+        user,
+        jobId: id,
+        quoteId: quote.id,
+        milestoneId: milestone.id,
+        decision,
+        revisionReason: decision === "request_revision" ? milestoneRevisionReason.trim() : undefined,
+      });
+      toast.success(
+        decision === "approve"
+          ? "Milestone work approved and unlocked for payout release!"
+          : "Revision requested — tradesperson notified."
+      );
+      setReviewingRevisionMilestoneId(null);
+      setMilestoneRevisionReason("");
+    } catch (err: any) {
+      console.error("Milestone Deliverable Review Error:", err);
+      toast.error(err?.message || "Failed to review milestone deliverables.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const handleReleaseMilestone = async (quote: any, milestone: any) => {
     if (!user || !id) return;
-    if (!window.confirm(`Are you sure you want to release £${milestone.amount} to the tradesperson? This confirms you are happy with this stage of work.`)) return;
-    
+    if (confirmReleaseMilestoneId !== milestone.id) {
+      setConfirmReleaseMilestoneId(milestone.id);
+      return;
+    }
+    setConfirmReleaseMilestoneId(null);
     setIsProcessing(true);
     try {
       const token = await user.getIdToken();
@@ -1399,6 +1454,11 @@ const libraries: any[] = ['places', 'geometry'];
   const [rescheduleDate, setRescheduleDate] = useState("");
   const [rescheduleReason, setRescheduleReason] = useState("");
   const [isRescheduling, setIsRescheduling] = useState(false);
+
+  // AT-A11Y-04: Accessible dialog keyboard (Escape-to-close) and focus restoration hooks
+  const disputeDialogRef = useDialogA11y<HTMLDivElement>(showDisputeModal, () => setShowDisputeModal(false));
+  const recurringDialogRef = useDialogA11y<HTMLDivElement>(showRecurringModal, () => setShowRecurringModal(false));
+  const rescheduleDialogRef = useDialogA11y<HTMLDivElement>(showRescheduleModal, () => setShowRescheduleModal(false));
   const [isUploadingBeforePhoto, setIsUploadingBeforePhoto] = useState(false);
   const [showPaymentReminder, setShowPaymentReminder] = useState(false);
   const [reminderChannels, setReminderChannels] = useState({
@@ -1427,17 +1487,17 @@ const libraries: any[] = ['places', 'geometry'];
     
     // Fairness Engine Enforcement
     if (!mediationStakePaid) {
-      alert("To raise a dispute, you must authorize a £25.00 Mediation Stake. This is refunded if the claim is valid, but compensated to the trader if the claim is frivolous.");
+      toast.error("To raise a dispute, please authorize the £25.00 Mediation Stake (refunded if valid).");
       return;
     }
 
     if (disputePhotos.length === 0) {
-      alert("Mandatory Requirement Failure: You must provide photo evidence of the issue to raise a dispute under our Fairness Policy.");
+      toast.error("Photo evidence of the issue is required to raise a dispute.");
       return;
     }
 
     if (!technicalFaultReport.trim() && !isPropertyDamage) {
-      alert("Please provide a technical explanation of the fault. General dissatisfaction or 'petty' reasons are not eligible for platform protection.");
+      toast.error("Please provide a technical explanation of the fault to submit a dispute.");
       return;
     }
 
@@ -1573,7 +1633,7 @@ const libraries: any[] = ['places', 'geometry'];
           quoteId: quote.id,
           milestoneId: quote.milestones?.[0]?.id || "deposit",
           isQrHandshake: true,
-          handshakeCode: job.verificationPin || job.handshakeCode
+          handshakeCode: homeownerArrivalPin || enteredPin || job.verificationPin || job.handshakeCode
         })
       });
 
@@ -1804,6 +1864,24 @@ const libraries: any[] = ['places', 'geometry'];
         quoteId: quote.id,
         reason: "Revision declined by homeowner",
       });
+
+      const wasActive = ["pending", "requoted", "requote_requested", "submitted"].includes(String(quote.status || ""));
+      setQuotes((prev) =>
+        prev.map((q) => (q.id === quote.id ? { ...q, status: "rejected", rejectedAt: new Date().toISOString() } : q))
+      );
+      if (wasActive) {
+        setJob((prev: any) => {
+          if (!prev) return prev;
+          const nextCount = Math.max(0, Number(prev.quoteCount ?? prev.quotesCount ?? 1) - 1);
+          return {
+            ...prev,
+            quoteCount: nextCount,
+            quotesCount: nextCount,
+            hasQuotes: nextCount > 0,
+            status: prev.status === "quoted" && nextCount === 0 ? "open" : prev.status,
+          };
+        });
+      }
       
       // Notify tradesperson
       await sendNotification(
@@ -1826,15 +1904,23 @@ const libraries: any[] = ['places', 'geometry'];
   const handleCancelJob = async () => {
     if (!id || !user) return;
     setIsProcessing(true);
+    setError(null);
     try {
-      await cancelJobViaCommand({
+      const cancelResult = await cancelJobViaCommand({
         user,
         jobId: id,
       });
-      setJob((prev: any) => ({ ...prev, status: "cancelled" }));
+      if (!cancelResult?.success || cancelResult.status !== "cancelled") {
+        throw new Error("Server did not confirm cancellation status.");
+      }
+      setJob((prev: any) => ({ ...prev, ...(cancelResult.job || {}), status: "cancelled" }));
       setShowActions(false);
-    } catch (err) {
-      console.error(err);
+      toast.success("Job cancelled and counterpart notified.");
+    } catch (err: any) {
+      console.error("Job cancellation error:", err);
+      const errMsg = err?.message || "Failed to cancel job. Please try again.";
+      setError(errMsg);
+      toast.error(errMsg);
     } finally {
       setIsProcessing(false);
     }
@@ -2053,8 +2139,14 @@ const libraries: any[] = ['places', 'geometry'];
   const isHomeowner = user?.uid === job?.homeownerId;
   const isAssignedTrader = quotes.find(q => q.status === "accepted")?.tradespersonId === user?.uid || job?.acceptedTradespersonId === user?.uid;
   const canSeeFullDetails = isHomeowner || isAssignedTrader;
-  const hasQuoted = quotes.some(q => q.tradespersonId === user?.uid);
-  const myQuote = quotes.find(q => q.tradespersonId === user?.uid);
+  const isJobOpenForQuotes = ["posted", "open", "quoted", "quoting", "in_bidding"].includes(String(job?.status || "open"));
+  const targetedTraderUid =
+    job?.targetTradespersonId || job?.targetTraderId || job?.targetProId || job?.directTraderId || null;
+  const isExplicitlyInvitedTrader = Boolean(targetedTraderUid && user?.uid && targetedTraderUid === user.uid);
+  const myQuote = quotes.find(
+    (q) => q.tradespersonId === user?.uid && !["withdrawn", "rejected"].includes(String(q.status || ""))
+  );
+  const hasQuoted = Boolean(myQuote);
   const needsRequote = myQuote?.status === "requote_requested";
 
   useEffect(() => {
@@ -2914,7 +3006,7 @@ const libraries: any[] = ['places', 'geometry'];
         )}
 
         {/* Verification PIN Banner (Homeowner) */}
-        {isHomeowner && job.status === "accepted" && job.verificationPin && (
+        {isHomeowner && job.status === "accepted" && (homeownerArrivalPin || job.verificationPin) && (
           <div className="bg-indigo-600 text-white p-6 rounded-3xl space-y-4 shadow-xl shadow-indigo-100 relative overflow-hidden">
             <div className="absolute top-0 right-0 p-4 opacity-10">
               <ShieldCheck className="w-24 h-24" />
@@ -2927,7 +3019,7 @@ const libraries: any[] = ['places', 'geometry'];
               <div className="bg-white/10 p-4 rounded-2xl flex items-center justify-between">
                 <div>
                   <p className="text-xs font-bold text-indigo-200 uppercase tracking-widest mb-1">Verification PIN</p>
-                  <p className="text-4xl font-black font-mono tracking-[0.25em]">{job.verificationPin}</p>
+                  <p className="text-4xl font-black font-mono tracking-[0.25em]">{homeownerArrivalPin || job.verificationPin}</p>
                 </div>
               </div>
             </div>
@@ -3245,12 +3337,12 @@ const libraries: any[] = ['places', 'geometry'];
             )}
             <span className={cn(
               "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider",
-              job.status === "posted" ? ((job.quoteCount || 0) >= 5 ? "bg-yellow-50 text-yellow-700 border border-black" : "bg-blue-50 text-blue-600") :
+              isJobOpenForQuotes ? ((job.quoteCount || 0) >= 5 ? "bg-yellow-50 text-yellow-700 border border-black" : "bg-blue-50 text-blue-600") :
               job.status === "accepted" ? "bg-green-50 text-green-600" :
               job.status === "in_progress" ? "bg-orange-50 text-orange-600" :
               "bg-slate-100 text-slate-600"
             )}>
-              {job.status === 'posted' ? ((job.quoteCount || 0) >= 5 ? 'Max Quotes Reached' : 'Seeking Quotes') : job.status.replace('_', ' ')}
+              {isJobOpenForQuotes ? ((job.quoteCount || 0) >= 5 ? 'Max Quotes Reached' : 'Seeking Quotes') : String(job.status || '').replace('_', ' ')}
             </span>
             {job.status === "accepted" && job.scheduledDate && (
               <div className="flex items-center gap-2">
@@ -3403,10 +3495,18 @@ const libraries: any[] = ['places', 'geometry'];
                   setJob((prev: any) => ({ ...prev, urgency: "asap", expiryAcknowledged: true }));
                 }} className="bg-white text-red-600 border border-red-200 px-4 py-2 rounded-xl text-sm font-bold">Convert to Standard</button>
                 <button onClick={async () => {
-                  if (user && id) {
-                    await cancelJobViaCommand({ user, jobId: id, reason: "Cancelled via expiry banner" });
+                  try {
+                    if (user && id) {
+                      const cancelResult = await cancelJobViaCommand({ user, jobId: id, reason: "Cancelled via expiry banner" });
+                      if (!cancelResult?.success || cancelResult.status !== "cancelled") {
+                        throw new Error("Server did not confirm cancellation.");
+                      }
+                      toast.success("Job cancelled.");
+                    }
+                    navigate("/my-jobs");
+                  } catch (cancelErr: any) {
+                    toast.error(cancelErr?.message || "Failed to cancel job.");
                   }
-                  navigate("/my-jobs");
                 }} className="bg-white text-slate-600 border border-black px-4 py-2 rounded-xl text-sm font-bold">Delete Post</button>
               </div>
             </div>
@@ -3958,13 +4058,13 @@ const libraries: any[] = ['places', 'geometry'];
                 Quotes ({Math.max(quotes.length, Math.max(0, job.quoteCount || 0))})
               </h3>
               <div className="flex items-center gap-3">
-                {isHomeowner && quotes.length > 1 && job.status === "posted" && (
+                {isHomeowner && quotes.length > 1 && isJobOpenForQuotes && (
                   <div className="flex items-center gap-1.5 bg-blue-50 px-3 py-1.5 rounded-xl border border-blue-100">
                     <Sparkles className="w-3.5 h-3.5 text-blue-600" />
                     <span className="text-[10px] font-black text-blue-700 uppercase tracking-wider">Smart Sorted</span>
                   </div>
                 )}
-                {quotes.length > 1 && isHomeowner && job.status === "posted" && (
+                {quotes.length > 1 && isHomeowner && isJobOpenForQuotes && (
                   <button 
                     onClick={() => setIsComparisonModalOpen(true)}
                     className="bg-blue-600 text-white px-6 py-2.5 rounded-2xl font-black text-sm hover:bg-blue-700 transition-all shadow-lg shadow-blue-100 flex items-center gap-2 active:scale-95"
@@ -4486,56 +4586,187 @@ const libraries: any[] = ['places', 'geometry'];
                       </div>
                     ) : (
                       <div className="space-y-3">
-                        {(quote.milestones || []).map((milestone: any, idx: number) => (
-                          <div key={milestone.id} className="bg-white p-3 rounded-xl border border-black flex items-center justify-between shadow-sm">
-                            <div className="flex items-center gap-3">
-                              <div className={cn(
-                                "w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold",
-                                milestone.status === "funded" ? "bg-green-100 text-green-600" :
-                                milestone.status === "funds_released" ? "bg-blue-100 text-blue-600" :
-                                "bg-slate-100 text-slate-400"
-                              )}>
-                                {idx + 1}
-                              </div>
-                              <div>
-                                <p className="text-xs font-bold text-slate-900">{milestone.title}</p>
-                                <p className="text-[10px] font-medium text-slate-500 capitalize">{milestone.status.replace('_', ' ')}</p>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-4">
-                              <p className="text-sm font-black text-slate-900">£{milestone.amount}</p>
-                              {isHomeowner ? (
-                                milestone.status === 'pending_funding' ? (
-                                  <button 
-                                    onClick={() => handleFundMilestone(quote, milestone)}
-                                    disabled={isProcessing}
-                                    className="bg-[#1e3a5f] text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-[#162a45] transition-all"
-                                  >
-                                    Authorize Payment
-                                  </button>
-                                ) : milestone.status === 'funded' ? (
-                                  <button 
-                                    onClick={() => handleReleaseMilestone(quote, milestone)}
-                                    disabled={isProcessing}
-                                    className="bg-green-600 text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-green-700 transition-all"
-                                  >
-                                    Release Funds
-                                  </button>
-                                ) : (
-                                  <div className="flex items-center gap-1 text-blue-600">
-                                    <CheckCircle2 className="w-3.5 h-3.5" />
-                                    <span className="text-[10px] font-bold uppercase">Paid</span>
+                        {(quote.milestones || []).map((milestone: any, idx: number) => {
+                          const msStatus = String(milestone.status || "pending");
+                          const isPendingFunding = msStatus === "pending" || msStatus === "pending_funding";
+                          const isFundedOrActive = msStatus === "funded" || msStatus === "in_progress";
+                          const isSubmitted = msStatus === "submitted";
+                          const isApproved = msStatus === "approved";
+                          const isReleased = msStatus === "released" || msStatus === "funds_released";
+                          const isTraderForQuote = user?.uid === quote.tradespersonId;
+
+                          return (
+                            <div key={milestone.id} className="bg-white p-3.5 rounded-xl border border-black shadow-sm space-y-2.5">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-3 min-w-0">
+                                  <div className={cn(
+                                    "w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0",
+                                    isFundedOrActive ? "bg-green-100 text-green-700" :
+                                    isSubmitted ? "bg-amber-100 text-amber-800" :
+                                    isApproved || isReleased ? "bg-blue-100 text-blue-700" :
+                                    "bg-slate-100 text-slate-600"
+                                  )}>
+                                    {idx + 1}
                                   </div>
-                                )
-                              ) : (
-                                <div className="px-3 py-1.5 rounded-lg text-[10px] font-bold bg-slate-50 text-slate-400">
-                                  {milestone.status === 'pending_funding' ? "Awaiting Deposit" : 
-                                   milestone.status === 'funded' ? "Ready to Release" : "Disbursed"}
+                                  <div className="min-w-0">
+                                    <p className="text-xs font-bold text-black truncate">{milestone.title}</p>
+                                    <p className="text-[10px] font-medium text-slate-600 capitalize">
+                                      {msStatus.replace(/_/g, " ")}
+                                    </p>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2.5 shrink-0">
+                                  <p className="text-sm font-black text-black">£{Number(milestone.amount || 0).toFixed(2)}</p>
+                                  {isHomeowner ? (
+                                    isPendingFunding ? (
+                                      <button
+                                        onClick={() => handleFundMilestone(quote, milestone)}
+                                        disabled={isProcessing}
+                                        className="bg-[#1e3a5f] text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-[#162a45] transition-all"
+                                      >
+                                        Authorize Payment
+                                      </button>
+                                    ) : isReleased ? (
+                                      <div className="flex items-center gap-1 text-blue-600">
+                                        <CheckCircle2 className="w-3.5 h-3.5" />
+                                        <span className="text-[10px] font-bold uppercase">Paid</span>
+                                      </div>
+                                    ) : (isFundedOrActive || isApproved) ? (
+                                      <button
+                                        onClick={() => handleReleaseMilestone(quote, milestone)}
+                                        disabled={isProcessing}
+                                        className={cn(
+                                          "text-white px-3 py-1.5 rounded-lg text-[10px] font-bold transition-all",
+                                          confirmReleaseMilestoneId === milestone.id ? "bg-emerald-700 ring-2 ring-emerald-400" : "bg-green-600 hover:bg-green-700"
+                                        )}
+                                      >
+                                        {confirmReleaseMilestoneId === milestone.id ? "Confirm Release" : "Release Funds"}
+                                      </button>
+                                    ) : null
+                                  ) : (
+                                    <div className="px-2.5 py-1 rounded-lg text-[10px] font-bold bg-slate-100 text-black border border-black/20">
+                                      {isPendingFunding
+                                        ? "Awaiting Deposit"
+                                        : isSubmitted
+                                        ? "Awaiting Approval"
+                                        : isApproved
+                                        ? "Approved — Payout Ready"
+                                        : isReleased
+                                        ? "Disbursed"
+                                        : "Escrow Funded"}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {milestone.deliverableNotes && (
+                                <div className="bg-slate-50 border border-black/20 rounded-lg p-2.5 text-[11px] text-black">
+                                  <span className="font-bold">Work Submitted: </span>
+                                  {milestone.deliverableNotes}
                                 </div>
                               )}
+                              {milestone.revisionReason && msStatus === "in_progress" && (
+                                <div className="bg-amber-50 border border-amber-300 rounded-lg p-2.5 text-[11px] text-amber-900">
+                                  <span className="font-bold">Revision Requested: </span>
+                                  {milestone.revisionReason}
+                                </div>
+                              )}
+
+                              {/* Tradesperson Deliverable Submission */}
+                              {isTraderForQuote && isFundedOrActive && (
+                                submittingMilestoneId === milestone.id ? (
+                                  <div className="space-y-2 pt-1">
+                                    <textarea
+                                      rows={2}
+                                      className="w-full p-2 border border-black rounded-lg text-xs text-black"
+                                      placeholder="Describe completed work for this milestone..."
+                                      value={milestoneDeliverableNotes}
+                                      onChange={(e) => setMilestoneDeliverableNotes(e.target.value)}
+                                    />
+                                    <div className="flex gap-2">
+                                      <button
+                                        onClick={() => handleSubmitMilestoneDeliverable(quote, milestone)}
+                                        disabled={isProcessing}
+                                        className="flex-1 bg-blue-600 text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-blue-700"
+                                      >
+                                        Submit Work for Review
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          setSubmittingMilestoneId(null);
+                                          setMilestoneDeliverableNotes("");
+                                        }}
+                                        className="px-3 py-1.5 border border-black rounded-lg text-[10px] font-bold text-black"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <button
+                                    onClick={() => {
+                                      setSubmittingMilestoneId(milestone.id);
+                                      setMilestoneDeliverableNotes(milestone.deliverableNotes || "");
+                                    }}
+                                    className="w-full bg-blue-600 text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-blue-700"
+                                  >
+                                    Submit Work Deliverables
+                                  </button>
+                                )
+                              )}
+
+                              {/* Homeowner Review / Approve / Request Revision */}
+                              {isHomeowner && isSubmitted && (
+                                reviewingRevisionMilestoneId === milestone.id ? (
+                                  <div className="space-y-2 pt-1">
+                                    <textarea
+                                      rows={2}
+                                      className="w-full p-2 border border-black rounded-lg text-xs text-black"
+                                      placeholder="Describe what changes are needed..."
+                                      value={milestoneRevisionReason}
+                                      onChange={(e) => setMilestoneRevisionReason(e.target.value)}
+                                    />
+                                    <div className="flex gap-2">
+                                      <button
+                                        onClick={() => handleReviewMilestoneDeliverable(quote, milestone, "request_revision")}
+                                        disabled={isProcessing}
+                                        className="flex-1 bg-amber-600 text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-amber-700"
+                                      >
+                                        Send Revision Request
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          setReviewingRevisionMilestoneId(null);
+                                          setMilestoneRevisionReason("");
+                                        }}
+                                        className="px-3 py-1.5 border border-black rounded-lg text-[10px] font-bold text-black"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex flex-wrap gap-2 pt-1">
+                                    <button
+                                      onClick={() => handleReviewMilestoneDeliverable(quote, milestone, "approve")}
+                                      disabled={isProcessing}
+                                      className="flex-1 bg-emerald-600 text-white px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-emerald-700"
+                                    >
+                                      Approve Deliverables
+                                    </button>
+                                    <button
+                                      onClick={() => setReviewingRevisionMilestoneId(milestone.id)}
+                                      disabled={isProcessing}
+                                      className="flex-1 border border-black text-black px-3 py-1.5 rounded-lg text-[10px] font-bold hover:bg-slate-50"
+                                    >
+                                      Request Revision
+                                    </button>
+                                  </div>
+                                )
+                              )}
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
 
@@ -4575,7 +4806,7 @@ const libraries: any[] = ['places', 'geometry'];
                    </div>
                 )}
 
-                {isHomeowner && (quote.status === "pending" || quote.status === "requote_requested") && job.status === "posted" && (
+                {isHomeowner && (quote.status === "pending" || quote.status === "requote_requested" || quote.status === "requoted") && isJobOpenForQuotes && (
                      <div className="pt-3 flex flex-col gap-3">
                        {activeQuoteId === quote.id ? (
                          <div className="space-y-2 mt-1">
@@ -4649,7 +4880,7 @@ const libraries: any[] = ['places', 'geometry'];
                      </div>
                   )}
 
-                  {!isHomeowner && quote.tradespersonId === user?.uid && quote.status === "pending" && job.status === "posted" && (
+                  {!isHomeowner && quote.tradespersonId === user?.uid && (quote.status === "pending" || quote.status === "requoted") && isJobOpenForQuotes && (
                     <div className="flex flex-col gap-2 pt-2 border-t border-slate-100 mt-2">
                       {quote.paymentPreference === "negotiable" && !quote.pendingRevision && (
                         isEditingRevision ? (
@@ -4772,8 +5003,8 @@ const libraries: any[] = ['places', 'geometry'];
         )}
 
         {/* Sidebar Actions (Tradesperson view) */}
-        {!isHomeowner && job.status === "posted" && (
-          (job.quoteCount || 0) >= 5 && !hasQuoted ? (
+        {!isHomeowner && isJobOpenForQuotes && (
+          (job.quoteCount || 0) >= 5 && !hasQuoted && !isExplicitlyInvitedTrader ? (
             <div className="bg-white p-8 rounded-3xl border border-black shadow-sm text-center space-y-4">
               <div className="w-16 h-16 bg-red-50 rounded-full flex items-center justify-center mx-auto">
                 <AlertCircle className="w-8 h-8 text-red-500" />
@@ -5286,8 +5517,26 @@ const libraries: any[] = ['places', 'geometry'];
           )
         )}
 
-        {/* Completion / Review Actions */}
-        {isHomeowner && (job.status === "accepted" || job.status === "in_progress") && (
+        {/* Completion / Arrival Prompt / Review Actions (AT-CJ-JOB-09) */}
+        {isHomeowner && job.status === "accepted" && (
+          <div className="space-y-3">
+            <div className="bg-amber-50 border border-black rounded-2xl p-4 space-y-1.5">
+              <p className="text-xs font-black text-black uppercase tracking-wider">Awaiting Arrival &amp; Start of Work</p>
+              <p className="text-xs text-black/80">
+                The tradesperson must arrive and start work (via the 4-digit arrival PIN) before the job can be marked as completed.
+              </p>
+            </div>
+            <button 
+              onClick={() => setShowDisputeModal(true)}
+              className="w-full bg-white border border-red-200 text-red-600 p-4 rounded-2xl font-bold hover:bg-red-50 transition-all flex items-center justify-center gap-2"
+            >
+              <AlertTriangle className="w-5 h-5" />
+              Raise a Dispute
+            </button>
+          </div>
+        )}
+
+        {isHomeowner && job.status === "in_progress" && (
           <div className="space-y-3">
             <button 
               onClick={handleCompleteJob}
@@ -5484,25 +5733,48 @@ const libraries: any[] = ['places', 'geometry'];
                   </div>
                 )}
               </div>
-              <div className="space-y-3 text-sm">
-                <div className="flex justify-between items-center">
-                   <span className="text-slate-600 font-medium">Trade Works Labour:</span>
-                   <span className="text-slate-900 font-medium">£{(quotes.find(q => q.status === "accepted")?.amount || 0).toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                   <span className="text-slate-600 font-medium">Estimated Materials:</span>
-                   <span className="text-slate-900 font-medium">£{(job.materialsCost || quotes.find(q => q.status === "accepted")?.materialsCost || 0).toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between items-center">
-                   <span className="text-[#1e3a8a] font-medium">VAT (20%):</span>
-                   <span className="text-slate-900 font-medium">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.20).toFixed(2)}</span>
-                </div>
-                <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
-                <div className="flex justify-between items-center pt-1">
-                   <span className="text-black font-black text-[18px]">Total {(job.isPaid === true || job.paymentStatus === "handshake_complete") ? "Paid" : "Due"}:</span>
-                   <span className="text-black font-black text-[18px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}</span>
-                </div>
-              </div>
+              {(() => {
+                const acceptedQuote = quotes.find(q => q.status === "accepted");
+                const tpProf = acceptedQuote ? tradespersonProfiles[acceptedQuote.tradespersonId] : null;
+                const invSummary = calculateInvoiceSummary(acceptedQuote, job, tpProf);
+                return (
+                  <div className="space-y-3 text-sm">
+                    <div className="flex justify-between items-center">
+                      <span className="text-slate-600 font-medium">
+                        {invSummary.platformFee > 0 ? "Trade Works (Net of Platform Fee):" : "Trade Works Labour:"}
+                      </span>
+                      <span className="text-black font-medium">£{invSummary.netLaborLine.toFixed(2)}</span>
+                    </div>
+                    {invSummary.materialsAmount > 0 && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-600 font-medium">Materials &amp; Parts:</span>
+                        <span className="text-black font-medium">£{invSummary.materialsAmount.toFixed(2)}</span>
+                      </div>
+                    )}
+                    {invSummary.platformFee > 0 && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-600 font-medium">Platform Guarantee &amp; Processing:</span>
+                        <span className="text-black font-medium">£{invSummary.platformFee.toFixed(2)}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between items-center pt-1 border-t border-slate-200">
+                      <span className="text-slate-700 font-semibold">Subtotal:</span>
+                      <span className="text-black font-semibold">£{invSummary.subtotal.toFixed(2)}</span>
+                    </div>
+                    {invSummary.vatAmount > 0 && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-[#1e3a8a] font-medium">VAT (20%):</span>
+                        <span className="text-black font-medium">£{invSummary.vatAmount.toFixed(2)}</span>
+                      </div>
+                    )}
+                    <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
+                    <div className="flex justify-between items-center pt-1">
+                      <span className="text-black font-black text-[18px]">Total {(job.isPaid === true || job.paymentStatus === "handshake_complete") ? "Paid" : "Due"}:</span>
+                      <span className="text-black font-black text-[18px]">£{invSummary.totalAmount.toFixed(2)}</span>
+                    </div>
+                  </div>
+                );
+              })()}
               <button 
                 onClick={handleDownloadInvoice}
                 className="w-full mt-2 bg-slate-900 text-white hover:bg-black py-3.5 rounded-[1rem] font-bold text-[15px] transition-colors flex items-center justify-center gap-2 border border-black shadow-sm"
@@ -5727,10 +5999,15 @@ const libraries: any[] = ['places', 'geometry'];
               className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
             />
             <motion.div 
+              ref={disputeDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dispute-modal-title"
+              tabIndex={-1}
               initial={{ opacity: 0, y: 100 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 100 }}
-              className="relative w-full max-w-md bg-white rounded-t-[32px] sm:rounded-3xl overflow-hidden shadow-2xl"
+              className="relative w-full max-w-md bg-white rounded-t-[32px] sm:rounded-3xl overflow-hidden shadow-2xl focus:outline-none"
             >
               <div className="p-6 space-y-6">
                 <div className="flex items-center justify-between">
@@ -5739,11 +6016,11 @@ const libraries: any[] = ['places', 'geometry'];
                       <AlertTriangle className="w-6 h-6 text-red-600" />
                     </div>
                     <div>
-                      <h3 className="text-xl font-bold text-slate-900">Raise Dispute</h3>
+                      <h3 id="dispute-modal-title" className="text-xl font-bold text-slate-900">Raise Dispute</h3>
                       <p className="text-xs text-slate-500">Professional mediation will be required</p>
                     </div>
                   </div>
-                  <button onClick={() => setShowDisputeModal(false)} className="p-2 hover:bg-slate-50 rounded-full transition-colors">
+                  <button type="button" onClick={() => setShowDisputeModal(false)} aria-label="Close raise dispute modal" className="p-2 hover:bg-slate-50 rounded-full transition-colors">
                     <X className="w-6 h-6 text-slate-400" />
                   </button>
                 </div>
@@ -5762,8 +6039,9 @@ const libraries: any[] = ['places', 'geometry'];
                   )}
 
                   <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Summary of Issue</label>
+                    <label htmlFor="dispute-summary-input" className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Summary of Issue</label>
                     <textarea 
+                      id="dispute-summary-input"
                       rows={3}
                       className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600 resize-none text-sm leading-relaxed"
                       placeholder="High-level reason for this dispute..."
@@ -5773,8 +6051,9 @@ const libraries: any[] = ['places', 'geometry'];
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Technical Fault Description (Mandatory)</label>
+                    <label htmlFor="dispute-technical-fault-input" className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Technical Fault Description (Mandatory)</label>
                     <textarea 
+                      id="dispute-technical-fault-input"
                       rows={4}
                       className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-red-600/20 focus:border-red-600 resize-none text-sm leading-relaxed"
                       placeholder="Describe exactly what isn't working. Frivolous or non-technical claims will be rejected..."
@@ -5816,32 +6095,39 @@ const libraries: any[] = ['places', 'geometry'];
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Evidence Photos (Burden of Proof Required)</label>
+                    <label htmlFor="dispute-evidence-photos-input" className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Evidence Photos (Burden of Proof Required)</label>
                     <div className="grid grid-cols-4 gap-2">
                       {disputePhotos.map((file, i) => (
                         <div key={i} className="aspect-square rounded-xl bg-slate-100 relative overflow-hidden group">
                           <img 
                             src={URL.createObjectURL(file)} 
                             className="w-full h-full object-cover" 
-                            alt="Evidence"
+                            alt={`Evidence photo ${i + 1}`}
                           />
                           <button 
+                            type="button"
+                            aria-label={`Remove evidence photo ${i + 1}`}
                             onClick={() => setDisputePhotos(prev => prev.filter((_, idx) => idx !== i))}
-                            className="absolute top-1 right-1 p-1 bg-red-500 text-white rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity"
+                            className="absolute top-1 right-1 p-1 bg-red-500 text-white rounded-full opacity-100 md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 transition-opacity"
                           >
                             <X className="w-3 h-3" />
                           </button>
                         </div>
                       ))}
                       {disputePhotos.length < 4 && (
-                        <label className="aspect-square rounded-xl border-2 border-dashed border-black flex flex-col items-center justify-center gap-1 cursor-pointer hover:border-red-600 hover:bg-red-50 transition-all group">
+                        <label
+                          htmlFor="dispute-evidence-photos-input"
+                          className="aspect-square rounded-xl border-2 border-dashed border-black flex flex-col items-center justify-center gap-1 cursor-pointer hover:border-red-600 hover:bg-red-50 focus-within:ring-2 focus-within:ring-red-600 transition-all group"
+                        >
                           <Camera className="w-6 h-6 text-slate-300 group-hover:text-red-600" />
                           <span className="text-[8px] font-bold text-slate-400 group-hover:text-red-600 uppercase">Add Photo</span>
                           <input 
+                            id="dispute-evidence-photos-input"
+                            aria-label="Upload dispute evidence photos"
                             type="file" 
                             accept="image/*" 
                             multiple 
-                            className="hidden" 
+                            className="sr-only" 
                             onChange={(e) => {
                               if (e.target.files) {
                                 setDisputePhotos(prev => [...prev, ...Array.from(e.target.files!)].slice(0, 4));
@@ -5856,6 +6142,7 @@ const libraries: any[] = ['places', 'geometry'];
 
                 <div className="flex flex-col gap-3 pt-2">
                   <button 
+                    type="button"
                     onClick={handleRaiseDispute}
                     disabled={!disputeReason || isProcessing}
                     className="w-full bg-red-600 text-white p-4 rounded-2xl font-bold hover:bg-red-700 transition-all shadow-lg shadow-red-100 flex items-center justify-center gap-2 disabled:opacity-50"
@@ -5894,10 +6181,15 @@ const libraries: any[] = ['places', 'geometry'];
               className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
             />
             <motion.div 
+              ref={recurringDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="recurring-schedule-modal-title"
+              tabIndex={-1}
               initial={{ opacity: 0, y: 100 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 100 }}
-              className="relative w-full max-w-md bg-white rounded-t-[32px] sm:rounded-3xl overflow-hidden shadow-2xl"
+              className="relative w-full max-w-md bg-white rounded-t-[32px] sm:rounded-3xl overflow-hidden shadow-2xl focus:outline-none"
             >
               <div className="p-6 space-y-6">
                 <div className="flex items-center justify-between">
@@ -5906,19 +6198,20 @@ const libraries: any[] = ['places', 'geometry'];
                       <RefreshCw className="w-6 h-6 text-indigo-600" />
                     </div>
                     <div>
-                      <h3 className="text-xl font-bold text-slate-900">Set up Schedule</h3>
+                      <h3 id="recurring-schedule-modal-title" className="text-xl font-bold text-slate-900">Set up Schedule</h3>
                       <p className="text-xs text-slate-500">Propose a recurring service</p>
                     </div>
                   </div>
-                  <button onClick={() => setShowRecurringModal(false)} className="p-2 hover:bg-slate-50 rounded-full transition-colors">
+                  <button type="button" onClick={() => setShowRecurringModal(false)} aria-label="Close recurring schedule modal" className="p-2 hover:bg-slate-50 rounded-full transition-colors">
                     <X className="w-6 h-6 text-slate-400" />
                   </button>
                 </div>
 
                 <div className="space-y-4">
                   <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Frequency</label>
+                    <label htmlFor="recurring-frequency-select" className="text-xs font-bold text-slate-500 uppercase tracking-wider block">Frequency</label>
                     <select 
+                      id="recurring-frequency-select"
                       className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600 text-sm bg-white"
                       value={recurringFrequency}
                       onChange={(e) => setRecurringFrequency(e.target.value)}
@@ -5936,6 +6229,7 @@ const libraries: any[] = ['places', 'geometry'];
                 </div>
 
                 <button 
+                  type="button"
                   onClick={handleProposeRecurring}
                   disabled={isProposingRecurring}
                   className="w-full bg-indigo-600 text-white p-4 rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 flex items-center justify-center gap-2 disabled:opacity-50"
@@ -5957,25 +6251,31 @@ const libraries: any[] = ['places', 'geometry'];
         {showRescheduleModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
             <motion.div 
+              ref={rescheduleDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="reschedule-modal-title"
+              tabIndex={-1}
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl"
+              className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl focus:outline-none"
             >
               <div className="flex items-center justify-between mb-6">
-                <h3 className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                <h3 id="reschedule-modal-title" className="text-xl font-bold text-slate-900 flex items-center gap-2">
                   <Calendar className="w-6 h-6 text-indigo-600" />
                   Propose Reschedule
                 </h3>
-                <button onClick={() => setShowRescheduleModal(false)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
+                <button type="button" onClick={() => setShowRescheduleModal(false)} aria-label="Close reschedule modal" className="p-2 hover:bg-slate-100 rounded-full transition-colors">
                   <X className="w-5 h-5 text-slate-400" />
                 </button>
               </div>
 
               <div className="space-y-4">
                 <div>
-                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">New Proposed Date</label>
+                  <label htmlFor="reschedule-date-input" className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">New Proposed Date</label>
                   <input 
+                    id="reschedule-date-input"
                     type="date"
                     value={rescheduleDate}
                     onChange={(e) => setRescheduleDate(e.target.value)}
@@ -5985,8 +6285,9 @@ const libraries: any[] = ['places', 'geometry'];
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Reason for Change</label>
+                  <label htmlFor="reschedule-reason-input" className="block text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Reason for Change</label>
                   <textarea 
+                    id="reschedule-reason-input"
                     value={rescheduleReason}
                     onChange={(e) => setRescheduleReason(e.target.value)}
                     placeholder="e.g., Previous job overran, or material delivery delay..."
@@ -6002,6 +6303,7 @@ const libraries: any[] = ['places', 'geometry'];
                 </div>
 
                 <button 
+                  type="button"
                   onClick={handleProposeReschedule}
                   disabled={isRescheduling || !rescheduleDate || !rescheduleReason}
                   className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-lg flex items-center justify-center gap-2 hover:bg-indigo-700 transition-all shadow-xl shadow-indigo-900/10 disabled:opacity-50"
@@ -6202,11 +6504,7 @@ const libraries: any[] = ['places', 'geometry'];
               <div className="p-4 flex flex-col gap-2 bg-white">
                 <button
                   onClick={() => {
-                    if (enteredPin === job.verificationPin) {
-                      confirmStartJob();
-                    } else {
-                      setPinError("Incorrect PIN. Please try again.");
-                    }
+                    confirmStartJob();
                   }}
                   disabled={enteredPin.length !== 4 || loading}
                   className="w-full py-4 font-bold text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
@@ -6468,6 +6766,7 @@ const libraries: any[] = ['places', 'geometry'];
         onClose={() => setShowContractModal(false)}
         job={job}
         quote={quotes.find(q => q.status === "accepted") || quotes[0]}
+        traderProfile={tradespersonProfiles[job.acceptedTradespersonId || job.assignedTradespersonId]}
         traderName={
           tradespersonProfiles[job.acceptedTradespersonId]?.firstName
             ? `${tradespersonProfiles[job.acceptedTradespersonId]?.firstName} ${tradespersonProfiles[job.acceptedTradespersonId]?.lastName || ""}`

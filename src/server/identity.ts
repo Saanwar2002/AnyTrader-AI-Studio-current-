@@ -185,20 +185,37 @@ export function resolveCapabilities(params: {
       capabilities.add("homeowner");
       break;
 
-    case "business":
-      // Business users possess organizational contractor/tradesperson capabilities
-      capabilities.add("contractor");
-      capabilities.add("tradesperson");
+    case "business": {
       capabilities.add("homeowner");
 
-      if (params.businessLayer === "properties" || params.role === "landlord" || params.role === "estate_agent" || params.role === "property_manager") {
+      const normalizedLayer = (params.businessLayer || "").trim().toLowerCase();
+      const normalizedRole = (params.role || "").trim().toLowerCase();
+      const isPropertyBusiness =
+        normalizedLayer === "properties" ||
+        normalizedRole === "landlord" ||
+        normalizedRole === "estate_agent" ||
+        normalizedRole === "property_manager";
+      const isConsultancyBusiness =
+        normalizedLayer === "consultancy" || normalizedRole === "consultant";
+      const isTradesBusiness =
+        normalizedLayer === "trades" ||
+        normalizedLayer === "field_services" ||
+        normalizedRole === "contractor_org";
+
+      if (isTradesBusiness) {
+        capabilities.add("contractor");
+        capabilities.add("tradesperson");
+      }
+
+      if (isPropertyBusiness) {
         capabilities.add("landlord");
         capabilities.add("property_manager");
         capabilities.add("estate_agent");
-      } else if (params.businessLayer === "consultancy") {
+      } else if (isConsultancyBusiness) {
         capabilities.add("consultant");
       }
       break;
+    }
 
     case "consumer":
     default:
@@ -210,8 +227,9 @@ export function resolveCapabilities(params: {
       break;
   }
 
-  // 2. Process explicit capability array, filtering against accountType permissions
+  // 2. Process explicit capability array, filtering against accountType and businessLayer permissions
   if (Array.isArray(params.explicitCapabilities)) {
+    const normalizedLayer = (params.businessLayer || "").trim().toLowerCase();
     for (const cap of params.explicitCapabilities) {
       if (isValidCapability(cap)) {
         // Enforce boundary: consumer cannot claim fleet_driver or contractor without proper accountType
@@ -223,6 +241,19 @@ export function resolveCapabilities(params: {
         }
         if (accountType === "service_provider" && !["tradesperson", "contractor", "homeowner"].includes(cap)) {
           continue;
+        }
+        if (accountType === "business") {
+          const allowedBusinessCaps: CanonicalCapability[] = ["homeowner"];
+          if (normalizedLayer === "properties") {
+            allowedBusinessCaps.push("landlord", "property_manager", "estate_agent");
+          } else if (normalizedLayer === "consultancy") {
+            allowedBusinessCaps.push("consultant");
+          } else if (normalizedLayer === "trades" || normalizedLayer === "field_services" || params.role === "contractor_org") {
+            allowedBusinessCaps.push("contractor", "tradesperson");
+          }
+          if (!allowedBusinessCaps.includes(cap)) {
+            continue;
+          }
         }
         capabilities.add(cap);
       }

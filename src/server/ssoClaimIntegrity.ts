@@ -14,7 +14,7 @@
  */
 
 import jwt from "jsonwebtoken";
-import { UnauthorizedError, ForbiddenError, BadRequestError, ConflictError } from "./httpErrors.ts";
+import { UnauthorizedError, ForbiddenError, BadRequestError, ConflictError, ServiceUnavailableError } from "./httpErrors.ts";
 import { AuthenticatedUser, isUserAdminClaim } from "./authorization.ts";
 
 export interface SsoTokenGenerationResult {
@@ -38,6 +38,113 @@ export interface VerifiedProviderClaims {
   sub: string;
   email?: string;
   email_verified?: boolean;
+}
+
+const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing"]);
+const FREE_OR_BASELINE_TIERS = new Set([
+  "free",
+  "basic",
+  "standard",
+  "free explorer",
+  "standard homeowner",
+  "standard driver",
+]);
+
+/**
+ * AT-SSO-01: Derives TradeShop discount strictly from active, verified entitlement state
+ * rather than trusting stale `tierId` strings left on expired/canceled accounts.
+ */
+export function deriveVerifiedShopDiscount(
+  userData: Record<string, any> | null | undefined,
+  authoritativeRole: string,
+  platformConfig?: any
+): number {
+  if (!userData) return 0;
+  if (userData.isSuspended === true || userData.isFrozen === true || userData.banned === true) {
+    return 0;
+  }
+
+  // Check expiration timestamp if present
+  const rawExpiry =
+    userData.subscriptionExpiresAt ||
+    userData.subscriptionCurrentPeriodEnd ||
+    userData.proExpiresAt ||
+    userData.entitlements?.shopDiscountExpiresAt;
+  if (rawExpiry) {
+    const expiryMs =
+      typeof rawExpiry?.toMillis === "function"
+        ? rawExpiry.toMillis()
+        : typeof rawExpiry === "number"
+        ? rawExpiry
+        : Date.parse(String(rawExpiry));
+    if (Number.isFinite(expiryMs) && expiryMs <= Date.now()) {
+      return 0;
+    }
+  }
+
+  const subStatus = String(userData.subscriptionStatus || "").trim().toLowerCase();
+  const hasExplicitInactiveStatus =
+    subStatus.length > 0 && !ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
+  if (hasExplicitInactiveStatus) {
+    return 0;
+  }
+
+  // Explicit server-computed entitlement field takes top precedence when active
+  if (
+    typeof userData.entitlements?.shopDiscount === "number" &&
+    userData.entitlements.shopDiscount >= 0 &&
+    userData.entitlements.active !== false
+  ) {
+    return Math.min(50, Math.max(0, userData.entitlements.shopDiscount));
+  }
+
+  const normalizedTier = String(
+    userData.activeSubscriptionTier || userData.subscriptionTier || userData.tierId || ""
+  ).trim();
+  const tierLower = normalizedTier.toLowerCase();
+
+  // Paid tiers MUST be backed by an active subscription status or verified entitlement flag
+  const hasVerifiedActivePaidEntitlement =
+    ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus) ||
+    userData.entitlements?.active === true ||
+    (userData.isTradeOsPro === true && !hasExplicitInactiveStatus) ||
+    (userData.hasVerifiedVideoProSubscription === true && !hasExplicitInactiveStatus) ||
+    (userData.landlordProActive === true && !hasExplicitInactiveStatus);
+
+  const isPaidTier = normalizedTier.length > 0 && !FREE_OR_BASELINE_TIERS.has(tierLower);
+  if (isPaidTier && !hasVerifiedActivePaidEntitlement) {
+    // Reject stale tierId strings when no active subscription entitlement exists
+    return 0;
+  }
+
+  if (platformConfig) {
+    const tiers =
+      authoritativeRole === "tradesperson"
+        ? platformConfig?.feeTiers
+        : platformConfig?.businessTiers;
+    if (Array.isArray(tiers)) {
+      const match = tiers.find(
+        (t: any) =>
+          String(t?.name || "").trim().toLowerCase() === tierLower ||
+          String(t?.id || "").trim().toLowerCase() === tierLower
+      );
+      if (match && typeof match.shopDiscount === "number") {
+        // Only grant non-zero discount from a paid tier if entitlement is verified active
+        if (match.shopDiscount > 0 && !hasVerifiedActivePaidEntitlement && isPaidTier) {
+          return 0;
+        }
+        return Math.min(50, Math.max(0, match.shopDiscount));
+      }
+    }
+  }
+
+  if (hasVerifiedActivePaidEntitlement) {
+    if (tierLower.includes("platinum") || tierLower.includes("enterprise")) return 15;
+    if (tierLower.includes("gold") || tierLower.includes("pro") || userData.isTradeOsPro === true) return 10;
+    if (tierLower.includes("silver") || tierLower.includes("starter")) return 5;
+  }
+
+  return 0;
 }
 
 /**
@@ -85,18 +192,14 @@ export async function generateAuthoritativeSsoToken(
   // Category: from authoritative Firestore profile
   const authoritativeCategory = userData?.primaryTrade || userData?.category || null;
 
-  // Discount: derived server-side from authoritative tier in Firestore and cached config
+  // AT-SSO-01: Derive TradeShop discount strictly from active verified entitlement state,
+  // never from a stale tierId string when a subscription is expired, canceled, or unpaid.
   let discount = 0;
   try {
-    const tierId = userData?.tierId || (authoritativeRole === "tradesperson" ? "Basic" : "Standard");
-    if (configFetcher) {
-      const platformConfig = await configFetcher();
-      const tiers = authoritativeRole === "tradesperson" ? platformConfig?.feeTiers : platformConfig?.businessTiers;
-      const tier = tiers?.find((t: any) => t.name === tierId);
-      discount = tier?.shopDiscount || 0;
-    }
+    const platformConfig = configFetcher ? await configFetcher() : null;
+    discount = deriveVerifiedShopDiscount(userData, authoritativeRole, platformConfig);
   } catch (tierErr) {
-    console.warn("[SSO Engine] Could not calculate tier discount:", tierErr);
+    console.warn("[SSO Engine] Could not calculate verified entitlement discount:", tierErr);
   }
 
   const token = jwt.sign(
@@ -206,6 +309,13 @@ export async function evaluateAccountLinkingEligibility(
   const isEmailCryptographicallyVerified = verifiedClaims.email_verified === true;
 
   const callerUid = caller.uid;
+
+  // AT-AUTH-LINK-01: Fail closed with 503 Service Unavailable when Firestore is unavailable
+  if (!db) {
+    throw new ServiceUnavailableError(
+      "Unable to verify provider linking eligibility because the database service is temporarily unavailable."
+    );
+  }
 
   if (db) {
     try {
@@ -472,6 +582,13 @@ export async function executeAuthoritativeAccountLinking(
     providerId: verifiedClaims.providerId,
     sub: verifiedClaims.sub,
   };
+
+  // AT-AUTH-LINK-01: Fail closed with 503 Service Unavailable if Firestore is unavailable
+  if (!db) {
+    throw new ServiceUnavailableError(
+      "Account provider linking is temporarily unavailable because the database service is offline."
+    );
+  }
 
   // Step 4 & 5: Transactionally check eligibility AND persist provider identity in database
   if (db) {

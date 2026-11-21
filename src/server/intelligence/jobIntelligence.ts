@@ -55,6 +55,36 @@ export interface JobSourceInput {
 }
 
 /**
+ * AT-INTEL-JOB-01: Computes a deterministic SHA-256 content/version fingerprint
+ * from the canonical job source fields so re-analyzing an edited job generates
+ * a new idempotency key while identical source content deduplicates cleanly.
+ */
+export function computeJobAnalysisVersionHash(job: Partial<JobSourceInput> & Record<string, any>): string {
+  const canonicalPayload = {
+    jobId: String(job.jobId || job.id || "").trim(),
+    propertyId: String(job.propertyId || job.property_id || "").trim(),
+    title: String(job.title || "").trim(),
+    description: String(job.description || "").trim(),
+    category: String(job.category || "").trim(),
+    postcode: String(job.postcode || "").trim().toUpperCase(),
+    sourceVersion: job.sourceVersion !== undefined && job.sourceVersion !== null ? String(job.sourceVersion) : "",
+    updatedAt:
+      job.updatedAt && typeof job.updatedAt?.toDate === "function"
+        ? job.updatedAt.toDate().toISOString()
+        : typeof job.updatedAt === "string"
+        ? job.updatedAt
+        : typeof job.updatedAt === "number"
+        ? String(job.updatedAt)
+        : "",
+    photos: Array.isArray(job.photos) ? [...job.photos].map(String).sort() : [],
+    documents: Array.isArray(job.documents) ? [...job.documents].map(String).sort() : [],
+    pipelineVersion: String(job.pipelineVersion || INTELLIGENCE_PIPELINE_VERSION),
+    schemaVersion: String(job.schemaVersion || INTELLIGENCE_SCHEMA_VERSION),
+  };
+  return `cv_${computeSha256(JSON.stringify(canonicalPayload)).slice(0, 16)}`;
+}
+
+/**
  * Resolves the authoritative propertyId linked to a transactional job in Firestore.
  * Fails closed if the database is unavailable or the job does not exist or lacks propertyId.
  */

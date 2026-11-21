@@ -7,6 +7,7 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/src/lib/utils";
 import { calculateFlexiPayMerchantFee } from "@/src/services/stripeIntegrationService";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 
 interface BnplFinancingModalProps {
   isOpen: boolean;
@@ -28,6 +29,7 @@ export default function BnplFinancingModal({
   const [depositAmount, setDepositAmount] = useState<number>(0);
   const [isCheckingEligibility, setIsCheckingEligibility] = useState(false);
   const [isPreApproved, setIsPreApproved] = useState(false);
+  const dialogRef = useDialogA11y<HTMLDivElement>(isOpen, onClose);
 
   if (!isOpen) return null;
 
@@ -92,10 +94,15 @@ export default function BnplFinancingModal({
     <AnimatePresence>
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
         <motion.div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="bnpl-financing-modal-title"
+          tabIndex={-1}
           initial={{ opacity: 0, scale: 0.95, y: 15 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
           exit={{ opacity: 0, scale: 0.95, y: 15 }}
-          className="bg-white rounded-[2.5rem] border border-black shadow-2xl max-w-2xl w-full p-6 sm:p-8 space-y-6 overflow-hidden relative max-h-[92vh] overflow-y-auto"
+          className="bg-white rounded-[2.5rem] border border-black shadow-2xl max-w-2xl w-full p-6 sm:p-8 space-y-6 overflow-hidden relative max-h-[92vh] overflow-y-auto focus:outline-none"
         >
           {/* Top Branding Banner */}
           <div className="flex items-start justify-between border-b border-slate-200 pb-4">
@@ -104,7 +111,7 @@ export default function BnplFinancingModal({
                 <CreditCard className="w-3.5 h-3.5 text-indigo-600" />
                 <span>TradeOS FlexiPay BNPL Financing (£1,000+)</span>
               </div>
-              <h2 className="text-2xl font-black text-slate-900 tracking-tight">
+              <h2 id="bnpl-financing-modal-title" className="text-2xl font-black text-slate-900 tracking-tight">
                 Major Repair Payment Plan
               </h2>
               <p className="text-xs text-slate-500 font-semibold">
@@ -112,7 +119,9 @@ export default function BnplFinancingModal({
               </p>
             </div>
             <button
+              type="button"
               onClick={onClose}
+              aria-label="Close FlexiPay financing modal"
               className="p-2 text-slate-400 hover:text-slate-700 rounded-full hover:bg-slate-100 transition shrink-0"
             >
               <X className="w-5 h-5" />
@@ -127,10 +136,11 @@ export default function BnplFinancingModal({
                 <h4 className="text-sm font-black text-slate-900">{jobTitle}</h4>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-xs font-extrabold text-slate-600">Cost:</span>
+                <label htmlFor="bnpl-repair-cost-input" className="text-xs font-extrabold text-slate-600">Cost:</label>
                 <div className="relative">
                   <span className="absolute left-3 top-1/2 -translate-y-1/2 font-black text-slate-900 text-sm">£</span>
                   <input
+                    id="bnpl-repair-cost-input"
                     type="number"
                     min={1000}
                     max={25000}
@@ -152,6 +162,7 @@ export default function BnplFinancingModal({
               </div>
               <input
                 type="range"
+                aria-label="Repair financing amount slider"
                 min={1000}
                 max={25000}
                 step={250}
@@ -163,11 +174,11 @@ export default function BnplFinancingModal({
           </div>
 
           {/* Term Selection (3, 6, 12, 24, 36 Months) */}
-          <div className="space-y-3">
-            <label className="text-xs font-black uppercase text-slate-700 flex items-center justify-between">
+          <div className="space-y-3" role="group" aria-labelledby="bnpl-repayment-period-label">
+            <p id="bnpl-repayment-period-label" className="text-xs font-black uppercase text-slate-700 flex items-center justify-between">
               <span>Select Repayment Period:</span>
               <span className="text-indigo-600 font-bold">{apr === 0 ? "⚡ 0% Interest (Interest Free)" : `${apr}% Fixed APR`}</span>
-            </label>
+            </p>
 
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
               {[3, 6, 12, 24, 36].map((months) => {
@@ -175,6 +186,8 @@ export default function BnplFinancingModal({
                 return (
                   <button
                     key={months}
+                    type="button"
+                    aria-pressed={selectedTerm === months}
                     onClick={() => setSelectedTerm(months)}
                     className={cn(
                       "p-3 rounded-2xl border text-center transition-all flex flex-col items-center justify-between gap-1",

@@ -235,4 +235,35 @@ describe("PL-02: Server-Authoritative Account Profile Initialization", () => {
     expect(result.profileData.name).toBe("Fallback User");
     expect(result.profileData.role).toBe("homeowner");
   });
+
+  it("AT-AUTH-03: properties and consultancy businesses never inherit contractor/tradesperson capabilities or trader public profiles", async () => {
+    expect(capabilitiesFor("business", "properties")).toEqual([
+      "homeowner",
+      "landlord",
+      "property_manager",
+      "estate_agent",
+    ]);
+    expect(capabilitiesFor("business", "consultancy")).toEqual(["homeowner", "consultant"]);
+    expect(capabilitiesFor("business", null)).toEqual(["homeowner"]);
+    expect(capabilitiesFor("business", "trades")).toEqual(["contractor", "tradesperson", "homeowner"]);
+    expect(capabilitiesFor("business", "field_services")).toEqual(["contractor", "tradesperson", "homeowner"]);
+
+    const mockDb = createMockFirestore();
+    await executeBootstrapProfileCommand(
+      mockDb,
+      { uid: "biz_prop_1", email: "prop@example.com" },
+      {
+        role: "business",
+        name: "Acme Lettings",
+        businessLayer: "properties",
+      },
+      "127.0.0.1"
+    );
+
+    const createdPropBiz = mockDb._store["users/biz_prop_1"];
+    expect(createdPropBiz.capabilities).not.toContain("tradesperson");
+    expect(createdPropBiz.capabilities).not.toContain("contractor");
+    expect(createdPropBiz.capabilities).toContain("landlord");
+    expect(mockDb._store["public_profiles/biz_prop_1"]).toBeUndefined();
+  });
 });

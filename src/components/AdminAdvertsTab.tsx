@@ -2,9 +2,10 @@ import React, { useState, useEffect } from "react";
 import { Plus, Loader2, Save, Trash2, Zap, LayoutGrid, Calendar, Eye, Briefcase, ShieldCheck, Star, Gift, ShieldAlert, Award, FileText } from "lucide-react";
 import { collection, query, orderBy, onSnapshot, doc, setDoc, updateDoc, deleteDoc, serverTimestamp } from "firebase/firestore";
 import { Link } from "react-router-dom";
-import { db } from "../firebase";
+import { db, auth } from "../firebase";
 import { cn } from "../lib/utils";
 import { useCategories } from "../lib/CategoryProvider";
+import { toast } from "sonner";
 
 const iconMap: Record<string, any> = {
   Zap, Briefcase, ShieldCheck, Star, Gift, ShieldAlert, Award, FileText
@@ -164,13 +165,14 @@ export default function AdminAdvertsTab() {
       (ad.title || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
       (ad.billingCycle || "").toLowerCase().includes(searchQuery.toLowerCase());
     
+    const isPendingMod = ad.approvalStatus === "pending" || ad.approvalStatus === "pending_review";
     const matchesStatus = statusFilter === "all" 
       ? true 
       : statusFilter === "active" 
         ? ad.isActive 
         : statusFilter === "pending" 
-          ? ad.approvalStatus === "pending" 
-          : !ad.isActive && ad.approvalStatus !== "pending";
+          ? isPendingMod 
+          : !ad.isActive && !isPendingMod;
     const matchesTarget = targetFilter === "all" ? true : ad.targetRole === targetFilter;
 
     return matchesSearch && matchesStatus && matchesTarget;
@@ -288,15 +290,49 @@ export default function AdminAdvertsTab() {
                   </p>
                </div>
                <div className="flex gap-2">
-                 {ad.approvalStatus === "pending" && (
+                 {(ad.approvalStatus === "pending" || ad.approvalStatus === "pending_review") && (
                    <>
                      <button onClick={async () => {
-                       await updateDoc(doc(db, "advertisements", ad.id), { approvalStatus: "approved", isActive: true });
+                       try {
+                         const token = await auth.currentUser?.getIdToken();
+                         const res = await fetch(`/api/ads/${ad.id}/moderate`, {
+                           method: "POST",
+                           headers: {
+                             "Content-Type": "application/json",
+                             ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                           },
+                           body: JSON.stringify({ decision: "approve" }),
+                         });
+                         if (!res.ok) {
+                           const err = await res.json().catch(() => ({}));
+                           throw new Error(err.error || "Failed to approve advertisement");
+                         }
+                         toast.success("Advertisement approved");
+                       } catch (err: any) {
+                         toast.error(err.message || "Approval failed");
+                       }
                      }} className="px-3 bg-emerald-100 hover:bg-emerald-200 text-emerald-700 font-bold rounded-lg text-xs" title="Approve">
                        Approve
                      </button>
                      <button onClick={async () => {
-                       await updateDoc(doc(db, "advertisements", ad.id), { approvalStatus: "rejected" });
+                       try {
+                         const token = await auth.currentUser?.getIdToken();
+                         const res = await fetch(`/api/ads/${ad.id}/moderate`, {
+                           method: "POST",
+                           headers: {
+                             "Content-Type": "application/json",
+                             ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                           },
+                           body: JSON.stringify({ decision: "reject" }),
+                         });
+                         if (!res.ok) {
+                           const err = await res.json().catch(() => ({}));
+                           throw new Error(err.error || "Failed to reject advertisement");
+                         }
+                         toast.success("Advertisement rejected");
+                       } catch (err: any) {
+                         toast.error(err.message || "Rejection failed");
+                       }
                      }} className="px-3 bg-red-100 hover:bg-red-200 text-red-700 font-bold rounded-lg text-xs" title="Reject">
                        Reject
                      </button>
@@ -304,7 +340,7 @@ export default function AdminAdvertsTab() {
                  )}
                  <button onClick={() => {
                    navigator.clipboard.writeText(`${window.location.origin}/ad-report/${ad.id}`);
-                   alert("Tracking link copied to clipboard");
+                   toast.success("Tracking link copied to clipboard");
                  }} className="p-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg" title="Copy Tracking Link">
                    <LayoutGrid className="w-4 h-4" />
                  </button>
@@ -317,7 +353,7 @@ export default function AdminAdvertsTab() {
                </div>
              </div>
              
-             {ad.approvalStatus === "pending" ? (
+             {(ad.approvalStatus === "pending" || ad.approvalStatus === "pending_review") ? (
                <div className="absolute top-2 right-2 bg-amber-100 text-amber-800 text-[10px] font-bold px-2 py-1 rounded">PENDING</div>
              ) : ad.approvalStatus === "rejected" ? (
                <div className="absolute top-2 right-2 bg-red-900 text-white text-[10px] font-bold px-2 py-1 rounded">REJECTED</div>

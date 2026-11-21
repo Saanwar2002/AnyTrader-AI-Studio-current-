@@ -1,4 +1,4 @@
-import { db, collection, query, onSnapshot, doc, updateDoc, setDoc, addDoc, getDoc, serverTimestamp, orderBy, limit, where } from "@/src/firebase";
+import { auth, db, collection, query, onSnapshot, doc, updateDoc, setDoc, addDoc, getDoc, serverTimestamp, orderBy, limit, where } from "@/src/firebase";
 
 export interface ThresholdRuleConfig {
   maxRegistrationsPer15m: number;
@@ -188,41 +188,35 @@ export async function sendAdminEmailAlert(
       </div>
     `;
 
-    // 1. Post to Server Email Dispatch Route
-    try {
-      await fetch("/api/admin/send-email-alert", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          to: recipientEmail,
-          subject: emailSubject,
-          html: emailHtml,
-          breachId: breach.id,
-          severity: breach.severity,
-          breachType: breach.breachType,
-        }),
-      }).catch((e) => console.warn("Direct /api/admin/send-email-alert call fallback:", e));
-    } catch (err) {
-      console.warn("Direct fetch error:", err);
-    }
+    // 1. Post to Server Email Dispatch Route with Admin Auth Bearer token
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : "";
+    const res = await fetch("/api/admin/send-email-alert", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+      },
+      body: JSON.stringify({
+        to: recipientEmail,
+        subject: emailSubject,
+        html: emailHtml,
+        breachId: breach.id,
+        severity: breach.severity,
+        breachType: breach.breachType,
+      }),
+    });
 
-    // 2. Queue in Firestore for resilient background worker persistence
-    const queueRef = collection(db, "email_alerts_queue");
-    await addDoc(queueRef, {
-      to: recipientEmail,
-      subject: emailSubject,
-      breachId: breach.id,
-      severity: breach.severity,
-      breachType: breach.breachType,
-      htmlBody: emailHtml,
-      status: "queued",
-      createdAt: serverTimestamp(),
-      isoCreatedAt: new Date().toISOString()
-    }).catch(() => {});
+    const data = await res.json().catch(() => ({} as any));
+    if (!res.ok || !data?.delivered) {
+      return {
+        success: false,
+        message: data?.error || `Email dispatch failed (${res.status})`,
+      };
+    }
 
     return {
       success: true,
-      message: `Alert email dispatched to ${recipientEmail}`
+      message: data?.message || `Alert email delivered to ${recipientEmail}`
     };
   } catch (error: any) {
     console.error("Failed to send admin email alert:", error);

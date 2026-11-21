@@ -345,14 +345,14 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
 
       const updates = {
         videoVerificationUrl: downloadUrl,
-        videoVerificationStatus: "verified",
+        videoVerificationStatus: "pending",
         videoVerificationTimestamp: new Date().toISOString()
       };
 
       await updateDoc(doc(db, "users", profile.uid), updates);
       if (onUpdateProfile) onUpdateProfile(updates);
 
-      toast.success("🎥 Video Credential Verification published! You earned +35 AI Match Points.");
+      toast.success("🎥 Video Credential uploaded and submitted for verification!");
       setMediaBlobUrl(null);
       setRecordedBlob(null);
     } catch (err) {
@@ -370,7 +370,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
     try {
       const updates = {
         videoVerificationUrl: null,
-        videoVerificationStatus: isVideoProSubscriber ? "verified" : "none"
+        videoVerificationStatus: "none"
       };
       await updateDoc(doc(db, "users", profile.uid), updates);
       if (onUpdateProfile) onUpdateProfile(updates);
@@ -381,6 +381,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
   };
 
   const hasVerifiedVideo = Boolean(profile?.videoVerificationUrl);
+  const isVideoVerified = hasVerifiedVideo && profile?.videoVerificationStatus === "verified";
 
   return (
     <div className="bg-white rounded-[2rem] border border-black shadow-md p-5 mb-6 overflow-hidden relative">
@@ -392,12 +393,16 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
           <div>
             <h3 className="text-lg font-black text-slate-900 leading-tight flex items-center gap-2">
               Video Credential Verification
-              {hasVerifiedVideo && (
+              {isVideoVerified ? (
                 <span className="bg-emerald-100 text-emerald-800 text-[10px] font-black uppercase px-2 py-0.5 rounded-full flex items-center gap-1 border border-emerald-200">
                   <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                   Verified
                 </span>
-              )}
+              ) : hasVerifiedVideo ? (
+                <span className="bg-amber-100 text-amber-800 text-[10px] font-black uppercase px-2 py-0.5 rounded-full flex items-center gap-1 border border-amber-200">
+                  Pending Review
+                </span>
+              ) : null}
             </h3>
             <p className="text-xs text-slate-500 font-medium">
               15–30 sec video selfie intro & credential showcase to build 100% homeowner trust.

@@ -40,6 +40,7 @@ import {
 import { toast } from "sonner";
 import { cn } from "@/src/lib/utils";
 import { useLocation, useNavigate } from "react-router-dom";
+import { useDialogA11y } from "@/src/lib/useDialogA11y";
 
 import { ConsultancyProposals } from "./ConsultancyProposals";
 import { ConsultancyProjects } from "./ConsultancyProjects";
@@ -101,6 +102,9 @@ export function ConsultancyManager() {
   const [showBookingModal, setShowBookingModal] = useState(false);
   const [showClientModal, setShowClientModal] = useState(false);
   const [showInvoiceModal, setShowInvoiceModal] = useState(false);
+  const bookingDialogRef = useDialogA11y(showBookingModal, () => setShowBookingModal(false));
+  const clientDialogRef = useDialogA11y(showClientModal, () => setShowClientModal(false));
+  const invoiceDialogRef = useDialogA11y(showInvoiceModal, () => setShowInvoiceModal(false));
   const [appointments, setAppointments] = useState<any[]>([]);
   const [clients, setClients] = useState<any[]>([]);
   const [invoices, setInvoices] = useState<any[]>([]);
@@ -613,20 +617,26 @@ export function ConsultancyManager() {
             className="fixed inset-0 z-[150] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm"
           >
             <motion.div
+              ref={bookingDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="consultancy-booking-modal-title"
+              tabIndex={-1}
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden border border-black relative"
+              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden border border-black relative outline-none"
             >
               <button 
                 type="button" 
+                aria-label="Close schedule consultation dialog"
                 onClick={() => setShowBookingModal(false)} 
                 className="absolute top-4 right-4 p-1.5 bg-white/20 hover:bg-white/30 rounded-full text-white transition z-10"
               >
                  <X className="w-5 h-5" />
               </button>
               <div className="p-6 bg-indigo-600 text-white">
-                <h3 className="font-black text-xl pr-8">Schedule Consultation</h3>
+                <h3 id="consultancy-booking-modal-title" className="font-black text-xl pr-8">Schedule Consultation</h3>
                 <p className="text-white/80 text-sm font-medium">
                   Block time in your calendar for a client session.
                 </p>
@@ -636,10 +646,11 @@ export function ConsultancyManager() {
                 className="p-6 space-y-4"
               >
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="booking-title-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Meeting Title
                   </label>
                   <input
+                    id="booking-title-input"
                     required
                     value={bookingForm.title}
                     onChange={(e) =>
@@ -650,10 +661,11 @@ export function ConsultancyManager() {
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="booking-client-name-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Client Name
                   </label>
                   <input
+                    id="booking-client-name-input"
                     required
                     value={bookingForm.clientName}
                     onChange={(e) =>
@@ -668,10 +680,11 @@ export function ConsultancyManager() {
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                    <label htmlFor="booking-date-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                       Date
                     </label>
                     <input
+                      id="booking-date-input"
                       type="date"
                       required
                       value={bookingForm.date}
@@ -682,10 +695,11 @@ export function ConsultancyManager() {
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                    <label htmlFor="booking-time-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                       Time
                     </label>
                     <input
+                      id="booking-time-input"
                       type="time"
                       required
                       value={bookingForm.time}
@@ -697,10 +711,11 @@ export function ConsultancyManager() {
                   </div>
                 </div>
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="booking-duration-select" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Duration
                   </label>
                   <select
+                    id="booking-duration-select"
                     value={bookingForm.duration}
                     onChange={(e) =>
                       setBookingForm({
@@ -740,30 +755,37 @@ export function ConsultancyManager() {
             className="fixed inset-0 z-[150] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm"
           >
             <motion.div
+              ref={clientDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="consultancy-client-modal-title"
+              tabIndex={-1}
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden border border-black relative"
+              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden border border-black relative outline-none"
             >
               <button 
                 type="button" 
+                aria-label="Close add client dialog"
                 onClick={() => setShowClientModal(false)} 
                 className="absolute top-4 right-4 p-1.5 bg-white/20 hover:bg-white/30 rounded-full text-white transition z-10"
               >
                  <X className="w-5 h-5" />
               </button>
               <div className="p-6 bg-emerald-600 text-white">
-                <h3 className="font-black text-xl pr-8">Add New Client</h3>
+                <h3 id="consultancy-client-modal-title" className="font-black text-xl pr-8">Add New Client</h3>
                 <p className="text-white/80 text-sm font-medium">
                   Add a client profile to your consultancy roster.
                 </p>
               </div>
               <form onSubmit={handleAddClient} className="p-6 space-y-4">
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="client-name-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Client Name
                   </label>
                   <input
+                    id="client-name-input"
                     required
                     value={clientForm.name}
                     onChange={(e) =>
@@ -774,10 +796,11 @@ export function ConsultancyManager() {
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="client-company-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Company (Optional)
                   </label>
                   <input
+                    id="client-company-input"
                     value={clientForm.company}
                     onChange={(e) =>
                       setClientForm({ ...clientForm, company: e.target.value })
@@ -787,10 +810,11 @@ export function ConsultancyManager() {
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="client-email-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Email
                   </label>
                   <input
+                    id="client-email-input"
                     type="email"
                     required
                     value={clientForm.email}
@@ -802,10 +826,11 @@ export function ConsultancyManager() {
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="client-phone-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Phone
                   </label>
                   <input
+                    id="client-phone-input"
                     type="tel"
                     value={clientForm.phone}
                     onChange={(e) =>
@@ -839,30 +864,37 @@ export function ConsultancyManager() {
             className="fixed inset-0 z-[150] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm"
           >
             <motion.div
+              ref={invoiceDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="consultancy-invoice-modal-title"
+              tabIndex={-1}
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden border border-black relative"
+              className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden border border-black relative outline-none"
             >
               <button 
                 type="button" 
+                aria-label="Close create invoice dialog"
                 onClick={() => setShowInvoiceModal(false)} 
                 className="absolute top-4 right-4 p-1.5 bg-white/20 hover:bg-white/30 rounded-full text-white transition z-10"
               >
                  <X className="w-5 h-5" />
               </button>
               <div className="p-6 bg-amber-500 text-white">
-                <h3 className="font-black text-xl pr-8">Create Invoice</h3>
+                <h3 id="consultancy-invoice-modal-title" className="font-black text-xl pr-8">Create Invoice</h3>
                 <p className="text-white/80 text-sm font-medium">
                   Generate a new invoice for a client.
                 </p>
               </div>
               <form onSubmit={handleCreateInvoice} className="p-6 space-y-4">
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="invoice-client-select" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Select Client
                   </label>
                   <select
+                    id="invoice-client-select"
                     required
                     value={invoiceForm.clientId}
                     onChange={(e) =>
@@ -878,10 +910,11 @@ export function ConsultancyManager() {
                 </div>
                 
                 <div>
-                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                  <label htmlFor="invoice-description-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                     Description
                   </label>
                   <input
+                    id="invoice-description-input"
                     required
                     value={invoiceForm.description}
                     onChange={(e) =>
@@ -894,10 +927,11 @@ export function ConsultancyManager() {
 
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                    <label htmlFor="invoice-amount-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                       Amount (£)
                     </label>
                     <input
+                      id="invoice-amount-input"
                       type="number"
                       required
                       min="1"
@@ -911,10 +945,11 @@ export function ConsultancyManager() {
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
+                    <label htmlFor="invoice-due-date-input" className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-1 mb-1 block">
                       Due Date
                     </label>
                     <input
+                      id="invoice-due-date-input"
                       type="date"
                       required
                       value={invoiceForm.dueDate}

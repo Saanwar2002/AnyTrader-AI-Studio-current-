@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { useSearchParams, Link, useNavigate } from "react-router-dom";
-import { db, doc, getDoc, collection, addDoc, handleFirestoreError, OperationType } from "@/src/firebase";
+import { auth, db, doc, getDoc } from "@/src/firebase";
 import { Home, Wrench, AlertTriangle, CheckCircle2, ShieldAlert, Phone, User, FileText, ArrowLeft, Send, Camera, Clock, Sparkles } from "lucide-react";
 import { motion } from "motion/react";
 import { toast } from "sonner";
@@ -58,30 +58,41 @@ export function TenantReportPortal() {
 
     setSubmitting(true);
     try {
-      const issueRef = await addDoc(collection(db, "tenant_issues"), {
-        propertyId: propertyId || "manual",
-        propertyName: property?.name || manualAddress || "Home Property",
-        address: property?.address?.line1 || manualAddress || "UK Address",
-        postcode: property?.address?.postcode || "",
-        landlordOwnerId: property?.ownerId || null,
-        tenantName,
-        tenantPhone,
-        tenantEmail,
-        flatUnit,
-        category,
-        urgency,
-        title: issueTitle,
-        description,
-        status: "open",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      });
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (auth.currentUser) {
+        const token = await auth.currentUser.getIdToken().catch(() => null);
+        if (token) headers.Authorization = `Bearer ${token}`;
+      }
 
-      setSubmittedIssueId(issueRef.id);
+      const response = await fetch("/api/tenant-issues", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          propertyId: propertyId || undefined,
+          propertyName: property?.name || manualAddress || "Home Property",
+          address: property?.address?.line1 || manualAddress || "UK Address",
+          postcode: property?.address?.postcode || "",
+          tenantName,
+          tenantPhone,
+          tenantEmail,
+          flatUnit,
+          category,
+          urgency,
+          title: issueTitle,
+          description,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.id) {
+        throw new Error(result.error || "Failed to submit repair issue.");
+      }
+
+      setSubmittedIssueId(String(result.id));
       toast.success("Repair issue logged in Property Passport successfully!");
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, "tenant_issues");
-      toast.error("Failed to submit report. Please try again.");
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to submit report. Please try again.");
     } finally {
       setSubmitting(false);
     }
