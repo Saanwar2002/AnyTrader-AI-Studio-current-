@@ -11,7 +11,6 @@ import { useAuth } from "./AuthProvider";
 import { createJobViaCommand } from "../services/jobCommandService";
 import { AnimatePresence, motion } from "framer-motion";
 import { useJsApiLoader } from "@react-google-maps/api";
-import { Capacitor } from '@capacitor/core';
 import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
 import { getInstantMatchCopy } from "@/src/lib/boosts";
 import { toast } from "sonner";

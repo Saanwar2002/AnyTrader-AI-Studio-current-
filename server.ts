@@ -91,6 +91,18 @@ import {
   sendAuthoritativeChatPush,
 } from "./src/server/notificationEngine.ts";
 import {
+  getMetaWhatsAppConfig,
+  verifyMetaWebhookSignature,
+  enqueueWhatsAppFallback,
+  processWhatsAppFallbackQueue,
+  createWhatsAppActivationLink,
+  getUserNotificationPreferences,
+  updateUserNotificationPreferences,
+  recordUserChatPresence,
+  handleMetaWhatsAppWebhook,
+  type WhatsAppContextType,
+} from "./src/server/whatsappNotificationEngine.ts";
+import {
   buildAndroidAssetLinksPayload,
   buildAppleAppSiteAssociationPayload,
 } from "./src/server/mobileDeepLinks.ts";
@@ -977,6 +989,13 @@ const startBackgroundSchedulers = () => {
     await runWithSchedulerLease("sms_queue", 45000, async () => processSmsQueue());
   });
 
+  // 1b. Run 4-tier WhatsApp offline fallback processor every minute (45s unread check + 5-min cooldown)
+  cron.schedule("* * * * *", async () => {
+    await runWithSchedulerLease("whatsapp_fallback_queue", 30000, async () =>
+      processWhatsAppFallbackQueue(db)
+    );
+  });
+
   // 2. Schedule: 00:30 every day for profitability aggregation
   cron.schedule("30 0 * * *", async () => {
     await runWithSchedulerLease("daily_aggregation", 300000, async () => runDailyAggregation());
@@ -1598,13 +1617,11 @@ async function startServer() {
   app.set("trust proxy", 1);
   const PORT = Number(process.env.PORT) || 3000;
 
-  // Allowed Origins Configuration for Web, Native Capacitor Mobile Apps (Android/iOS), and Preview
+  // Allowed Origins Configuration for Web, PWA, and Preview
   const defaultAllowedOrigins = [
     "http://localhost:3000",
     "http://localhost:5173",
     "https://localhost",
-    "capacitor://localhost",
-    "ionic://localhost",
   ];
   const envAllowedOrigins = process.env.ALLOWED_ORIGINS 
     ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim()).filter(Boolean)
@@ -1641,7 +1658,7 @@ async function startServer() {
     return false;
   };
 
-  // CORS middleware for Native Capacitor Mobile Apps (Android/iOS) and Web
+  // CORS middleware for Web and PWA clients
   app.use((req, res, next) => {
     const origin = req.headers.origin;
     if (origin) {
@@ -1807,6 +1824,58 @@ async function startServer() {
       'Surrogate-Control': 'no-store'
     });
     next();
+  });
+
+  // Meta WhatsApp Cloud API Webhook Verification & Inbound Handler (MUST come before express.json() for raw HMAC-SHA256 verification)
+  app.get("/api/webhooks/whatsapp", (req, res) => {
+    const cfg = getMetaWhatsAppConfig();
+    const mode = String(req.query["hub.mode"] || "");
+    const token = String(req.query["hub.verify_token"] || "");
+    const challenge = String(req.query["hub.challenge"] || "");
+
+    if (!cfg.verifyToken) {
+      return res.status(503).send("WhatsApp webhook verification token not configured.");
+    }
+    const providedBuf = Buffer.from(token, "utf8");
+    const expectedBuf = Buffer.from(cfg.verifyToken, "utf8");
+    const tokenMatches =
+      providedBuf.length === expectedBuf.length &&
+      crypto.timingSafeEqual(providedBuf, expectedBuf);
+
+    if (mode === "subscribe" && tokenMatches && challenge) {
+      return res.status(200).type("text/plain").send(challenge);
+    }
+    return res.status(403).send("Forbidden");
+  });
+
+  app.post("/api/webhooks/whatsapp", express.raw({ type: "application/json" }), async (req, res) => {
+    try {
+      const cfg = getMetaWhatsAppConfig();
+      if (!cfg.appSecret) {
+        return res.status(503).json({ error: "Meta WhatsApp webhook secret is not configured." });
+      }
+      const rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(typeof req.body === "string" ? req.body : JSON.stringify(req.body || ""), "utf8");
+      const signature = req.headers["x-hub-signature-256"] as string | undefined;
+
+      if (!verifyMetaWebhookSignature(rawBody, signature, cfg.appSecret)) {
+        return res.status(401).json({ error: "Invalid webhook signature." });
+      }
+
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(rawBody.toString("utf8"));
+      } catch {
+        return res.status(400).json({ error: "Malformed JSON payload." });
+      }
+
+      const outcome = await handleMetaWhatsAppWebhook(db, parsed, { config: cfg });
+      return res.status(200).json({ received: true, ...outcome });
+    } catch (error: any) {
+      console.error("Meta WhatsApp webhook error:", error);
+      return res.status(500).json({ error: "Webhook processing failed." });
+    }
   });
 
   // Stripe Webhook MUST come before express.json()
@@ -7033,9 +7102,12 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       const result = await targetFunc(...(args || []));
       res.json(result);
     } catch (error: any) {
-      console.error(`Gemini Server Execution Error for ${req.body?.functionName}:`, error);
+      const upstreamStatus = geminiServer.extractUpstreamApiStatus(error);
+      const cleanMessage = geminiServer.extractCleanGeminiErrorMessage(error);
+      console.error(`Gemini Server Execution Error for ${req.body?.functionName}:`, cleanMessage);
       const isValidationError = typeof error?.message === "string" && error.message.startsWith("Invalid TradeBot request:");
-      res.status(isValidationError ? 400 : 500).json({ error: error.message || "Failed to execute Gemini function" });
+      const responseStatus = isValidationError ? 400 : (upstreamStatus || 500);
+      res.status(responseStatus).json({ error: cleanMessage || "Failed to execute Gemini function" });
     }
   });
 
@@ -7070,9 +7142,11 @@ Limit your response to just the text of the tip. Do not use quotes.`;
 
     const abortController = new AbortController();
     const handleClientClose = () => {
-      abortController.abort();
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
     };
-    req.on("close", handleClientClose);
+    res.on("close", handleClientClose);
 
     try {
       if (task === "callTradeBotStream") {
@@ -7096,12 +7170,14 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         }
       }
     } catch (error: any) {
-      console.error(`Gemini Streaming Server Error [${task}]:`, error);
+      const upstreamStatus = geminiServer.extractUpstreamApiStatus(error);
+      const cleanMessage = geminiServer.extractCleanGeminiErrorMessage(error);
+      console.error(`Gemini Streaming Server Error [${task}]:`, cleanMessage);
       if (!abortController.signal.aborted && !res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ type: "error", error: error.message || "Streaming failed" })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: "error", status: upstreamStatus || 500, error: cleanMessage || "Streaming failed" })}\n\n`);
       }
     } finally {
-      req.off("close", handleClientClose);
+      res.off("close", handleClientClose);
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
@@ -7592,6 +7668,56 @@ Limit your response to just the text of the tip. Do not use quotes.`;
 
         const docRef = await db.collection("notifications").add(notificationData);
 
+        // Tier 2 (Free Push) + Tier 4 (Delayed Offline WhatsApp Fallback with 5-min cooldown)
+        const notifTypeLower = String(type || "").toLowerCase();
+        const isCriticalEvent =
+          notifTypeLower.includes("quote") ||
+          notifTypeLower.includes("emergency") ||
+          notifTypeLower.includes("accepted") ||
+          notifTypeLower.includes("arrived");
+
+        // Best-effort Tier 2 multi-device FCM Push (Web PWA + Native Android)
+        dispatchAuthoritativeFcmPush(db, getFirebaseMessagingClient(), {
+          recipientId,
+          title,
+          body: message,
+          channelId: isCriticalEvent ? "job_leads" : "chat_messages",
+          notificationId: docRef.id,
+          eventType: type || "notification",
+          data: {
+            link: link || "/notifications",
+            jobId: jobId || "",
+            conversationId: conversationId || "",
+            type: type || "notification",
+          },
+        }).catch(() => {});
+
+        // Best-effort Tier 4 delayed WhatsApp offline fallback (self-cancels if read or active within 45s)
+        const waContextId =
+          conversationId ||
+          (validated as any).rideId ||
+          jobId ||
+          (link ? link.replace(/[^a-zA-Z0-9_-]/g, "_") : docRef.id);
+        const waContextType: WhatsAppContextType = (validated as any).rideId
+          ? "anyroller_ride"
+          : notifTypeLower.includes("quote")
+            ? "anytrader_quote"
+            : conversationId || notifTypeLower === "message"
+              ? "anytrader_chat"
+              : "anytrader_job";
+
+        enqueueWhatsAppFallback(db, {
+          recipientUid: recipientId,
+          senderUid: callerUid,
+          senderLabel: title || "AnyTrader UK",
+          contextId: waContextId,
+          contextType: waContextType,
+          contextSummary: message,
+          deepLinkPath: link || (conversationId ? `/chat/${conversationId}` : jobId ? `/job/${jobId}` : "/notifications"),
+          notificationId: docRef.id,
+          urgent: isCriticalEvent,
+        }).catch(() => {});
+
         res.json({
           success: true,
           notificationId: docRef.id,
@@ -7734,17 +7860,116 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // AT-CJ-NOTIF-06: Authoritative multi-device FCM chat push dispatch behind strict config gate
+  // User Notification & WhatsApp Preferences (Server-Authoritative, Caller-Scoped)
+  app.get("/api/notifications/preferences", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const prefs = await getUserNotificationPreferences(db, caller);
+      res.json({ success: true, preferences: prefs });
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.patch("/api/notifications/preferences", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const prefs = await updateUserNotificationPreferences(db, caller, req.body || {});
+      res.json({ success: true, preferences: prefs });
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post(
+    "/api/notifications/whatsapp-activation-link",
+    requireAuth,
+    generalLimiter,
+    async (req, res) => {
+      try {
+        const caller = (req as any).user;
+        const result = await createWhatsAppActivationLink(db, caller, {
+          contextLabel: typeof req.body?.contextLabel === "string" ? req.body.contextLabel : undefined,
+        });
+        res.json({ success: true, ...result });
+      } catch (error: any) {
+        sendHttpError(res, error, req);
+      }
+    }
+  );
+
+  app.post("/api/notifications/presence", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      const result = await recordUserChatPresence(db, caller, req.body || {});
+      res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-CJ-NOTIF-06: Authoritative multi-device FCM chat push dispatch + Tier-4 WhatsApp fallback
   const handleAuthoritativeChatPush = async (req: express.Request, res: express.Response) => {
     try {
       const caller = (req as any).user;
-      const result = await sendAuthoritativeChatPush(
-        db,
-        getFirebaseMessagingClient(),
-        caller,
-        req.body || {}
-      );
-      res.json(result);
+      const body = req.body || {};
+      let pushResult: any = null;
+      let pushError: any = null;
+
+      try {
+        pushResult = await sendAuthoritativeChatPush(
+          db,
+          getFirebaseMessagingClient(),
+          caller,
+          body
+        );
+      } catch (err: any) {
+        pushError = err;
+      }
+
+      // If caller is forbidden or unauthorized, fail closed immediately
+      if (pushError && (pushError instanceof ForbiddenError || pushError instanceof UnauthorizedError)) {
+        throw pushError;
+      }
+
+      // Enqueue Tier-4 WhatsApp fallback (45s unread delay / 5s for ride arrival) when authorized
+      const recipientId = typeof body.recipientId === "string" ? body.recipientId.trim() : "";
+      let whatsappFallback: any = { queued: false };
+      if (recipientId && (!pushError || String(pushError?.message || "").includes("no registered push token"))) {
+        const hasRide = Boolean(body.rideId);
+        const contextId = body.conversationId || body.rideId || body.jobId || "chat";
+        const isRideArrival = String(body.type || "").toLowerCase().includes("arrived");
+        whatsappFallback = await enqueueWhatsAppFallback(db, {
+          recipientUid: recipientId,
+          senderUid: caller?.uid,
+          senderLabel: body.title || (hasRide ? "AnyRoller Driver" : "AnyTrader Message"),
+          contextId,
+          contextType: hasRide ? "anyroller_ride" : "anytrader_chat",
+          contextSummary: body.body || body.message || "You have a new message.",
+          deepLinkPath: hasRide
+            ? `/rides`
+            : body.conversationId
+              ? `/chat/${body.conversationId}`
+              : body.jobId
+                ? `/job/${body.jobId}`
+                : "/messages",
+          notificationId: body.notificationId || null,
+          urgent: isRideArrival,
+        }).catch(() => ({ queued: false }));
+      }
+
+      if (pushResult) {
+        return res.json({ ...pushResult, whatsappFallback });
+      }
+      if (whatsappFallback?.queued) {
+        return res.json({
+          success: true,
+          recipientId,
+          status: "whatsapp_fallback_queued",
+          whatsappFallback,
+        });
+      }
+      throw pushError;
     } catch (error: any) {
       sendHttpError(res, error, req);
     }
@@ -7958,6 +8183,12 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         case "sms-queue":
           canonicalJob = "sms_queue";
           outcome = await runWithSchedulerLease("sms_queue", 45000, async () => processSmsQueue());
+          break;
+        case "whatsapp-fallback-queue":
+          canonicalJob = "whatsapp_fallback_queue";
+          outcome = await runWithSchedulerLease("whatsapp_fallback_queue", 30000, async () =>
+            processWhatsAppFallbackQueue(db)
+          );
           break;
         case "daily-aggregation":
           canonicalJob = "daily_aggregation";

@@ -241,9 +241,9 @@ How can I assist your project today?`,
         : undefined
     };
 
-    // Bounded history excluding previous error placeholders
+    // Bounded history excluding the initial greeting and previous error placeholders
     const historyPayload = messages
-      .filter(m => !m.errorRetryPrompt && m.text.trim().length > 0)
+      .filter(m => !m.isInitialGreeting && !m.errorRetryPrompt && m.text.trim().length > 0)
       .slice(-10)
       .map(m => ({ role: m.role, text: m.text }));
 
@@ -443,6 +443,10 @@ How can I assist your project today?`,
       if (error instanceof TradeBotHttpError) {
         if (error.status === 401) {
           friendlyError = "Please sign in to your AnyTrader account to chat with AnyTrader AI Copilot.";
+        } else if (error.status === 402) {
+          friendlyError = "AnyTrader AI is temporarily paused while AI service credits are being replenished. You can still browse verified local trades or post your job directly below.";
+        } else if (error.status === 403) {
+          friendlyError = "AnyTrader AI is temporarily unavailable due to service configuration. Please browse verified local trades directly.";
         } else if (error.status === 429) {
           friendlyError = "You've sent several AI requests in a short window. Please wait a minute and tap Retry.";
         } else if (error.status === 400) {

@@ -28,6 +28,7 @@ import { GrowthNotificationsCard } from "./profile/GrowthNotificationsCard";
 import { HomeownerIdentityCard } from "./profile/HomeownerIdentityCard";
 import { SafetyEmergencyCard } from "./profile/SafetyEmergencyCard";
 import TraderNotificationPreferencesModal from "./TraderNotificationPreferencesModal";
+import { OfflineAlertsCard } from "./shared/OfflineAlertsCard";
 import { cn } from "@/src/lib/utils";
 import { sanitizePublicProfilePayload } from "@/src/lib/publicProfileProjection";
 import { 
@@ -2583,6 +2584,11 @@ export default function Profile() {
           handleUpdateRecurringStatus={handleUpdateRecurringStatus}
         />
       )}
+
+      {/* Hybrid Offline Alerts (Free Web Push + 1-Tap WhatsApp Fallback) */}
+      <div id="offline-alerts" className="break-inside-avoid mb-4">
+        <OfflineAlertsCard variant="full" />
+      </div>
 
       {/* Phase 3: Grouped Menu List */}
       <>

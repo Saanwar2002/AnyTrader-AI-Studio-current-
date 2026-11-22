@@ -15,7 +15,6 @@ import {
   BarChart3, ShieldCheck, Info, QrCode, TrendingDown, Home, Navigation,
   MessageCircle, Mail, Check, Plus, ImageIcon, Mic, Play, CreditCard, Award
 } from "lucide-react";
-import { Capacitor } from '@capacitor/core';
 import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
 import { GoogleMap, useJsApiLoader, MarkerF, OverlayViewF, OverlayView } from "@react-google-maps/api";
 import { cn, getOutwardPostcode, formatJobLocation } from "@/src/lib/utils";
@@ -64,6 +63,7 @@ import {
   buildLondonIcsContent,
 } from "@/src/lib/calendarExport";
 import { useDialogA11y } from "@/src/lib/useDialogA11y";
+import { OfflineAlertsCard } from "./shared/OfflineAlertsCard";
 
 // Helper to generate Google Calendar link (Europe/London)
 const generateGoogleCalendarLink = (job: any, quote: any) => buildGoogleCalendarUrl(job, quote);
@@ -2422,6 +2422,12 @@ const libraries: any[] = ['places', 'geometry'];
       </div>
 
       <div className="p-4 space-y-6">
+        {user && job.status !== "completed" && job.status !== "cancelled" && (
+          <OfflineAlertsCard
+            variant="compact"
+            contextLabel={job.title || job.category || "this job"}
+          />
+        )}
         {(!isHomeowner && job.status === "in_progress") ? (
           <div className="space-y-6 pb-[100px] mt-4">
             {/* UK Active Job Tracker Header */}

@@ -13,8 +13,6 @@ import { useCategories } from "../lib/CategoryProvider";
 import MediaGalleryModal from "./MediaGalleryModal";
 import { SEO } from "./SEO";
 import { useEntitlements } from "../lib/useEntitlements";
-import { Capacitor } from '@capacitor/core';
-import { SpeechRecognition } from "@capacitor-community/speech-recognition";
 import { toast } from "sonner";
 import { PullToRefresh } from "./common/PullToRefresh";
 import { calculateTraderMatchScore, type MatchEngineResult } from "@/src/services/matchingEngine";
@@ -143,66 +141,20 @@ export default function JobFeed() {
   const startVoiceSearch = async () => {
     try {
       if (isListening) {
-        if (Capacitor.isNativePlatform()) {
-          try { await SpeechRecognition.stop(); } catch (e) {}
-        } else if (recognitionRef.current) {
+        if (recognitionRef.current) {
           recognitionRef.current.stop();
         }
         setIsListening(false);
         return;
       }
 
-      if (Capacitor.isNativePlatform()) {
-        const { available } = await SpeechRecognition.available();
-        if (!available) {
-          toast.error("Speech recognition not available on this device.");
-          return;
-        }
+      const InternalSpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (!InternalSpeechRecognition) {
+        toast.error("Your browser does not support voice search. Please try Chrome, Edge, or Safari.");
+        return;
+      }
 
-        const check = await SpeechRecognition.checkPermissions();
-        if (check.speechRecognition !== 'granted') {
-          const req = await SpeechRecognition.requestPermissions();
-          if (req.speechRecognition !== 'granted') {
-            toast.error("Microphone permission is required for voice search.");
-            return;
-          }
-        }
-
-        setIsListening(true);
-        if ((window as any)._jobFeedSpeechListener) await (window as any)._jobFeedSpeechListener.remove().catch(() => {});
-        const listener = await SpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
-          if (data.matches && data.matches.length > 0) {
-            setSearchTerm(data.matches[0]);
-          }
-        });
-        (window as any)._jobFeedSpeechListener = listener;
-
-        if ((window as any)._jobFeedStateListener) await (window as any)._jobFeedStateListener.remove().catch(() => {});
-        const stateListener = await SpeechRecognition.addListener('listeningState', (data: { status: 'started' | 'stopped' }) => {
-          if (data.status === 'stopped') {
-            setIsListening(false);
-            if ((window as any)._jobFeedSpeechListener) (window as any)._jobFeedSpeechListener.remove().catch(() => {});
-            stateListener.remove().catch(() => {});
-          }
-        });
-        (window as any)._jobFeedStateListener = stateListener;
-
-        await SpeechRecognition.start({
-          language: "en-GB",
-          maxResults: 2,
-          prompt: "What are you looking for...",
-          partialResults: true,
-          popup: false,
-        });
-
-      } else {
-        const InternalSpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-        if (!InternalSpeechRecognition) {
-          toast.error("Your browser does not support voice search. Please try Chrome, Edge, or Safari.");
-          return;
-        }
-
-        const recognition = new InternalSpeechRecognition();
+      const recognition = new InternalSpeechRecognition();
         recognitionRef.current = recognition;
         recognition.continuous = false;
         recognition.interimResults = true;
@@ -231,7 +183,6 @@ export default function JobFeed() {
         };
 
         recognition.start();
-      }
     } catch (e: any) {
       console.error(e);
       setIsListening(false);

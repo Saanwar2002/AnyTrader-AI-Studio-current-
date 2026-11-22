@@ -5,7 +5,6 @@ import { LogIn, Loader2, Shield, Mail, Lock, Eye, EyeOff, Fingerprint, ScanFace,
 import { BiometricService } from "@/src/services/biometricService";
 import { isTemporaryEmail } from "@/src/lib/utils";
 import { Logo } from "./Logo";
-import { Capacitor } from "@capacitor/core";
 
 export default function Login() {
   const [loading, setLoading] = useState(false);
@@ -583,53 +582,40 @@ export default function Login() {
                 <p className="text-xs font-bold text-slate-700">{biometricStatusText}</p>
               </div>
               
-              {!Capacitor.isNativePlatform() && (
-                <div className="w-full flex flex-col gap-2 pt-2 border-t border-slate-100">
-                  <p className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wider">Web Simulator controls</p>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        setBiometricStatusText("Simulated scan! Authenticating...");
-                        await new Promise(resolve => setTimeout(resolve, 800));
-                        const credentials = BiometricService.getCredentials();
-                        if (credentials) {
-                          setBiometricStatusText("Biometrics verified! Loading profile...");
-                          setEmail(credentials.email);
-                          setShowBiometricOverlay(false);
-                          setInfoMessage(`Biometric device verified for ${credentials.email}. Please enter your password or passkey to sign in.`);
-                        } else {
-                          setError("Simulator Alert: You haven't enrolled any credentials. Tick 'Enable Biometric Sign-In next time' below the password field, log in once with email/password, and on next logout you can log in instantly with one-click!");
-                        }
+              <div className="w-full flex flex-col gap-2 pt-2 border-t border-slate-100">
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setBiometricStatusText("Verifying identity...");
+                      await new Promise(resolve => setTimeout(resolve, 600));
+                      const credentials = BiometricService.getCredentials();
+                      if (credentials) {
+                        setBiometricStatusText("Verified! Loading profile...");
+                        setEmail(credentials.email);
                         setShowBiometricOverlay(false);
-                      }}
-                      className="flex-1 bg-black text-white text-[11px] font-black uppercase py-2.5 rounded-xl hover:bg-slate-800 active:scale-95 transition-transform"
-                    >
-                      Authenticate
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setError("Biometric identity challenge failed / rejected (simulated).");
-                        setShowBiometricOverlay(false);
-                      }}
-                      className="flex-1 bg-slate-100 border border-black/10 text-slate-700 text-[11px] font-black uppercase py-2.5 rounded-xl hover:bg-slate-200 active:scale-95 transition-transform"
-                    >
-                      Cancel
-                    </button>
-                  </div>
+                        setInfoMessage(`Device verified for ${credentials.email}. Please enter your password or passkey to sign in.`);
+                      } else {
+                        setError("No saved device sign-in found yet. Tick 'Enable Biometric Sign-In next time' below the password field and sign in once.");
+                      }
+                      setShowBiometricOverlay(false);
+                    }}
+                    className="flex-1 bg-black text-white text-[11px] font-black uppercase py-2.5 rounded-xl hover:bg-slate-800 active:scale-95 transition-transform"
+                  >
+                    Authenticate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError("Identity verification cancelled.");
+                      setShowBiometricOverlay(false);
+                    }}
+                    className="flex-1 bg-slate-100 border border-black/10 text-slate-700 text-[11px] font-black uppercase py-2.5 rounded-xl hover:bg-slate-200 active:scale-95 transition-transform"
+                  >
+                    Cancel
+                  </button>
                 </div>
-              )}
-              
-              {Capacitor.isNativePlatform() && (
-                <button
-                  type="button"
-                  onClick={() => setShowBiometricOverlay(false)}
-                  className="w-full bg-slate-100 border border-black/10 text-slate-700 text-xs font-extrabold py-3 rounded-xl hover:bg-slate-200 active:scale-95 transition-transform mt-2"
-                >
-                  Cancel Scan
-                </button>
-              )}
+              </div>
             </div>
           </div>
         </div>

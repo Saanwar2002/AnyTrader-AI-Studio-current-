@@ -1,5 +1,20 @@
 # AnyTrader Platform Maintenance & Multi-Portal Development Guide
 
+## 💬 Hybrid Messaging & 4-Tier Notification Waterfall (November 22, 2026)
+- **Scope**: Built full AnyTrader UI and shared backend notification infrastructure compatible with the upcoming standalone native Android AnyRoller Driver App (AnyRoller web UI screens intentionally untouched per product scope).
+- **4-Tier Cost-Controlled Escalation Engine (`src/server/whatsappNotificationEngine.ts`, `server.ts`)**:
+  - **Tier 1 (Free In-App Real-Time)** -> **Tier 2 (Free PWA Web Push & Native Android FCM Push via `dispatchAuthoritativeFcmPush`)** -> **Tier 3 (Email)** -> **Tier 4 (Direct Meta WhatsApp Cloud API offline fallback, zero Twilio markup)**.
+  - **45-Second Unread Check & Presence Cancellation**: Standard chat messages enqueue into `whatsapp_fallback_queue/{recipientUid}_{contextId}` with a 45s delay (5s for urgent events). The leased 1-minute scheduler job (`whatsapp_fallback_queue` + `POST /api/cron/whatsapp-fallback-queue`) cancels delivery with `skipped_read` if the recipient has an active `user_presence/{uid}` heartbeat or read notification.
+  - **Atomic 5-Minute Cooldown & Daily Cap**: `claimWhatsAppCooldownSlot` uses Firestore transactions over `notification_cooldowns` to enforce at most 1 WhatsApp alert per 5 minutes per conversation and 20/day per user.
+  - **Smart 24h Service Window & 1-Tap Opt-In**: `POST /api/notifications/whatsapp-activation-link` mints a single-use 15-minute `AT-XXXXXX` code (`whatsapp_activation_codes`) and `wa.me` link to the platform's official business number. Signed Meta webhooks (`GET`/`POST /api/webhooks/whatsapp`, timing-safe `X-Hub-Signature-256` verification on raw body before JSON parsing) verify `AT-XXXXXX` opt-in, stamp a 24h service window (`whatsappWindowExpiresAtMs`), process instant UK GDPR `STOP` opt-outs, and return a 1-way privacy reminder on general replies.
+  - **Zero Phone Exposure & Blocklist Parity**: User phone numbers remain server-side only (masked via `GET /api/notifications/preferences`); `chat_user_blocks` is enforced on both enqueue and dispatch.
+- **Free PWA Web Push (`public/firebase-messaging-sw.js`, `src/lib/pushNotifications.ts`, `src/App.tsx`)**:
+  - Added CSP-safe zero-external-CDN FCM Web Push service worker, VAPID token registration to `/api/notifications/register-token` (`platform: "web"`), and `WebPushRuntimeBridge` for silent token sync and foreground push sound/toast alerts.
+- **AnyTrader UI & Chat Presence (`src/components/shared/OfflineAlertsCard.tsx`, `Notifications.tsx`, `Profile.tsx`, `Chat.tsx`, `JobDetails.tsx`)**:
+  - Added full Offline Alerts control card (Web Push, PWA Install / iOS Home Screen guide, UK mobile save/pause, 1-tap WhatsApp activation) on `Notifications` and `Profile`, compact auto-hiding prompts on active `Chat` and `JobDetails` views, and active 45s presence heartbeats in `Chat.tsx` (`POST /api/notifications/presence`).
+- **Firestore Security Rules & Blueprint (`firestore.rules`, `firebase-blueprint.json`)**:
+  - Locked `notification_cooldowns`, `whatsapp_fallback_queue`, `whatsapp_activation_codes` to server-only (`allow read, write: if false;`), `whatsapp_delivery_logs` to admin read-only, and `user_presence` to owner/admin read-only with server-only writes.
+
 ## 🤖 AnyTrader AI Bot Full Audit & Remediation (November 21, 2026)
 - **Model & SDK Alignment (`package.json`, `src/services/geminiServer.ts`)**: Upgraded `@google/genai` to `^3.6.1`, aligned `DEFAULT_FAST_AI_MODEL` to `"gemini-4-hydrogen"`, and rejected deprecated legacy model names while verifying live Google Search grounding compatibility.
 - **Security, Prompt Isolation & Telemetry Governance (`src/services/geminiServer.ts`, `server.ts`, `firestore.rules`, `src/services/searchOptimizationService.ts`)**:

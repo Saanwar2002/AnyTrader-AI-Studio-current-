@@ -5,6 +5,10 @@ import {
   DEFAULT_FAST_AI_MODEL,
   sanitizeTradeBotInput,
   stripMatchedCategoriesTag,
+  buildNormalizedGeminiContents,
+  extractUpstreamApiStatus,
+  extractCleanGeminiErrorMessage,
+  isNonRetryableQuotaOrAuthError,
 } from "../../src/services/geminiServer";
 import {
   extractCanonicalTradeIntent,
@@ -82,6 +86,40 @@ describe("AnyTrader AI Bot — Full Audit Remediation Suite", () => {
       const adminSanitized = sanitizeTradeBotInput("Check boiler rules", [], { postcode: "UK Wide" }, "admin");
       expect(adminSanitized.safeRole).toBe("admin");
       expect(adminSanitized.hasPersonalizedContext).toBe(false);
+    });
+
+    it("normalizes Gemini multi-turn contents to always start with user and strictly alternate roles", () => {
+      // Leading initial greeting (role: model) must be stripped
+      const firstTurn = buildNormalizedGeminiContents(
+        [{ role: "model", text: "Hi! I'm AnyTrader AI." }],
+        "How much is a boiler service?"
+      );
+      expect(firstTurn).toEqual([
+        { role: "user", parts: [{ text: "How much is a boiler service?" }] },
+      ]);
+
+      // Retry after failed turn (consecutive user turns) must coalesce without duplicate text
+      const retryTurn = buildNormalizedGeminiContents(
+        [
+          { role: "model", text: "Hi! I'm AnyTrader AI." },
+          { role: "user", text: "How much is a boiler service?" },
+        ],
+        "How much is a boiler service?"
+      );
+      expect(retryTurn).toEqual([
+        { role: "user", parts: [{ text: "How much is a boiler service?" }] },
+      ]);
+
+      // Multi-turn alternating history stays intact after leading model greeting is removed
+      const multiTurn = buildNormalizedGeminiContents(
+        [
+          { role: "model", text: "Initial greeting" },
+          { role: "user", text: "Boiler has low pressure" },
+          { role: "model", text: "Check the filling loop." },
+        ],
+        "How much to repressurise?"
+      );
+      expect(multiTurn.map((c) => c.role)).toEqual(["user", "model", "user"]);
     });
   });
 
@@ -216,14 +254,30 @@ describe("AnyTrader AI Bot — Full Audit Remediation Suite", () => {
       expect(telemetryBlock![1]).not.toContain("allow read: if isSignedIn()");
 
       expect(serverSrc).toContain('app.post("/api/telemetry/unmatched-search", requireAuth, generalLimiter');
-      expect(serverSrc).toContain('req.on("close", handleClientClose)');
+      expect(serverSrc).toContain('res.on("close", handleClientClose)');
+      expect(serverSrc).toContain("!res.writableEnded");
+      expect(serverSrc).not.toContain('req.on("close", handleClientClose)');
       expect(serverSrc).toContain("authoritativeRole");
     });
 
-    it("propagates SSE error events cleanly and avoids redundant retries on 401/403/429 in client gemini.ts", () => {
+    it("propagates SSE error events cleanly, short-circuits 402 billing exhaustion, and avoids redundant retries on 401/402/403/429", () => {
       expect(geminiClientSrc).toContain("class TradeBotHttpError");
-      expect(geminiClientSrc).toContain("[400, 401, 403, 429].includes(error.status)");
+      expect(geminiClientSrc).toContain("[400, 401, 402, 403, 429].includes(error.status)");
       expect(geminiClientSrc).toContain("if (streamError)");
+
+      const billingErr = {
+        status: 402,
+        message: JSON.stringify({
+          error: {
+            code: 402,
+            message: "Your prepayment credits are depleted.",
+            status: "RESOURCE_EXHAUSTED",
+          },
+        }),
+      };
+      expect(extractUpstreamApiStatus(billingErr)).toBe(402);
+      expect(isNonRetryableQuotaOrAuthError(billingErr)).toBe(true);
+      expect(extractCleanGeminiErrorMessage(billingErr)).toContain("billing credits are depleted");
     });
 
     it("stops non-admin 403 category sync calls in initSearchOptimizationService", () => {
@@ -239,6 +293,7 @@ describe("AnyTrader AI Bot — Full Audit Remediation Suite", () => {
       expect(tradeBotSrc).toContain('role="dialog"');
       expect(tradeBotSrc).toContain('aria-modal="true"');
       expect(tradeBotSrc).toContain("useDialogA11y");
+      expect(tradeBotSrc).toContain("!m.isInitialGreeting");
       expect(tradeBotSrc).toContain("autoOpenQuoteModal: true");
       expect(tradeBotSrc).not.toContain("Market Standard (£120 - £350)");
       expect(tradeBotSrc).not.toContain("94 trade sectors");

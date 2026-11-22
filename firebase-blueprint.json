@@ -4534,6 +4534,36 @@
         "$ref": "#/entities/Job"
       },
       "description": "Append-only immutable data lifecycle audit events recording policy mutations, legal holds, revocations, and erasures."
+    },
+    "/notification_cooldowns/{cooldownId}": {
+      "schema": {
+        "$ref": "#/entities/Notification"
+      },
+      "description": "Server-authoritative atomic 5-minute per-conversation cooldowns and daily per-user caps for WhatsApp fallback notifications."
+    },
+    "/whatsapp_fallback_queue/{queueId}": {
+      "schema": {
+        "$ref": "#/entities/Notification"
+      },
+      "description": "Server-authoritative delayed 45-second unread fallback queue deduplicated per recipient and conversation/job/ride context."
+    },
+    "/whatsapp_delivery_logs/{logId}": {
+      "schema": {
+        "$ref": "#/entities/Notification"
+      },
+      "description": "Server-authoritative Meta WhatsApp Cloud API delivery audit logs tracking free-form service window vs utility template usage."
+    },
+    "/whatsapp_activation_codes/{code}": {
+      "schema": {
+        "$ref": "#/entities/Notification"
+      },
+      "description": "Server-authoritative single-use 15-minute AT-XXXXXX activation codes binding 1-tap WhatsApp opt-in and 24-hour service windows."
+    },
+    "/user_presence/{userId}": {
+      "schema": {
+        "$ref": "#/entities/User"
+      },
+      "description": "Server-authoritative active chat presence heartbeats used to self-cancel delayed WhatsApp fallback nudges while a user is actively viewing a chat."
     }
   }
 }

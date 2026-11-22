@@ -31,7 +31,7 @@
   --border-color: #f1f5f9;
   --header-color: #0f172a;
 
-  /* Capacitor Safe Area Inset Support */
+  /* Mobile Web / PWA Safe Area Inset Support */
   --sat: env(safe-area-inset-top, 0px);
   --sab: env(safe-area-inset-bottom, 0px);
   --sal: env(safe-area-inset-left, 0px);
@@ -194,7 +194,7 @@ body.hide-driver-bottom-nav #mobile-bottom-nav {
   pointer-events: none;
 }
 
-/* Capacitor Virtual Keyboard Layout Adjustments */
+/* Mobile Virtual Keyboard Layout Adjustments */
 body.keyboard-is-open #mobile-bottom-nav,
 body.keyboard-is-open .hide-on-keyboard {
   display: none !important;

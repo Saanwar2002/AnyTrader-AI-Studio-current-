@@ -56,9 +56,7 @@ import { useAuth } from "./AuthProvider";
 import { useNavigate, useLocation } from "react-router-dom";
 import { createJobViaCommand, updateJobViaCommand } from "../services/jobCommandService";
 import { useJsApiLoader } from "@react-google-maps/api";
-import { Capacitor } from '@capacitor/core';
-import { SpeechRecognition } from '@capacitor-community/speech-recognition';
-import { getGoogleMapsApiKey, isCapacitor } from "@/src/lib/capacitor";
+import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
 import { useBusinessTab } from "@/src/store/businessTabStore";
 import { toast } from "sonner";
 import VoiceJobAssistant from "./voice/VoiceJobAssistant";
@@ -795,20 +793,6 @@ export default function PostJobWizard() {
   const handleStartAudioNote = async () => {
     if (!user) return;
     try {
-      if (Capacitor.isNativePlatform()) {
-        const { available } = await SpeechRecognition.available();
-        if (available) {
-          const check = await SpeechRecognition.checkPermissions();
-          if (check.speechRecognition !== 'granted') {
-            const req = await SpeechRecognition.requestPermissions();
-            if (req.speechRecognition !== 'granted') {
-              toast.error("Microphone permission is required to record audio notes.");
-              return;
-            }
-          }
-        }
-      }
-
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioNoteStreamRef.current = stream;
       
@@ -924,89 +908,19 @@ export default function PostJobWizard() {
 
   const handleToggleListening = async () => {
     if (isListening) {
-      if (Capacitor.isNativePlatform()) {
-        try {
-          await SpeechRecognition.stop();
-        } catch (e) {
-          console.error("Native stop error:", e);
-        }
-        setIsListening(false);
-      } else {
-        if (audioRecorderRef.current && audioRecorderRef.current.state !== 'inactive') {
-          audioRecorderRef.current.stop();
-        }
-        setIsListening(false);
+      if (audioRecorderRef.current && audioRecorderRef.current.state !== 'inactive') {
+        audioRecorderRef.current.stop();
       }
+      setIsListening(false);
       return;
     }
 
-    if (Capacitor.isNativePlatform()) {
-      // Capacitor Native Voice Recognition
-      setVoiceText("");
-      setVoiceError(null);
-      
-      try {
-        const { available } = await SpeechRecognition.available();
-        if (!available) throw new Error("Speech recognition not available");
-
-        const check = await SpeechRecognition.checkPermissions();
-        if (check.speechRecognition !== 'granted') {
-          const req = await SpeechRecognition.requestPermissions();
-          if (req.speechRecognition !== 'granted') {
-            setShowPermissionModal(true);
-            return;
-          }
-        }
-
-        if ((window as any)._postJobSpeechListener) await (window as any)._postJobSpeechListener.remove().catch(() => {});
-        const listener = await SpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
-          if (data.matches && data.matches.length > 0) {
-            setVoiceText(data.matches[0]);
-            resetSilenceTimer();
-          }
-        });
-        (window as any)._postJobSpeechListener = listener;
-
-        const resetSilenceTimer = () => {
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = setTimeout(async () => {
-            try { await SpeechRecognition.stop(); } catch (err) {}
-          }, 4000);
-        };
-
-        if ((window as any)._postJobStateListener) await (window as any)._postJobStateListener.remove().catch(() => {});
-        const stateListener = await SpeechRecognition.addListener('listeningState', (data: { status: 'started' | 'stopped' }) => {
-          if (data.status === 'stopped') {
-            if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-            setIsListening(false);
-            if ((window as any)._postJobSpeechListener) (window as any)._postJobSpeechListener.remove().catch(() => {});
-            if ((window as any)._postJobStateListener) (window as any)._postJobStateListener.remove().catch(() => {});
-          }
-        });
-        (window as any)._postJobStateListener = stateListener;
-
-        setIsListening(true);
-        setVoiceText("Listening...");
-        resetSilenceTimer();
-
-        await SpeechRecognition.start({
-          language: 'en-GB',
-          maxResults: 1,
-          partialResults: true,
-          popup: false,
-        });
-      } catch (err: any) {
-        console.error("Native speech failed:", err);
-        setVoiceError("Microphone issue detected (Permission denied or blocked). Please continue typing manually.");
-        setIsListening(false);
-      }
-    } else {
-      setVoiceText("");
-      setVoiceError(null);
-      audioChunksRef.current = [];
-      
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    setVoiceText("");
+    setVoiceError(null);
+    audioChunksRef.current = [];
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioStreamRef.current = stream;
         
         let mimeType = 'audio/webm';
@@ -1080,7 +994,6 @@ export default function PostJobWizard() {
         setIsListening(false);
         setVoiceText("");
       }
-    }
   };
 
   const handleFallbackAudio = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2307,23 +2220,6 @@ export default function PostJobWizard() {
               </div>
 
               <div className="flex flex-col gap-3">
-                {Capacitor.isNativePlatform() && (
-                  <button 
-                    onClick={async () => {
-                      try {
-                        const { App: CapacitorApp } = await import('@capacitor/app');
-                        if (CapacitorApp && (CapacitorApp as any).openAppSettings) {
-                           await (CapacitorApp as any).openAppSettings();
-                        }
-                      } catch (e) {
-                         console.error("Failed to open app settings", e);
-                      }
-                    }}
-                    className="w-full py-4 rounded-[2rem] bg-indigo-600 text-white font-bold tracking-wide active:scale-95 transition-all shadow-lg flex items-center justify-center gap-2"
-                  >
-                    Open Settings
-                  </button>
-                )}
                 <button 
                   onClick={() => setShowPermissionModal(false)}
                   className="w-full py-4 rounded-[2rem] bg-slate-100 text-slate-700 font-bold active:scale-95 transition-all"

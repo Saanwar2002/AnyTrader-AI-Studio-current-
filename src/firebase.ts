@@ -1,17 +1,16 @@
 import { initializeApp } from "firebase/app";
-import { initializeAppCheck, ReCaptchaV3Provider, CustomProvider } from "firebase/app-check";
+import { initializeAppCheck, ReCaptchaV3Provider } from "firebase/app-check";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signInAnonymously, type User as FirebaseUser, createUserWithEmailAndPassword, signInWithEmailAndPassword, sendEmailVerification, sendPasswordResetEmail, RecaptchaVerifier, linkWithPhoneNumber, PhoneAuthProvider, initializeAuth, indexedDBLocalPersistence, browserLocalPersistence, browserSessionPersistence, inMemoryPersistence, signInWithCredential, browserPopupRedirectResolver } from "firebase/auth";
 import { enableMultiTabIndexedDbPersistence, initializeFirestore, getFirestore, collection, collectionGroup, doc, getDoc, getDocs, setDoc as originalSetDoc, updateDoc as originalUpdateDoc, deleteDoc as originalDeleteDoc, onSnapshot as originalOnSnapshot, query, where, or, and, orderBy, limit, startAfter, getDocFromServer, serverTimestamp, addDoc as originalAddDoc, runTransaction as originalRunTransaction, writeBatch as originalWriteBatch, deleteField, arrayUnion, arrayRemove, increment } from "firebase/firestore";
 import { getPerformance, trace } from "firebase/performance";
 import { getStorage, ref, uploadBytes, getDownloadURL, uploadBytesResumable, uploadString } from "firebase/storage";
-import { Capacitor } from "@capacitor/core";
 import { getApiUrl } from "./lib/apiUrl";
 import firebaseConfig from "../firebase-applet-config.json";
 
 // Initialize Firebase SDK
 export const app = initializeApp(firebaseConfig);
 
-// Initialize Firebase App Check symmetrically across Iframes, Web browsers, and Capacitor Native containers
+// Initialize Firebase App Check for Web browsers
 (async () => {
   try {
     if (typeof window !== "undefined") {
@@ -22,46 +21,15 @@ export const app = initializeApp(firebaseConfig);
         return;
       }
 
-      if (Capacitor.isNativePlatform()) {
-        try {
-          console.log("Capacitor native platform detected. Initializing App Check with Native App Attest / Play Integrity...");
-          const packageName = "@capacitor-firebase/app-check";
-          const { FirebaseAppCheck } = await import(/* @vite-ignore */ packageName) as any;
-          
-          // First, run native initialization of App Check
-          await FirebaseAppCheck.initialize();
-
-          // Create standard Web CustomProvider to pull tokens from native SDK
-          const provider = new CustomProvider({
-            getToken: async () => {
-              const { token } = await FirebaseAppCheck.getToken();
-              return {
-                token,
-                expireTimeMillis: Date.now() + 30 * 60 * 1000 // default 30 mins
-              };
-            }
-          });
-
-          initializeAppCheck(app, {
-            provider,
-            isTokenAutoRefreshEnabled: true
-          });
-          console.log("Firebase App Check successfully initialized for Capacitor Native Client.");
-        } catch (nativeErr) {
-          console.error("Failed to initialize App Check on Capacitor Native Platform. Make sure '@capacitor-firebase/app-check' is compiled into the build package:", nativeErr);
-        }
+      const siteKey = (import.meta as any).env?.VITE_RECAPTCHA_SITE_KEY;
+      if (siteKey && siteKey !== "your_recaptcha_v3_site_key" && siteKey !== "YOUR_RECAPTCHA_V3_SITE_KEY") {
+        initializeAppCheck(app, {
+          provider: new ReCaptchaV3Provider(siteKey),
+          isTokenAutoRefreshEnabled: true
+        });
+        console.log("Firebase App Check initialized successfully with reCAPTCHA v3 site key.");
       } else {
-        // Standard Web browser
-        const siteKey = (import.meta as any).env?.VITE_RECAPTCHA_SITE_KEY;
-        if (siteKey && siteKey !== "your_recaptcha_v3_site_key" && siteKey !== "YOUR_RECAPTCHA_V3_SITE_KEY") {
-          initializeAppCheck(app, {
-            provider: new ReCaptchaV3Provider(siteKey),
-            isTokenAutoRefreshEnabled: true
-          });
-          console.log("Firebase App Check initialized successfully with reCAPTCHA v3 site key.");
-        } else {
-          console.log("Firebase App Check skipped: No valid VITE_RECAPTCHA_SITE_KEY detected. Disabling App Check for development/preview to prevent connection blocking.");
-        }
+        console.log("Firebase App Check skipped: No valid VITE_RECAPTCHA_SITE_KEY detected. Disabling App Check for development/preview to prevent connection blocking.");
       }
     }
   } catch (e) {
@@ -202,47 +170,8 @@ export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 // Auth Helpers
-export const signInWithGoogle = async (options?: { forceWebView?: boolean }) => {
-  const forceWebView = options?.forceWebView === true;
-
-  if (Capacitor.isNativePlatform() && !forceWebView) {
-    try {
-      console.log("[signInWithGoogle] Capacitor native container detected. Loading @capacitor-firebase/authentication plugin...");
-      const authPluginPkg = "@capacitor-firebase/authentication";
-      const { FirebaseAuthentication } = (await import(/* @vite-ignore */ authPluginPkg)) as any;
-      console.log("[signInWithGoogle] Triggering native Google Flow on device...");
-      const result = await FirebaseAuthentication.signInWithGoogle({});
-      console.log("[signInWithGoogle] Native authentication completed. Checking credentials...");
-      
-      const idToken = result.credential?.idToken;
-      if (!idToken) {
-        console.error("[signInWithGoogle] No idToken returned in credential. Native result structure was:", JSON.stringify(result));
-        throw new Error("Google Sign-In completed, but no ID Token was returned. Web Client ID may need configuration.");
-      }
-      
-      const credential = GoogleAuthProvider.credential(idToken);
-      console.log("[signInWithGoogle] Handshaking native credentials with Firebase SDK...");
-      const userCredential = await signInWithCredential(auth, credential);
-      console.log("[signInWithGoogle] Success! Authenticated user ID:", userCredential.user?.uid);
-      return userCredential;
-    } catch (err: any) {
-      console.warn("[signInWithGoogle] Native Google Sign-In status:", err);
-      
-      const rawErrorStr = err.message || JSON.stringify(err) || "Unknown Error";
-      const isUserCanceled = rawErrorStr.toLowerCase().includes("canceled") || 
-                             rawErrorStr.toLowerCase().includes("cancel") || 
-                             rawErrorStr.includes("12501");
-
-      if (isUserCanceled) {
-        throw new Error("Sign-in was canceled by the user.");
-      }
-
-      console.warn("[signInWithGoogle] Native flow encountered an issue. Executing force-web-view fallback for frictionless login...");
-      return await executeWebViewGoogleSignIn();
-    }
-  } else {
-    return await executeWebViewGoogleSignIn();
-  }
+export const signInWithGoogle = async (_options?: { forceWebView?: boolean }) => {
+  return await executeWebViewGoogleSignIn();
 };
 
 const executeWebViewGoogleSignIn = async () => {

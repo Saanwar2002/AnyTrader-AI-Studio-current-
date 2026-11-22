@@ -7,7 +7,6 @@ import { useNavigate } from "react-router-dom";
 import { cn } from "@/src/lib/utils";
 import { toast } from "sonner";
 import { useJsApiLoader } from "@react-google-maps/api";
-import { Capacitor } from '@capacitor/core';
 import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
 
 const libraries: any[] = ["places", "geometry"];

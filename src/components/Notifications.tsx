@@ -6,6 +6,7 @@ import { Bell, MessageSquare, FileText, Info, Check, Loader2, Clock, X, Calendar
 import { useNavigate } from "react-router-dom";
 import { cn } from "@/src/lib/utils";
 import TraderNotificationPreferencesModal from "./TraderNotificationPreferencesModal";
+import { OfflineAlertsCard } from "./shared/OfflineAlertsCard";
 
 export default function Notifications() {
   const { user, profile } = useAuth();
@@ -248,6 +249,8 @@ export default function Notifications() {
           {error}
         </div>
       )}
+
+      <OfflineAlertsCard variant="full" />
 
       <div className="space-y-3">
         <AnimatePresence mode="popLayout">

@@ -19,9 +19,6 @@ import { toast } from "sonner";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { processTaxiVoiceCommand } from "@/src/services/gemini";
 import { triggerHaptic, ImpactStyle, hideNativeKeyboard, getGoogleMapsApiKey } from "@/src/lib/capacitor";
-import { Capacitor } from '@capacitor/core';
-import { SpeechRecognition } from '@capacitor-community/speech-recognition';
-import { LocalNotifications } from '@capacitor/local-notifications';
 
 // Google Maps Imports
 import { GoogleMap, useJsApiLoader, MarkerF, PolylineF, OverlayViewF, OverlayView } from "@react-google-maps/api";
@@ -1235,118 +1232,15 @@ export default function PassengerBooking() {
     
     if (isListening) {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      
-      if (Capacitor.isNativePlatform()) {
-        try {
-          await SpeechRecognition.stop();
-        } catch (e: any) {
-          console.error("Native stop error:", e);
-        }
-        setIsListening(false);
-        if (transcriptRef.current.trim().length > 0) {
-          processVoiceCommand(transcriptRef.current);
-          transcriptRef.current = "";
-        }
-      } else {
-        // Let the onend handler process the current transcript when it fires.
-        recognitionRef.current?.stop(); 
-      }
+      // Let the onend handler process the current transcript when it fires.
+      recognitionRef.current?.stop();
       return;
     }
 
     transcriptRef.current = "";
 
-    if (Capacitor.isNativePlatform()) {
-      try {
-        // 1. Check if available
-        const { available } = await SpeechRecognition.available();
-        if (!available) {
-          toast.error("Speech recognition is not available or supported on this device.");
-          return;
-        }
-
-        // 2. Check & Request permissions
-        const check = await SpeechRecognition.checkPermissions();
-        if (check.speechRecognition !== 'granted') {
-          const req = await SpeechRecognition.requestPermissions();
-          if (req.speechRecognition !== 'granted') {
-            setShowPermissionModal(true);
-            return;
-          }
-        }
-
-        // 3. Setup partial results listener
-        if ((window as any)._speechListener) {
-          try {
-            await (window as any)._speechListener.remove();
-          } catch (_) {}
-        }
-        
-        const listener = await SpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
-          if (data.matches && data.matches.length > 0) {
-            transcriptRef.current = data.matches[0];
-            resetSilenceTimer();
-          }
-        });
-        (window as any)._speechListener = listener;
-
-        const resetSilenceTimer = () => {
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = setTimeout(async () => {
-            try {
-              await SpeechRecognition.stop();
-            } catch (err) {}
-          }, 4000); // Wait 4 seconds of silence before automatically stopping
-        };
-
-        // Listen for when it stops
-        if ((window as any)._speechStateListener) {
-          try {
-            await (window as any)._speechStateListener.remove();
-          } catch (_) {}
-        }
-        const stateListener = await SpeechRecognition.addListener('listeningState', (data: { status: 'started' | 'stopped' }) => {
-          if (data.status === 'stopped') {
-            if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-            setIsListening(false);
-            
-            // Clean up listeners
-            if ((window as any)._speechListener) {
-              (window as any)._speechListener.remove().catch(() => {});
-              (window as any)._speechListener = null;
-            }
-            if ((window as any)._speechStateListener) {
-              (window as any)._speechStateListener.remove().catch(() => {});
-              (window as any)._speechStateListener = null;
-            }
-
-            if (transcriptRef.current.trim().length > 0) {
-              processVoiceCommand(transcriptRef.current);
-              transcriptRef.current = "";
-            }
-          }
-        });
-        (window as any)._speechStateListener = stateListener;
-
-        setIsListening(true);
-        resetSilenceTimer();
-
-        // 4. Start native recorder
-        await SpeechRecognition.start({
-          language: 'en-GB',
-          maxResults: 1,
-          partialResults: true,
-          popup: false,
-        });
-
-      } catch (err: any) {
-        console.error("Capacitor Speech Recognition failed:", err);
-        toast.error("Capacitor Voice Error: " + (err.message || String(err)));
-        setIsListening(false);
-      }
-    } else {
-      // Browser Web Speech API fallback
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitRecognition || (window as any).webkitSpeechRecognition;
+    // Browser Web Speech API
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitRecognition || (window as any).webkitSpeechRecognition;
       if (!SpeechRecognition) {
         toast.error("Speech recognition not supported in this browser. Please use Google Chrome or Safari.");
         return;
@@ -1420,7 +1314,6 @@ export default function PassengerBooking() {
         }
         setIsListening(false);
       }
-    }
   };
 
   const geocodeLocation = (address: string, setter: (val: string) => void, coordSetter: (coords: {lat: number, lng: number}) => void) => {
@@ -1881,32 +1774,7 @@ export default function PassengerBooking() {
         lastPopupMessageIdRef.current = latestMsg.id;
         playSound('notification');
         if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-        
-        if (Capacitor.isNativePlatform()) {
-          try {
-            LocalNotifications.requestPermissions().then((perm) => {
-              if (perm.display === 'granted') {
-                LocalNotifications.schedule({
-                  notifications: [
-                    {
-                      title: "New Message from Driver",
-                      body: latestMsg.text,
-                      id: new Date().getTime(),
-                      schedule: { at: new Date(Date.now() + 100) },
-                      sound: undefined,
-                      attachments: undefined,
-                      actionTypeId: "",
-                      extra: null
-                    }
-                  ]
-                }).catch(e => console.warn("LocalNotifications error:", e));
-              }
-            }).catch(e => console.warn("LocalNotifications error:", e));
-          } catch (e) {
-             console.warn("LocalNotifications error:", e);
-          }
-        }
-        
+
         if (!isChatOpen) {
           setIncomingPopupMessage({ id: latestMsg.id, text: latestMsg.text });
         }
@@ -2625,29 +2493,6 @@ export default function PassengerBooking() {
              lastSoundStatusRef.current = 'accepted';
              // Only show the overlay if we just transitioned to accepted
              setShowDriverFoundOverlay(true);
-
-             if (Capacitor.isNativePlatform()) {
-               try {
-                 LocalNotifications.requestPermissions().then((perm) => {
-                   if (perm.display === 'granted') {
-                     LocalNotifications.schedule({
-                       notifications: [
-                         {
-                           title: "Driver Assigned",
-                           body: `${data.driverName || "A driver"} is on their way to pick you up.`,
-                           id: 1002,
-                           schedule: { at: new Date(Date.now() + 100) },
-                           actionTypeId: "",
-                           extra: null
-                         }
-                       ]
-                     });
-                   }
-                 }).catch(e => console.warn("LocalNotifications error:", e));
-               } catch (e) {
-                 console.warn("LocalNotifications error:", e);
-               }
-             }
           }
           setAssignedDriverInfo(prev => ({ 
              uid: data.driverId, 
@@ -2671,47 +2516,14 @@ export default function PassengerBooking() {
              playSound('notification');
              if (navigator.vibrate) navigator.vibrate([300, 150, 300, 150, 500]); // Distinct arrival vibration pattern
              lastSoundStatusRef.current = 'arrived';
-             
-             if (Capacitor.isNativePlatform()) {
-               try {
-                 LocalNotifications.requestPermissions().then((perm) => {
-                   if (perm.display === 'granted') {
-                     LocalNotifications.schedule({
-                       notifications: [
-                         {
-                           title: "Driver Arrived",
-                           body: "Your driver is outside the pickup location.",
-                           id: 1001,
-                           schedule: { at: new Date(Date.now() + 100) },
-                           actionTypeId: "",
-                           extra: null
-                         }
-                       ]
-                     });
-                   }
-                 }).catch(e => console.warn("LocalNotifications error:", e));
-               } catch (e) {
-                 console.warn("LocalNotifications error:", e);
-               }
-             }
 
              // Attempt Text-to-Speech
              try {
                const textToSpeak = "Your driver has arrived outside.";
-               if (Capacitor.isNativePlatform()) {
-                 import('@capacitor-community/text-to-speech').then(({ TextToSpeech }) => {
-                   TextToSpeech.speak({
-                     text: textToSpeak,
-                     rate: 1.0,
-                     pitch: 1.0,
-                     volume: 1.0,
-                     lang: 'en-US'
-                   }).catch(e => console.warn("Capacitor TTS error:", e));
-                 }).catch(e => console.warn("Capacitor TTS import error:", e));
-               } else if ('speechSynthesis' in window) {
-                  const utterance = new SpeechSynthesisUtterance(textToSpeak);
-                  utterance.rate = 1.0;
-                  window.speechSynthesis.speak(utterance);
+               if ('speechSynthesis' in window) {
+                 const utterance = new SpeechSynthesisUtterance(textToSpeak);
+                 utterance.rate = 1.0;
+                 window.speechSynthesis.speak(utterance);
                }
              } catch (e) {
                console.warn("TTS error:", e);
@@ -5737,23 +5549,6 @@ export default function PassengerBooking() {
                 </div>
 
                 <div className="flex flex-col gap-3">
-                  {Capacitor.isNativePlatform() && (
-                    <button 
-                      onClick={async () => {
-                        try {
-                          const { App: CapacitorApp } = await import('@capacitor/app');
-                          if (CapacitorApp && (CapacitorApp as any).openAppSettings) {
-                             await (CapacitorApp as any).openAppSettings();
-                          }
-                        } catch (e) {
-                           console.error("Failed to open app settings", e);
-                        }
-                      }}
-                      className="w-full py-3.5 rounded-2xl bg-indigo-600 text-white font-bold text-[15px] active:scale-95 transition-all shadow-lg flex items-center justify-center gap-2"
-                    >
-                      Open Settings
-                    </button>
-                  )}
                   <button 
                     onClick={() => setShowPermissionModal(false)}
                     className="w-full py-3.5 rounded-2xl bg-slate-100 text-slate-700 font-bold text-[15px] active:scale-95 transition-all border border-black/5 hover:bg-slate-200"

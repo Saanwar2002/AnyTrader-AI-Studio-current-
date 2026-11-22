@@ -1,6 +1,4 @@
 import React, { useState, useEffect } from "react";
-import { Device } from "@capacitor/device";
-import { Capacitor } from "@capacitor/core";
 import { Battery, BatteryCharging, BatteryLow, BatteryMedium, Zap } from "lucide-react";
 import { motion } from "motion/react";
 
@@ -27,13 +25,7 @@ export function BatteryStatus() {
 
     const updateBatteryInfo = async () => {
       try {
-        if (Capacitor.isNativePlatform()) {
-          const info = await Device.getBatteryInfo();
-          if (info && info.batteryLevel !== undefined) {
-            setLevel(Math.round(info.batteryLevel * 100));
-            setIsCharging(info.isCharging ?? false);
-          }
-        } else if (typeof navigator !== "undefined" && "getBattery" in navigator) {
+        if (typeof navigator !== "undefined" && "getBattery" in navigator) {
           const battery = await (navigator as any).getBattery();
           webBattery = battery;
           setLevel(Math.round(battery.level * 100));

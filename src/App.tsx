@@ -8,21 +8,20 @@ import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link } from "react
 import { CategoryProvider } from "./lib/CategoryProvider";
 import Layout from "./components/Layout";
 import { useAuth } from "./components/AuthProvider";
-import { Toaster } from "sonner";
+import { Toaster, toast } from "sonner";
 import { ReviewReminder } from "./components/ReviewReminder";
 import { PlusCircle, Briefcase, MessageSquare, User as UserIcon, Bell, ChevronRight, PoundSterling, Search, Lock, Loader2 } from "lucide-react";
 import { db, collection, query, where, onSnapshot, collectionGroup, doc } from "@/src/firebase";
 
-import { registerForPushNotifications } from "./lib/pushNotifications";
 import { PortalProvider, usePortal } from "./lib/PortalContext";
 import PlatformSwitcher from "./components/shared/PlatformSwitcher";
 import { AppUpdateModal } from "./components/common/AppUpdateModal";
 import { ShareViewModal } from "./components/ShareViewModal";
 import { ShareType } from "./utils/shareUtils";
-import { Capacitor } from '@capacitor/core';
-import { initCapacitorKeyboard } from './lib/capacitor';
 import ReferralTracker, { RefRedirect } from "./components/shared/ReferralTracker";
 import { RecurringJobManager } from "./components/RecurringJobManager";
+import { registerForPushNotifications, subscribeForegroundWebPush } from "./lib/pushNotifications";
+import { playSound } from "./lib/sound";
 
 // Lazy loading helper with auto-retry for resilient chunk fetching
 function lazyWithRetry<T extends React.ComponentType<any>>(componentImport: () => Promise<{ default: T } | any>) {
@@ -132,60 +131,6 @@ function IndexRoute() {
   return <Dashboard />;
 }
 
-function DeepLinkListener() {
-  const navigate = useNavigate();
-
-  useEffect(() => {
-    if (!Capacitor.isNativePlatform()) return;
-
-    let isSubscribed = true;
-
-    const setupListener = async () => {
-      try {
-        const appPkg = '@capacitor/app';
-        const { App: CapacitorApp } = (await import(/* @vite-ignore */ appPkg)) as any;
-
-        CapacitorApp.addListener('appUrlOpen', (data: { url: string }) => {
-          if (!isSubscribed || !data?.url) return;
-          console.log('[DeepLink] App opened with URL:', data.url);
-
-          try {
-            let path = '';
-            if (data.url.includes('://')) {
-              if (data.url.startsWith('anytrader://')) {
-                const raw = data.url.replace('anytrader://', '');
-                path = raw.startsWith('/') ? raw : '/' + raw;
-              } else {
-                const urlObj = new URL(data.url);
-                path = urlObj.pathname + urlObj.search + urlObj.hash;
-              }
-            } else {
-              path = data.url;
-            }
-
-            if (path) {
-              console.log('[DeepLink] Navigating directly to path:', path);
-              navigate(path);
-            }
-          } catch (err) {
-            console.error('[DeepLink] Error handling deep link URL:', err);
-          }
-        });
-      } catch (err) {
-        console.error('[DeepLink] Error registering appUrlOpen listener:', err);
-      }
-    };
-
-    setupListener();
-
-    return () => {
-      isSubscribed = false;
-    };
-  }, [navigate]);
-
-  return null;
-}
-
 function ShareGlobalContainer() {
   const navigate = useNavigate();
   const [shared, setShared] = useState<{ type: ShareType; id: string } | null>(null);
@@ -226,6 +171,47 @@ function ShareGlobalContainer() {
       onOpenChat={handleOpenChat}
     />
   );
+}
+
+function WebPushRuntimeBridge() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!user?.uid) return;
+    let cancelled = false;
+    let unsubscribeFn: (() => void) | null = null;
+
+    void registerForPushNotifications(user.uid);
+    void subscribeForegroundWebPush((payload) => {
+      playSound("notification");
+      toast(payload.title, {
+        description: payload.body || undefined,
+        action: payload.link
+          ? {
+              label: "Open",
+              onClick: () => navigate(payload.link!),
+            }
+          : undefined,
+      });
+    }).then((unsub) => {
+      if (typeof unsub !== "function") return;
+      if (cancelled) {
+        unsub();
+      } else {
+        unsubscribeFn = unsub;
+      }
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (typeof unsubscribeFn === "function") {
+        unsubscribeFn();
+      }
+    };
+  }, [user?.uid, navigate]);
+
+  return null;
 }
 
 type RoleGroup = "admin" | "ecosystem" | "business" | "driver" | "corporate";
@@ -292,21 +278,8 @@ export default function App() {
       console.error("Firestore Platform Config Error:", error);
     });
     
-    // Register Push Notification on Auth
-    if (user && Capacitor.isNativePlatform()) {
-      registerForPushNotifications(user.uid);
-    }
-
     return () => unsub();
   }, [isAuthReady, user]);
-
-  // Native Capacitor plugin initializations (Contextual permissions are requested per-feature)
-  useEffect(() => {
-    if (Capacitor.isNativePlatform()) {
-      // Initialize Capacitor Keyboard resize and scroll behavior
-      initCapacitorKeyboard();
-    }
-  }, []);
 
   useEffect(() => {
     const handleFocusIn = (e: FocusEvent) => {
@@ -372,8 +345,8 @@ export default function App() {
         <Suspense fallback={<PageSkeleton />}>
           <SplashScreen />
           <AppUpdateModal platformConfig={platformConfig} />
-          <DeepLinkListener />
           <ShareGlobalContainer />
+          <WebPushRuntimeBridge />
           <ReferralTracker />
           <PortalProvider>
             <PlatformSwitcher />

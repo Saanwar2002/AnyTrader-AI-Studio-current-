@@ -6,15 +6,14 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { AuthProvider } from './components/AuthProvider';
 import { RemoteConfigProvider } from './components/RemoteConfigProvider';
 import { HelmetProvider } from 'react-helmet-async';
-import { Capacitor } from '@capacitor/core';
 import { registerSW } from 'virtual:pwa-register';
 import { installApiAuthInterceptor } from './lib/apiAuthInterceptor';
 
-// Install Global Fetch Interceptor for Auth Token Injection and Capacitor Native API Resolution
+// Install Global Fetch Interceptor for Auth Token Injection
 installApiAuthInterceptor();
 
 // Register service worker for offline support and versioned cache management
-if ('serviceWorker' in navigator && !Capacitor.isNativePlatform()) {
+if ('serviceWorker' in navigator) {
   // Clear legacy or outdated versioned caches and any legacy api-cache entries on startup
   if ('caches' in window) {
     const activeCachePrefix = 'anytrader-v1.0.4';
@@ -65,36 +64,6 @@ if ('serviceWorker' in navigator && !Capacitor.isNativePlatform()) {
     console.log('App is back online, checking for updates...');
     updateSW(true);
   });
-}
-
-
-// Save the last known web origin for dynamic server-side routing inside Capacitor
-if (!Capacitor.isNativePlatform() && typeof window !== 'undefined') {
-  try {
-    localStorage.setItem('last_known_origin', window.location.origin);
-  } catch (e) {
-    console.warn('Failed to save last_known_origin:', e);
-  }
-}
-
-// Native Firebase Crashlytics Unhandled Error Listener
-if (Capacitor.isNativePlatform()) {
-  const crashlyticsPkg = '@capacitor-firebase/crashlytics';
-  import(/* @vite-ignore */ crashlyticsPkg).then(({ FirebaseCrashlytics }: any) => {
-    window.addEventListener("error", (event) => {
-      FirebaseCrashlytics.recordException({
-        message: event.error?.message || event.message || 'Unknown Error',
-        stacktrace: event.error?.stack || ''
-      }).catch(() => {});
-    });
-    
-    window.addEventListener("unhandledrejection", (event) => {
-      FirebaseCrashlytics.recordException({
-        message: event.reason?.message || String(event.reason) || 'Unhandled Promise Rejection',
-        stacktrace: event.reason?.stack || ''
-      }).catch(() => {});
-    });
-  }).catch(e => console.error("Could not load Crashlytics for main error boundary:", e));
 }
 
 const originalConsoleError = console.error;

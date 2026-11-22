@@ -8,8 +8,6 @@ import {
 import { cn } from "@/src/lib/utils";
 import { toast } from "sonner";
 import { processVoiceTranscript, transcribeVoiceAudio, processVoiceAudio } from "@/src/services/gemini";
-import { Capacitor } from "@capacitor/core";
-import { SpeechRecognition as CapSpeechRecognition } from "@capacitor-community/speech-recognition";
 
 interface ExtractedVoiceJob {
   title: string;
@@ -99,19 +97,6 @@ export default function VoiceJobAssistant({
   useEffect(() => {
     return () => {
       stopRecordingSession();
-      if (Capacitor.isNativePlatform()) {
-        try {
-          CapSpeechRecognition.stop();
-        } catch (e) {}
-        if ((window as any)._voiceJobSpeechListener) {
-          (window as any)._voiceJobSpeechListener.remove().catch(() => {});
-          (window as any)._voiceJobSpeechListener = null;
-        }
-        if ((window as any)._voiceJobStateListener) {
-          (window as any)._voiceJobStateListener.remove().catch(() => {});
-          (window as any)._voiceJobStateListener = null;
-        }
-      }
       if (recordedAudioUrlRef.current) {
         URL.revokeObjectURL(recordedAudioUrlRef.current);
       }
@@ -130,19 +115,6 @@ export default function VoiceJobAssistant({
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
-    }
-    if (Capacitor.isNativePlatform()) {
-      try {
-        CapSpeechRecognition.stop();
-      } catch (e) {}
-      if ((window as any)._voiceJobSpeechListener) {
-        (window as any)._voiceJobSpeechListener.remove().catch(() => {});
-        (window as any)._voiceJobSpeechListener = null;
-      }
-      if ((window as any)._voiceJobStateListener) {
-        (window as any)._voiceJobStateListener.remove().catch(() => {});
-        (window as any)._voiceJobStateListener = null;
-      }
     }
     if (speechRecognitionRef.current) {
       try {
@@ -177,70 +149,6 @@ export default function VoiceJobAssistant({
     setInterimTranscript("");
     setRecordingDuration(0);
     audioChunksRef.current = [];
-
-    // Native Capacitor App flow
-    if (Capacitor.isNativePlatform()) {
-      try {
-        const { available } = await CapSpeechRecognition.available();
-        if (!available) throw new Error("Native speech recognition unavailable");
-
-        const perm = await CapSpeechRecognition.checkPermissions();
-        if (perm.speechRecognition !== 'granted') {
-          const req = await CapSpeechRecognition.requestPermissions();
-          if (req.speechRecognition !== 'granted') {
-            setVoiceError("Microphone permission denied. Please allow microphone access in device settings.");
-            return;
-          }
-        }
-
-        // Clean up previous listeners if any
-        if ((window as any)._voiceJobSpeechListener) {
-          try {
-            await (window as any)._voiceJobSpeechListener.remove();
-          } catch (_) {}
-        }
-        if ((window as any)._voiceJobStateListener) {
-          try {
-            await (window as any)._voiceJobStateListener.remove();
-          } catch (_) {}
-        }
-
-        setIsRecording(true);
-        recordingTimerRef.current = setInterval(() => {
-          setRecordingDuration(prev => {
-            if (prev >= 60) {
-              stopVoiceRecording();
-              return 60;
-            }
-            return prev + 1;
-          });
-        }, 1000);
-
-        const listener = await CapSpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
-          if (data.matches && data.matches.length > 0) {
-            setTranscript(data.matches[0]);
-          }
-        });
-        (window as any)._voiceJobSpeechListener = listener;
-
-        const stateListener = await CapSpeechRecognition.addListener('listeningState', (data: { status: 'started' | 'stopped' }) => {
-          if (data.status === 'stopped') {
-            stopVoiceRecording();
-          }
-        });
-        (window as any)._voiceJobStateListener = stateListener;
-
-        await CapSpeechRecognition.start({
-          language: 'en-GB',
-          maxResults: 1,
-          partialResults: true,
-          popup: false
-        });
-        return;
-      } catch (err: any) {
-        console.warn("Capacitor speech recognition error, falling back to Web audio:", err);
-      }
-    }
 
     // Web / PWA flow with Real-Time Web Speech API + Audio Stream
     try {

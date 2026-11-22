@@ -9,8 +9,6 @@ import { toast } from "sonner";
 import DOMPurify from 'dompurify';
 import { QRCodeSVG } from 'qrcode.react';
 import { triggerHaptic, ImpactStyle, getGoogleMapsApiKey, isCapacitor, speakText } from "@/src/lib/capacitor";
-import { Capacitor } from '@capacitor/core';
-import { LocalNotifications } from '@capacitor/local-notifications';
 import {
   Navigation,
   Info,
@@ -3207,31 +3205,6 @@ export default function DriverTerminal() {
         lastPopupMessageIdRef.current = latestMsg.id;
         playSound("notification");
         if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-        
-        if (Capacitor.isNativePlatform()) {
-          try {
-            LocalNotifications.requestPermissions().then((perm) => {
-              if (perm.display === 'granted') {
-                LocalNotifications.schedule({
-                  notifications: [
-                    {
-                      title: "New Message from Passenger",
-                      body: latestMsg.text,
-                      id: new Date().getTime(),
-                      schedule: { at: new Date(Date.now() + 100) },
-                      sound: undefined,
-                      attachments: undefined,
-                      actionTypeId: "",
-                      extra: null
-                    }
-                  ]
-                }).catch(e => console.warn("LocalNotifications error:", e));
-              }
-            }).catch(e => console.warn("LocalNotifications error:", e));
-          } catch (e) {
-             console.warn("LocalNotifications error:", e);
-          }
-        }
         
         if (!isChatOpen) {
           setIncomingPopupMessage({ id: latestMsg.id, text: latestMsg.text });

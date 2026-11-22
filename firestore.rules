@@ -1849,5 +1849,30 @@ service cloud.firestore {
     match /push_device_index/{tokenHash} {
       allow read, write: if false; // Internal server token-ownership index only
     }
+
+    // =========================================================================
+    // Hybrid Messaging & 4-Tier Notification Waterfall (Server-Authoritative)
+    // =========================================================================
+    match /notification_cooldowns/{cooldownId} {
+      allow read, write: if false; // Server Admin SDK cooldown & daily cap ledger only
+    }
+
+    match /whatsapp_fallback_queue/{queueId} {
+      allow read, write: if false; // Server Admin SDK delayed unread fallback queue only
+    }
+
+    match /whatsapp_delivery_logs/{logId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false; // Server Admin SDK delivery audit logs only
+    }
+
+    match /whatsapp_activation_codes/{code} {
+      allow read, write: if false; // Server Admin SDK single-use 1-tap WhatsApp activation codes only
+    }
+
+    match /user_presence/{userId} {
+      allow read: if isSignedIn() && (isOwner(userId) || isAdmin());
+      allow create, update, delete: if false; // Server Admin SDK presence heartbeat writes only
+    }
   }
 }

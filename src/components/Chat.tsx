@@ -8,6 +8,8 @@ import { cn } from "@/src/lib/utils";
 import { playSound } from "@/src/lib/sound";
 import { toast } from "sonner";
 import { useDialogA11y } from "@/src/lib/useDialogA11y";
+import { sendChatPresenceHeartbeat } from "@/src/lib/pushNotifications";
+import { OfflineAlertsCard } from "./shared/OfflineAlertsCard";
 
 export default function Chat() {
   const { conversationId } = useParams();
@@ -99,6 +101,33 @@ export default function Chat() {
     const timer = setTimeout(() => setShowHint(false), 8000);
     return () => clearTimeout(timer);
   }, []);
+
+  // Hybrid Messaging: Active chat presence heartbeat so delayed WhatsApp fallback cancels while user is actively viewing this chat
+  useEffect(() => {
+    if (!user || !conversationId) return;
+
+    const ping = (active: boolean) => {
+      const isVisible =
+        typeof document === "undefined" || document.visibilityState === "visible";
+      void sendChatPresenceHeartbeat(
+        active && isVisible ? conversationId : null,
+        active && isVisible
+      );
+    };
+
+    ping(true);
+    const intervalId = setInterval(() => ping(true), 45_000);
+    const handleVisibilityChange = () => {
+      ping(document.visibilityState === "visible");
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      void sendChatPresenceHeartbeat(null, false);
+    };
+  }, [user, conversationId]);
 
   // AT-CJ-CHAT-03: Load user's active chat blocks from server
   useEffect(() => {
@@ -565,6 +594,10 @@ export default function Chat() {
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <OfflineAlertsCard
+          variant="compact"
+          contextLabel={jobTitle || conversation?.jobTitle || "this chat"}
+        />
         {isOtherParticipantBlocked && (
           <div className="p-3 bg-amber-50 border border-black rounded-xl text-black text-xs flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">

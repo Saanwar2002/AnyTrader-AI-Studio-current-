@@ -3,7 +3,7 @@ import { triggerHaptic, ImpactStyle } from './capacitor';
 export function playSound(type: 'alert' | 'success' | 'notification' = 'notification') {
   if (typeof window === 'undefined') return;
 
-  // Always trigger native haptic feedback on Capacitor
+  // Trigger subtle haptic vibration where supported by mobile browsers
   triggerHaptic(type === 'alert' ? ImpactStyle.Heavy : ImpactStyle.Medium).catch(() => {});
 
   try {

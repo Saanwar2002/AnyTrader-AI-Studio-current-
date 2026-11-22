@@ -128,7 +128,6 @@ export default defineConfig(({mode}) => {
               if (id.includes('@react-google-maps/api')) return 'vendor-maps';
               if (id.includes('leaflet') || id.includes('react-leaflet')) return 'vendor-leaflet';
               if (id.includes('jspdf')) return 'vendor-pdf';
-              if (id.includes('@capacitor')) return 'vendor-capacitor';
               if (id.includes('@google/genai')) return 'vendor-genai';
               return 'vendor';
             }

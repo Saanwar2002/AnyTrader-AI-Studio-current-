@@ -182,6 +182,110 @@ function extractCanonicalCategoriesFromText(text: string): string[] {
 }
 
 /**
+ * Ensures multi-turn Gemini `contents` ALWAYS starts with role "user"
+ * and strictly alternates "user" / "model" turns (preventing 400 INVALID_ARGUMENT
+ * when UI history starts with an initial greeting or contains consecutive user retries).
+ */
+export function buildNormalizedGeminiContents(
+  history: { role: "user" | "model"; text: string }[],
+  userMessage: string
+): Array<{ role: "user" | "model"; parts: { text: string }[] }> {
+  const normalized: Array<{ role: "user" | "model"; parts: { text: string }[] }> = [];
+
+  for (const msg of history || []) {
+    const text = typeof msg?.text === "string" ? msg.text.trim() : "";
+    if (!text) continue;
+    const role: "user" | "model" = msg.role === "model" ? "model" : "user";
+
+    // Gemini requires the first turn in contents to be role "user"
+    if (normalized.length === 0 && role === "model") {
+      continue;
+    }
+
+    const prev = normalized[normalized.length - 1];
+    if (prev && prev.role === role) {
+      prev.parts[0].text = `${prev.parts[0].text}\n\n${text}`.slice(0, 2400);
+    } else {
+      normalized.push({ role, parts: [{ text }] });
+    }
+  }
+
+  const trimmedUser = String(userMessage || "").trim();
+  if (trimmedUser) {
+    const prev = normalized[normalized.length - 1];
+    if (prev && prev.role === "user") {
+      // Avoid duplicate consecutive user turns (e.g. after a retry)
+      if (prev.parts[0].text !== trimmedUser) {
+        prev.parts[0].text = `${prev.parts[0].text}\n\n${trimmedUser}`.slice(0, 2400);
+      }
+    } else {
+      normalized.push({ role: "user", parts: [{ text: trimmedUser }] });
+    }
+  }
+
+  return normalized;
+}
+
+function isModelNotFoundOrUnsupportedError(error: any): boolean {
+  const status = error?.status || error?.code;
+  const msg = String(error?.message || error || "").toLowerCase();
+  return (
+    status === 404 ||
+    msg.includes("404") ||
+    msg.includes("not_found") ||
+    msg.includes("is not found") ||
+    msg.includes("not supported for generatecontent")
+  );
+}
+
+export function extractUpstreamApiStatus(error: any): number | undefined {
+  const directStatus = Number(error?.status ?? error?.code);
+  if (Number.isInteger(directStatus) && directStatus >= 400 && directStatus < 600) {
+    return directStatus;
+  }
+  const rawMessage = String(error?.message || error || "");
+  const codeMatch = rawMessage.match(/"code"\s*:\s*(\d{3})/);
+  if (codeMatch) {
+    const parsed = Number(codeMatch[1]);
+    if (parsed >= 400 && parsed < 600) return parsed;
+  }
+  if (/prepayment credits are depleted|payment required/i.test(rawMessage)) return 402;
+  if (/resource_exhausted|quota|rate limit|too many requests/i.test(rawMessage)) return 429;
+  if (/api_key_invalid|invalid api key/i.test(rawMessage)) return 403;
+  if (/permission_denied/i.test(rawMessage)) return 403;
+  return undefined;
+}
+
+export function extractCleanGeminiErrorMessage(error: any): string {
+  const raw = String(error?.message || error || "AI service request failed").trim();
+  const status = extractUpstreamApiStatus(error);
+  if (status === 402 || /prepayment credits are depleted|payment required/i.test(raw)) {
+    return "AI service billing credits are depleted. Please check project billing in AI Studio.";
+  }
+  if (status === 429 || /resource_exhausted|quota/i.test(raw)) {
+    return "AI service quota temporarily exhausted. Please try again shortly.";
+  }
+  if (status === 403 || /api_key_invalid|permission_denied/i.test(raw)) {
+    return "AI service API key is invalid or lacks permission.";
+  }
+  return raw;
+}
+
+export function isNonRetryableQuotaOrAuthError(error: any): boolean {
+  const status = extractUpstreamApiStatus(error);
+  if (status && [401, 402, 403, 429].includes(status)) {
+    return true;
+  }
+  const msg = String(error?.message || error || "").toLowerCase();
+  return (
+    msg.includes("prepayment credits are depleted") ||
+    msg.includes("payment required") ||
+    msg.includes("resource_exhausted") ||
+    msg.includes("api_key_invalid")
+  );
+}
+
+/**
  * Synchronizes the server-side category registry with Firestore or client updates
  */
 export function syncCategoryRegistryServer(categories?: any[], synonyms?: any[]) {
@@ -2077,35 +2181,49 @@ export async function callTradeBot(
   const systemInstruction = buildTradeBotSystemInstruction(sanitized);
 
   const ai = getGenAI();
-  const model = resolveValidAiModel(await getGlobalAiModel());
+  const primaryModel = resolveValidAiModel(await getGlobalAiModel());
+  const modelCandidates = Array.from(new Set([primaryModel, "gemini-2.5-flash"]));
+  const contents = buildNormalizedGeminiContents(sanitized.history, sanitized.userMessage);
 
-  const contents = [
-    ...sanitized.history.map(msg => ({
-      role: msg.role === "model" ? "model" as const : "user" as const,
-      parts: [{ text: msg.text }]
-    })),
-    { role: "user" as const, parts: [{ text: sanitized.userMessage }] }
-  ];
+  let response: any = null;
+  let lastError: any = null;
+  for (const candidateModel of modelCandidates) {
+    try {
+      response = await ai.models.generateContent({
+        model: candidateModel,
+        contents,
+        config: {
+          systemInstruction,
+          tools: [{ googleSearch: {} }]
+        }
+      });
+      break;
+    } catch (searchError: any) {
+      if (isNonRetryableQuotaOrAuthError(searchError)) {
+        throw searchError;
+      }
+      console.warn(`TradeBot [${candidateModel}] search grounding error, retrying without grounding:`, searchError?.message || searchError);
+      try {
+        response = await ai.models.generateContent({
+          model: candidateModel,
+          contents,
+          config: {
+            systemInstruction
+          }
+        });
+        break;
+      } catch (plainError: any) {
+        lastError = plainError;
+        if (!isModelNotFoundOrUnsupportedError(plainError)) {
+          throw plainError;
+        }
+        console.warn(`TradeBot model [${candidateModel}] unavailable, trying fallback model...`);
+      }
+    }
+  }
 
-  let response;
-  try {
-    response = await ai.models.generateContent({
-      model,
-      contents,
-      config: {
-        systemInstruction,
-        tools: [{ googleSearch: {} }]
-      }
-    });
-  } catch (searchError) {
-    console.warn("TradeBot search grounding error, falling back to standard generation:", searchError);
-    response = await ai.models.generateContent({
-      model,
-      contents,
-      config: {
-        systemInstruction
-      }
-    });
+  if (!response) {
+    throw lastError || new Error("TradeBot generation failed");
   }
 
   const candidates = response.candidates;
@@ -2182,36 +2300,51 @@ export async function* callTradeBotStream(
 
   try {
     const ai = getGenAI();
-    const model = resolveValidAiModel(await getGlobalAiModel());
+    const primaryModel = resolveValidAiModel(await getGlobalAiModel());
+    const modelCandidates = Array.from(new Set([primaryModel, "gemini-2.5-flash"]));
+    const contents = buildNormalizedGeminiContents(sanitized.history, sanitized.userMessage);
 
-    const contents = [
-      ...sanitized.history.map(msg => ({
-        role: msg.role === "model" ? "model" as const : "user" as const,
-        parts: [{ text: msg.text }]
-      })),
-      { role: "user" as const, parts: [{ text: sanitized.userMessage }] }
-    ];
-
-    let stream;
-    try {
-      stream = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: {
-          systemInstruction,
-          tools: [{ googleSearch: {} }]
-        }
-      });
-    } catch (searchError) {
+    let stream: any = null;
+    let lastError: any = null;
+    for (const candidateModel of modelCandidates) {
       if (abortSignal?.aborted) return;
-      console.warn("TradeBot search grounding stream error, falling back to standard streaming:", searchError);
-      stream = await ai.models.generateContentStream({
-        model,
-        contents,
-        config: {
-          systemInstruction
+      try {
+        stream = await ai.models.generateContentStream({
+          model: candidateModel,
+          contents,
+          config: {
+            systemInstruction,
+            tools: [{ googleSearch: {} }]
+          }
+        });
+        break;
+      } catch (searchError: any) {
+        if (abortSignal?.aborted) return;
+        if (isNonRetryableQuotaOrAuthError(searchError)) {
+          throw searchError;
         }
-      });
+        console.warn(`TradeBot stream [${candidateModel}] search grounding error, retrying without grounding:`, searchError?.message || searchError);
+        try {
+          stream = await ai.models.generateContentStream({
+            model: candidateModel,
+            contents,
+            config: {
+              systemInstruction
+            }
+          });
+          break;
+        } catch (plainError: any) {
+          lastError = plainError;
+          if (!isModelNotFoundOrUnsupportedError(plainError)) {
+            throw plainError;
+          }
+          console.warn(`TradeBot stream model [${candidateModel}] unavailable, trying fallback model...`);
+        }
+      }
+    }
+
+    if (!stream) {
+      throw lastError || new Error("Failed to open TradeBot stream");
     }
 
     const sources: { title: string; url: string }[] = [];

@@ -1,16 +1,13 @@
-import { Capacitor } from '@capacitor/core';
 import { auth } from '../firebase';
-import { getApiUrl } from './apiUrl';
 
 let isInterceptorInstalled = false;
 
 /**
  * Installs a global fetch interceptor that:
- * 1. Resolves relative /api/... URLs to the correct backend host on native Capacitor platforms.
- * 2. Automatically injects the user's Firebase ID token (`Authorization: Bearer <token>`)
+ * 1. Automatically injects the user's Firebase ID token (`Authorization: Bearer <token>`)
  *    into all outgoing requests targeting `/api/...` endpoints, eliminating the risk of 401s
  *    when server routes are protected.
- * 3. Preserves all caller-specified headers and options.
+ * 2. Preserves all caller-specified headers and options.
  */
 export function installApiAuthInterceptor(): void {
   if (typeof window === 'undefined' || !window.fetch) {
@@ -50,22 +47,6 @@ export function installApiAuthInterceptor(): void {
         rawUrl.includes('ipify.org');
 
       if (isApiRoute && !isExternalService) {
-        // Resolve URL on native platforms if relative
-        if (Capacitor.isNativePlatform() && rawUrl.startsWith('/api/')) {
-          const resolvedUrl = getApiUrl(rawUrl);
-          if (typeof input === 'string') {
-            input = resolvedUrl;
-          } else if (input instanceof URL) {
-            input = new URL(resolvedUrl);
-          } else if (input && typeof input === 'object' && 'url' in input) {
-            try {
-              input = new Request(resolvedUrl, input as RequestInit);
-            } catch {
-              input = resolvedUrl;
-            }
-          }
-        }
-
         // Retrieve current Firebase ID token if user is signed in
         let idToken: string | null = null;
         try {

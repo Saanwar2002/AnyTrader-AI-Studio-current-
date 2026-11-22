@@ -26,7 +26,7 @@ async function callServerGemini(functionName: string, args: any[]): Promise<any>
         const errData = await response.json().catch(() => ({}));
         if (errData && errData.error) errorMsg = errData.error;
       }
-      throw new Error(errorMsg);
+      throw new TradeBotHttpError(errorMsg, response.status);
     }
     
     if (!contentType.includes("application/json")) {
@@ -502,7 +502,10 @@ export async function callTradeBotStream(
           categories = parsed.categories;
           callbacks?.onCategories?.(categories);
         } else if (parsed.type === "error") {
-          streamError = new Error(parsed.error || "Streaming error occurred");
+          const errStatus = typeof parsed.status === "number" ? parsed.status : undefined;
+          streamError = errStatus
+            ? new TradeBotHttpError(parsed.error || "Streaming error occurred", errStatus)
+            : new Error(parsed.error || "Streaming error occurred");
           break;
         }
       }
@@ -520,11 +523,11 @@ export async function callTradeBotStream(
     callbacks?.onDone?.(accumulatedText);
     return { text: accumulatedText, sources, categories };
   } catch (error: any) {
-    // Never fall back on user abort or deterministic auth/validation/rate-limit statuses
+    // Never fall back on user abort or deterministic auth/billing/validation/rate-limit statuses
     if (error?.name === "AbortError" || signal?.aborted) {
       throw error;
     }
-    if (error instanceof TradeBotHttpError && [400, 401, 403, 429].includes(error.status)) {
+    if (error instanceof TradeBotHttpError && [400, 401, 402, 403, 429].includes(error.status)) {
       callbacks?.onError?.(error);
       throw error;
     }
