@@ -28,7 +28,7 @@ export const DEFAULT_THRESHOLD_RULES: ThresholdRuleConfig = {
   enableToastAlerts: true,
   enableAudioChime: true,
   enableEmailAlerts: true,
-  adminAlertEmail: "admin@tradequote.uk",
+  adminAlertEmail: "",
   minSeverityForEmail: "HIGH_AND_CRITICAL",
 };
 
@@ -145,10 +145,14 @@ export function playAlertChime(severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" 
  */
 export async function sendAdminEmailAlert(
   breach: ActiveBreachAlert,
-  recipientEmail: string = "admin@tradequote.uk"
+  recipientEmail: string = ""
 ): Promise<{ success: boolean; message: string }> {
   try {
-    const emailSubject = `🚨 [SECURITY BREACH ${breach.severity}] ${breach.title} - TradeQuote Admin`;
+    const sentinelUrl =
+      typeof window !== "undefined"
+        ? `${window.location.origin}/admin?tab=sentinel_analytics`
+        : "/admin?tab=sentinel_analytics";
+    const emailSubject = `🚨 [SECURITY BREACH ${breach.severity}] ${breach.title} - AnyTrader Admin`;
     const emailHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 2px solid #000; border-radius: 12px; overflow: hidden; background: #ffffff;">
         <div style="background: ${breach.severity === 'CRITICAL' ? '#b91c1c' : breach.severity === 'HIGH' ? '#ea580c' : '#2563eb'}; padding: 20px; color: #ffffff;">
@@ -176,7 +180,7 @@ export async function sendAdminEmailAlert(
           </div>
 
           <div style="text-align: center; margin-top: 24px;">
-            <a href="https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app/admin?tab=sentinel_analytics" 
+            <a href="${sentinelUrl}" 
                style="background: #0f172a; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 13px; display: inline-block;">
               Open Admin Sentinel Dashboard →
             </a>
@@ -563,7 +567,7 @@ function dispatchBreachNotification(
 export function triggerTestBreachAlert(
   type: "multiple_profile_creations" | "rapid_api_usage" | "deals_misuse",
   onBreach: (breach: ActiveBreachAlert) => void,
-  targetEmail: string = "admin@tradequote.uk"
+  targetEmail: string = ""
 ): ActiveBreachAlert {
   let breach: ActiveBreachAlert;
 

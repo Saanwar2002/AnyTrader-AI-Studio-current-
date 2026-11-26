@@ -4,6 +4,7 @@ import { useAuth } from "./AuthProvider";
 import { Briefcase, Clock, MapPin, Loader2, AlertCircle, Zap, Calendar } from "lucide-react";
 import { Link } from "react-router-dom";
 import { cn, getOutwardPostcode, formatJobLocation } from "@/src/lib/utils";
+import { isOpenJobStatus } from "@/src/lib/marketplaceContracts";
 
 export default function TradeJobs() {
   const { user } = useAuth();
@@ -227,10 +228,11 @@ export default function TradeJobs() {
                     {(() => {
                       const qCount = job.quoteCount || (job.quotes ? job.quotes.length : 0);
                       const isFull = qCount >= 5;
+                      const isOpen = isOpenJobStatus(job.status);
                       return (
                         <span className={cn(
                           "px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider transition-all",
-                          job.status === "posted"
+                          isOpen
                             ? isFull
                               ? "border-2 border-red-500 text-red-700 bg-red-50"
                               : "border-2 border-emerald-500 text-emerald-800 bg-emerald-50 pulse-green-border"
@@ -239,7 +241,7 @@ export default function TradeJobs() {
                             : job.status === "completed" ? "bg-green-50 text-green-600"
                             : "bg-slate-50 text-slate-600"
                         )}>
-                          {job.status === 'posted' ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : job.status.replace(/_/g, " ")}
+                          {isOpen ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : String(job.status || "").replace(/_/g, " ")}
                         </span>
                       );
                     })()}

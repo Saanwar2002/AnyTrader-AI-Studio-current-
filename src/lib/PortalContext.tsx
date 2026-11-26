@@ -59,24 +59,33 @@ export function PortalProvider({ children }: { children: React.ReactNode }) {
     if (profile.role === "admin") availableRoles.push("admin");
     else if (profile.role === "ecosystem_manager") availableRoles.push("ecosystem_manager");
     else {
-      availableRoles.push("customer"); // Everyone can be a customer
+      availableRoles.push("customer"); // Everyone can be a customer / rider
       if (profile.role === "fleet_driver" || profile.role === "driver") availableRoles.push("driver");
-      if (profile.role === "tradesperson" || profile.role === "business" || profile.subscriptionType === "business") {
-          availableRoles.push("business");
+      if (profile.role === "tradesperson") {
+        availableRoles.push("trader");
+      } else if (profile.role === "business" || profile.subscriptionType === "business") {
+        availableRoles.push("business");
       }
     }
   }
+
+  const getPrimaryAnyTraderRole = (): ActiveRoleType => {
+    if (profile?.role === "admin") return "admin";
+    if (profile?.role === "ecosystem_manager") return "ecosystem_manager";
+    if (profile?.role === "tradesperson") return "trader";
+    if (profile?.role === "business" || profile?.subscriptionType === "business") return "business";
+    return "customer";
+  };
 
   // Determine initial role
   const determineInitialRole = (): ActiveRoleType => {
     const saved = localStorage.getItem("anytrader_active_role") as ActiveRoleType;
     if (saved && availableRoles.includes(saved)) return saved;
-    
+
     if (profile?.role === "admin") return "admin";
     if (profile?.role === "ecosystem_manager") return "ecosystem_manager";
     if ((profile?.role === "fleet_driver" || profile?.role === "driver") && activePortal === "anyroller") return "driver";
-    if (profile?.subscriptionType === "business" || profile?.role === "tradesperson" || profile?.role === "business") return "business";
-    return "customer";
+    return getPrimaryAnyTraderRole();
   };
 
   const [activeRole, setActiveRoleState] = useState<ActiveRoleType>(determineInitialRole());
@@ -118,10 +127,7 @@ export function PortalProvider({ children }: { children: React.ReactNode }) {
     }
 
     const isDriverProfile = profile.role === "fleet_driver" || profile.role === "driver";
-    const isBusinessOrTrader =
-      profile.subscriptionType === "business" ||
-      profile.role === "tradesperson" ||
-      profile.role === "business";
+    const primaryAnyTraderRole = getPrimaryAnyTraderRole();
 
     if (activePortal === "anyroller") {
       const targetRole: ActiveRoleType = isDriverProfile ? "driver" : "customer";
@@ -131,14 +137,20 @@ export function PortalProvider({ children }: { children: React.ReactNode }) {
 
     // AnyTrader portal: never retain an unauthorized or stale role from a prior session
     if (!availableRoles.includes(activeRole) || activeRole === "driver") {
-      setActiveRoleState(isBusinessOrTrader ? "business" : "customer");
+      setActiveRoleState(primaryAnyTraderRole);
       return;
     }
 
-    // If user landed with no saved role preference and is a business/trader, default to business
+    // If user landed with no saved role preference (or stale saved role from another portal),
+    // or just upgraded / hydrated with a saved preference matching their newly unlocked primary role,
+    // switch into their primary role automatically.
     const saved = localStorage.getItem("anytrader_active_role") as ActiveRoleType | null;
-    if (!saved && isBusinessOrTrader && activeRole === "customer") {
-      setActiveRoleState("business");
+    if (
+      primaryAnyTraderRole !== "customer" &&
+      activeRole === "customer" &&
+      (!saved || !availableRoles.includes(saved) || saved === primaryAnyTraderRole)
+    ) {
+      setActiveRoleState(primaryAnyTraderRole);
     }
   }, [activePortal, profile, activeRole, availableRoles.join(",")]);
 

@@ -5,7 +5,7 @@ import { buildLandlordCheckoutFulfillmentPatch, buildSubscriptionLifecyclePatch,
 import { ownsStripeWebhookClaim } from "./src/server/stripeWebhookIdempotency.ts";
 import { claimStripeEventLease, markStripeEventCompleted, markStripeEventFailed } from "./src/server/stripeWebhookHandler.ts";
 import { generateFinancialReconciliationReport, executeReconciliationOperatorAction } from "./src/server/reconciliationReport.ts";
-import { suspendOrDeleteAccount, reinstateSuspendedAccount, verifyTraderAccountWithProjection } from "./src/server/accountLifecycle.ts";
+import { suspendOrDeleteAccount, reinstateSuspendedAccount, verifyTraderAccountWithProjection, reviewTraderVerificationDocument } from "./src/server/accountLifecycle.ts";
 import { publishPlatformPricingConfigAtomic } from "./src/server/pricingConfigPublish.ts";
 import { createMediationStakePaymentIntent, confirmMediationStakePayment, recordMediationStakePaymentFailure } from "./src/server/mediationStake.ts";
 import { getRefundEventReconciliationStatus, recordConfirmedRefund, reconcilePaymentRefundAggregates } from "./src/server/refundReconciliation.ts";
@@ -17,6 +17,18 @@ import {
   ensureStripeCustomerIdForUser,
   reconcileStripeAccountUpdatedWebhook,
 } from "./src/server/stripeConnectHelpers.ts";
+import {
+  listCustomerPaymentMethods,
+  setCustomerDefaultPaymentMethod,
+  detachCustomerPaymentMethod,
+  syncDefaultPaymentMethodFromSetupSession,
+  PaymentMethodRouteError,
+} from "./src/server/stripePaymentMethods.ts";
+import { executeUpgradeHomeownerToTraderCommand } from "./src/server/accountUpgrade.ts";
+import {
+  executeExportUserDataCommand,
+  executeSelfServiceAccountDeletionCommand,
+} from "./src/server/accountGdpr.ts";
 import {
   executeTransitionRideCommand,
   executeCompleteRideCommand,
@@ -40,13 +52,18 @@ import cron from "node-cron";
 import Stripe from 'stripe';
 import twilio from 'twilio';
 import rateLimit from "express-rate-limit";
-import { startInstantMatchEngine } from "./instantMatchWorker.ts";
+import { startInstantMatchEngine, advanceInstantMatchAfterDecline } from "./instantMatchWorker.ts";
 import * as geminiServer from "./src/services/geminiServer.ts";
 import { sendHttpError, BadRequestError, UnauthorizedError, ForbiddenError, NotFoundError, ConflictError, InternalServerError, ServiceUnavailableError } from "./src/server/httpErrors.ts";
 import { runProductionChecks } from "./src/server/productionChecks.ts";
 import { isMaintenanceModeActive, invalidateMaintenanceCache, createMaintenanceEmergencyStopMiddleware } from "./src/server/maintenanceGate.ts";
 import { verifyFirebaseIdTokenWithRevocation } from "./src/server/tokenVerification.ts";
 import { buildClaimPropertyTransferUpdate } from "./src/server/propertyTransferCommand.ts";
+import {
+  sanitizePropertyTenantContext,
+  resolveTenantIssueCreationPayload,
+  TenantIssueValidationError,
+} from "./src/server/propertyLifecycleHelpers.ts";
 import { assertCanReadJobIntelligence } from "./src/server/intelligence/jobIntelligenceAccess.ts";
 import {
   resolveAdminCapabilityTier,
@@ -62,6 +79,12 @@ import {
   type AdminCapabilityTier,
   type AdminActor,
 } from "./src/server/adminGovernance.ts";
+import {
+  executeAdminResolveDisputeCommand,
+  executeAdminVideoVerificationCommand,
+  executeAdminProvisionalOverrideCommand,
+  executeAdminModerateReviewCommand,
+} from "./src/server/adminControlCommands.ts";
 import { FirestoreRateLimitStore } from "./src/server/distributedRateLimit.ts";
 import {
   reportOrBlockChatParticipantCommand,
@@ -72,6 +95,7 @@ import {
   processSmsQueueCommand,
   runConsultancyRecurringSessionCreatorCommand,
   runConsultancyScoreRecalculatorCommand,
+  publishMatureCoolingOffReviewsCommand,
   buildCronDispatchResponse,
   fetchPostcodeWithTimeout,
 } from "./src/server/cronWorkers.ts";
@@ -81,6 +105,16 @@ import { sanitizeRedirectUrl, getAuthoritativeAppUrl } from "./src/server/paymen
 import { assertResourceOwner, assertCanManageMilestone, sanitizeClientPayload, validateNotificationPayload, authorizeNotificationRequest, isUserAdminClaim } from "./src/server/authorization.ts";
 import { assertCanReview, ReviewType, getJobParticipantIds } from "./src/server/reviewAuthorization.ts";
 import { executeBootstrapProfileCommand, bootstrapProfileSchema } from "./src/server/accountBootstrap.ts";
+import {
+  executeAcceptTermsCommand,
+  executeSyncExpiredVerificationDocsCommand,
+  executeRemoveVideoVerificationCommand,
+  executeListBusinessTeamCommand,
+  executeSendBusinessTeamInviteCommand,
+  executeRevokeBusinessTeamInviteCommand,
+  executeAcceptBusinessTeamInviteCommand,
+  executeRemoveBusinessTeamMemberCommand,
+} from "./src/server/slice1AccountCommands.ts";
 import {
   listAuthoritativeNotifications,
   markAuthoritativeNotificationRead,
@@ -114,12 +148,18 @@ import { AbuseDefenseEngine } from "./src/server/abuseDefense.ts";
 import { BusinessLogicDefense } from "./src/server/businessLogicDefense.ts";
 import { domainEvents } from "./src/server/domainEvents.ts";
 import { resolveAuthoritativeLineItem, SERVER_PRICING_CATALOG, calculateGothamSaaSPlanServer, getDynamicFirestoreConfigs } from "./src/server/pricingCatalog.ts";
+import { normalizeTraderTier } from "./src/services/stripeIntegrationService.ts";
 import { resolveTrustedCanonicalIdentity } from "./src/server/identity.ts";
-import { executeCreateJobCommand, executeUpdateJobCommand, resolveCreateJobQuota } from "./src/server/createJobCommand.ts";
+import { executeCreateJobCommand, executeUpdateJobCommand, executeDeleteJobCommand, resolveCreateJobQuota } from "./src/server/createJobCommand.ts";
 import { executeQuoteCommand, executeAcceptQuoteCommand } from "./src/server/quoteCommands.ts";
 import { executeAcceptRideCommand } from "./src/server/driverAuthorization.ts";
 import { executeCreateTripPaymentCommand } from "./src/server/tripPaymentAuthorization.ts";
-import { executeJobLifecycleCommand } from "./src/server/jobLifecycleCommands.ts";
+import { executeJobLifecycleCommand, executeJobScheduleActionCommand } from "./src/server/jobLifecycleCommands.ts";
+import {
+  executeInviteTraderToJobCommand,
+  executeCreateBomOrderCommand,
+  executeGenerateRecurringJobCommand,
+} from "./src/server/stage1Commands.ts";
 import { 
   startPublicJobCardsSync, 
   backfillPublicJobCards, 
@@ -204,12 +244,22 @@ import {
   BackfillValidationError,
 } from "./src/server/intelligence/backfillEngine.ts";
 import { isStripeChargebackEventType, processStripeChargebackEvent } from "./src/server/chargebackLifecycle.ts";
-import { filterEligibleLeadRecipients } from "./src/server/leadDistribution.ts";
-import { createManualInvoiceCommand } from "./src/server/invoiceCreation.ts";
+import {
+  filterEligibleLeadRecipients,
+  distributeJobLeadsAuthoritative,
+  expandLowQuoteJobsWave2,
+} from "./src/server/leadDistribution.ts";
+import { createManualInvoiceCommand, createOrGetJobInvoiceCommand } from "./src/server/invoiceCreation.ts";
+import {
+  resolveInstantMatchPaymentIntentId,
+  canReplaceLinkedSubscription,
+  resolveSubscriptionPeriodEndIso,
+} from "./src/server/slice2MoneyFlowHelpers.ts";
 import { respondToInstantMatchAttempt } from "./src/server/instantMatchEligibility.ts";
 import {
   createBannerAdCommand,
   createCpcCampaignCommand,
+  editAdCreativeCommand,
   moderateAdCommand,
   processAdAutoTopUpCommand,
   toggleAdActiveCommand,
@@ -1039,6 +1089,36 @@ const startBackgroundSchedulers = () => {
       sweepStaleCheckoutIntents({ db, stripeClient: getOptionalStripeClient() })
     );
   });
+
+  // 10. Every 15 minutes Publish Mature Cooling-Off Reviews
+  cron.schedule("*/15 * * * *", async () => {
+    await runWithSchedulerLease("cooling_off_reviews", 120000, async () =>
+      publishMatureCoolingOffReviewsCommand(db)
+    );
+  });
+
+  // 11. Every 15 minutes Low-Quote Lead Wave 2 Radius Expansion
+  cron.schedule("*/15 * * * *", async () => {
+    await runWithSchedulerLease("lead_wave_expansion", 60000, async () =>
+      expandLowQuoteJobsWave2({
+        db,
+        extraRadiusMiles: 10,
+        maxJobsPerRun: 25,
+        dispatchFcmPush: (payload) => dispatchAuthoritativeFcmPush(db!, getFirebaseMessagingClient(), payload),
+      })
+    );
+  });
+};
+
+const getFirebaseMessagingClient = () => {
+  try {
+    if (admin.apps.length > 0 && typeof admin.messaging === "function") {
+      return admin.messaging();
+    }
+  } catch {
+    // Unconfigured FCM environment — strict gate handles honestly
+  }
+  return null;
 };
 
 // Decoupled Matching Engine Cycle Execution
@@ -1242,158 +1322,54 @@ async function runMatchingCycle(leaseCtx?: { isFenced: () => boolean }) {
         console.error("Error in Fairness Dispatch Engine:", err);
       }
       
-      // Original matching logic...
+      // Unified AnyTrader Lead Distribution Bridge (replaces legacy unverified 2-char postcode loop)
+      const messagingClientForCycle = getFirebaseMessagingClient();
+      const dispatchFcmForCycle = (payload: {
+        recipientId: string;
+        title: string;
+        body: string;
+        channelId: string;
+        eventType: string;
+        data: Record<string, string>;
+      }) => dispatchAuthoritativeFcmPush(db!, messagingClientForCycle, payload);
+
       for (const doc of snapshot.docs) {
         if (leaseCtx?.isFenced()) break;
-        const notification = doc.data();
-        console.log("New emergency job notification:", notification);
-        
-        // Fetch job details to get title and description for service matching
-        let jobData: any = null;
-        try {
-          const jobDoc = await db.collection("jobs").doc(notification.jobId).get();
-          if (jobDoc.exists) {
-            jobData = jobDoc.data();
-          }
-        } catch (err) {
-          console.error("Error fetching job for matching:", err);
-        }
-
-        // 1. Query tradespeople from users collection
-        console.log("Querying tradespeople...");
-        let tradersSnapshot;
-        try {
-          tradersSnapshot = await db.collection("users")
-            .where("role", "==", "tradesperson")
-            .get();
-        } catch (err) {
-          console.error("Error querying users for matching:", err);
-          continue;
-        }
-        
-        console.log(`Found ${tradersSnapshot.docs.length} total tradespeople.`);
-
-        const matchedTraders = tradersSnapshot.docs.filter(traderDoc => {
-          const trader = traderDoc.data();
-          
-          // Basic availability and area check
-          const matchesArea = trader.postcode && notification.postcode && 
-                             trader.postcode.substring(0, 2) === notification.postcode.substring(0, 2);
-          
-          if (!matchesArea) return false;
-
-          // Match by Category (Trades)
-          const matchesCategory = trader.trades && trader.trades.includes(notification.category);
-          
-          // Match by Products and Services
-          const matchesService = jobData && trader.services && trader.services.some((service: string) => 
-            jobData.title?.toLowerCase().includes(service.toLowerCase()) || 
-            jobData.description?.toLowerCase().includes(service.toLowerCase())
-          );
-
-          // Match by Specializations (Tags)
-          const matchesTag = jobData && trader.tags && trader.tags.some((tag: string) => 
-            jobData.title?.toLowerCase().includes(tag.toLowerCase()) || 
-            jobData.description?.toLowerCase().includes(tag.toLowerCase())
-          );
-
-          return matchesCategory || matchesService || matchesTag;
-        });
-
-        console.log(`Found ${matchedTraders.length} matched traders for job ${notification.jobId}`);
-
-        // 2. Send notifications to matched traders
-        for (const traderDoc of matchedTraders) {
-          const trader = traderDoc.data();
-          console.log(`Sending notification to trader: ${trader.email} (${trader.uid})`);
-          
-          // Check for Quiet Hours
-          let shouldNotifyNow = true;
-          if (trader.notificationSettings?.quietHoursEnabled) {
-            const now = new Date();
-            const currentTime = now.getHours() * 60 + now.getMinutes();
-            
-            const [startH, startM] = trader.notificationSettings.quietHoursStart.split(":").map(Number);
-            const [endH, endM] = trader.notificationSettings.quietHoursEnd.split(":").map(Number);
-            
-            const startTime = startH * 60 + startM;
-            const endTime = endH * 60 + endM;
-            
-            if (startTime > endTime) {
-              // Overnight range (e.g., 22:00 to 07:00)
-              if (currentTime >= startTime || currentTime <= endTime) {
-                shouldNotifyNow = false;
-              }
-            } else {
-              // Same day range (e.g., 09:00 to 17:00)
-              if (currentTime >= startTime && currentTime <= endTime) {
-                shouldNotifyNow = false;
-              }
-            }
-          }
-
-          if (!shouldNotifyNow) {
-            console.log(`Trader ${trader.uid} is in Quiet Hours. Notification will be available in feed.`);
-          }
-
-          // Evaluate Fast Pass (Exclusive Leads) logic
-          let visibleAt = admin.firestore.FieldValue.serverTimestamp();
-          let isExclusiveNotification = false;
-
-          if (globalConfig.paywallEnabled !== false && jobData?.exclusiveUntil) {
-            const exclusiveUntil = jobData.exclusiveUntil.toDate ? jobData.exclusiveUntil.toDate() : new Date(jobData.exclusiveUntil);
-            if (exclusiveUntil > new Date()) {
-              // Determine if the user holds an active Fast Pass
-              if (trader.hasExclusiveAddon && trader.isExclusiveActive !== false) {
-                // Determine fairness limit (Have they hit the 3 quotes per day?)
-                const lastQuoteDate = trader.lastExclusiveQuoteDate?.toDate ? trader.lastExclusiveQuoteDate.toDate() : (trader.lastExclusiveQuoteDate ? new Date(trader.lastExclusiveQuoteDate) : new Date(0));
-                const today = new Date();
-                const isSameDay = lastQuoteDate.getDate() === today.getDate() && lastQuoteDate.getMonth() === today.getMonth() && lastQuoteDate.getFullYear() === today.getFullYear();
-                
-                const usedToday = isSameDay ? (trader.exclusiveSlotsUsedToday || 0) : 0;
-                const cooldownUntil = trader.exclusiveCooldownUntil?.toDate ? trader.exclusiveCooldownUntil.toDate() : (trader.exclusiveCooldownUntil ? new Date(trader.exclusiveCooldownUntil) : new Date(0));
-
-                if (usedToday < 3 && cooldownUntil <= new Date()) {
-                  isExclusiveNotification = true;
-                } else {
-                  // Delay until exclusivity goes away
-                  visibleAt = admin.firestore.Timestamp.fromDate(exclusiveUntil);
-                }
-              } else {
-                // Standard User - Delay notification until exclusive window ends
-                visibleAt = admin.firestore.Timestamp.fromDate(exclusiveUntil);
-              }
-            }
-          }
-
-          let notificationTitle = shouldNotifyNow ? "New Job Match!" : "New Job Match (Quiet Mode) 🌙";
-          if (notification.urgency === "emergency") notificationTitle = shouldNotifyNow ? "New Emergency Job Match! 🚨" : "New Emergency Job (Quiet Mode) 🌙";
-          if (isExclusiveNotification) notificationTitle = "⚡ FAST PASS DIRECT LEAD ⚡";
-
-          // Create a notification in the notifications collection for the trader
+        const notification = doc.data() || {};
+        if (notification.jobId) {
           try {
-            await db.collection("notifications").add({
-              userId: trader.uid,
-              title: notificationTitle,
-              message: `A new ${notification.category} job matches your services in ${notification.postcode}.`,
-              type: "system",
-              link: `/job/${notification.jobId}`,
-              read: false,
-              silent: !shouldNotifyNow, // Flag for client-side to suppress sound/vibration if they implement it
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              visibleAt
+            await distributeJobLeadsAuthoritative({
+              db,
+              jobId: String(notification.jobId),
+              maxRecipients: 25,
+              wave: 1,
+              dispatchFcmPush: dispatchFcmForCycle,
             });
           } catch (err) {
-            console.error(`Error sending notification to trader ${trader.uid}:`, err);
+            console.error(`Error distributing leads for legacy notification ${doc.id}:`, err);
           }
         }
-        
+
         // Mark as processed
         try {
           await doc.ref.update({ processed: true });
         } catch (err) {
           console.error("Error marking notification as processed:", err);
         }
+      }
+
+      // Dynamic Wave 2 Radius Expansion (throttled to once every 5 minutes inside matching cycle)
+      const nowMsForWave2 = Date.now();
+      const lastWave2RunMs = (globalThis as any).__anytraderLastWave2RunMs || 0;
+      if (!leaseCtx?.isFenced() && nowMsForWave2 - lastWave2RunMs >= 5 * 60 * 1000) {
+        (globalThis as any).__anytraderLastWave2RunMs = nowMsForWave2;
+        await expandLowQuoteJobsWave2({
+          db,
+          nowMs: nowMsForWave2,
+          extraRadiusMiles: 10,
+          maxJobsPerRun: 15,
+          dispatchFcmPush: dispatchFcmForCycle,
+        }).catch((err) => console.warn("Wave 2 low-quote expansion warning:", err));
       }
   } catch (error: any) {
     const msg = error?.message || String(error);
@@ -1528,17 +1504,24 @@ const requireAdmin = async (req: express.Request, res: express.Response, next: e
 
     // AT-ADMIN-AUTH-01: Resolve explicit admin capability tier (support_readonly | financial_operator | super_admin)
     let userDocData: Record<string, any> | null = null;
+    let adminDocData: Record<string, any> | null = null;
     if (db && decodedToken?.uid) {
       try {
-        const userSnap = await db.collection("users").doc(decodedToken.uid).get();
+        const [userSnap, adminSnap] = await Promise.all([
+          db.collection("users").doc(decodedToken.uid).get(),
+          db.collection("admins").doc(decodedToken.uid).get(),
+        ]);
         if (userSnap.exists) {
           userDocData = userSnap.data() || null;
+        }
+        if (adminSnap.exists) {
+          adminDocData = adminSnap.data() || null;
         }
       } catch {
         // Non-blocking fallback to token claims
       }
     }
-    const adminTier = resolveAdminCapabilityTier(decodedToken, userDocData);
+    const adminTier = resolveAdminCapabilityTier(decodedToken, userDocData, adminDocData);
     (req as any).adminTier = adminTier;
     (req as any).adminActor = {
       uid: decodedToken.uid,
@@ -1546,8 +1529,8 @@ const requireAdmin = async (req: express.Request, res: express.Response, next: e
       tier: adminTier,
     } as AdminActor;
 
-    // Auto-migrate verified admin by applying custom claim for future requests if missing
-    if (decodedToken.admin !== true || decodedToken.isAdmin !== true) {
+    // Auto-migrate verified admin by applying custom claim (including explicit adminTier) if missing or drifted
+    if (decodedToken.admin !== true || decodedToken.isAdmin !== true || decodedToken.adminTier !== adminTier) {
       try {
         const userRecord = await admin.auth().getUser(decodedToken.uid);
         const currentClaims = userRecord.customClaims || {};
@@ -1617,16 +1600,39 @@ async function startServer() {
   app.set("trust proxy", 1);
   const PORT = Number(process.env.PORT) || 3000;
 
+  const isProd = process.env.NODE_ENV === "production";
+  const isAiStudioContainer = Boolean(
+    process.env.APPLET_ID ||
+    (process.env.K_SERVICE && process.env.K_SERVICE.startsWith("ais-"))
+  );
+
   // Allowed Origins Configuration for Web, PWA, and Preview
-  const defaultAllowedOrigins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://localhost",
-  ];
-  const envAllowedOrigins = process.env.ALLOWED_ORIGINS 
+  const defaultAllowedOrigins: string[] = isProd
+    ? []
+    : [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://localhost",
+      ];
+  const configuredAppOrigins = [process.env.APP_URL, process.env.PUBLIC_APP_URL]
+    .map((candidate) => {
+      if (!candidate) return null;
+      try {
+        const parsed = new URL(candidate.trim());
+        return parsed.protocol === "https:" || !isProd ? parsed.origin : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter((origin): origin is string => Boolean(origin));
+  const envAllowedOrigins = process.env.ALLOWED_ORIGINS
     ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim()).filter(Boolean)
     : [];
-  const allowedOriginsSet = new Set([...defaultAllowedOrigins, ...envAllowedOrigins]);
+  const allowedOriginsSet = new Set([
+    ...defaultAllowedOrigins,
+    ...configuredAppOrigins,
+    ...envAllowedOrigins,
+  ]);
 
   // Helper to validate origin strictly without substring hijacking vulnerabilities (e.g. evil-localhost.com)
   const isOriginAllowed = (origin: string, allowedSet: Set<string>): boolean => {
@@ -1635,7 +1641,7 @@ async function startServer() {
     }
     try {
       const parsed = new URL(origin);
-      if (process.env.NODE_ENV !== "production") {
+      if (!isProd) {
         // Strict localhost check: hostname must be exactly localhost, 127.0.0.1, or ::1
         const isStrictLocalhost =
           parsed.hostname === "localhost" ||
@@ -1645,10 +1651,17 @@ async function startServer() {
           return true;
         }
       }
-      // Strict Cloud Run and Google development previews
+      // Preview container origins are permitted ONLY in non-production or AI Studio preview containers,
+      // never in standalone production deployments (prevents multi-tenant *.run.app CORS exposure).
       if (
+        (!isProd || isAiStudioContainer) &&
         parsed.protocol === "https:" &&
-        (parsed.hostname.endsWith(".run.app") || parsed.hostname.endsWith(".google.com") || parsed.hostname.endsWith(".aistudio.google.com"))
+        (
+          parsed.hostname.endsWith(".aistudio.google.com") ||
+          parsed.hostname.endsWith(".ai.studio") ||
+          (isAiStudioContainer && /^ais-(dev|pre)-[a-z0-9-]+\.run\.app$/i.test(parsed.hostname)) ||
+          (!isProd && parsed.hostname.endsWith(".run.app"))
+        )
       ) {
         return true;
       }
@@ -1695,16 +1708,24 @@ async function startServer() {
     );
 
     // 2. Comprehensive Content-Security-Policy (CSP)
+    const aiStudioConnectOrigins = (!isProd || isAiStudioContainer)
+      ? " https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app"
+      : "";
+    const frameAncestorsDirective = (!isProd || isAiStudioContainer)
+      ? "frame-ancestors 'self' https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://*.google.com https://ai.studio https://*.ai.studio https://studio.google.com https://*.googleusercontent.com https://*.usercontent.goog"
+      : "frame-ancestors 'self'";
+
     const csp = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' https://apis.google.com https://*.googleapis.com https://js.stripe.com https://maps.googleapis.com https://*.firebaseapp.com",
+      "script-src 'self' 'unsafe-inline' https://apis.google.com https://*.googleapis.com https://*.gstatic.com https://js.stripe.com https://maps.googleapis.com https://*.firebaseapp.com",
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' data: https://fonts.gstatic.com",
       "img-src 'self' data: blob: https:",
       "media-src 'self' data: blob: https:",
-      "connect-src 'self' https://*.googleapis.com https://*.google.com https://*.firebaseio.com https://api.stripe.com https://*.cloudfunctions.net https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app wss://*.firebaseio.com https://api.postcodes.io",
+      `connect-src 'self' https://*.googleapis.com https://*.google.com https://*.firebaseio.com https://api.stripe.com https://*.cloudfunctions.net${aiStudioConnectOrigins} wss://*.firebaseio.com https://api.postcodes.io`,
       "frame-src 'self' https://js.stripe.com https://accounts.google.com https://*.firebaseapp.com https://*.google.com",
-      "frame-ancestors 'self' https://ais-dev-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://ais-pre-vumupz44ljjitc6rsqobbz-437256678397.europe-west2.run.app https://*.google.com https://ai.studio https://*.ai.studio https://studio.google.com https://*.googleusercontent.com https://*.usercontent.goog",
+      frameAncestorsDirective,
+      "worker-src 'self' blob:",
       "object-src 'none'",
       "base-uri 'self'",
     ].join('; ');
@@ -1713,11 +1734,7 @@ async function startServer() {
 
     // 3. Clickjacking Protection fallback for legacy clients in standalone production
     // Skip X-Frame-Options in development / AI Studio preview containers where embedded framing is governed by CSP frame-ancestors.
-    const isAiStudioContainer = Boolean(
-      process.env.APPLET_ID ||
-      (process.env.K_SERVICE && process.env.K_SERVICE.startsWith("ais-"))
-    );
-    if (process.env.NODE_ENV === "production" && !isAiStudioContainer) {
+    if (isProd && !isAiStudioContainer) {
       res.setHeader("X-Frame-Options", "SAMEORIGIN");
     }
 
@@ -1910,7 +1927,8 @@ async function startServer() {
 
       // Handle the event
       if (!db) {
-         return res.json({received: true});
+        console.error("[Stripe Webhook] Database unavailable; returning 503 so Stripe retries.");
+        return res.status(503).json({ error: "Database service temporarily unavailable" });
       }
 
       // Idempotency: Use a transaction to atomically claim 'processing' state with stale-worker lease takeover
@@ -1933,6 +1951,28 @@ async function startServer() {
 
       if (event.type === 'checkout.session.completed') {
         const session = event.data.object as Stripe.Checkout.Session;
+        if (session.mode === 'setup') {
+          let syncResult = { updated: false, defaultPaymentMethodId: null as string | null };
+          try {
+            syncResult = await syncDefaultPaymentMethodFromSetupSession({ stripe: stripeClient, session });
+          } catch (setupSyncErr) {
+            console.warn(`[Webhook Warning] Failed to sync default payment method for setup session ${session.id}:`, setupSyncErr);
+          }
+          await db.runTransaction(async (tx: any) => {
+            const claimSnap = await tx.get(eventRef);
+            const claimData = claimSnap.data() || {};
+            if (!ownsStripeWebhookClaim(claimData, claimToken)) {
+              throw new Error('Webhook claim lost before setup-session completion.');
+            }
+            tx.update(eventRef, {
+              status: 'completed',
+              setupDefaultSynced: syncResult.updated,
+              defaultPaymentMethodId: syncResult.defaultPaymentMethodId,
+              claimToken: admin.firestore.FieldValue.delete()
+            });
+          });
+          return res.status(200).json({ received: true, status: 'setup_completed', defaultUpdated: syncResult.updated });
+        }
         if (session.payment_status !== 'paid') {
           console.warn(`[Webhook Warning] Checkout session ${session.id} completed with payment_status '${session.payment_status}'. Skipping fulfillment until paid.`);
           await db.runTransaction(async (tx: any) => {
@@ -2001,6 +2041,7 @@ async function startServer() {
               throw new Error("Subscription fulfilment requires a valid Stripe Subscription ID.");
             }
             const subscriptionId = session.subscription;
+            const periodEndIso = await resolveSubscriptionPeriodEndIso(stripeClient, subscriptionId);
             const userRef = db.collection("users").doc(userId);
             const markerRef = db.collection("stripe_fulfillments").doc(`video_pro_${session.id}`);
             await db.runTransaction(async (tx: any) => {
@@ -2013,24 +2054,43 @@ async function startServer() {
               if (!userSnap.exists) throw new Error("Video Pro subscription user does not exist.");
               if (markerSnap.exists) return;
               const current = userSnap.data() || {};
-              if (current.videoProSubscriptionId && current.videoProSubscriptionId !== subscriptionId) {
-                throw new Error("A different Video Pro subscription is already linked; manual reconciliation required.");
+              if (!canReplaceLinkedSubscription({
+                existingSubscriptionId: current.videoProSubscriptionId,
+                incomingSubscriptionId: subscriptionId,
+                existingStatus: current.videoProSubscriptionStatus,
+                isCurrentlyActive: current.hasVerifiedVideoProSubscription,
+              })) {
+                throw new Error("A different active Video Pro subscription is already linked; manual reconciliation required.");
               }
+              // Video verification credential is strictly moderated by admin; subscription purchase must never bypass review.
               tx.update(userRef, {
                 hasVerifiedVideoProSubscription: true,
+                videoProSubscriptionStatus: "active",
+                videoProCancelAtPeriodEnd: false,
                 videoProSubscribedAt: current.videoProSubscribedAt || new Date().toISOString(),
-                videoVerificationStatus: "verified",
                 videoProSubscriptionId: subscriptionId,
+                ...(periodEndIso ? { videoProCurrentPeriodEnd: periodEndIso } : {}),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
               });
               tx.create(markerRef, { eventId: event.id, sessionId: session.id, subscriptionId, userId, type: "video_pro_subscription", createdAt: admin.firestore.FieldValue.serverTimestamp() });
             });
+            try {
+              const pubRef = db.collection("public_profiles").doc(userId);
+              const pubSnap = await pubRef.get();
+              if (pubSnap.exists) {
+                await pubRef.update({
+                  hasVerifiedVideoProSubscription: true,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              }
+            } catch { /* non-fatal public profile sync */ }
           }
           else if ((meta?.isExclusiveAddon === 'true' || meta?.type === 'exclusive_leads') && userId && db) {
             if (session.mode !== "subscription" || typeof session.subscription !== "string" || !session.subscription) {
               throw new Error("Subscription fulfilment requires a valid Stripe Subscription ID.");
             }
             const subscriptionId = session.subscription;
+            const periodEndIso = await resolveSubscriptionPeriodEndIso(stripeClient, subscriptionId);
             const userRef = db.collection("users").doc(userId);
             const markerRef = db.collection("stripe_fulfillments").doc(`exclusive_leads_${session.id}`);
             await db.runTransaction(async (tx: any) => {
@@ -2043,17 +2103,67 @@ async function startServer() {
               if (!userSnap.exists) throw new Error("Exclusive Leads subscription user does not exist.");
               if (markerSnap.exists) return;
               const current = userSnap.data() || {};
-              if (current.exclusiveSubscriptionId && current.exclusiveSubscriptionId !== subscriptionId) {
+              if (!canReplaceLinkedSubscription({
+                existingSubscriptionId: current.exclusiveSubscriptionId,
+                incomingSubscriptionId: subscriptionId,
+                existingStatus: current.exclusiveSubscriptionStatus,
+                isCurrentlyActive: current.hasExclusiveAddon,
+              })) {
                 throw new Error("A different Exclusive Leads subscription is already linked; manual reconciliation required.");
               }
               tx.update(userRef, {
                 hasExclusiveAddon: true,
                 isExclusiveActive: true,
+                exclusiveSubscriptionStatus: "active",
+                exclusiveCancelAtPeriodEnd: false,
                 exclusiveSubscribedAt: current.exclusiveSubscribedAt || new Date().toISOString(),
                 exclusiveSubscriptionId: subscriptionId,
+                ...(periodEndIso ? { exclusiveCurrentPeriodEnd: periodEndIso } : {}),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
               });
               tx.create(markerRef, { eventId: event.id, sessionId: session.id, subscriptionId, userId, type: "exclusive_leads", createdAt: admin.firestore.FieldValue.serverTimestamp() });
+            });
+          }
+          else if ((meta?.type === "appointments" || meta?.subscriptionType === "appointments") && userId && db) {
+            if (session.mode !== "subscription" || typeof session.subscription !== "string" || !session.subscription) {
+              throw new Error("Appointments add-on fulfilment requires a valid Stripe Subscription ID.");
+            }
+            const subscriptionId = session.subscription;
+            const periodEndIso = await resolveSubscriptionPeriodEndIso(stripeClient, subscriptionId);
+            const userRef = db.collection("users").doc(userId);
+            const markerRef = db.collection("stripe_fulfillments").doc(`appointments_${session.id}`);
+            await db.runTransaction(async (tx: any) => {
+              const claimSnap = await tx.get(eventRef);
+              const claimData = claimSnap.data() || {};
+              if (!ownsStripeWebhookClaim(claimData, claimToken)) {
+                throw new Error('Webhook claim lost before checkout fulfillment mutation.');
+              }
+              const [userSnap, markerSnap] = await Promise.all([tx.get(userRef), tx.get(markerRef)]);
+              if (!userSnap.exists) throw new Error("Appointments subscription user does not exist.");
+              if (markerSnap.exists) return;
+              const current = userSnap.data() || {};
+              if (!canReplaceLinkedSubscription({
+                existingSubscriptionId: current.appointmentsSubscriptionId,
+                incomingSubscriptionId: subscriptionId,
+                existingStatus: current.appointmentsSubscriptionStatus,
+                isCurrentlyActive: current.hasAppointmentsAddon,
+              })) {
+                throw new Error("A different Appointments subscription is already linked; manual reconciliation required.");
+              }
+              tx.update(userRef, {
+                hasAppointmentsAddon: true,
+                appointmentsSubscriptionId: subscriptionId,
+                appointmentsSubscriptionStatus: "active",
+                appointmentsCancelAtPeriodEnd: false,
+                appointmentsSubscribedAt: current.appointmentsSubscribedAt || new Date().toISOString(),
+                ...(periodEndIso ? { appointmentsCurrentPeriodEnd: periodEndIso } : {}),
+                appointmentSettings: {
+                  ...(current.appointmentSettings || {}),
+                  enabled: true,
+                },
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+              });
+              tx.create(markerRef, { eventId: event.id, sessionId: session.id, subscriptionId, userId, type: "appointments", createdAt: admin.firestore.FieldValue.serverTimestamp() });
             });
           }
           else if (meta?.type === "driver_gold" || meta?.subscriptionType === "driver_gold") {
@@ -2097,6 +2207,7 @@ async function startServer() {
               throw new Error("Gotham SaaS fulfilment requires a valid Stripe Subscription ID.");
             }
             const subscriptionId = session.subscription;
+            const periodEndIso = await resolveSubscriptionPeriodEndIso(stripeClient, subscriptionId);
             const doorsCount = Math.max(1, Math.min(100000, Math.floor(Number(meta.gothamDoorsCount) || 100)));
             const billingCycle = meta.gothamBillingCycle === "annual" ? "annual" : "monthly";
             const gothamTierName = String(meta.gothamTierName || meta.tierName || "Starter Housing Authority");
@@ -2112,8 +2223,13 @@ async function startServer() {
               if (!userSnap.exists) throw new Error("Gotham SaaS subscription user does not exist.");
               if (markerSnap.exists) return;
               const current = userSnap.data() || {};
-              if (current.gothamSubscriptionId && current.gothamSubscriptionId !== subscriptionId) {
-                throw new Error("A different Gotham SaaS subscription is already linked; manual reconciliation required.");
+              if (!canReplaceLinkedSubscription({
+                existingSubscriptionId: current.gothamSubscriptionId,
+                incomingSubscriptionId: subscriptionId,
+                existingStatus: current.gothamSubscriptionStatus,
+                isCurrentlyActive: current.isGothamSubscriber,
+              })) {
+                throw new Error("A different active Gotham SaaS subscription is already linked; manual reconciliation required.");
               }
               tx.update(userRef, {
                 isGothamSubscriber: true,
@@ -2127,6 +2243,7 @@ async function startServer() {
                 gothamBillingCycle: billingCycle,
                 gothamCancelAtPeriodEnd: false,
                 gothamSubscribedAt: current.gothamSubscribedAt || new Date().toISOString(),
+                ...(periodEndIso ? { gothamCurrentPeriodEnd: periodEndIso } : {}),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
               });
               tx.create(markerRef, { eventId: event.id, sessionId: session.id, subscriptionId, userId, type: "gotham_saas", doorsCount, tierName: gothamTierName, billingCycle, createdAt: admin.firestore.FieldValue.serverTimestamp() });
@@ -2153,6 +2270,9 @@ async function startServer() {
                   await stripeClient.subscriptions.retrieve(subscriptionId) as any
                 )
               : null;
+            const membershipPeriodEndIso = !isLandlord
+              ? await resolveSubscriptionPeriodEndIso(stripeClient, subscriptionId)
+              : undefined;
             await db.runTransaction(async (tx: any) => {
               const claimSnap = await tx.get(eventRef);
               const claimData = claimSnap.data() || {};
@@ -2163,12 +2283,22 @@ async function startServer() {
               if (!userSnap.exists) throw new Error("Membership subscription user does not exist.");
               if (markerSnap.exists) return;
               const current = userSnap.data() || {};
-              if (current.subscriptionId && current.subscriptionId !== subscriptionId) {
-                const currentStatus = current.subscriptionType === "landlord"
-                  ? current.homeownerSubscriptionStatus
-                  : current.subscriptionStatus;
-                if (["active", "trialing", "past_due", "incomplete", "paused"].includes(String(currentStatus || ""))) {
-                  throw new Error("A different active subscription is already linked; manual reconciliation required.");
+              if (isLandlord) {
+                const existingLandlordSubId =
+                  current.landlordSubscriptionId ||
+                  (current.subscriptionType === "landlord" ? current.subscriptionId : undefined);
+                if (existingLandlordSubId && existingLandlordSubId !== subscriptionId) {
+                  if (["active", "trialing", "past_due", "incomplete", "paused"].includes(String(current.homeownerSubscriptionStatus || ""))) {
+                    throw new Error("A different active Landlord subscription is already linked; manual reconciliation required.");
+                  }
+                }
+              } else {
+                const existingTraderSubId =
+                  current.subscriptionType === "landlord" ? undefined : current.subscriptionId;
+                if (existingTraderSubId && existingTraderSubId !== subscriptionId) {
+                  if (["active", "trialing", "past_due", "incomplete", "paused"].includes(String(current.subscriptionStatus || ""))) {
+                    throw new Error("A different active subscription is already linked; manual reconciliation required.");
+                  }
                 }
               }
               if (landlordPatch) {
@@ -2178,18 +2308,38 @@ async function startServer() {
                 });
               } else {
                 tx.update(userRef, {
-                  subscriptionStatus: "active", subscriptionId, tierId: rawTier, tier: canonicalTier,
-                  isLandlord: false,
+                  subscriptionStatus: "active",
+                  subscriptionId,
+                  tierId: rawTier,
+                  tier: canonicalTier,
+                  cancelAtPeriodEnd: false,
                   subscriptionType: canonicalTier !== 'payg' ? 'tier' : 'standard',
-                  isPro: canonicalTier !== 'payg', isProInvoiceSubscriber: canonicalTier !== 'payg',
+                  isPro: canonicalTier !== 'payg',
+                  isProInvoiceSubscriber: canonicalTier !== 'payg',
+                  ...(membershipPeriodEndIso ? { currentPeriodEnd: membershipPeriodEndIso } : {}),
                   updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
               }
-              tx.create(markerRef, { eventId: event.id, sessionId: session.id, subscriptionId, userId, tier: canonicalTier, type: "membership_subscription", createdAt: admin.firestore.FieldValue.serverTimestamp() });
+              tx.create(markerRef, { eventId: event.id, sessionId: session.id, subscriptionId, userId, tier: canonicalTier, type: isLandlord ? "landlord_subscription" : "membership_subscription", createdAt: admin.firestore.FieldValue.serverTimestamp() });
             });
+            if (!isLandlord) {
+              try {
+                const pubRef = db.collection("public_profiles").doc(userId);
+                const pubSnap = await pubRef.get();
+                if (pubSnap.exists) {
+                  await pubRef.update({
+                    tierId: rawTier,
+                    tier: canonicalTier,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                }
+              } catch { /* non-fatal public profile sync */ }
+            }
           } else if (session.mode === 'payment') {
-            if (meta?.type === 'ad_wallet_topup' && userId && db) {
-              const topupAmount = Number(meta?.topupAmount) || (session.amount_total ? session.amount_total / 100 : 0);
+            if ((meta?.type === 'ad_wallet_topup' || meta?.type === 'banner_ad') && userId && db) {
+              const topupAmount = meta?.type === 'banner_ad'
+                ? (session.amount_total ? session.amount_total / 100 : Number(meta?.totalPence || 0) / 100)
+                : (Number(meta?.topupAmount) || (session.amount_total ? session.amount_total / 100 : 0));
               if (topupAmount > 0) {
                 // Event-scoped marker and wallet credit commit atomically. If a later
                 // webhook side effect fails and Stripe retries this event, the credit
@@ -2222,6 +2372,7 @@ async function startServer() {
               }
             } else if (meta?.type === 'mediation_stake' && meta?.jobId && db) {
               const mediationJobRef = db.collection("jobs").doc(meta.jobId);
+              const mediationCardRef = db.collection("public_job_cards").doc(meta.jobId);
               const mediationFulfillmentRef = db.collection("stripe_fulfillments").doc(`mediation_stake_${session.id}`);
               await db.runTransaction(async (tx: any) => {
               const claimSnap = await tx.get(eventRef);
@@ -2229,8 +2380,8 @@ async function startServer() {
               if (!ownsStripeWebhookClaim(claimData, claimToken)) {
                 throw new Error('Webhook claim lost before checkout fulfillment mutation.');
               }
-                const [jobSnap, fulfillmentSnap] = await Promise.all([
-                  tx.get(mediationJobRef), tx.get(mediationFulfillmentRef)
+                const [jobSnap, cardSnap, fulfillmentSnap] = await Promise.all([
+                  tx.get(mediationJobRef), tx.get(mediationCardRef), tx.get(mediationFulfillmentRef)
                 ]);
                 if (!jobSnap.exists) throw new Error("Mediation stake job does not exist.");
                 if (fulfillmentSnap.exists) return;
@@ -2242,9 +2393,20 @@ async function startServer() {
                 if (dispute.mediationStakePaid && dispute.stakePaymentId !== session.id) {
                   throw new Error("Mediation stake is already marked paid; manual reconciliation required.");
                 }
+                const disputePhotos = Array.isArray(intent?.disputePhotoUrls)
+                  ? intent.disputePhotoUrls.filter((u: any) => typeof u === "string" && /^https?:\/\//i.test(u)).slice(0, 8)
+                  : [];
+                const isPropertyDamageFlag = String(meta.isPropertyDamage || "").toLowerCase() === "true" || dispute.isPropertyDamage === true;
                 tx.update(mediationJobRef, {
                   status: "disputed",
+                  mediationStakePaid: true,
                   "dispute.status": "pending_arbitration",
+                  "dispute.reason": meta.disputeReason || dispute.reason || "Unspecified",
+                  "dispute.technicalFaultReport": meta.technicalFaultReport || dispute.technicalFaultReport || "Unspecified",
+                  "dispute.isPropertyDamage": isPropertyDamageFlag,
+                  "dispute.raisedBy": userId,
+                  "dispute.createdAt": dispute.createdAt || admin.firestore.FieldValue.serverTimestamp(),
+                  ...(disputePhotos.length > 0 ? { "dispute.photos": disputePhotos } : {}),
                   "dispute.mediationStakePaid": true,
                   "dispute.mediationStakeAmount": Number(session.amount_total || 0) / 100,
                   "dispute.stakePaymentId": session.id,
@@ -2253,6 +2415,12 @@ async function startServer() {
                   technicalFaultReport: meta.technicalFaultReport || "Unspecified",
                   disputedAt: jobData.disputedAt || admin.firestore.FieldValue.serverTimestamp()
                 });
+                if (cardSnap.exists) {
+                  tx.update(mediationCardRef, {
+                    status: "disputed",
+                    updatedAt: new Date().toISOString(),
+                  });
+                }
                 tx.create(mediationFulfillmentRef, {
                   eventId: event.id,
                   sessionId: session.id,
@@ -2274,7 +2442,7 @@ async function startServer() {
                     {
                       userId: counterpartUid,
                       title: "Dispute Mediation Stake Confirmed",
-                      message: `A £25.00 mediation stake has been confirmed for "${jobData.title || `Job #${meta.jobId}`}". The dispute is queued for arbitration.`,
+                      message: `A £${(Number(session.amount_total || 2500) / 100).toFixed(2)} mediation stake has been confirmed for "${jobData.title || `Job #${meta.jobId}`}". The dispute is queued for arbitration.`,
                       type: "status",
                       read: false,
                       jobId: meta.jobId,
@@ -2328,8 +2496,7 @@ async function startServer() {
                 }
                 if (isIM && !imMarkerSnap.exists) {
                   if (!matchSnap.exists) {
-                    const paymentIntentId = typeof intent.paymentIntentId === "string" && /^pi_[A-Za-z0-9]+$/.test(intent.paymentIntentId)
-                      ? intent.paymentIntentId : null;
+                    const paymentIntentId = resolveInstantMatchPaymentIntentId(session as any, intent);
                     tx.create(matchRef, {
                       id: matchId, jobId: meta.jobId, customerId: userId || "",
                       chargeAmountPence: Number(session.amount_total || 0),
@@ -2389,6 +2556,124 @@ async function startServer() {
                 eventRef,
                 claimToken,
               });
+            }
+            if (meta?.type === 'milestone_funding' && meta?.jobId && meta?.quoteId && meta?.milestoneId && db) {
+              const { jobId, quoteId, milestoneId } = meta;
+              const quoteRef = db.collection("jobs").doc(jobId).collection("quotes").doc(quoteId);
+              const jobRef = db.collection("jobs").doc(jobId);
+              const milestoneFulfillmentRef = db.collection("stripe_fulfillments").doc(`milestone_${session.id}`);
+              const paymentIntentId = typeof session.payment_intent === "string"
+                ? session.payment_intent
+                : typeof (session.payment_intent as any)?.id === "string"
+                  ? (session.payment_intent as any).id
+                  : session.id;
+              const verifiedAmountPence = Number(session.amount_total || meta.milestoneAmountPence || 0);
+              const parsedFeePence = meta.platformFeePence !== undefined ? Number(meta.platformFeePence) : undefined;
+              const parsedRate = meta.appliedCommissionRate !== undefined ? Number(meta.appliedCommissionRate) : undefined;
+              const parsedCapGbp = meta.commissionCapGbp !== undefined ? Number(meta.commissionCapGbp) : undefined;
+              let resolvedTraderId = meta.traderId || "";
+              let fundedMilestoneTitle = "Milestone";
+              let newlyFunded = false;
+
+              await db.runTransaction(async (tx: any) => {
+                const claimSnap = await tx.get(eventRef);
+                const claimData = claimSnap.data() || {};
+                if (!ownsStripeWebhookClaim(claimData, claimToken)) {
+                  throw new Error('Webhook claim lost before milestone funding mutation.');
+                }
+                const [jobSnap, quoteSnap, fulfillmentSnap] = await Promise.all([
+                  tx.get(jobRef),
+                  tx.get(quoteRef),
+                  tx.get(milestoneFulfillmentRef),
+                ]);
+                if (fulfillmentSnap.exists) return;
+                if (!jobSnap.exists || !quoteSnap.exists) {
+                  throw new Error("Milestone funding target job or quote does not exist.");
+                }
+                const jobData = jobSnap.data() || {};
+                const quoteData = quoteSnap.data() || {};
+                const ownerId = jobData.homeownerId || jobData.userId;
+                if (ownerId && userId && ownerId !== userId) {
+                  throw new Error("Milestone funding checkout user does not own the target job.");
+                }
+                resolvedTraderId = meta.traderId || quoteData.tradespersonId || "";
+                const milestones = Array.isArray(quoteData.milestones) ? quoteData.milestones : [];
+                const targetMs = milestones.find((m: any) => m.id === milestoneId);
+                if (!targetMs) {
+                  throw new Error("Milestone funding target milestone not found on quote.");
+                }
+                fundedMilestoneTitle = targetMs.title || "Milestone";
+                const updatedMilestones = milestones.map((m: any) => {
+                  if (m.id === milestoneId) {
+                    const feeVal =
+                      parsedFeePence !== undefined && Number.isFinite(parsedFeePence) && parsedFeePence >= 0
+                        ? Math.round(parsedFeePence)
+                        : undefined;
+                    return {
+                      ...m,
+                      status: m.status === "pending" || !m.status ? "funded" : m.status,
+                      fundedAt: m.fundedAt || new Date().toISOString(),
+                      stripePaymentIntentId: paymentIntentId,
+                      isDestinationCharge: true,
+                      ...(feeVal !== undefined ? { platformFeePence: feeVal, netPayoutPence: Math.max(0, verifiedAmountPence - feeVal) } : {}),
+                      ...(parsedRate !== undefined && Number.isFinite(parsedRate) ? { appliedCommissionRate: parsedRate } : {}),
+                      ...(parsedCapGbp !== undefined && Number.isFinite(parsedCapGbp) ? { commissionCapGbp: parsedCapGbp } : {}),
+                    };
+                  }
+                  return m;
+                });
+                const allMilestonesFunded =
+                  updatedMilestones.length > 0 &&
+                  updatedMilestones.every((m: any) => ["funded", "submitted", "approved", "released"].includes(String(m.status || "").toLowerCase()));
+                tx.update(quoteRef, { milestones: updatedMilestones, updatedAt: new Date().toISOString() });
+                tx.update(jobRef, {
+                  paymentStatus: allMilestonesFunded ? "funded" : "partially_funded",
+                  updatedAt: new Date().toISOString(),
+                });
+                tx.create(milestoneFulfillmentRef, {
+                  eventId: event.id,
+                  sessionId: session.id,
+                  paymentIntentId,
+                  intentId: session.metadata?.intentId || null,
+                  userId,
+                  jobId,
+                  quoteId,
+                  milestoneId,
+                  traderId: resolvedTraderId,
+                  amountPence: verifiedAmountPence,
+                  ...(parsedFeePence !== undefined && Number.isFinite(parsedFeePence) ? { platformFeePence: Math.round(parsedFeePence) } : {}),
+                  type: "milestone_funding",
+                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                newlyFunded = true;
+              });
+
+              if (newlyFunded && verifiedAmountPence > 0) {
+                await PaymentLedgerEngine.recordEscrowFunding(db, {
+                  jobId,
+                  milestoneId,
+                  paymentIntentId,
+                  idempotencyKey: `stripe_fund_${session.id}`,
+                  customerId: userId || "",
+                  traderId: resolvedTraderId || "trader",
+                  verifiedAmount: verifiedAmountPence,
+                  currency: String(session.currency || "gbp").toLowerCase(),
+                  ...(parsedFeePence !== undefined && Number.isFinite(parsedFeePence) ? { platformFeePence: Math.round(parsedFeePence) } : {}),
+                  ...(parsedRate !== undefined && Number.isFinite(parsedRate) ? { appliedCommissionRate: parsedRate } : {}),
+                  ...(parsedCapGbp !== undefined && Number.isFinite(parsedCapGbp) ? { commissionCapGbp: parsedCapGbp } : {}),
+                });
+                if (resolvedTraderId) {
+                  await db.collection("notifications").doc(`ms_fund_${session.id}_${resolvedTraderId}`).set({
+                    userId: resolvedTraderId,
+                    title: "Milestone Funded! 💰",
+                    message: `Homeowner funded "${fundedMilestoneTitle}". You can now start work!`,
+                    type: "status",
+                    link: `/job/${jobId}`,
+                    read: false,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                  }, { merge: true });
+                }
+              }
             }
           }
         await transitionCheckoutIntentState({
@@ -2519,7 +2804,12 @@ async function startServer() {
         const meta = pi.metadata || {};
         if (meta.type === "mediation_stake" && event.type !== "payment_intent.canceled") {
           const isSuccess = event.type === "payment_intent.succeeded";
-          if (!meta.jobId || !meta.paymentAttemptId || !meta.userId || pi.currency !== "gbp" || pi.amount !== 2500) {
+          const cachedGlobalCfg = await getCachedConfig("global").catch(() => null);
+          const dynamicStakeGbp = Number(cachedGlobalCfg?.paidAddons?.milestoneEscrow?.homeownerMediationStake);
+          const expectedStakePence = Number.isFinite(dynamicStakeGbp) && dynamicStakeGbp > 0
+            ? Math.round(dynamicStakeGbp * 100)
+            : 2500;
+          if (!meta.jobId || !meta.paymentAttemptId || !meta.userId || pi.currency !== "gbp" || pi.amount !== expectedStakePence) {
             await db.runTransaction(async (tx: any) => {
               const claim = await tx.get(eventRef);
               if (!ownsStripeWebhookClaim(claim.data() || {}, claimToken)) throw new Error("Webhook claim lost before rejecting mediation payment.");
@@ -2585,9 +2875,11 @@ async function startServer() {
             : await stripeClient.subscriptions.retrieve(subscriptionId);
           const products = [
             { key: "membership", idField: "subscriptionId", lastCreated: "subscriptionLastEventCreated", lastId: "subscriptionLastEventId" },
+            { key: "landlord", idField: "landlordSubscriptionId", lastCreated: "homeownerSubscriptionLastEventCreated", lastId: "homeownerSubscriptionLastEventId" },
             { key: "gold_driver", idField: "driverSubscriptionId", lastCreated: "driverSubscriptionLastEventCreated", lastId: "driverSubscriptionLastEventId" },
             { key: "exclusive_leads", idField: "exclusiveSubscriptionId", lastCreated: "exclusiveSubscriptionLastEventCreated", lastId: "exclusiveSubscriptionLastEventId" },
             { key: "video_pro", idField: "videoProSubscriptionId", lastCreated: "videoProSubscriptionLastEventCreated", lastId: "videoProSubscriptionLastEventId" },
+            { key: "appointments", idField: "appointmentsSubscriptionId", lastCreated: "appointmentsSubscriptionLastEventCreated", lastId: "appointmentsSubscriptionLastEventId" },
             { key: "gotham_saas", idField: "gothamSubscriptionId", lastCreated: "gothamSubscriptionLastEventCreated", lastId: "gothamSubscriptionLastEventId" }
           ];
           const matches = await Promise.all(products.map(async (product) => {
@@ -2602,6 +2894,7 @@ async function startServer() {
           if (resolved) {
             const { product, userDoc } = resolved;
             const eventCreated = Number(event.created || 0);
+            let publicSyncPatch: Record<string, any> | null = null;
             await db.runTransaction(async (tx: any) => {
               const claimSnap = await tx.get(eventRef);
               const claimData = claimSnap.data() || {};
@@ -2614,14 +2907,38 @@ async function startServer() {
               if (current[product.idField] !== subscriptionId) return;
               // Event ordering is tracked independently for each product subscription.
               if (Number(current[product.lastCreated] || 0) > eventCreated) return;
+              const lifecyclePatch = buildSubscriptionLifecyclePatch(product.key, subscription as any, isSubscriptionDeleted);
               const patch: Record<string, any> = {
-                ...buildSubscriptionLifecyclePatch(product.key, subscription as any, isSubscriptionDeleted),
+                ...lifecyclePatch,
                 [product.lastCreated]: eventCreated,
                 [product.lastId]: event.id,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
               };
+              if (product.key === "appointments" && typeof lifecyclePatch.hasAppointmentsAddon === "boolean") {
+                patch.appointmentSettings = {
+                  ...(current.appointmentSettings || {}),
+                  enabled: lifecyclePatch.hasAppointmentsAddon,
+                };
+              }
+              if (product.key === "membership" && lifecyclePatch.tierId) {
+                publicSyncPatch = { tierId: lifecyclePatch.tierId, tier: lifecyclePatch.tier || "payg" };
+              } else if (product.key === "video_pro" && typeof lifecyclePatch.hasVerifiedVideoProSubscription === "boolean") {
+                publicSyncPatch = { hasVerifiedVideoProSubscription: lifecyclePatch.hasVerifiedVideoProSubscription };
+              }
               tx.update(userDoc.ref, patch);
             });
+            if (publicSyncPatch) {
+              try {
+                const pubRef = db.collection("public_profiles").doc(userDoc.id);
+                const pubSnap = await pubRef.get();
+                if (pubSnap.exists) {
+                  await pubRef.update({
+                    ...publicSyncPatch,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                }
+              } catch { /* non-fatal public profile sync */ }
+            }
           }
         }
       }
@@ -2699,10 +3016,10 @@ async function startServer() {
         status: "degraded",
         ready: true,
         bootstrapReady: false,
-        message: "TradeQuote UK API running (client SPA mode active)"
+        message: "AnyTrader UK API running (client SPA mode active)"
       });
     }
-    res.json({ status: "ok", ready: true, bootstrapReady: true, message: "TradeQuote UK API is running and ready" });
+    res.json({ status: "ok", ready: true, bootstrapReady: true, message: "AnyTrader UK API is running and ready" });
   });
 
   app.get("/api/maintenance/status", async (req, res) => {
@@ -2831,7 +3148,8 @@ async function startServer() {
         if (configuredPrice !== undefined && Number(configuredPrice) !== 0) {
           throw new ForbiddenError("The Standard Homeowner tier is not currently configured as free.");
         }
-        if (userData.subscriptionType === "landlord" && userData.subscriptionId &&
+        const activeLandlordSubId = userData.landlordSubscriptionId || (userData.subscriptionType === "landlord" ? userData.subscriptionId : undefined);
+        if (activeLandlordSubId &&
             !terminalStatuses.includes(String(userData.homeownerSubscriptionStatus || ""))) {
           throw new ConflictError("Cancel the active Landlord subscription before selecting the free tier.");
         }
@@ -2839,11 +3157,13 @@ async function startServer() {
           const latest = await tx.get(userRef);
           if (!latest.exists) throw new NotFoundError("User profile not found.");
           const current = latest.data() || {};
-          if (current.subscriptionType === "landlord" && current.subscriptionId &&
+          const latestLandlordSubId = current.landlordSubscriptionId || (current.subscriptionType === "landlord" ? current.subscriptionId : undefined);
+          if (latestLandlordSubId &&
               !terminalStatuses.includes(String(current.homeownerSubscriptionStatus || ""))) {
             throw new ConflictError("Cancel the active Landlord subscription before selecting the free tier.");
           }
           tx.update(userRef, {
+            isLandlord: false,
             homeownerTierId: "standard",
             homeownerSubscriptionStatus: "free",
             homeownerCancelAtPeriodEnd: false,
@@ -2852,16 +3172,17 @@ async function startServer() {
           });
         });
         return res.json({ success: true, fields: {
+          isLandlord: false,
           homeownerTierId: "standard",
           homeownerSubscriptionStatus: "free",
           homeownerCancelAtPeriodEnd: false
         }});
       }
 
-      if (role !== "tradesperson" || !["payg", "free explorer", "free explorer plan"].includes(tierName)) {
+      if (!["tradesperson", "business"].includes(role) || !["payg", "free explorer", "free explorer plan"].includes(tierName)) {
         throw new ForbiddenError("This account cannot select the requested free tier.");
       }
-      if (userData.subscriptionType === "tier" && userData.subscriptionId &&
+      if (userData.subscriptionType !== "landlord" && userData.subscriptionId &&
           !terminalStatuses.includes(String(userData.subscriptionStatus || ""))) {
         throw new ConflictError("Cancel the active membership subscription before selecting the free tier.");
       }
@@ -2869,7 +3190,7 @@ async function startServer() {
         const latest = await tx.get(userRef);
         if (!latest.exists) throw new NotFoundError("User profile not found.");
         const current = latest.data() || {};
-        if (current.subscriptionType === "tier" && current.subscriptionId &&
+        if (current.subscriptionType !== "landlord" && current.subscriptionId &&
             !terminalStatuses.includes(String(current.subscriptionStatus || ""))) {
           throw new ConflictError("Cancel the active membership subscription before selecting the free tier.");
         }
@@ -2877,6 +3198,7 @@ async function startServer() {
           tierId: "Free Explorer",
           tier: "payg",
           subscriptionStatus: "free",
+          subscriptionType: "standard",
           isPro: false,
           isProInvoiceSubscriber: false,
           cancelAtPeriodEnd: false,
@@ -2884,6 +3206,17 @@ async function startServer() {
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
       });
+      try {
+        const pubRef = db.collection("public_profiles").doc(userId);
+        const pubSnap = await pubRef.get();
+        if (pubSnap.exists) {
+          await pubRef.update({
+            tierId: "Free Explorer",
+            tier: "payg",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+      } catch { /* non-fatal public profile sync */ }
       res.json({ success: true, fields: {
         tierId: "Free Explorer",
         tier: "payg",
@@ -2915,6 +3248,12 @@ async function startServer() {
       
       // CREATE PRE-CHECKOUT INTENT (Fixes C-01 and C-03 by never trusting Stripe metadata)
       const intentId = `chk_intent_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+      const sanitizedDisputePhotoUrls =
+        authoritativeResult.metadata?.type === "mediation_stake" && Array.isArray(req.body?.disputePhotoUrls)
+          ? req.body.disputePhotoUrls
+              .filter((u: any) => typeof u === "string" && /^https?:\/\//i.test(u))
+              .slice(0, 8)
+          : [];
       if (db) {
          await db.collection("payment_intents").doc(intentId).set({
             intentId,
@@ -2923,6 +3262,7 @@ async function startServer() {
             metadata: authoritativeResult.metadata,
             mode: authoritativeResult.mode,
             amount: authoritativeResult.authoritativeAmountPence || 0,
+            ...(sanitizedDisputePhotoUrls.length > 0 ? { disputePhotoUrls: sanitizedDisputePhotoUrls } : {}),
             status: "pending"
          });
       }
@@ -2943,17 +3283,34 @@ async function startServer() {
           if (meta.isVideoPro === 'true' || meta.type === 'video_pro_subscription') {
             await db.collection("users").doc(userId).set({
               hasVerifiedVideoProSubscription: true,
+              videoProSubscriptionStatus: "active",
+              videoProCancelAtPeriodEnd: false,
               videoProSubscribedAt: new Date().toISOString(),
-              videoVerificationStatus: "verified",
               videoProSubscriptionId: "mock_sub_vpro_" + Math.random().toString(36).substring(7),
+              videoProCurrentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
               updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
           } else if (meta.isExclusiveAddon === 'true' || meta.type === 'exclusive_leads') {
             await db.collection("users").doc(userId).set({
               hasExclusiveAddon: true,
               isExclusiveActive: true,
+              exclusiveSubscriptionStatus: "active",
+              exclusiveCancelAtPeriodEnd: false,
               exclusiveSubscribedAt: new Date().toISOString(),
               exclusiveSubscriptionId: "mock_sub_excl_" + Math.random().toString(36).substring(7),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+          } else if (meta.type === 'appointments' || meta.subscriptionType === 'appointments') {
+            const existingSnap = await db.collection("users").doc(userId).get();
+            const existingApptSettings = existingSnap.exists ? (existingSnap.data()?.appointmentSettings || {}) : {};
+            await db.collection("users").doc(userId).set({
+              hasAppointmentsAddon: true,
+              appointmentsSubscriptionStatus: "active",
+              appointmentsCancelAtPeriodEnd: false,
+              appointmentsSubscribedAt: new Date().toISOString(),
+              appointmentsSubscriptionId: "mock_sub_appt_" + Math.random().toString(36).substring(7),
+              appointmentsCurrentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+              appointmentSettings: { ...existingApptSettings, enabled: true },
               updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
           } else if (meta.subscriptionType === 'gotham_saas' || meta.type === 'gotham_saas') {
@@ -3007,16 +3364,20 @@ async function startServer() {
             await db.collection("users").doc(userId).set({
               tierId: meta.tierName || "Pro",
               tier: canonicalTier,
+              subscriptionType: canonicalTier !== 'payg' ? 'tier' : 'standard',
               isPro: canonicalTier !== 'payg',
               isProInvoiceSubscriber: canonicalTier !== 'payg',
               subscriptionStatus: "active",
+              cancelAtPeriodEnd: false,
               subscriptionId: "mock_sub_" + Math.random().toString(36).substring(7),
               currentPeriodEnd: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
               updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
           } else if (authoritativeResult.mode === 'payment') {
-            if (meta.type === 'ad_wallet_topup') {
-              const topupAmount = Number(meta.topupAmount) || 0;
+            if (meta.type === 'ad_wallet_topup' || meta.type === 'banner_ad') {
+              const topupAmount = meta.type === 'banner_ad'
+                ? Number(meta.totalPence || 0) / 100
+                : (Number(meta.topupAmount) || 0);
               if (topupAmount > 0) {
                 await db.collection("users").doc(userId).set({
                   adWalletBalance: admin.firestore.FieldValue.increment(topupAmount),
@@ -3030,15 +3391,36 @@ async function startServer() {
               if (quoteDoc.exists) {
                 const quoteData = quoteDoc.data();
                 const milestones = quoteData?.milestones || [];
+                const platformFeePence = meta.platformFeePence !== undefined ? Number(meta.platformFeePence) : undefined;
+                const netPayoutPence = meta.netPayoutPence !== undefined ? Number(meta.netPayoutPence) : undefined;
+                const appliedCommissionRate = meta.appliedCommissionRate !== undefined ? Number(meta.appliedCommissionRate) : undefined;
+                const commissionCapGbp = meta.commissionCapGbp !== undefined ? Number(meta.commissionCapGbp) : undefined;
                 const updatedMilestones = milestones.map((m: any) => {
                   if (m.id === milestoneId) {
-                    return { ...m, status: 'funded', fundedAt: new Date().toISOString(), stripePaymentIntentId: intentId };
+                    return {
+                      ...m,
+                      status: 'funded',
+                      fundedAt: new Date().toISOString(),
+                      stripePaymentIntentId: intentId,
+                      isDestinationCharge: Boolean(authoritativeResult.paymentIntentData),
+                      ...(platformFeePence !== undefined && Number.isFinite(platformFeePence) ? { platformFeePence } : {}),
+                      ...(netPayoutPence !== undefined && Number.isFinite(netPayoutPence) ? { netPayoutPence } : {}),
+                      ...(appliedCommissionRate !== undefined && Number.isFinite(appliedCommissionRate) ? { appliedCommissionRate } : {}),
+                      ...(commissionCapGbp !== undefined && Number.isFinite(commissionCapGbp) ? { commissionCapGbp } : {}),
+                    };
                   }
                   return m;
                 });
                 await quoteRef.update({ milestones: updatedMilestones });
+                const allMilestonesFunded =
+                  updatedMilestones.length > 0 &&
+                  updatedMilestones.every((m: any) => ["funded", "submitted", "approved", "released"].includes(String(m.status || "").toLowerCase()));
+                await db.collection("jobs").doc(jobId).update({
+                  paymentStatus: allMilestonesFunded ? "funded" : "partially_funded",
+                  updatedAt: new Date().toISOString(),
+                });
 
-                // Record to immutable payment ledger
+                // Record to immutable payment ledger with exact authoritative commission from pricingCatalog
                 await PaymentLedgerEngine.recordEscrowFunding(db, {
                   jobId,
                   milestoneId,
@@ -3047,7 +3429,10 @@ async function startServer() {
                   customerId: userId,
                   traderId: meta.traderId || quoteData?.tradespersonId || "trader",
                   verifiedAmount: authoritativeResult.authoritativeAmountPence,
-                  currency: "gbp"
+                  currency: "gbp",
+                  ...(platformFeePence !== undefined && Number.isFinite(platformFeePence) ? { platformFeePence } : {}),
+                  ...(appliedCommissionRate !== undefined && Number.isFinite(appliedCommissionRate) ? { appliedCommissionRate } : {}),
+                  ...(commissionCapGbp !== undefined && Number.isFinite(commissionCapGbp) ? { commissionCapGbp } : {}),
                 });
 
                 await db.collection("notifications").add({
@@ -3061,13 +3446,31 @@ async function startServer() {
                 });
               }
             } else if (meta.type === 'mediation_stake' && meta.jobId) {
+              const isPropertyDamageFlag = String(meta.isPropertyDamage || "").toLowerCase() === "true";
               await db.collection("jobs").doc(meta.jobId).update({
                 status: "disputed",
                 mediationStakePaid: true,
+                "dispute.status": "pending_arbitration",
+                "dispute.reason": meta.disputeReason || "Unspecified",
+                "dispute.technicalFaultReport": meta.technicalFaultReport || "Unspecified",
+                "dispute.isPropertyDamage": isPropertyDamageFlag,
+                "dispute.raisedBy": userId,
+                "dispute.createdAt": admin.firestore.FieldValue.serverTimestamp(),
+                "dispute.mediationStakePaid": true,
+                ...(sanitizedDisputePhotoUrls.length > 0 ? { "dispute.photos": sanitizedDisputePhotoUrls } : {}),
                 disputeReason: meta.disputeReason || "Unspecified",
                 technicalFaultReport: meta.technicalFaultReport || "Unspecified",
                 disputedAt: admin.firestore.FieldValue.serverTimestamp()
               });
+              try {
+                const pubCardSnap = await db.collection("public_job_cards").doc(meta.jobId).get();
+                if (pubCardSnap.exists) {
+                  await db.collection("public_job_cards").doc(meta.jobId).update({
+                    status: "disputed",
+                    updatedAt: new Date().toISOString(),
+                  });
+                }
+              } catch { /* non-blocking public card sync */ }
             } else if (meta.jobId && meta.type === 'boost') {
               const boostExpiresAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
               const isIM = meta.tier === 'instant_match';
@@ -3121,6 +3524,135 @@ async function startServer() {
       let customerId: string | undefined;
       if (userId && db) {
         customerId = await ensureStripeCustomerIdForUser({ db, stripe, userId });
+      }
+
+      // Guard against accidental duplicate active subscriptions & support seamless in-place Trader Tier upgrades
+      if (authoritativeResult.mode === "subscription" && userId && db) {
+        const userSnap = await db.collection("users").doc(userId).get();
+        const userData = userSnap.exists ? (userSnap.data() || {}) : {};
+        const meta = authoritativeResult.metadata || {};
+        const activeStatuses = new Set(["active", "trialing"]);
+
+        if (meta.subscriptionType === "tier" && userData.subscriptionType !== "landlord") {
+          const existingSubId = typeof userData.subscriptionId === "string" ? userData.subscriptionId.trim() : "";
+          if (existingSubId && existingSubId.startsWith("sub_")) {
+            try {
+              const liveSub = await stripe.subscriptions.retrieve(existingSubId);
+              const liveCustomer = typeof liveSub.customer === "string" ? liveSub.customer : liveSub.customer?.id;
+              if ((!customerId || liveCustomer === customerId) && activeStatuses.has(String(liveSub.status || ""))) {
+                const firstItem = liveSub.items?.data?.[0];
+                const existingProductId = typeof firstItem?.price?.product === "string"
+                  ? firstItem.price.product
+                  : firstItem?.price?.product?.id;
+                if (firstItem?.id && existingProductId) {
+                  const updatedSub = await stripe.subscriptions.update(existingSubId, {
+                    items: [{
+                      id: firstItem.id,
+                      price_data: {
+                        currency: "gbp",
+                        product: existingProductId,
+                        unit_amount: authoritativeResult.authoritativeAmountPence,
+                        recurring: { interval: "month" },
+                      },
+                    }],
+                    cancel_at_period_end: false,
+                    proration_behavior: "create_prorations",
+                    metadata: {
+                      tier: meta.tier || "pro",
+                      tierName: meta.tierName || "Silver Pro Subscription",
+                      userId,
+                    },
+                  });
+                  const canonicalTier = meta.tier || "pro";
+                  const tierName = meta.tierName || "Silver Pro Subscription";
+                  const periodEndIso = updatedSub.current_period_end
+                    ? new Date(updatedSub.current_period_end * 1000).toISOString()
+                    : undefined;
+                  await db.collection("users").doc(userId).update({
+                    tier: canonicalTier,
+                    tierId: tierName,
+                    subscriptionStatus: updatedSub.status || "active",
+                    subscriptionType: "tier",
+                    isPro: true,
+                    isProInvoiceSubscriber: true,
+                    cancelAtPeriodEnd: false,
+                    ...(periodEndIso ? { currentPeriodEnd: periodEndIso } : {}),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                  try {
+                    const pubRef = db.collection("public_profiles").doc(userId);
+                    const pubSnap = await pubRef.get();
+                    if (pubSnap.exists) {
+                      await pubRef.update({
+                        tier: canonicalTier,
+                        tierId: tierName,
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                      });
+                    }
+                  } catch { /* non-fatal public profile sync */ }
+                  await db.collection("payment_intents").doc(intentId).update({
+                    status: "completed",
+                    upgradedInPlace: true,
+                    subscriptionId: updatedSub.id,
+                    completedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                  return res.json({
+                    upgraded: true,
+                    tier: canonicalTier,
+                    tierName,
+                    subscriptionId: updatedSub.id,
+                    currentPeriodEnd: periodEndIso,
+                    message: `Successfully switched to ${tierName} on your existing Stripe subscription with automatic proration.`,
+                  });
+                }
+              }
+            } catch (subErr: any) {
+              // If the old subscription no longer exists in Stripe (404), fall through to fresh Checkout
+              if (Number(subErr?.statusCode) !== 404 && subErr?.code !== "resource_missing") {
+                throw subErr;
+              }
+            }
+          }
+        } else {
+          // Prevent duplicate active subscriptions for single-instance add-ons & plans
+          const duplicateChecks: Array<{ match: boolean; label: string; subId?: string; status?: string }> = [
+            {
+              match: meta.subscriptionType === "landlord" || meta.tier === "landlord",
+              label: "Landlord Pro",
+              subId: userData.landlordSubscriptionId || (userData.subscriptionType === "landlord" ? userData.subscriptionId : undefined),
+              status: userData.homeownerSubscriptionStatus,
+            },
+            {
+              match: meta.isExclusiveAddon === "true" || meta.type === "exclusive_leads",
+              label: "Priority Exclusive Leads",
+              subId: userData.exclusiveSubscriptionId,
+              status: userData.exclusiveSubscriptionStatus || (userData.hasExclusiveAddon ? "active" : undefined),
+            },
+            {
+              match: meta.isVideoPro === "true" || meta.type === "video_pro_subscription",
+              label: "Verified Video Pro",
+              subId: userData.videoProSubscriptionId,
+              status: userData.videoProSubscriptionStatus || (userData.hasVerifiedVideoProSubscription ? "active" : undefined),
+            },
+            {
+              match: meta.type === "appointments" || meta.subscriptionType === "appointments",
+              label: "Automated Appointments",
+              subId: userData.appointmentsSubscriptionId,
+              status: userData.appointmentsSubscriptionStatus || (userData.hasAppointmentsAddon ? "active" : undefined),
+            },
+            {
+              match: meta.type === "gotham_saas" || meta.subscriptionType === "gotham_saas",
+              label: "Gotham B2B SaaS",
+              subId: userData.gothamSubscriptionId,
+              status: userData.gothamSubscriptionStatus || (userData.isGothamSubscriber ? "active" : undefined),
+            },
+          ];
+          for (const check of duplicateChecks) {
+            if (check.match && check.subId && activeStatuses.has(String(check.status || "").toLowerCase())) {
+              throw new ConflictError(`You already have an active ${check.label} subscription. Manage or resume it in Billing.`);
+            }
+          }
+        }
       }
 
       const sessionOptions: any = {
@@ -3220,11 +3752,11 @@ async function startServer() {
     }
   });
 
-  // List Saved Cards
+  // List Saved Cards (with real Stripe default_payment_method status)
   app.get("/api/payment-methods/:userId", requireAuth, async (req, res) => {
     try {
       const { userId } = req.params;
-      if (!db) return res.json({ paymentMethods: [], mock: true });
+      if (!db) return res.json({ paymentMethods: [], defaultPaymentMethodId: null, mock: true });
 
       if ((req as any).user.uid !== userId) {
         return res.status(403).json({ error: "Forbidden: Not your payment methods" });
@@ -3234,37 +3766,30 @@ async function startServer() {
       if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
 
       const stripeCustomerId = userDoc.data()?.stripeCustomerId;
-      if (!stripeCustomerId) return res.json({ paymentMethods: [] });
+      if (!stripeCustomerId) return res.json({ paymentMethods: [], defaultPaymentMethodId: null });
 
       let stripe;
       try {
         stripe = getStripe();
       } catch (e) {
-        return res.json({ paymentMethods: [], mock: true });
+        return res.json({ paymentMethods: [], defaultPaymentMethodId: null, mock: true });
       }
 
-      const paymentMethods = await stripe.paymentMethods.list({
-        customer: stripeCustomerId,
-        type: 'card',
+      const { paymentMethods, defaultPaymentMethodId } = await listCustomerPaymentMethods({
+        stripe,
+        stripeCustomerId,
       });
 
-      const formattedMethods = paymentMethods.data.map(pm => ({
-        id: pm.id,
-        brand: pm.card?.brand,
-        last4: pm.card?.last4,
-        expMonth: pm.card?.exp_month,
-        expYear: pm.card?.exp_year,
-      }));
-
-      res.json({ paymentMethods: formattedMethods });
+      res.json({ paymentMethods, defaultPaymentMethodId });
     } catch (error: any) {
       console.error("Fetch Payment Methods Error:", error);
-      res.status(500).json({ error: error.message || "Failed to fetch payment methods" });
+      const status = error instanceof PaymentMethodRouteError ? error.statusCode : 500;
+      res.status(status).json({ error: error.message || "Failed to fetch payment methods" });
     }
   });
 
-  // Delete Saved Card
-  app.delete("/api/payment-methods/:userId/:paymentMethodId", requireAuth, async (req, res) => {
+  // Set Real Stripe Default Payment Method
+  app.post("/api/payment-methods/:userId/:paymentMethodId/default", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
     try {
       const { userId, paymentMethodId } = req.params;
       if ((req as any).user.uid !== userId) {
@@ -3272,7 +3797,7 @@ async function startServer() {
       }
 
       if (!db) {
-        return res.status(500).json({ error: "Database service unavailable" });
+        return res.status(503).json({ error: "Database service unavailable" });
       }
 
       const userDoc = await db.collection("users").doc(userId).get();
@@ -3289,20 +3814,69 @@ async function startServer() {
       try {
         stripe = getStripe();
       } catch (e) {
-        return res.json({ success: true, mock: true });
+        if (process.env.NODE_ENV === "production" || process.env.ALLOW_MOCK_PAYMENTS !== "true") {
+          return res.status(503).json({ error: "Stripe gateway is unconfigured." });
+        }
+        return res.json({ success: true, defaultPaymentMethodId: paymentMethodId, mock: true });
       }
 
-      // Verify ownership of the payment method in Stripe
-      const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
-      if (paymentMethod.customer !== stripeCustomerId) {
-        return res.status(403).json({ error: "Forbidden: Payment method does not belong to your account" });
+      const result = await setCustomerDefaultPaymentMethod({
+        stripe,
+        stripeCustomerId,
+        paymentMethodId,
+      });
+
+      res.json({ success: true, defaultPaymentMethodId: result.defaultPaymentMethodId });
+    } catch (error: any) {
+      console.error("Set Default Payment Method Error:", error);
+      const status = error instanceof PaymentMethodRouteError ? error.statusCode : 500;
+      res.status(status).json({ error: error.message || "Failed to update default payment method" });
+    }
+  });
+
+  // Delete Saved Card (with ownership verification and automatic default promotion)
+  app.delete("/api/payment-methods/:userId/:paymentMethodId", requireAuth, paymentLimiter, paymentAttemptAbuseLimiter, async (req, res) => {
+    try {
+      const { userId, paymentMethodId } = req.params;
+      if ((req as any).user.uid !== userId) {
+        return res.status(403).json({ error: "Forbidden: Not your payment method" });
       }
 
-      await stripe.paymentMethods.detach(paymentMethodId);
-      res.json({ success: true });
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable" });
+      }
+
+      const userDoc = await db.collection("users").doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({ error: "User profile not found" });
+      }
+
+      const stripeCustomerId = userDoc.data()?.stripeCustomerId;
+      if (!stripeCustomerId) {
+        return res.status(400).json({ error: "No Stripe customer found for this profile" });
+      }
+
+      let stripe;
+      try {
+        stripe = getStripe();
+      } catch (e) {
+        if (process.env.NODE_ENV === "production" || process.env.ALLOW_MOCK_PAYMENTS !== "true") {
+          return res.status(503).json({ error: "Stripe gateway is unconfigured." });
+        }
+        return res.json({ success: true, defaultPaymentMethodId: null, mock: true });
+      }
+
+      const result = await detachCustomerPaymentMethod({
+        stripe,
+        stripeCustomerId,
+        paymentMethodId,
+      });
+
+      res.json({ success: true, detachedId: result.detachedId, defaultPaymentMethodId: result.defaultPaymentMethodId });
     } catch (error: any) {
       console.error("Delete Payment Method Error:", error);
-      res.status(500).json({ error: error.message || "Failed to delete payment method" });
+      const status = error instanceof PaymentMethodRouteError ? error.statusCode : 500;
+      res.status(status).json({ error: error.message || "Failed to delete payment method" });
     }
   });
 
@@ -3324,7 +3898,7 @@ async function startServer() {
       }
 
       const userData = userDoc.data();
-      const customerId = userData?.stripeCustomerId;
+      let customerId = typeof userData?.stripeCustomerId === "string" ? userData.stripeCustomerId.trim() : "";
 
       let stripe;
       try {
@@ -3337,7 +3911,11 @@ async function startServer() {
       }
 
       if (!customerId) {
-        return res.status(400).json({ error: "No active Stripe customer account found for this profile." });
+        customerId = await ensureStripeCustomerIdForUser({
+          db,
+          stripe,
+          userId: authUid,
+        });
       }
 
       const portalSession = await stripe.billingPortal.sessions.create({
@@ -3355,7 +3933,12 @@ async function startServer() {
     } catch (error: any) {
       console.error("Customer Portal Session Error:", error);
       const stripeStatus = Number(error?.statusCode);
-      const status = stripeStatus >= 400 && stripeStatus < 500 ? 400 : 502;
+      const status =
+        stripeStatus >= 400 && stripeStatus < 500
+          ? stripeStatus
+          : stripeStatus === 503
+          ? 503
+          : 502;
       res.status(status).json({ error: error.message || "Failed to create Stripe billing portal session" });
     }
   });
@@ -3400,6 +3983,10 @@ async function startServer() {
         const currentEnd = userData.videoProCurrentPeriodEnd;
         fieldUpdates.videoProCancelAtPeriodEnd = true;
         if (currentEnd) fieldUpdates.videoProCurrentPeriodEnd = currentEnd;
+      } else if (subscriptionType === "appointments") {
+        const currentEnd = userData.appointmentsCurrentPeriodEnd;
+        fieldUpdates.appointmentsCancelAtPeriodEnd = true;
+        if (currentEnd) fieldUpdates.appointmentsCurrentPeriodEnd = currentEnd;
       } else if (subscriptionType === "gotham_saas") {
         fieldUpdates.gothamCancelAtPeriodEnd = true;
         const currentEnd = userData.gothamCurrentPeriodEnd || userData.currentPeriodEnd;
@@ -3469,6 +4056,9 @@ async function startServer() {
         } else if (subscriptionType === "video_pro") {
           fieldUpdates.videoProCancelAtPeriodEnd = true;
           fieldUpdates.videoProCurrentPeriodEnd = periodEndIso;
+        } else if (subscriptionType === "appointments") {
+          fieldUpdates.appointmentsCancelAtPeriodEnd = true;
+          fieldUpdates.appointmentsCurrentPeriodEnd = periodEndIso;
         } else if (subscriptionType === "gotham_saas") {
           fieldUpdates.gothamCancelAtPeriodEnd = true;
           fieldUpdates.gothamCurrentPeriodEnd = periodEndIso;
@@ -3486,7 +4076,7 @@ async function startServer() {
       res.json({
         success: true,
         cancelAtPeriodEnd: true,
-        currentPeriodEnd: fieldUpdates.currentPeriodEnd || fieldUpdates.homeownerCurrentPeriodEnd || fieldUpdates.exclusiveCurrentPeriodEnd || fieldUpdates.videoProCurrentPeriodEnd || fieldUpdates.gothamCurrentPeriodEnd || fieldUpdates.driverCurrentPeriodEnd,
+        currentPeriodEnd: fieldUpdates.currentPeriodEnd || fieldUpdates.homeownerCurrentPeriodEnd || fieldUpdates.exclusiveCurrentPeriodEnd || fieldUpdates.videoProCurrentPeriodEnd || fieldUpdates.appointmentsCurrentPeriodEnd || fieldUpdates.gothamCurrentPeriodEnd || fieldUpdates.driverCurrentPeriodEnd,
         message: "Subscription will cancel at the end of the current billing cycle. You will retain all benefits until your renewal date."
       });
     } catch (error: any) {
@@ -3530,6 +4120,8 @@ async function startServer() {
         fieldUpdates.exclusiveCancelAtPeriodEnd = false;
       } else if (subscriptionType === "video_pro") {
         fieldUpdates.videoProCancelAtPeriodEnd = false;
+      } else if (subscriptionType === "appointments") {
+        fieldUpdates.appointmentsCancelAtPeriodEnd = false;
       } else if (subscriptionType === "gotham_saas") {
         fieldUpdates.gothamCancelAtPeriodEnd = false;
       } else if (subscriptionType === "driver_gold") {
@@ -3604,12 +4196,26 @@ async function startServer() {
         console.error("Stripe unavailable for mediation stake:", stripeError?.message || stripeError);
         return res.status(503).json({ error: "Payment service temporarily unavailable. Please try again shortly." });
       }
+      let stakeAmountPence = 2500;
+      try {
+        const globalCfgSnap = await db.collection("platform_config").doc("global").get();
+        const dynamicStake = Number(globalCfgSnap.exists ? globalCfgSnap.data()?.paidAddons?.milestoneEscrow?.homeownerMediationStake : NaN);
+        if (Number.isFinite(dynamicStake) && dynamicStake > 0) {
+          stakeAmountPence = Math.round(dynamicStake * 100);
+        }
+      } catch { /* fallback to canonical £25.00 */ }
       const result = await createMediationStakePaymentIntent(db, stripe, {
         jobId, userId: authUid, candidateAttemptId: db.collection("payment_attempts").doc().id,
         disputeReason, technicalFaultReport, isPropertyDamage, photos,
+        stakeAmountPence,
         serverTimestamp: () => admin.firestore.FieldValue.serverTimestamp()
       });
-      return res.json({ success: true, clientSecret: result.paymentIntent.client_secret, paymentIntentId: result.paymentIntent.id, amount: 25.00 });
+      return res.json({
+        success: true,
+        clientSecret: result.paymentIntent.client_secret,
+        paymentIntentId: result.paymentIntent.id,
+        amount: Math.round(result.stakeAmountPence) / 100,
+      });
     } catch (error: any) {
       console.error("Create Dispute Stake Intent Error:", error);
       const status = Number(error?.httpStatus) || 500;
@@ -3747,8 +4353,29 @@ async function startServer() {
     }
   });
 
+  // Server-Authoritative Creative Edit (resets approvalStatus to pending_review & retracts public_ads)
+  app.post("/api/ads/:id/edit", requireAuth, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const { id } = req.params;
+      const authUid = (req as any).user.uid;
+      const { description, title } = req.body || {};
+      const result = await editAdCreativeCommand({
+        db,
+        authUid,
+        adId: id,
+        description,
+        title,
+      });
+      return res.json(result);
+    } catch (err: any) {
+      console.error("Edit ad creative error:", err);
+      return sendHttpError(res, err, req);
+    }
+  });
+
   // Admin Moderation Endpoint for Advertisements (Approve / Reject)
-  app.post("/api/ads/:id/moderate", requireAdmin, async (req, res) => {
+  app.post("/api/ads/:id/moderate", requireAdmin, requireAdminTier("financial_operator", "moderating advertisements"), async (req, res) => {
     try {
       if (!db) return res.status(503).json({ error: "Database service unavailable" });
       const { id } = req.params;
@@ -3803,7 +4430,7 @@ async function startServer() {
   });
 
   // Admin Public Ads Backfill Sync (AT-ADS-13, AT-PROJ-03)
-  app.post("/api/admin/sync-public-ads", requireAdmin, async (req, res) => {
+  app.post("/api/admin/sync-public-ads", requireAdmin, requireAdminTier("financial_operator", "syncing public ads projection"), async (req, res) => {
     try {
       if (!db) {
         return res.status(503).json({ error: "Database service unavailable" });
@@ -4309,7 +4936,7 @@ async function startServer() {
   // =========================================================================
   // PUBLIC JOB CARD PROJECTION SYNCHRONIZATION
   // =========================================================================
-  app.post("/api/admin/sync-public-job-cards", requireAdmin, async (req, res) => {
+  app.post("/api/admin/sync-public-job-cards", requireAdmin, requireAdminTier("financial_operator", "syncing public job cards projection"), async (req, res) => {
     try {
       if (!db) {
         return res.status(503).json({ error: "Database service unavailable" });
@@ -4365,7 +4992,7 @@ async function startServer() {
   // =========================================================================
   // PUBLIC PROPERTY PROJECTION SYNCHRONIZATION
   // =========================================================================
-  app.post("/api/admin/sync-public-properties", requireAdmin, async (req, res) => {
+  app.post("/api/admin/sync-public-properties", requireAdmin, requireAdminTier("financial_operator", "syncing public properties projection"), async (req, res) => {
     try {
       if (!db) {
         return res.status(503).json({ error: "Database service unavailable" });
@@ -4389,7 +5016,7 @@ async function startServer() {
 
       const body = req.body || {};
       const allowedFields = [
-        "name", "address", "postcode", "city", "propertyType", "status",
+        "name", "address", "postcode", "city", "propertyType", "status", "association",
         "contactName", "contactPhone", "accessInstructions", "era", "heatingType",
         "boilerInfo", "roofCondition", "epcRating", "gasSafetyExpiry", "eicrExpiry",
         "totalAreaSqFt", "unitCount", "photos"
@@ -4435,7 +5062,7 @@ async function startServer() {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
-      for (const key of ["contactName", "contactPhone", "accessInstructions", "era", "heatingType", "roofCondition", "epcRating", "gasSafetyExpiry", "eicrExpiry"]) {
+      for (const key of ["association", "contactName", "contactPhone", "accessInstructions", "era", "heatingType", "roofCondition", "epcRating", "gasSafetyExpiry", "eicrExpiry"]) {
         if (typeof body[key] === "string") propertyData[key] = body[key].slice(0, key === "accessInstructions" ? 2000 : 200);
       }
       if (body.totalAreaSqFt !== undefined && body.totalAreaSqFt !== "") {
@@ -4777,6 +5404,7 @@ async function startServer() {
           }
         }
         tx.delete(propertyRef);
+        tx.delete(db.collection("public_properties").doc(propertyRef.id));
         return { id: propertyRef.id };
       });
       res.json({ success: true, ...result });
@@ -5006,6 +5634,8 @@ async function startServer() {
             transferCode: code,
           })
         );
+        // Remove previous owner's public passport projection atomically upon ownership transfer
+        tx.delete(db.collection("public_properties").doc(propertyRef.id));
         if (previousCount !== null) tx.set(previousUsageRef, {
           userId: previousOwnerId, propertyCount: previousCount,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -5175,6 +5805,28 @@ async function startServer() {
     }
   });
 
+  // Privacy-safe property context lookup for Tenant Repair Portal links (/tenant-report?propertyId=...)
+  app.get("/api/properties/:id/tenant-context", generalLimiter, async (req, res) => {
+    try {
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable" });
+      }
+      const propertyId = String(req.params.id || "").trim();
+      if (!propertyId || propertyId === "manual") {
+        throw new BadRequestError("Valid Property ID is required.");
+      }
+      const propDoc = await db.collection("properties").doc(propertyId).get();
+      if (!propDoc.exists) {
+        throw new NotFoundError("Property not found.");
+      }
+      const context = sanitizePropertyTenantContext(propDoc.id, propDoc.data() || {});
+      return res.json({ success: true, property: context });
+    } catch (error: any) {
+      console.error("Get Tenant Property Context Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
   // AT-TENANT-02: Server-authoritative tenant issue creation deriving landlordOwnerId from authoritative property doc
   app.post("/api/tenant-issues", generalLimiter, async (req, res) => {
     try {
@@ -5182,27 +5834,7 @@ async function startServer() {
         return res.status(503).json({ error: "Database service unavailable" });
       }
       const body = req.body || {};
-      const tenantName = typeof body.tenantName === "string" ? body.tenantName.trim().slice(0, 120) : "";
-      const tenantPhone = typeof body.tenantPhone === "string" ? body.tenantPhone.trim().slice(0, 40) : "";
-      const tenantEmail = typeof body.tenantEmail === "string" ? body.tenantEmail.trim().toLowerCase().slice(0, 160) : "";
-      const flatUnit = typeof body.flatUnit === "string" ? body.flatUnit.trim().slice(0, 60) : "";
-      const category = typeof body.category === "string" && body.category.trim() ? body.category.trim().slice(0, 80) : "General Maintenance";
-      const urgency = ["emergency", "urgent", "routine"].includes(String(body.urgency || "").toLowerCase())
-        ? String(body.urgency).toLowerCase()
-        : "urgent";
-      const title = typeof body.title === "string" ? body.title.trim().slice(0, 160) : "";
-      const description = typeof body.description === "string" ? body.description.trim().slice(0, 3000) : "";
       const rawPropertyId = typeof body.propertyId === "string" ? body.propertyId.trim().slice(0, 128) : "";
-      const manualAddress = typeof body.manualAddress === "string" ? body.manualAddress.trim().slice(0, 240) : "";
-
-      if (!tenantName || !title || !description) {
-        throw new BadRequestError("Tenant name, issue title, and description are required.");
-      }
-
-      // Reject forged client ownership/lifecycle overrides
-      if (body.landlordOwnerId !== undefined && body.landlordOwnerId !== null && body.landlordOwnerId !== "") {
-        throw new BadRequestError("landlordOwnerId is derived server-side from the authoritative property record.");
-      }
 
       let reporterUid: string | null = null;
       const authHeader = req.headers.authorization;
@@ -5215,54 +5847,54 @@ async function startServer() {
         }
       }
 
-      let authoritativePropertyId = "manual";
-      let authoritativeLandlordId: string | null = null;
-      let propertyName = manualAddress || "Home Property";
-      let address = manualAddress || "UK Address";
-      let postcode = "";
-
+      let linkedPropDoc: { id: string; data: Record<string, any> } | null = null;
       if (rawPropertyId && rawPropertyId !== "manual") {
         const propDoc = await db.collection("properties").doc(rawPropertyId).get();
         if (!propDoc.exists) {
           throw new NotFoundError("Referenced property was not found.");
         }
-        const propData = propDoc.data() || {};
-        authoritativePropertyId = propDoc.id;
-        authoritativeLandlordId = String(propData.ownerId || propData.userId || propData.landlordId || "") || null;
-        propertyName = String(propData.name || propertyName).slice(0, 160);
-        address = String(propData.address?.line1 || address).slice(0, 200);
-        postcode = String(propData.address?.postcode || propData.postcode || "").slice(0, 20);
+        linkedPropDoc = { id: propDoc.id, data: propDoc.data() || {} };
+      }
+
+      let resolved;
+      try {
+        resolved = resolveTenantIssueCreationPayload(body, linkedPropDoc);
+      } catch (err: any) {
+        if (err instanceof TenantIssueValidationError) {
+          throw new BadRequestError(err.message);
+        }
+        throw err;
       }
 
       const nowIso = new Date().toISOString();
       const docRef = await db.collection("tenant_issues").add({
-        propertyId: authoritativePropertyId,
-        propertyName,
-        address,
-        postcode,
-        landlordOwnerId: authoritativeLandlordId,
+        propertyId: resolved.propertyId,
+        propertyName: resolved.propertyName,
+        address: resolved.address,
+        postcode: resolved.postcode,
+        landlordOwnerId: resolved.landlordOwnerId,
         reporterUid,
-        tenantName,
-        tenantPhone,
-        tenantEmail,
-        flatUnit,
-        category,
-        urgency,
-        title,
-        description,
+        tenantName: resolved.tenantName,
+        tenantPhone: resolved.tenantPhone,
+        tenantEmail: resolved.tenantEmail,
+        flatUnit: resolved.flatUnit,
+        category: resolved.category,
+        urgency: resolved.urgency,
+        title: resolved.title,
+        description: resolved.description,
         status: "open",
         createdAt: nowIso,
         updatedAt: nowIso,
       });
 
-      if (authoritativeLandlordId) {
+      if (resolved.landlordOwnerId) {
         try {
           await db.collection("notifications").add({
-            userId: authoritativeLandlordId,
-            title: `New ${urgency.toUpperCase()} Tenant Repair Report`,
-            message: `${tenantName} reported "${title}" at ${propertyName}.`,
+            userId: resolved.landlordOwnerId,
+            title: `New ${resolved.urgency.toUpperCase()} Tenant Repair Report`,
+            message: `${resolved.tenantName} reported "${resolved.title}" at ${resolved.propertyName}.`,
             type: "tenant_issue",
-            propertyId: authoritativePropertyId,
+            propertyId: resolved.propertyId,
             issueId: docRef.id,
             link: "/portfolio",
             read: false,
@@ -5276,7 +5908,8 @@ async function startServer() {
       return res.status(201).json({
         success: true,
         id: docRef.id,
-        propertyId: authoritativePropertyId,
+        propertyId: resolved.propertyId,
+        linkedToLandlord: resolved.linkedToLandlord,
         status: "open",
       });
     } catch (error: any) {
@@ -5349,7 +5982,7 @@ async function startServer() {
   });
 
   // AT-ACCOUNT-03: Atomic Admin Trader Verification & Public Discovery Sync
-  app.post("/api/admin/traders/:uid/verify", requireAdmin, async (req, res) => {
+  app.post("/api/admin/traders/:uid/verify", requireAdmin, requireAdminTier("financial_operator", "verifying trader accounts"), async (req, res) => {
     try {
       if (!db) return res.status(503).json({ error: "Database service unavailable" });
       const targetUid = String(req.params.uid || "").trim();
@@ -5366,6 +5999,125 @@ async function startServer() {
       return res.json(result);
     } catch (error: any) {
       console.error("Admin Verify Trader Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-ACCOUNT-04: Atomic Admin Verification Document Review & Public Discovery Sync
+  app.post("/api/admin/traders/:uid/documents/review", requireAdmin, requireAdminTier("financial_operator", "reviewing trader verification documents"), async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const targetUid = String(req.params.uid || "").trim();
+      const adminUser = (req as any).user;
+      const { docType, decision, reason } = req.body || {};
+      const result = await reviewTraderVerificationDocument({
+        db,
+        adminUid: adminUser.uid,
+        adminEmail: adminUser.email || undefined,
+        targetUid,
+        docType,
+        decision,
+        reason: typeof reason === "string" ? reason.slice(0, 300) : undefined,
+      });
+      return res.json(result);
+    } catch (error: any) {
+      console.error("Admin Review Verification Document Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-ADMIN-DISPUTE-01: Authoritative Admin Dispute Resolution with Projection Sync & Participant Notifications
+  app.post(
+    "/api/admin/disputes/:jobId/resolve",
+    requireAdmin,
+    requireAdminTier("financial_operator", "resolving disputes"),
+    async (req, res) => {
+      try {
+        if (!db) return res.status(503).json({ error: "Database service unavailable" });
+        const jobId = String(req.params.jobId || "").trim();
+        const adminUser = (req as any).user;
+        const { resolution, notes } = req.body || {};
+        const result = await executeAdminResolveDisputeCommand({
+          db,
+          admin: { uid: adminUser.uid, email: adminUser.email || null },
+          jobId,
+          resolution,
+          notes,
+          stripe: getOptionalStripeClient(),
+        });
+        return res.json(result);
+      } catch (error: any) {
+        console.error("Admin Resolve Dispute Error:", error);
+        sendHttpError(res, error, req);
+      }
+    }
+  );
+
+  // AT-ADMIN-VIDEO-KYC-01: Authoritative Admin Video Credential Verification Review
+  app.post("/api/admin/traders/:uid/video-verification", requireAdmin, requireAdminTier("financial_operator", "reviewing trader video credentials"), async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const targetUid = String(req.params.uid || "").trim();
+      const adminUser = (req as any).user;
+      const { decision, reason } = req.body || {};
+      const result = await executeAdminVideoVerificationCommand({
+        db,
+        admin: { uid: adminUser.uid, email: adminUser.email || null },
+        targetUid,
+        decision,
+        reason,
+      });
+      return res.json(result);
+    } catch (error: any) {
+      console.error("Admin Video Verification Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // AT-ADMIN-PROVISIONAL-01: Per-Trader Provisional Grace Extension & Duplicate-Phone Override
+  app.post(
+    "/api/admin/traders/:uid/provisional-override",
+    requireAdmin,
+    requireAdminTier("super_admin", "overriding provisional trader status"),
+    async (req, res) => {
+      try {
+        if (!db) return res.status(503).json({ error: "Database service unavailable" });
+        const targetUid = String(req.params.uid || "").trim();
+        const adminUser = (req as any).user;
+        const { action, extendDays, reason } = req.body || {};
+        const result = await executeAdminProvisionalOverrideCommand({
+          db,
+          admin: { uid: adminUser.uid, email: adminUser.email || null },
+          targetUid,
+          action,
+          extendDays,
+          reason,
+        });
+        return res.json(result);
+      } catch (error: any) {
+        console.error("Admin Provisional Override Error:", error);
+        sendHttpError(res, error, req);
+      }
+    }
+  );
+
+  // AT-ADMIN-REVIEW-01: Authoritative Review Moderation & Atomic Rating Recalculation
+  app.post("/api/admin/reviews/:reviewId/moderate", requireAdmin, requireAdminTier("financial_operator", "moderating reviews"), async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const reviewId = String(req.params.reviewId || "").trim();
+      const adminUser = (req as any).user;
+      const { action, reason } = req.body || {};
+      const result = await executeAdminModerateReviewCommand({
+        db,
+        admin: { uid: adminUser.uid, email: adminUser.email || null },
+        reviewId,
+        action,
+        reason,
+      });
+      return res.json(result);
+    } catch (error: any) {
+      console.error("Admin Review Moderation Error:", error);
       sendHttpError(res, error, req);
     }
   });
@@ -5387,6 +6139,10 @@ async function startServer() {
 
       // Enforce payout-eligible provider/driver role before initializing Connect onboarding
       assertPayoutEligibleRole(userData);
+
+      const rawReturnTarget = typeof req.body?.returnTarget === "string" ? req.body.returnTarget.trim().toLowerCase() : "";
+      const safeReturnBasePath = rawReturnTarget === "profile" ? "/profile" : "/billing";
+      const safeHashSuffix = rawReturnTarget === "profile" ? "#payments" : "";
 
       const appUrl = getAuthoritativeAppUrl();
       let stripe;
@@ -5411,7 +6167,7 @@ async function startServer() {
           success: true,
           mock: true,
           stripeAccountId: mockAccountId,
-          url: `${appUrl}/billing?stripe_connect=success&account_id=${mockAccountId}`
+          url: `${appUrl}${safeReturnBasePath}?stripe_connect=success&account_id=${mockAccountId}${safeHashSuffix}`
         });
       }
 
@@ -5420,12 +6176,13 @@ async function startServer() {
         stripe,
         authUid,
         userData,
+        requestedBusinessType: req.body?.businessType,
       });
 
       const accountLink = await stripe.accountLinks.create({
         account: accountId,
-        refresh_url: `${appUrl}/billing?stripe_connect=refresh`,
-        return_url: `${appUrl}/billing?stripe_connect=success&account_id=${accountId}`,
+        refresh_url: `${appUrl}${safeReturnBasePath}?stripe_connect=refresh${safeHashSuffix}`,
+        return_url: `${appUrl}${safeReturnBasePath}?stripe_connect=success&account_id=${accountId}${safeHashSuffix}`,
         type: "account_onboarding",
       });
 
@@ -5935,6 +6692,9 @@ async function startServer() {
           });
         }
 
+        // Release stale completed idempotency lock on definite preflight failure so clean retry works
+        await PaymentLedgerEngine.releaseFailedPreflightIdempotencyLock(firestoreDb, idempotencyKey).catch(() => {});
+
         return res.status(502).json({
           success: false,
           error: `Stripe escrow transfer failed: ${stripeTransferResult.error}. Milestone remains funded and can be retried.`,
@@ -5942,6 +6702,18 @@ async function startServer() {
           stripeError: stripeTransferResult.error,
         });
       }
+
+      // Reconcile parent job aggregate paymentStatus & isPaid (+ official invoice) after transfer confirmation
+      const jobPaymentProjection = await PaymentLedgerEngine.reconcileJobPaymentStatus(firestoreDb, {
+        jobId,
+        quoteId,
+        isQrHandshake: Boolean(isQrHandshake),
+      }).catch(() => ({
+        allMilestonesReleased: false,
+        anyMilestoneReleased: true,
+        paymentStatus: null,
+        isPaid: false,
+      }));
 
       // Notify Trader (outside transaction) with status-aware notification messaging
       if (result.traderId) {
@@ -5968,6 +6740,8 @@ async function startServer() {
         stripeTransferStatus: stripeTransferResult.transferStatus,
         stripeTransferId: stripeTransferResult.stripeTransferId,
         stripeError: stripeTransferResult.error,
+        jobPaymentStatus: jobPaymentProjection.paymentStatus,
+        jobIsPaid: jobPaymentProjection.isPaid,
       });
     } catch (error: any) {
       console.error("Milestone Release Error:", error);
@@ -6059,12 +6833,14 @@ async function startServer() {
       const reviewRef = firestoreDb.collection("reviews").doc(reviewDocId);
       const jobRef = firestoreDb.collection("jobs").doc(jobId);
       const userRef = firestoreDb.collection("users").doc(revieweeId);
+      const publicProfileRef = firestoreDb.collection("public_profiles").doc(revieweeId);
 
       await firestoreDb.runTransaction(async (transaction) => {
-        const [jobDoc, existingReviewDoc, userDoc] = await Promise.all([
+        const [jobDoc, existingReviewDoc, userDoc, publicProfileDoc] = await Promise.all([
           transaction.get(jobRef),
           transaction.get(reviewRef),
           transaction.get(userRef),
+          transaction.get(publicProfileRef),
         ]);
 
         if (!jobDoc.exists) throw new NotFoundError(`Job ${jobId} not found`);
@@ -6092,9 +6868,10 @@ async function startServer() {
           createdAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // 2. Update user profile aggregates (only if not in cooling off period)
+        // 2. Update user profile & public_profiles aggregates atomically (only if not in cooling off period)
         if (!isLowRating && userDoc.exists) {
           const userData = userDoc.data();
+          const nowIso = new Date().toISOString();
           if (type === "tradesperson_review") {
             const currentRating = Number(userData?.rating) || 0;
             const currentTotalReviews = Number(userData?.totalReviews) || 0;
@@ -6104,11 +6881,16 @@ async function startServer() {
             const newRating = Number((((currentRating * currentTotalReviews) + numRating) / newTotalReviews).toFixed(2));
             const newTotalRecommendations = recommended ? currentTotalRecommendations + 1 : currentTotalRecommendations;
 
-            transaction.update(userRef, {
+            const ratingPatch = {
               rating: newRating,
               totalReviews: newTotalReviews,
-              totalRecommendations: newTotalRecommendations
-            });
+              totalRecommendations: newTotalRecommendations,
+              updatedAt: nowIso,
+            };
+            transaction.update(userRef, ratingPatch);
+            if (publicProfileDoc.exists) {
+              transaction.update(publicProfileRef, ratingPatch);
+            }
           } else {
             const currentRating = Number(userData?.homeownerRating) || 0;
             const currentTotalReviews = Number(userData?.totalHomeownerReviews) || 0;
@@ -6116,10 +6898,15 @@ async function startServer() {
             const newTotalReviews = currentTotalReviews + 1;
             const newRating = Number((((currentRating * currentTotalReviews) + numRating) / newTotalReviews).toFixed(2));
 
-            transaction.update(userRef, {
+            const homeownerPatch = {
               homeownerRating: newRating,
-              totalHomeownerReviews: newTotalReviews
-            });
+              totalHomeownerReviews: newTotalReviews,
+              updatedAt: nowIso,
+            };
+            transaction.update(userRef, homeownerPatch);
+            if (publicProfileDoc.exists) {
+              transaction.update(publicProfileRef, homeownerPatch);
+            }
           }
         }
 
@@ -6150,7 +6937,7 @@ async function startServer() {
             read: false,
             visibleAt: admin.firestore.Timestamp.fromDate(visibleAt),
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            link: `/jobs/${jobId}`
+            link: `/job/${jobId}`
           });
         } else {
           transaction.set(reviewNotifRef, {
@@ -6160,7 +6947,7 @@ async function startServer() {
             type: "system",
             read: false,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            link: `/jobs/${jobId}`
+            link: `/job/${jobId}`
           });
         }
       });
@@ -6239,6 +7026,208 @@ async function startServer() {
     }
   });
 
+  // Server-Authoritative Homeowner -> Dual-Role Tradesperson Self-Service Upgrade (Task 8)
+  app.post("/api/account/upgrade-to-trader", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable. Please try again shortly." });
+      }
+      const result = await executeUpgradeHomeownerToTraderCommand(db, caller, req.body);
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative UK GDPR Data Portability Export (Task 11)
+  app.post("/api/account/gdpr/export", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable. Please try again shortly." });
+      }
+      const exportPayload = await executeExportUserDataCommand({
+        db,
+        uid: caller.uid,
+      });
+      res.status(200).json(exportPayload);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative UK GDPR Self-Service Account Deletion (Task 11)
+  app.post("/api/account/gdpr/delete-account", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable. Please try again shortly." });
+      }
+      let authClient: any = null;
+      try {
+        authClient = admin.auth();
+      } catch {
+        authClient = null;
+      }
+      const result = await executeSelfServiceAccountDeletionCommand({
+        db,
+        authClient,
+        uid: caller.uid,
+        email: caller.email,
+        confirmationText: req.body?.confirmationText,
+        reason: req.body?.reason,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Slice 1 P0 #1: Server-Authoritative Platform Terms & Privacy Acceptance
+  app.post("/api/account/accept-terms", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable. Please try again shortly." });
+      }
+      const forwarded = req.headers["x-forwarded-for"];
+      const clientIp = Array.isArray(forwarded)
+        ? forwarded[0]
+        : typeof forwarded === "string"
+        ? forwarded.split(",")[0].trim()
+        : req.ip || "unknown";
+      const result = await executeAcceptTermsCommand({
+        db,
+        caller,
+        rawInput: req.body,
+        clientIp,
+        userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : "Web",
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Slice 1 P1 #8: Server-Authoritative Verification Document Expiry & 30-Day Warning Sync
+  app.post("/api/account/sync-expired-docs", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeSyncExpiredVerificationDocsCommand({
+        db,
+        caller,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Slice 1 P1 #9: Server-Authoritative Video Verification Removal (Private + Public Profile)
+  app.post("/api/account/remove-video-verification", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeRemoveVideoVerificationCommand({
+        db,
+        caller,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Slice 1 P0 #4: Server-Authoritative Business Team Management Endpoints
+  app.get("/api/business/team", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeListBusinessTeamCommand({ db, caller });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/business/team/invite", requireAuth, paymentLimiter, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeSendBusinessTeamInviteCommand({
+        db,
+        caller,
+        email: req.body?.email,
+        appOrigin: getAuthoritativeAppUrl(),
+      });
+      res.status(201).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.delete("/api/business/team/invitations/:invitationId", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeRevokeBusinessTeamInviteCommand({
+        db,
+        caller,
+        invitationId: req.params.invitationId,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.post("/api/business/team/invitations/:invitationId/accept", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeAcceptBusinessTeamInviteCommand({
+        db,
+        caller,
+        invitationId: req.params.invitationId,
+        token: req.body?.token,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  app.delete("/api/business/team/members/:memberUid", requireAuth, async (req, res) => {
+    try {
+      const caller = (req as any).user;
+      if (!db) {
+        return res.status(503).json({ error: "Database service unavailable." });
+      }
+      const result = await executeRemoveBusinessTeamMemberCommand({
+        db,
+        caller,
+        memberUid: req.params.memberUid,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
   // Server-Authoritative Quote Acceptance Route (Task 4 Single Canonical Authority)
   app.post("/api/jobs/:jobId/accept-quote", requireAuth, async (req, res) => {
     try {
@@ -6267,6 +7256,7 @@ async function startServer() {
         quoteId,
         rawPayload,
         idempotencyKey,
+        messagingClient: getFirebaseMessagingClient(),
       });
 
       res.status(result.wasReplayed ? 200 : 200).json({
@@ -6319,6 +7309,7 @@ async function startServer() {
           idempotencyKey: idempotencyKey || `job_${commandType.toLowerCase()}_${jobId}_${identity.uid}`,
           strictTraderProfileRequired: commandType === "StartJob",
           stripe: commandType === "CancelJob" ? getOptionalStripeClient() : undefined,
+          messagingClient: getFirebaseMessagingClient(),
         });
 
         res.status(200).json({
@@ -6369,6 +7360,63 @@ async function startServer() {
     }
   });
 
+  // Server-Authoritative Job Delete / Archive with Atomic Public Card Cleanup (Slice 3)
+  app.post("/api/jobs/:jobId/delete", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const { jobId } = req.params;
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+
+      const mode = req.body?.mode === "archive" ? "archive" : "delete";
+      const result = await executeDeleteJobCommand({
+        db,
+        identity,
+        jobId,
+        mode,
+      });
+
+      return res.json({
+        success: true,
+        ...result,
+      });
+    } catch (error: any) {
+      console.error("Job Delete/Archive Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative Job Scheduling & Reschedule with Atomic Trader Calendar Sync (Slice 3)
+  app.post("/api/jobs/:jobId/schedule-action", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      const { jobId } = req.params;
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+
+      const result = await executeJobScheduleActionCommand({
+        db,
+        identity,
+        jobId,
+        action: req.body?.action,
+        proposedDate: req.body?.proposedDate,
+        reason: req.body?.reason,
+        messagingClient: getFirebaseMessagingClient(),
+      });
+
+      return res.json(result);
+    } catch (error: any) {
+      console.error("Job Schedule Action Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
   // Server-Authoritative Canonical CreateJob Command Route (Task 2)
   app.post("/api/jobs/create", requireAuth, async (req, res) => {
     try {
@@ -6402,6 +7450,23 @@ async function startServer() {
         idempotencyKey,
         quota,
       });
+
+      // Server-side automatic Wave 1 lead distribution on freshly created jobs
+      // (idempotent with client POST /api/jobs/:id/distribute-leads so recurring/BOM/tab-close jobs are never missed)
+      if (!result.wasReplayed && db) {
+        const messagingClient = getFirebaseMessagingClient();
+        void distributeJobLeadsAuthoritative({
+          db,
+          jobId: result.jobId,
+          jobData: result.job,
+          callerUid: identity.uid,
+          maxRecipients: 25,
+          wave: 1,
+          dispatchFcmPush: (payload) => dispatchAuthoritativeFcmPush(db!, messagingClient, payload),
+        }).catch((err) => {
+          console.warn(`[AutoLeadDistribution] Non-blocking dispatch failed for job ${result.jobId}:`, err);
+        });
+      }
 
       res.status(result.wasReplayed ? 200 : 201).json({
         success: true,
@@ -6460,6 +7525,7 @@ async function startServer() {
           payload: rawPayload,
         },
         idempotencyKey: trimmedIdempotencyKey,
+        messagingClient: getFirebaseMessagingClient(),
       });
 
       res.status(result.wasReplayed ? 200 : (commandType === "CreateQuote" ? 201 : 200)).json({
@@ -6473,6 +7539,67 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error("Quote Command Execution Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative Trader Invitation on Existing Open Job (Stage 1B)
+  app.post("/api/jobs/:jobId/invite-trader", requireAuth, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service is not initialized");
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+      const result = await executeInviteTraderToJobCommand({
+        db,
+        identity,
+        jobId: req.params.jobId,
+        traderId: req.body?.traderId,
+      });
+      res.status(200).json(result);
+    } catch (error: any) {
+      console.error("Invite Trader Command Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative BOM Material Order Placement (Stage 1B)
+  app.post("/api/bom/orders", requireAuth, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service is not initialized");
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+      const orderRecord = await executeCreateBomOrderCommand({
+        db,
+        identity,
+        payload: req.body,
+      });
+      res.status(201).json({ success: true, order: orderRecord });
+    } catch (error: any) {
+      console.error("BOM Order Creation Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative Recurring Job & Accepted Quote Generation (Stage 1B)
+  app.post("/api/recurring-schedules/:scheduleId/generate-job", requireAuth, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service is not initialized");
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+      const result = await executeGenerateRecurringJobCommand({
+        db,
+        identity,
+        scheduleId: req.params.scheduleId,
+      });
+      res.status(result.generated && !result.wasReplayed ? 201 : 200).json(result);
+    } catch (error: any) {
+      console.error("Recurring Job Generation Error:", error);
       sendHttpError(res, error, req);
     }
   });
@@ -6650,46 +7777,59 @@ async function startServer() {
         return res.json({ allowed: true, count: 0, limit: Infinity, betaMode: true, isJobExclusive });
       }
 
-      let tier;
-      let limitValue = 0;
+      const subStatus = String(userData.subscriptionStatus || "").trim().toLowerCase();
+      const isTerminalInactive = ["canceled", "cancelled", "unpaid", "incomplete_expired", "free"].includes(subStatus);
+      const normalizedTier = isTerminalInactive
+        ? "payg"
+        : normalizeTraderTier(String(userData.tier || userData.tierId || "payg"));
 
-      // New schema check
-      if (globalTiers && userData.subscription?.providerModel) {
-        const model = userData.subscription.providerModel;
-        const tierId = userData.subscription.tierId || "basic";
-        const tierConfig = globalTiers.providerModels?.[model]?.tiers?.[tierId];
-        
-        if (tierConfig) {
-          tier = {
-            name: tierId,
-            maxQuotes: tierConfig.maxQuotes,
-            limitPeriod: "monthly"
-          };
-          limitValue = tier.maxQuotes;
+      let tier: { name: string; maxQuotes?: number; limitPeriod?: string } | undefined;
+      let limitValue = Infinity;
+
+      const canonicalTierConfig = globalTiers?.providerModels?.one_off_trades?.tiers?.[normalizedTier];
+      if (canonicalTierConfig && typeof canonicalTierConfig.maxQuotes === "number") {
+        tier = {
+          name: normalizedTier,
+          maxQuotes: canonicalTierConfig.maxQuotes,
+          limitPeriod: "monthly",
+        };
+        limitValue = canonicalTierConfig.maxQuotes;
+      } else if (Array.isArray(platformConfig?.feeTiers)) {
+        const matched = platformConfig.feeTiers.find(
+          (t: any) => normalizeTraderTier(t?.name) === normalizedTier
+        );
+        if (matched && typeof matched.maxQuotes === "number") {
+          tier = matched;
+          limitValue = matched.maxQuotes;
         }
       }
 
-      // Legacy fallback
-      if (!tier) {
-        const tierId = userData.tierId || "Basic";
-        tier = platformConfig?.feeTiers?.find((t: any) => t.name === tierId);
-        limitValue = tier?.maxQuotes || Infinity;
+      if (!tier || !Number.isFinite(limitValue) || limitValue <= 0) {
+        return res.json({ allowed: true, tier: normalizedTier, isJobExclusive });
       }
-
-      if (!tier || limitValue === Infinity) return res.json({ allowed: true, isJobExclusive });
 
       const isLifetime = tier.limitPeriod === "lifetime";
       const startOfMonth = new Date();
       startOfMonth.setDate(1);
       startOfMonth.setHours(0, 0, 0, 0);
+      const sinceTimestamp = admin.firestore.Timestamp.fromDate(isLifetime ? new Date(0) : startOfMonth);
 
-      const quotesSnapshot = await db.collection("quotes")
-        .where("tradespersonId", "==", userId)
-        .where("createdAt", ">=", admin.firestore.Timestamp.fromDate(isLifetime ? new Date(0) : startOfMonth))
-        .get();
+      let count = 0;
+      try {
+        const groupSnap = await db.collectionGroup("quotes")
+          .where("tradespersonId", "==", userId)
+          .where("createdAt", ">=", sinceTimestamp)
+          .get();
+        count = groupSnap.size;
+      } catch {
+        const legacySnap = await db.collection("quotes")
+          .where("tradespersonId", "==", userId)
+          .where("createdAt", ">=", sinceTimestamp)
+          .get();
+        count = legacySnap.size;
+      }
 
-      const count = quotesSnapshot.size;
-      res.json({ allowed: count < limitValue, count, limit: limitValue, isJobExclusive });
+      res.json({ allowed: count < limitValue, count, limit: limitValue, tier: normalizedTier, isJobExclusive });
     } catch (error: any) {
       console.error("Quote Limit Check Error:", error);
       res.status(500).json({ error: error.message || "Failed to check quote limit" });
@@ -7195,7 +8335,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  app.post("/api/gemini/cache-clear", requireAdmin, (req, res) => {
+  app.post("/api/gemini/cache-clear", requireAdmin, requireAdminTier("financial_operator", "clearing Gemini semantic cache"), (req, res) => {
     try {
       geminiServer.clearSemanticCache();
       res.json({ success: true, message: "Semantic cache successfully purged" });
@@ -7205,7 +8345,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   });
 
   // Category Registry Synchronization Endpoint
-  app.post("/api/gemini/sync-categories", requireAdmin, (req, res) => {
+  app.post("/api/gemini/sync-categories", requireAdmin, requireAdminTier("financial_operator", "syncing category registry"), (req, res) => {
     try {
       const { categories, synonyms } = req.body || {};
       const syncResult = geminiServer.syncCategoryRegistryServer(categories, synonyms);
@@ -7378,74 +8518,63 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  // 1-Click Closed-Loop Execution Action
-  app.post("/api/admin/agents/execute-action", requireAdmin, async (req, res) => {
+  // Honest AI Agent Action Handler (Never fabricates unexecuted Stripe, dispatch, webhook, or broadcast actions)
+  app.post("/api/admin/agents/execute-action", requireAdmin, requireAdminTier("financial_operator", "executing AI agent actions"), async (req, res) => {
     try {
-      const { actionType, payload, agentName } = req.body;
+      const { actionType, payload, agentName } = req.body || {};
       const timestamp = new Date().toISOString();
-      let outcomeMessage = "";
+      const caller = (req as any).user || {};
+      const cleanAction = String(actionType || "UNKNOWN_ACTION").trim().slice(0, 80);
 
-      switch (actionType) {
-        case "EXECUTE_DISPUTE_SETTLEMENT":
-          // Split escrow funds & update dispute resolution
-          outcomeMessage = `Dispute ${payload?.disputeId || "DISP-001"} settled. Released £${payload?.traderAmount || "380.00"} to Trader and refunded £${payload?.customerRefund || "70.00"} to Customer via Stripe Escrow.`;
-          break;
+      const guidanceMap: Record<string, string> = {
+        EXECUTE_DISPUTE_SETTLEMENT:
+          "Automated AI escrow settlement is disabled. Use the Disputes tab (/api/admin/disputes/:jobId/resolve) to execute verified Stripe escrow settlements.",
+        DISPATCH_COMPLIANCE_JOB:
+          "Automated AI contractor dispatch is not connected to live job dispatch. Create or assign the compliance job through the Property Passport or Jobs console.",
+        PUBLISH_SOCIAL_CAMPAIGN:
+          "Direct Meta/X publishing webhooks are not active. Copy the campaign draft and publish through your verified social media manager.",
+        BROADCAST_ARBITRAGE_ALERT:
+          "AI one-click arbitrage broadcasting is disabled. Send verified trader announcements through the Admin Broadcasts console (/api/admin/broadcasts).",
+        APPLY_TRADER_RETENTION_INCENTIVE:
+          "Automated fee rebates and promo activation are disabled here. Manage promo codes or tier overrides directly in the Pricing & Promo Codes console.",
+        BROADCAST_DEMAND_SURGE_ALERT:
+          "AI one-click demand surge broadcasting is disabled. Dispatch verified surge alerts through the Admin Broadcasts console (/api/admin/broadcasts).",
+      };
 
-        case "DISPATCH_COMPLIANCE_JOB":
-          // Auto-dispatch 1-Tap Gas Safe / EICR / Awaab's Law renewal
-          outcomeMessage = `Dispatched urgent ${payload?.jobType || "CP12 Gas Safety Renewal"} to top-ranked local contractor (${payload?.assignedTrader || "Apex Heating"}) for unit ${payload?.propertyAddress || "Flat 4, 18 Albert Square, M2 6LW"}. Statutory SLA clock started.`;
-          break;
+      const guidance =
+        guidanceMap[cleanAction] ||
+        `Automated execution for '${cleanAction}' is not implemented. Perform this operation through the corresponding audited admin workflow.`;
 
-        case "PUBLISH_SOCIAL_CAMPAIGN":
-          // Webhook direct publishing
-          outcomeMessage = `Published campaign "${payload?.headline || "Zero Lead Fee"}" to connected webhooks (Meta Ads & Twitter/X API). Target audience: ${payload?.platform || "Meta & X"}.`;
-          break;
-
-        case "BROADCAST_ARBITRAGE_ALERT":
-          // Broadcast merchant trade material savings to local active traders
-          outcomeMessage = `Broadcasted instant flash trade savings alert to 38 active verified tradespeople for ${payload?.materialName || "15mm Copper Pipe pack"} at ${payload?.merchantName || "Travis Perkins"} (${payload?.savings || "27% off retail"}).`;
-          break;
-
-        case "APPLY_TRADER_RETENTION_INCENTIVE":
-          // Apply personalized fee rebate or wallet credit
-          outcomeMessage = `Applied retention concession for ${payload?.traderName || "Liam O'Connor"}: ${payload?.retentionTitle || "50% Platform Fee Rebate for 14 days"}. Incentive code ${payload?.discountCode || "RETENTION-50OFF"} activated.`;
-          break;
-
-        case "BROADCAST_DEMAND_SURGE_ALERT":
-          // Broadcast emergency surge alert to on-call tradespeople
-          outcomeMessage = `Activated Emergency On-Call Surge alert for ${payload?.category || "Plumbing & Heating"} across ${payload?.region || "Greater Manchester"} due to ${payload?.weatherAlert || "Freezing Frost Alert"}.`;
-          break;
-
-        default:
-          outcomeMessage = `Executed action ${actionType} successfully.`;
-      }
-
-      // Persist to Firestore Audit Log
       if (db) {
         try {
           await db.collection("ai_agent_audit_logs").add({
-            agentType: agentName || "AI_ECOSYSTEM_AGENT",
-            action: actionType,
-            details: outcomeMessage,
-            payload: payload || {},
+            agentType: String(agentName || "AI_ECOSYSTEM_AGENT").slice(0, 80),
+            action: cleanAction,
+            details: `Blocked unimplemented one-click action '${cleanAction}': ${guidance}`,
+            payload: payload && typeof payload === "object" ? payload : {},
+            adminUid: caller.uid || null,
+            adminEmail: caller.email || null,
             timestamp,
-            status: "executed",
-            triggerSource: "admin_one_click"
+            status: "not_implemented",
+            executed: false,
+            triggerSource: "admin_one_click",
           });
         } catch (logErr) {
           console.warn("Audit log save error:", logErr);
         }
       }
 
-      res.json({
-        success: true,
-        actionType,
-        outcomeMessage,
-        executedAt: timestamp
+      return res.status(501).json({
+        success: false,
+        executed: false,
+        actionType: cleanAction,
+        error: guidance,
+        outcomeMessage: guidance,
+        recordedAt: timestamp,
       });
     } catch (error: any) {
       console.error("Execute Agent Action Error:", error);
-      res.status(500).json({ error: error.message || "Failed to execute agent action" });
+      res.status(500).json({ success: false, executed: false, error: error.message || "Failed to process agent action" });
     }
   });
 
@@ -7468,7 +8597,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  app.post("/api/admin/agents/audit-logs", requireAdmin, async (req, res) => {
+  app.post("/api/admin/agents/audit-logs", requireAdmin, requireAdminTier("financial_operator", "writing AI agent audit logs"), async (req, res) => {
     try {
       if (!db) {
         return res.status(500).json({ error: "Database not available" });
@@ -7486,7 +8615,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   });
 
   // Admin Security & Misuse Email Alert Dispatcher (Real Transport + Queue Persistence)
-  app.post("/api/admin/send-email-alert", requireAdmin, async (req, res) => {
+  app.post("/api/admin/send-email-alert", requireAdmin, requireAdminTier("financial_operator", "sending admin email alerts"), async (req, res) => {
     try {
       const { to, subject, html, breachId, severity, breachType } = req.body || {};
       const recipient = to || process.env.ADMIN_ALERT_EMAIL || "";
@@ -7537,7 +8666,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   });
 
   // Durable Staff Invitations (Expiring SHA-256 Token + Real Email Dispatch)
-  app.post("/api/admin/invitations", requireAdmin, async (req, res) => {
+  app.post("/api/admin/invitations", requireAdmin, requireAdminTier("super_admin", "inviting admin staff"), async (req, res) => {
     try {
       const caller = (req as any).user || {};
       const result = await createAndDispatchStaffInvitation({
@@ -7575,6 +8704,38 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
+  app.delete("/api/admin/invitations/:invitationId", requireAdmin, requireAdminTier("super_admin", "cancelling staff invitations"), async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const invitationId = String(req.params.invitationId || "").trim();
+      if (!invitationId) {
+        throw new BadRequestError("invitationId is required.");
+      }
+      const caller = (req as any).user || {};
+      const invRef = db.collection("invitations").doc(invitationId);
+      const snap = await invRef.get();
+      if (!snap.exists) {
+        throw new NotFoundError("Invitation not found.");
+      }
+      const invData = snap.data() || {};
+      await invRef.delete();
+
+      await db.collection("admin_audit_logs").add({
+        action: "cancel_invitation",
+        targetId: invitationId,
+        targetType: "invitation",
+        details: `Cancelled staff invitation for ${invData.email || invitationId}`,
+        adminId: caller.uid,
+        adminEmail: caller.email || null,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      res.json({ success: true, invitationId });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
   app.post("/api/admin/invitations/:invitationId/accept", requireAuth, async (req, res) => {
     try {
       const caller = (req as any).user || {};
@@ -7593,6 +8754,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
           ...(userRecord.customClaims || {}),
           admin: true,
           isAdmin: true,
+          adminTier: accepted.adminTier,
         });
       } catch {
         // Non-blocking if Identity Toolkit unavailable in local tests
@@ -7603,7 +8765,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
           action: "accept_invitation",
           targetId: accepted.invitationId,
           targetType: "invitation",
-          details: `Staff invitation accepted by ${caller.email}`,
+          details: `Staff invitation accepted by ${caller.email} (tier: ${accepted.adminTier})`,
           adminId: caller.uid,
           adminEmail: caller.email || null,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
@@ -7632,13 +8794,13 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         if (!db) throw new BadRequestError("Database not initialized");
 
         const validated = validateNotificationPayload(req.body);
-        const { recipientId, title, message, type, link, jobId, conversationId, projectId } = validated;
+        const { recipientId, title, message, type, link, jobId, conversationId, projectId, appointmentId } = validated;
 
         const isAuthorized = await authorizeNotificationRequest(
           db,
           callerUid,
           (req as any).user,
-          { recipientId, type, link, jobId, conversationId, projectId, rideId: (validated as any).rideId }
+          { recipientId, type, link, jobId, conversationId, projectId, rideId: (validated as any).rideId, appointmentId }
         );
 
         if (!isAuthorized) {
@@ -7664,6 +8826,12 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         }
         if (jobId) {
           notificationData.jobId = jobId;
+        }
+        if (conversationId) {
+          notificationData.conversationId = conversationId;
+        }
+        if (appointmentId) {
+          notificationData.appointmentId = appointmentId;
         }
 
         const docRef = await db.collection("notifications").add(notificationData);
@@ -7803,17 +8971,6 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       sendHttpError(res, error, req);
     }
   });
-
-  const getFirebaseMessagingClient = () => {
-    try {
-      if (admin.apps.length > 0 && typeof admin.messaging === "function") {
-        return admin.messaging();
-      }
-    } catch {
-      // Unconfigured FCM environment — strict gate handles honestly
-    }
-    return null;
-  };
 
   // Server-Authoritative Push Token Registration (Task 35-D + AT-CJ-NOTIF-05)
   // Strictly binds per-installation deviceId token to authenticated caller's subcollection
@@ -8016,111 +9173,29 @@ Limit your response to just the text of the tip. Do not use quotes.`;
           throw new ForbiddenError("Only the job creator or an administrator can distribute job notifications.");
         }
 
-        const category = jobData.category || req.body.category || "General";
-        const postcode = jobData.postcode || req.body.postcode || "";
-        const urgency = jobData.urgency || req.body.urgency || "standard";
-        const isEmergency = urgency === "emergency" || jobData.isEmergency === true;
-        const jobLat = typeof jobData.lat === "number" ? jobData.lat : Number(jobData.latitude ?? jobData.coordinates?.lat);
-        const jobLng = typeof jobData.lng === "number" ? jobData.lng : Number(jobData.longitude ?? jobData.coordinates?.lng);
-
-        // Query candidate tradespeople from users (AT-LEAD-01: strict category + geo proximity on ALL jobs including emergency)
-        let matchedTradersSnapshot;
-        try {
-          matchedTradersSnapshot = await db.collection("users")
-            .where("role", "==", "tradesperson")
-            .limit(150)
-            .get();
-        } catch (err) {
-          console.error("Error querying tradespeople for distribution:", err);
-          return res.json({ success: true, notifiedCount: 0 });
-        }
-
-        const eligibleRecipients = filterEligibleLeadRecipients(
-          matchedTradersSnapshot.docs.map((d: any) => ({ id: d.id, data: d.data() || {} })),
-          {
-            jobId,
-            ownerId,
-            callerUid,
-            category,
-            postcode,
-            lat: Number.isFinite(jobLat) ? jobLat : null,
-            lng: Number.isFinite(jobLng) ? jobLng : null,
-            isEmergency,
+        const messagingClient = getFirebaseMessagingClient();
+        const distResult = await distributeJobLeadsAuthoritative({
+          db,
+          jobId,
+          jobData: {
+            ...jobData,
+            category: jobData.category || req.body?.category || "General",
+            postcode: jobData.postcode || req.body?.postcode || "",
+            urgency: jobData.urgency || req.body?.urgency || "standard",
           },
-          20
-        );
-
-        let notifiedCount = 0;
-        const batch = db.batch();
-
-        for (const recipient of eligibleRecipients) {
-          const trader = recipient.data;
-          const notifRef = db.collection("notifications").doc();
-          batch.set(notifRef, {
-            userId: recipient.id,
-            senderId: callerUid,
-            type: "new_job_lead",
-            title: isEmergency ? `🚨 Emergency ${category} Lead in ${postcode || "your area"}` : `New ${category} lead in ${postcode || "your area"}`,
-            message: isEmergency ? `URGENT: Emergency repair requested. Fast response required.` : `A new job was posted that matches your skills.`,
-            jobId,
-            link: `/job/${jobId}`,
-            actionPath: `/jobs/${jobId}`,
-            read: false,
-            isRead: false,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            visibleAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          // If emergency and trader has phone, enqueue server-controlled SMS
-          if (isEmergency && trader.phone) {
-            const smsRef = db.collection("sms_queue").doc();
-            batch.set(smsRef, {
-              to: trader.phone,
-              toUserId: recipient.id,
-              jobId,
-              body: `EMERGENCY ALERT: New ${category} job near you in ${postcode}. Open TradeOS to claim.`,
-              status: "pending",
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              requestedBy: callerUid
-            });
-          }
-
-          notifiedCount++;
-        }
-
-        if (notifiedCount > 0) {
-          await batch.commit();
-          // AT-CJ-NOTIF-06: Dispatch multi-device FCM push alerts behind strict provider config gate
-          const messagingClient = getFirebaseMessagingClient();
-          const fcmTargets = eligibleRecipients.slice(0, 25);
-          await Promise.allSettled(
-            fcmTargets.map((recipient) =>
-              dispatchAuthoritativeFcmPush(db, messagingClient, {
-                recipientId: recipient.id,
-                title: isEmergency ? `Emergency ${category} Job Nearby` : `New ${category} Job Match`,
-                body: `A new ${category} job in ${postcode || "your area"} is ready for quotes.`,
-                channelId: isEmergency ? "emergency_leads" : "job_leads",
-                eventType: isEmergency ? "emergency_lead" : "job_lead",
-                data: {
-                  jobId,
-                  category: String(category),
-                  type: isEmergency ? "emergency_lead" : "job_lead",
-                },
-              })
-            )
-          );
-        }
-
-        // Update job with timestamp
-        await jobDoc.ref.update({
-          leadsDistributedAt: admin.firestore.FieldValue.serverTimestamp(),
-          leadsDistributedCount: notifiedCount
-        }).catch(() => {});
+          callerUid,
+          maxRecipients: 25,
+          wave: 1,
+          forceRedistribute: Boolean(req.body?.forceRedistribute && isCallerAdmin),
+          dispatchFcmPush: (payload) => dispatchAuthoritativeFcmPush(db!, messagingClient, payload),
+        });
 
         res.json({
           success: true,
           jobId,
-          notifiedCount,
+          notifiedCount: distResult.notifiedCount,
+          skippedAlreadyDistributed: distResult.skippedAlreadyDistributed,
+          wave: distResult.wave,
         });
       } catch (error: any) {
         sendHttpError(res, error, req);
@@ -8147,6 +9222,25 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
+  // Server-Authoritative Official Job Invoice Creation / Retrieval (Slice 2 Money Flow Fix)
+  app.post("/api/invoices/job/:jobId", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) throw new BadRequestError("Database service is not initialized.");
+      const identity = await resolveTrustedCanonicalIdentity(req as any, async (uid) => {
+        const profileSnap = await db!.collection("users").doc(uid).get();
+        return profileSnap.exists ? (profileSnap.data() || null) : null;
+      });
+      const result = await createOrGetJobInvoiceCommand({
+        db,
+        identity,
+        jobId: req.params.jobId,
+      });
+      res.status(result.created ? 201 : 200).json({ success: true, id: result.id, invoice: result.invoice });
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
   // Server-Authoritative Instant Match Accept / Decline Command (AT-MATCH-08 / AT-CJ-SEC-START-01)
   app.post("/api/instant-match/respond", requireAuth, async (req, res) => {
     try {
@@ -8166,6 +9260,14 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         attemptId,
         action,
       });
+
+      // Immediately advance to Candidate #2 when a trader declines (prevents Instant Match stall!)
+      if (action === "decline" && result.instantMatchId) {
+        void advanceInstantMatchAfterDecline(db, result.instantMatchId).catch((advErr) => {
+          console.warn("[InstantMatch] Non-blocking decline advancement warning:", advErr);
+        });
+      }
+
       res.json({ success: true, ...result });
     } catch (error: any) {
       sendHttpError(res, error, req);
@@ -8218,6 +9320,17 @@ Limit your response to just the text of the tip. Do not use quotes.`;
           canonicalJob = "matching_system";
           outcome = await runWithSchedulerLease("matching_system", 12000, async (ctx) => runMatchingCycle(ctx));
           break;
+        case "lead-wave-expansion":
+          canonicalJob = "lead_wave_expansion";
+          outcome = await runWithSchedulerLease("lead_wave_expansion", 60000, async () =>
+            expandLowQuoteJobsWave2({
+              db,
+              extraRadiusMiles: 10,
+              maxJobsPerRun: 25,
+              dispatchFcmPush: (payload) => dispatchAuthoritativeFcmPush(db!, getFirebaseMessagingClient(), payload),
+            })
+          );
+          break;
         case "refund-reconciliation":
           canonicalJob = "refund_reconciliation";
           outcome = await runWithSchedulerLease("refund_reconciliation", 180000, async () =>
@@ -8228,6 +9341,12 @@ Limit your response to just the text of the tip. Do not use quotes.`;
           canonicalJob = "sweep_payment_intents";
           outcome = await runWithSchedulerLease("sweep_payment_intents", 120000, async () =>
             sweepStaleCheckoutIntents({ db, stripeClient: getOptionalStripeClient() })
+          );
+          break;
+        case "publish-cooling-off-reviews":
+          canonicalJob = "cooling_off_reviews";
+          outcome = await runWithSchedulerLease("cooling_off_reviews", 120000, async () =>
+            publishMatureCoolingOffReviewsCommand(db)
           );
           break;
         default:
@@ -8296,7 +9415,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  app.post("/api/admin/financial-reconciliation/audit", requireAdmin, async (req, res) => {
+  app.post("/api/admin/financial-reconciliation/audit", requireAdmin, requireAdminTier("financial_operator", "running financial reconciliation audits"), async (req, res) => {
     try {
       const caller = (req as any).user;
       const report = await generateFinancialReconciliationReport(
@@ -8311,7 +9430,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  app.post("/api/admin/financial-reconciliation/resolve", requireAdmin, async (req, res) => {
+  app.post("/api/admin/financial-reconciliation/resolve", requireAdmin, requireAdminTier("financial_operator", "resolving financial reconciliation findings"), async (req, res) => {
     try {
       const caller = (req as any).user;
       const result = await executeReconciliationOperatorAction({
@@ -8334,7 +9453,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   });
 
   // AT-ADMIN-CTRL-01, AT-ACCOUNT-01, AT-VER-09: Unified Account Suspension, Deletion & Reinstatement
-  app.post("/api/admin/users/:userId/suspend", requireAdmin, async (req, res) => {
+  app.post("/api/admin/users/:userId/suspend", requireAdmin, requireAdminTier("financial_operator", "suspending user accounts"), async (req, res) => {
     try {
       const caller = (req as any).user;
       const result = await suspendOrDeleteAccount({
@@ -8352,7 +9471,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     }
   });
 
-  app.post("/api/admin/users/:userId/reinstate", requireAdmin, async (req, res) => {
+  app.post("/api/admin/users/:userId/reinstate", requireAdmin, requireAdminTier("financial_operator", "reinstating user accounts"), async (req, res) => {
     try {
       const caller = (req as any).user;
       const result = await reinstateSuspendedAccount({
@@ -8386,8 +9505,150 @@ Limit your response to just the text of the tip. Do not use quotes.`;
       sendHttpError(res, err, req);
     }
   };
-  app.delete("/api/admin/users/:userId", requireAdmin, handleAdminDeleteUser);
-  app.post("/api/admin/users/:userId/delete", requireAdmin, handleAdminDeleteUser);
+  app.delete("/api/admin/users/:userId", requireAdmin, requireAdminTier("super_admin", "deleting user accounts"), handleAdminDeleteUser);
+  app.post("/api/admin/users/:userId/delete", requireAdmin, requireAdminTier("super_admin", "deleting user accounts"), handleAdminDeleteUser);
+
+  // Server-Authoritative User Tier, Founding Member & Recommended Categories Update (syncs users + public_profiles + audit)
+  app.post("/api/admin/users/:userId/attributes", requireAdmin, requireAdminTier("financial_operator", "updating user attributes"), async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const targetUid = String(req.params.userId || "").trim();
+      if (!targetUid) throw new BadRequestError("targetUid is required.");
+      const caller = (req as any).user || {};
+      const { tierId, isFoundingMember, recommendedCategories, reason } = req.body || {};
+
+      const userRef = db.collection("users").doc(targetUid);
+      const userSnap = await userRef.get();
+      if (!userSnap.exists) {
+        throw new NotFoundError("Target user not found.");
+      }
+
+      const nowIso = new Date().toISOString();
+      const userPatch: Record<string, any> = { updatedAt: nowIso };
+      const publicPatch: Record<string, any> = { updatedAt: nowIso };
+      const changes: string[] = [];
+
+      if (tierId !== undefined) {
+        const cleanTier = String(tierId || "").trim().slice(0, 64);
+        if (!cleanTier) throw new BadRequestError("Valid tierId string is required.");
+        userPatch.tierId = cleanTier;
+        userPatch.tier = cleanTier;
+        publicPatch.tierId = cleanTier;
+        publicPatch.tier = cleanTier;
+        changes.push(`tierId=${cleanTier}`);
+      }
+      if (typeof isFoundingMember === "boolean") {
+        userPatch.isFoundingMember = isFoundingMember;
+        publicPatch.isFoundingMember = isFoundingMember;
+        changes.push(`isFoundingMember=${isFoundingMember}`);
+      }
+      if (recommendedCategories !== undefined) {
+        if (!Array.isArray(recommendedCategories)) {
+          throw new BadRequestError("recommendedCategories must be an array of strings.");
+        }
+        const cleaned = Array.from(
+          new Set(
+            recommendedCategories
+              .map((c: any) => String(c || "").trim())
+              .filter(Boolean)
+              .slice(0, 20)
+          )
+        );
+        userPatch.recommendedCategories = cleaned;
+        publicPatch.recommendedCategories = cleaned;
+        changes.push(`recommendedCategories(${cleaned.length})`);
+      }
+
+      if (changes.length === 0) {
+        throw new BadRequestError("No supported attributes provided (tierId, isFoundingMember, recommendedCategories).");
+      }
+
+      const batch = db.batch();
+      batch.set(userRef, userPatch, { merge: true });
+      const publicRef = db.collection("public_profiles").doc(targetUid);
+      const publicSnap = await publicRef.get();
+      if (publicSnap.exists) {
+        batch.set(publicRef, publicPatch, { merge: true });
+      }
+      await batch.commit();
+
+      await db.collection("admin_audit_logs").add({
+        action: "update_user_attributes",
+        targetId: targetUid,
+        targetType: "user",
+        details: `Updated user attributes (${changes.join(", ")})${reason ? ` — ${String(reason).slice(0, 200)}` : ""}`,
+        adminId: caller.uid,
+        adminEmail: caller.email || null,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      res.json({ success: true, userId: targetUid, updated: userPatch });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
+
+  // Server-Authoritative Admin Job Deletion (blocks deleting funded/assigned/disputed jobs, removes public_job_cards projection)
+  app.delete("/api/admin/jobs/:jobId", requireAdmin, requireAdminTier("financial_operator", "deleting jobs"), async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database service unavailable" });
+      const jobId = String(req.params.jobId || "").trim();
+      if (!jobId) throw new BadRequestError("jobId is required.");
+      const caller = (req as any).user || {};
+
+      const jobRef = db.collection("jobs").doc(jobId);
+      const snap = await jobRef.get();
+      if (!snap.exists) {
+        throw new NotFoundError("Job not found.");
+      }
+      const data = snap.data() || {};
+
+      const isFunded =
+        data.funded === true ||
+        data.isPaid === true ||
+        Number(data.amountPaid || 0) > 0 ||
+        Number(data.escrowBalance || 0) > 0 ||
+        !["none", "unfunded", ""].includes(String(data.escrowStatus || "none").toLowerCase()) ||
+        Boolean(data.escrowPaymentIntentId || data.stripePaymentIntentId);
+      const isAssigned = Boolean(
+        data.acceptedTradespersonId ||
+        data.acceptedTraderId ||
+        data.assignedTraderId ||
+        data.acceptedQuoteId
+      );
+      const isDisputed =
+        !["none", ""].includes(String(data.disputeStatus || "none").toLowerCase()) ||
+        Boolean(data.disputeId || data.disputedAt);
+      const isActiveLifecycle = ["in_progress", "completed", "disputed"].includes(
+        String(data.status || "").toLowerCase()
+      );
+
+      if (isFunded || isAssigned || isDisputed || isActiveLifecycle) {
+        throw new ConflictError(
+          "Cannot delete a job that is funded, assigned to a tradesperson, in progress, completed, or under dispute."
+        );
+      }
+
+      const batch = db.batch();
+      batch.delete(jobRef);
+      batch.delete(db.collection("public_job_cards").doc(jobId));
+      await batch.commit();
+
+      await db.collection("admin_audit_logs").add({
+        action: "delete_job",
+        targetId: jobId,
+        targetType: "job",
+        details: `Deleted unfunded/unassigned job '${data.title || jobId}' (guest=${Boolean(data.isGuest)})`,
+        adminId: caller.uid,
+        adminEmail: caller.email || null,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      res.json({ success: true, jobId });
+    } catch (err: any) {
+      sendHttpError(res, err, req);
+    }
+  });
 
   // AT-ADMIN-CONFIG-01: Atomic Versioned Pricing & Commission Config Publisher
   app.post("/api/admin/pricing-config/publish", requireAdmin, requireAdminTier("super_admin", "publishing platform pricing configuration"), async (req, res) => {
@@ -8401,7 +9662,15 @@ Limit your response to just the text of the tip. Do not use quotes.`;
         feeTiers: req.body?.feeTiers,
         businessTiers: req.body?.businessTiers,
         paidAddons: req.body?.paidAddons,
+        commissionCapGbp:
+          req.body?.commissionCapGbp !== undefined
+            ? req.body.commissionCapGbp
+            : req.body?.tempConfig?.commissionCapGbp,
+        globalTiersProviderModels: req.body?.globalTiersProviderModels,
       });
+      // Immediately clear server-side cached config so live routes see the new pricing/commission without delay
+      configCache.delete("global");
+      configCache.delete("global_tiers");
       res.json(result);
     } catch (err: any) {
       sendHttpError(res, err, req);
@@ -9298,7 +10567,7 @@ Limit your response to just the text of the tip. Do not use quotes.`;
   // ==========================================
 
   // AT-OUTREACH-02: Durable server outbound outreach queue
-  app.post("/api/admin/outreach/enqueue", requireAdmin, generalLimiter, async (req, res) => {
+  app.post("/api/admin/outreach/enqueue", requireAdmin, requireAdminTier("financial_operator", "enqueueing outreach messages"), generalLimiter, async (req, res) => {
     try {
       const adminUser = (req as any).user;
       const record = await enqueueOutreachMessageCommand({
@@ -9830,9 +11099,30 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     });
   }
 
+  // Terminal Express error-handling middleware: guarantees sanitized JSON responses
+  // and prevents raw Express HTML stack traces (e.g. malformed JSON body parse errors).
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+    if (err?.type === "entity.parse.failed" || (err instanceof SyntaxError && (err as { status?: number }).status === 400 && "body" in err)) {
+      return res.status(400).json({
+        error: "Invalid JSON request body.",
+        code: "INVALID_JSON",
+      });
+    }
+    if (err?.type === "entity.too.large" || err?.status === 413) {
+      return res.status(413).json({
+        error: "Request payload exceeds the maximum allowed size.",
+        code: "PAYLOAD_TOO_LARGE",
+      });
+    }
+    return sendHttpError(res, err, req);
+  });
+
   return new Promise((resolve, reject) => {
     const serverInstance = app.listen(PORT, "0.0.0.0", () => {
-      console.log(`TradeQuote UK server running on http://localhost:${PORT}`);
+      console.log(`AnyTrader UK server running on http://localhost:${PORT}`);
       const preflight = runProductionChecks(process.env, db);
       console.log(`[V6 Pre-Flight Gate] Overall Status: ${preflight.overallStatus} (${preflight.checks.filter(c => c.status === 'FAIL').length} fails, ${preflight.checks.filter(c => c.status === 'WARN').length} warns)`);
       if (process.env.NODE_ENV === "production" && preflight.overallStatus === "NO_GO") {
@@ -9850,6 +11140,37 @@ Limit your response to just the text of the tip. Do not use quotes.`;
     serverInstance.on("error", (err) => {
       reject(err);
     });
+
+    // Graceful Cloud Run / container shutdown on SIGTERM & SIGINT
+    let isShuttingDown = false;
+    const handleGracefulShutdown = (signal: string) => {
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+      console.log(`[Shutdown] Received ${signal}. Stopping background workers and draining HTTP connections...`);
+      try {
+        intelligenceTaskQueue.stopWorker();
+      } catch (stopErr) {
+        console.warn("[Shutdown] Error stopping intelligenceTaskQueue:", stopErr);
+      }
+      const forceExitTimer = setTimeout(() => {
+        console.warn("[Shutdown] Force-exiting after 10s drain timeout.");
+        process.exit(1);
+      }, 10_000);
+      if (typeof forceExitTimer.unref === "function") {
+        forceExitTimer.unref();
+      }
+      serverInstance.close((closeErr) => {
+        clearTimeout(forceExitTimer);
+        if (closeErr) {
+          console.error("[Shutdown] HTTP server close error:", closeErr);
+          process.exit(1);
+        }
+        console.log("[Shutdown] Clean shutdown complete.");
+        process.exit(0);
+      });
+    };
+    process.once("SIGTERM", () => handleGracefulShutdown("SIGTERM"));
+    process.once("SIGINT", () => handleGracefulShutdown("SIGINT"));
   });
 }
 
@@ -9868,7 +11189,10 @@ export async function bootstrap() {
     },
     startSyncWorkers: (firestoreDb) => {
       db = firestoreDb;
-      startInstantMatchEngine(firestoreDb);
+      startInstantMatchEngine(firestoreDb, {
+        dispatchFcmPush: (payload) =>
+          dispatchAuthoritativeFcmPush(firestoreDb, getFirebaseMessagingClient(), payload),
+      });
       startCategoryRegistrySyncWorker(firestoreDb);
       startPublicJobCardsSync(firestoreDb);
       startPublicPropertiesSync(firestoreDb);

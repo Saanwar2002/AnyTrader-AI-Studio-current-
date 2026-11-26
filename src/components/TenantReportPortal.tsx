@@ -1,16 +1,16 @@
 import React, { useState, useEffect } from "react";
-import { useSearchParams, Link, useNavigate } from "react-router-dom";
-import { auth, db, doc, getDoc } from "@/src/firebase";
-import { Home, Wrench, AlertTriangle, CheckCircle2, ShieldAlert, Phone, User, FileText, ArrowLeft, Send, Camera, Clock, Sparkles } from "lucide-react";
+import { useSearchParams, Link } from "react-router-dom";
+import { auth } from "@/src/firebase";
+import { fetchTenantPropertyContext, TenantPropertyContextSummary } from "../services/propertyCommandService";
+import { Home, Wrench, AlertTriangle, CheckCircle2, ShieldAlert, ArrowLeft, Send, Clock } from "lucide-react";
 import { motion } from "motion/react";
 import { toast } from "sonner";
 
 export function TenantReportPortal() {
   const [searchParams] = useSearchParams();
-  const navigate = useNavigate();
   const propertyId = searchParams.get("propertyId") || "";
 
-  const [property, setProperty] = useState<any>(null);
+  const [property, setProperty] = useState<TenantPropertyContextSummary | null>(null);
   const [loadingProperty, setLoadingProperty] = useState(!!propertyId);
 
   // Form state
@@ -25,34 +25,40 @@ export function TenantReportPortal() {
   const [manualAddress, setManualAddress] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submittedIssueId, setSubmittedIssueId] = useState<string | null>(null);
+  const [submittedLinkedToLandlord, setSubmittedLinkedToLandlord] = useState<boolean>(false);
 
   useEffect(() => {
-    if (!propertyId) return;
+    if (!propertyId) {
+      setLoadingProperty(false);
+      return;
+    }
+    let cancelled = false;
     async function fetchProperty() {
       try {
-        // Query public projection first (publicly readable for tenant link access)
-        const pubRef = doc(db, "public_properties", propertyId);
-        let snap = await getDoc(pubRef);
-        if (!snap.exists()) {
-          const docRef = doc(db, "properties", propertyId);
-          snap = await getDoc(docRef);
-        }
-        if (snap.exists()) {
-          setProperty({ id: snap.id, ...snap.data() });
+        const ctx = await fetchTenantPropertyContext(propertyId);
+        if (!cancelled && ctx) {
+          setProperty(ctx);
         }
       } catch (err) {
-        console.error("Error fetching property for tenant portal:", err);
+        console.error("Error fetching property context for tenant portal:", err);
       } finally {
-        setLoadingProperty(false);
+        if (!cancelled) setLoadingProperty(false);
       }
     }
     fetchProperty();
+    return () => {
+      cancelled = true;
+    };
   }, [propertyId]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!issueTitle || !description || !tenantName) {
+    if (!issueTitle.trim() || !description.trim() || !tenantName.trim()) {
       toast.error("Please fill in your name, issue title, and description.");
+      return;
+    }
+    if (!property && !manualAddress.trim()) {
+      toast.error("Please enter your property address or postcode.");
       return;
     }
 
@@ -70,18 +76,16 @@ export function TenantReportPortal() {
         method: "POST",
         headers,
         body: JSON.stringify({
-          propertyId: propertyId || undefined,
-          propertyName: property?.name || manualAddress || "Home Property",
-          address: property?.address?.line1 || manualAddress || "UK Address",
-          postcode: property?.address?.postcode || "",
-          tenantName,
-          tenantPhone,
-          tenantEmail,
-          flatUnit,
+          propertyId: property?.id || undefined,
+          manualAddress: !property ? manualAddress.trim() : undefined,
+          tenantName: tenantName.trim(),
+          tenantPhone: tenantPhone.trim(),
+          tenantEmail: tenantEmail.trim(),
+          flatUnit: flatUnit.trim(),
           category,
           urgency,
-          title: issueTitle,
-          description,
+          title: issueTitle.trim(),
+          description: description.trim(),
         }),
       });
       const result = await response.json().catch(() => ({}));
@@ -89,8 +93,14 @@ export function TenantReportPortal() {
         throw new Error(result.error || "Failed to submit repair issue.");
       }
 
+      const linked = Boolean(result.linkedToLandlord);
+      setSubmittedLinkedToLandlord(linked);
       setSubmittedIssueId(String(result.id));
-      toast.success("Repair issue logged in Property Passport successfully!");
+      toast.success(
+        linked
+          ? "Repair issue logged in Property Passport and landlord notified!"
+          : "Repair report logged successfully!"
+      );
     } catch (err: any) {
       toast.error(err?.message || "Failed to submit report. Please try again.");
     } finally {
@@ -135,7 +145,15 @@ export function TenantReportPortal() {
             </div>
             <h2 className="text-2xl font-black text-white">Repair Request Logged!</h2>
             <p className="text-sm text-slate-300 max-w-md mx-auto">
-              Your issue has been attached directly to the landlord's <span className="font-bold text-blue-400">Property Passport</span>. The landlord and local emergency trades receive instant notification.
+              {submittedLinkedToLandlord ? (
+                <>
+                  Your issue has been attached directly to the landlord&apos;s <span className="font-bold text-blue-400">Property Passport</span> and the property owner has been notified.
+                </>
+              ) : (
+                <>
+                  Your repair report has been recorded under the address you entered. Share this reference ID with your landlord or ask them for their direct AnyTrader property link to auto-attach future issues.
+                </>
+              )}
             </p>
             <div className="p-4 bg-white/5 border border-white/10 rounded-2xl text-xs text-left space-y-2">
               <p className="text-slate-400 font-extrabold uppercase">Reference ID: <span className="text-white">{submittedIssueId}</span></p>
@@ -161,13 +179,19 @@ export function TenantReportPortal() {
         ) : (
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* Property details badge */}
-            {property ? (
+            {loadingProperty ? (
+              <div className="p-3.5 bg-white/5 border border-white/10 rounded-2xl text-xs text-slate-300 font-bold">
+                Loading linked property details...
+              </div>
+            ) : property ? (
               <div className="p-3.5 bg-blue-950/60 border border-blue-500/30 rounded-2xl flex items-center justify-between">
                 <div className="flex items-center gap-2.5">
                   <Home className="w-4 h-4 text-blue-400" />
                   <div>
-                    <p className="text-xs font-black text-white">{property.name || "Property"}</p>
-                    <p className="text-[11px] text-slate-300">{property.address?.line1 || "UK Address"}</p>
+                    <p className="text-xs font-black text-white">{property.name || "Managed Property"}</p>
+                    <p className="text-[11px] text-slate-300">
+                      {[property.city, property.outwardPostcode].filter(Boolean).join(" • ") || property.propertyType || "Linked Landlord Property"}
+                    </p>
                   </div>
                 </div>
                 <span className="text-[10px] font-bold text-blue-300 bg-blue-900/80 px-2 py-1 rounded-lg">Verified Property</span>

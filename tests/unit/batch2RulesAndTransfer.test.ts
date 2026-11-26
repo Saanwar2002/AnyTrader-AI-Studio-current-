@@ -39,7 +39,7 @@ describe("Batch 2 Security Remediations (Rules, Audit Trail, Transfer & Intellig
       expect(block).not.toMatch(/allow\s+read\s*:\s*if\s+isSignedIn\(\)\s*;/);
       expect(block).toContain("isAdmin()");
       expect(block).toContain("settingId == 'public_flags'");
-      expect(block).toContain("allow write: if isAdmin();");
+      expect(block).toContain("allow write: if isSuperAdmin();");
     });
   });
 

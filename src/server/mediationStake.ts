@@ -1,4 +1,5 @@
 import { getJobParticipantIds } from "./reviewAuthorization.ts";
+import { isJobEligibleForMediationStake } from "./slice2MoneyFlowHelpers.ts";
 
 function httpError(message: string, status?: number): Error {
   const error: any = new Error(message);
@@ -9,9 +10,13 @@ function httpError(message: string, status?: number): Error {
 export async function reserveMediationStakeAttempt(db: any, input: {
   jobId: string; userId: string; candidateAttemptId: string;
   disputeReason?: string; technicalFaultReport?: string; isPropertyDamage?: boolean;
-  photos?: unknown[]; serverTimestamp: () => unknown;
-}): Promise<{ attemptId: string; existingPaymentIntentId: string }> {
+  photos?: unknown[]; stakeAmountPence?: number; serverTimestamp: () => unknown;
+}): Promise<{ attemptId: string; existingPaymentIntentId: string; stakeAmountPence: number }> {
   const jobRef = db.collection("jobs").doc(input.jobId);
+  const resolvedStakePence = Number.isInteger(input.stakeAmountPence) && Number(input.stakeAmountPence) > 0
+    ? Number(input.stakeAmountPence)
+    : 2500;
+  const resolvedStakeGbp = Math.round(resolvedStakePence) / 100;
   let attemptId = "";
   let existingPaymentIntentId = "";
   await db.runTransaction(async (tx: any) => {
@@ -19,7 +24,9 @@ export async function reserveMediationStakeAttempt(db: any, input: {
     if (!snap.exists) throw httpError("Job not found", 404);
     const job = snap.data() || {};
     const dispute = job.dispute || {};
-    if (job.status !== "disputed") throw httpError("Mediation stake can only be paid for a disputed job", 409);
+    if (!isJobEligibleForMediationStake(job.status)) {
+      throw httpError("Mediation stake can only be paid for an accepted, in-progress, completed, or disputed job", 409);
+    }
     const { ownerIds, traderIds } = getJobParticipantIds(job);
     if (!ownerIds.includes(input.userId) && !traderIds.includes(input.userId)) {
       throw httpError("Only a job participant can pay the mediation stake", 403);
@@ -38,26 +45,28 @@ export async function reserveMediationStakeAttempt(db: any, input: {
         reason: input.disputeReason || dispute.reason || "Dispute raised",
         technicalFaultReport: input.technicalFaultReport || dispute.technicalFaultReport || "",
         isPropertyDamage: Boolean(input.isPropertyDamage), mediationStakePaid: false,
-        mediationStakeAmount: 25.00, stakePaymentAttemptId: attemptId,
+        mediationStakeAmount: resolvedStakeGbp, stakePaymentAttemptId: attemptId,
         stakePaymentStatus: "creating",
         photos: Array.isArray(input.photos) ? input.photos : (dispute.photos || []),
         status: "awaiting_payment", createdAt: dispute.createdAt || input.serverTimestamp()
       }});
     }
   });
-  return { attemptId, existingPaymentIntentId };
+  return { attemptId, existingPaymentIntentId, stakeAmountPence: resolvedStakePence };
 }
 
 export async function createMediationStakePaymentIntent(db: any, stripe: any, input: {
   jobId: string; userId: string; candidateAttemptId: string;
   disputeReason?: string; technicalFaultReport?: string; isPropertyDamage?: boolean;
-  photos?: unknown[]; serverTimestamp: () => unknown;
-}): Promise<{ attemptId: string; paymentIntent: any }> {
+  photos?: unknown[]; stakeAmountPence?: number; serverTimestamp: () => unknown;
+}): Promise<{ attemptId: string; paymentIntent: any; stakeAmountPence: number }> {
   const reservation = await reserveMediationStakeAttempt(db, input);
+  const stakePence = reservation.stakeAmountPence;
+  const stakeGbpFormatted = (stakePence / 100).toFixed(2);
   const paymentIntent = reservation.existingPaymentIntentId
     ? await stripe.paymentIntents.retrieve(reservation.existingPaymentIntentId)
     : await stripe.paymentIntents.create({
-        amount: 2500,
+        amount: stakePence,
         currency: "gbp",
         metadata: {
           type: "mediation_stake",
@@ -68,7 +77,7 @@ export async function createMediationStakePaymentIntent(db: any, stripe: any, in
           userId: input.userId,
           paymentAttemptId: reservation.attemptId
         },
-        description: `Mediation Dispute Stake for Job #${input.jobId} (£25.00)`,
+        description: `Mediation Dispute Stake for Job #${input.jobId} (£${stakeGbpFormatted})`,
         automatic_payment_methods: { enabled: true }
       }, { idempotencyKey: `mediation-stake:${input.jobId}:${reservation.attemptId}` });
 
@@ -78,16 +87,20 @@ export async function createMediationStakePaymentIntent(db: any, stripe: any, in
     paymentIntentId: paymentIntent.id,
     paymentIntentStatus: paymentIntent.status
   });
-  return { attemptId: reservation.attemptId, paymentIntent };
+  return { attemptId: reservation.attemptId, paymentIntent, stakeAmountPence: stakePence };
 }
 
 export async function confirmMediationStakePayment(db: any, input: {
   jobId: string; userId: string; attemptId: string; paymentIntentId: string;
-  serverTimestamp: () => unknown;
+  amountPence?: number; serverTimestamp: () => unknown;
 }): Promise<void> {
   const jobRef = db.collection("jobs").doc(input.jobId);
+  const publicCardRef = db.collection("public_job_cards").doc(input.jobId);
   await db.runTransaction(async (tx: any) => {
-    const snap = await tx.get(jobRef);
+    const [snap, cardSnap] = await Promise.all([
+      tx.get(jobRef),
+      tx.get(publicCardRef),
+    ]);
     if (!snap.exists) throw new Error("Mediation stake job not found");
     const job = snap.data() || {};
     const dispute = job.dispute || {};
@@ -96,11 +109,23 @@ export async function confirmMediationStakePayment(db: any, input: {
       throw new Error("Mediation stake reservation mismatch");
     }
     if (dispute.mediationStakePaid === true && dispute.stakePaymentId === input.paymentIntentId) return;
-    tx.update(jobRef, { status: "disputed", dispute: {
-      ...dispute, paymentIntentId: input.paymentIntentId, mediationStakePaid: true, mediationStakeAmount: 25.00,
+    const confirmedStakeGbp =
+      Number.isFinite(Number(input.amountPence)) && Number(input.amountPence) > 0
+        ? Math.round(Number(input.amountPence)) / 100
+        : (Number.isFinite(Number(dispute.mediationStakeAmount)) && Number(dispute.mediationStakeAmount) > 0
+            ? Number(dispute.mediationStakeAmount)
+            : 25.00);
+    tx.update(jobRef, { status: "disputed", mediationStakePaid: true, dispute: {
+      ...dispute, paymentIntentId: input.paymentIntentId, mediationStakePaid: true, mediationStakeAmount: confirmedStakeGbp,
       stakePaymentId: input.paymentIntentId, stakePaymentStatus: "succeeded",
       status: "pending_arbitration", paidAt: input.serverTimestamp()
     }, disputedAt: input.serverTimestamp() });
+    if (cardSnap?.exists) {
+      tx.update(publicCardRef, {
+        status: "disputed",
+        updatedAt: new Date().toISOString(),
+      });
+    }
 
     const { ownerIds, traderIds } = getJobParticipantIds(job);
     const counterpartIds = [...new Set([...ownerIds, ...traderIds])].filter(
@@ -113,7 +138,7 @@ export async function confirmMediationStakePayment(db: any, input: {
       tx.set(notifRef, {
         userId: counterpartUid,
         title: "Dispute Mediation Stake Confirmed",
-        message: `A £25.00 mediation stake has been lodged for "${job.title || `Job #${input.jobId}`}". The dispute is now in arbitration review.`,
+        message: `A £${confirmedStakeGbp.toFixed(2)} mediation stake has been lodged for "${job.title || `Job #${input.jobId}`}". The dispute is now in arbitration review.`,
         type: "status",
         read: false,
         jobId: input.jobId,

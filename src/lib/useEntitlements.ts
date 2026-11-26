@@ -117,10 +117,16 @@ export const resolveTier = (profile: any): ProviderTierName => {
   
   const rawTier = String(profile.tierId || profile.tier || profile.subscriptionType || '');
   const lower = rawTier.toLowerCase();
+  const status = String(profile.subscriptionStatus || '').trim().toLowerCase();
+  const isTerminalInactive = ['canceled', 'cancelled', 'unpaid', 'incomplete_expired', 'free'].includes(status);
 
-  // Founding member reward maps to Silver Professional
+  // Founding member reward maps to Silver Professional during initial free trial
   if (profile.isFoundingMember && (rawTier === "Free Trial" || !rawTier)) {
       return 'Silver Professional';
+  }
+
+  if (isTerminalInactive) {
+    return 'PAYG';
   }
   
   if (lower.includes('platinum') || lower.includes('enterprise powerhouse') || lower.includes('powerhouse') || lower.includes('enterprise') || lower === 'platinum') {

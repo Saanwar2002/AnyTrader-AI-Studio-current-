@@ -9,6 +9,8 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import { useAuth } from "./AuthProvider";
 import BnplFinancingModal from "./BnplFinancingModal";
+import { db, doc, onSnapshot } from "@/src/firebase";
+import { FlexiPayMode, resolveFlexiPayMode } from "@/src/lib/marketplaceContracts";
 
 interface SearchItem {
   id: string;
@@ -32,6 +34,29 @@ export function HeaderAccountSearch() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [showBnplModal, setShowBnplModal] = useState(false);
   const [showEmergencyGuide, setShowEmergencyGuide] = useState(false);
+  const [flexiPayMode, setFlexiPayMode] = useState<FlexiPayMode>("coming_soon");
+  const [taxiPortalMode, setTaxiPortalMode] = useState<string>("off");
+
+  useEffect(() => {
+    const unsub = onSnapshot(
+      doc(db, "platform_config", "global"),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() || {};
+          setFlexiPayMode(resolveFlexiPayMode(data));
+          setTaxiPortalMode(String(data.taxiPortalMode || "off").toLowerCase());
+        } else {
+          setFlexiPayMode("coming_soon");
+          setTaxiPortalMode("off");
+        }
+      },
+      () => {
+        setFlexiPayMode("coming_soon");
+        setTaxiPortalMode("off");
+      }
+    );
+    return () => unsub();
+  }, []);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -108,7 +133,7 @@ export function HeaderAccountSearch() {
       icon: Calculator,
       iconBg: "bg-amber-100",
       iconColor: "text-amber-800",
-      path: "/trade-dashboard",
+      path: "/trades-dashboard",
       keywords: ["tax", "ni", "national insurance", "hmrc", "self-assessment", "sole trader", "reserves", "accounting", "expenses"]
     },
     {
@@ -160,7 +185,7 @@ export function HeaderAccountSearch() {
     {
       id: "jobs-emergency",
       title: "24/7 Rapid Emergency Dispatch",
-      subtitle: "14m average arrival for burst pipes, gas leaks, power cuts & lockouts",
+      subtitle: "Rapid emergency dispatch for burst pipes, gas leaks, power cuts & lockouts",
       category: "Jobs & Quotes",
       icon: Zap,
       iconBg: "bg-red-100",
@@ -176,7 +201,7 @@ export function HeaderAccountSearch() {
       icon: DollarSign,
       iconBg: "bg-emerald-100",
       iconColor: "text-emerald-700",
-      path: "/trade-dashboard",
+      path: "/trades-dashboard",
       keywords: ["invoices", "invoice", "receipts", "bill", "billing", "paid", "create invoice", "pdf", "vat", "tradeos"]
     },
     {
@@ -214,17 +239,27 @@ export function HeaderAccountSearch() {
       path: "/tenant-report",
       keywords: ["tenant", "tenant report", "report repair", "landlord", "broken", "leak", "mould", "damp", "rent", "property issue"]
     },
-    {
-      id: "tool-bnpl",
-      title: "FlexiPay 0% APR Repair Financing",
-      subtitle: "Spread unexpected repairs (£1,000+) over 3 to 12 months with 0% APR",
-      category: "Tools & Portals",
-      icon: CreditCard,
-      iconBg: "bg-indigo-100",
-      iconColor: "text-indigo-700",
-      action: () => setShowBnplModal(true),
-      keywords: ["flexipay", "bnpl", "financing", "finance", "spread cost", "monthly payments", "0% apr", "loan", "installments"]
-    },
+    ...(flexiPayMode !== "off"
+      ? [
+          {
+            id: "tool-bnpl",
+            title:
+              flexiPayMode === "coming_soon"
+                ? "FlexiPay Repair Financing (Coming Soon)"
+                : "FlexiPay 0% APR Repair Financing",
+            subtitle:
+              flexiPayMode === "coming_soon"
+                ? "Monthly payment plans for £1,000+ repairs — launching soon"
+                : "Spread unexpected repairs (£1,000+) over 3 to 12 months with 0% APR",
+            category: "Tools & Portals" as const,
+            icon: CreditCard,
+            iconBg: "bg-indigo-100",
+            iconColor: "text-indigo-700",
+            action: () => setShowBnplModal(true),
+            keywords: ["flexipay", "bnpl", "financing", "finance", "spread cost", "monthly payments", "0% apr", "loan", "installments"],
+          },
+        ]
+      : []),
     {
       id: "tool-deals",
       title: "Quiet Period Off-Peak Flash Deals",
@@ -233,7 +268,7 @@ export function HeaderAccountSearch() {
       icon: Sparkles,
       iconBg: "bg-amber-100",
       iconColor: "text-amber-700",
-      path: "/trade-dashboard",
+      path: "/trades-dashboard",
       keywords: ["flash deals", "deals", "discounts", "off-peak", "quiet period", "offers", "promotions", "cheap", "save"]
     },
     {
@@ -244,20 +279,24 @@ export function HeaderAccountSearch() {
       icon: Layers,
       iconBg: "bg-slate-100",
       iconColor: "text-slate-800",
-      path: "/corporate",
+      path: "/gotham-portal",
       keywords: ["gotham", "b2b", "housing association", "council", "portfolio", "social housing", "enterprise", "sla", "awaab"]
     },
-    {
-      id: "tool-driver",
-      title: "AnyRoller Rides & Driver Terminal",
-      subtitle: "On-demand taxi booking, live GPS tracking, and driver navigation",
-      category: "Tools & Portals",
-      icon: Truck,
-      iconBg: "bg-amber-100",
-      iconColor: "text-amber-700",
-      path: "/driver-terminal",
-      keywords: ["taxi", "ride", "rides", "anyroller", "driver", "cab", "transport", "terminal", "book taxi"]
-    },
+    ...(taxiPortalMode === "live"
+      ? [
+          {
+            id: "tool-driver",
+            title: "AnyRoller Rides & Driver Terminal",
+            subtitle: "On-demand taxi booking, live GPS tracking, and driver navigation",
+            category: "Tools & Portals" as const,
+            icon: Truck,
+            iconBg: "bg-amber-100",
+            iconColor: "text-amber-700",
+            path: "/driver-terminal",
+            keywords: ["taxi", "ride", "rides", "anyroller", "driver", "cab", "transport", "terminal", "book taxi"],
+          },
+        ]
+      : []),
 
     // 4. Services & Trades
     {
@@ -336,10 +375,10 @@ export function HeaderAccountSearch() {
       icon: Shield,
       iconBg: "bg-emerald-100",
       iconColor: "text-emerald-700",
-      path: "/payment-protection",
+      path: "/billing",
       keywords: ["escrow", "protection", "payment protection", "milestone", "refund", "dispute", "safety", "guarantee"]
     }
-  ], []);
+  ], [flexiPayMode, taxiPortalMode]);
 
   // Filtered results based on query
   const filteredResults = useMemo(() => {

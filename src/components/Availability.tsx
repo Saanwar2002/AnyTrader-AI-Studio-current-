@@ -9,6 +9,8 @@ import {
   format, addMonths, subMonths, startOfMonth, endOfMonth, eachDayOfInterval, 
   isSameMonth, isSameDay, isToday, startOfWeek, endOfWeek, parseISO, isBefore, startOfDay
 } from 'date-fns';
+import { isProfileAcceptingNewWork } from "@/src/lib/marketplaceContracts";
+import { sanitizePublicProfilePayload } from "@/src/lib/publicProfileProjection";
 
 const timeOptions: string[] = [];
 for (let i = 0; i < 24; i++) {
@@ -76,7 +78,7 @@ export default function Availability() {
           const data = docSnap.data();
           if (data.availability) setAvailability(data.availability);
           if (data.dateOverrides) setDateOverrides(data.dateOverrides);
-          setIsAcceptingRequests(data.isAcceptingRequests !== false);
+          setIsAcceptingRequests(isProfileAcceptingNewWork(data));
         }
       } catch (err) {
         console.error("Error fetching availability:", err);
@@ -100,10 +102,10 @@ export default function Availability() {
         console.error("Error fetching appointments:", err);
       });
 
-      // AT-CJ-SCHED-03: Query canonical `jobs` collection instead of legacy `bidding_jobs`
+      // Query canonical `jobs` collection using canonical `acceptedTradespersonId`
       const qJobs = query(
         collection(db, "jobs"),
-        where("assignedTradespersonId", "==", user.uid),
+        where("acceptedTradespersonId", "==", user.uid),
         limit(100)
       );
       const unsubJobs = onSnapshot(qJobs, (snapshot) => {
@@ -145,8 +147,18 @@ export default function Availability() {
     try {
       await setDoc(doc(db, "users", user.uid), {
         availability,
-        isAcceptingRequests
+        isAcceptingRequests,
+        acceptingNewWork: isAcceptingRequests,
       }, { merge: true });
+      await setDoc(
+        doc(db, "public_profiles", user.uid),
+        sanitizePublicProfilePayload({
+          availability,
+          isAcceptingRequests,
+          acceptingNewWork: isAcceptingRequests,
+        }),
+        { merge: true }
+      ).catch((pubErr) => console.warn("Public profile availability sync skipped:", pubErr));
       setSuccess(true);
       setHasUnsavedChanges(false);
       setTimeout(() => setSuccess(false), 3000);
@@ -213,8 +225,22 @@ export default function Availability() {
     
     try {
       await setDoc(doc(db, "users", user.uid), {
-        isAcceptingRequests: newValue
+        isAcceptingRequests: newValue,
+        acceptingNewWork: newValue,
       }, { merge: true });
+      await setDoc(
+        doc(db, "public_profiles", user.uid),
+        sanitizePublicProfilePayload({
+          isAcceptingRequests: newValue,
+          acceptingNewWork: newValue,
+        }),
+        { merge: true }
+      ).catch((pubErr) => console.warn("Public profile availability toggle sync skipped:", pubErr));
+      toast.success(
+        newValue
+          ? "You are now accepting new work and visible in search."
+          : "New work paused — you won't receive new leads or quote requests."
+      );
     } catch (err) {
       console.error("Error saving availability toggle:", err);
       handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
@@ -258,8 +284,19 @@ export default function Availability() {
     if (status === 'available') return 'available';
 
     // Auto-sync Booked status based on jobs and appointments
-    const hasJob = jobs.some(j => j.status === 'accepted' && j.date && isSameDay(new Date(j.date), day));
-    const hasApt = appointments.some(a => a.status === 'confirmed' && a.date && isSameDay(new Date(a.date), day));
+    const hasJob = jobs.some((j) => {
+      const normalizedStatus = String(j.status || "").toLowerCase();
+      if (!["accepted", "in_progress"].includes(normalizedStatus)) return false;
+      const rawDate = j.scheduledDate || j.confirmedDate || j.preferredDate || j.date;
+      if (!rawDate) return false;
+      const parsed = typeof rawDate?.toDate === "function" ? rawDate.toDate() : new Date(rawDate);
+      return !Number.isNaN(parsed.getTime()) && isSameDay(parsed, day);
+    });
+    const hasApt = appointments.some((a) => {
+      if (a.status !== "confirmed" || !a.date) return false;
+      const parsed = typeof a.date?.toDate === "function" ? a.date.toDate() : new Date(a.date);
+      return !Number.isNaN(parsed.getTime()) && isSameDay(parsed, day);
+    });
     
     if (hasJob || hasApt) {
       return 'booked';

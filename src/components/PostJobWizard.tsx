@@ -62,6 +62,7 @@ import { toast } from "sonner";
 import VoiceJobAssistant from "./voice/VoiceJobAssistant";
 
 import { getInstantMatchCopy } from "@/src/lib/boosts";
+import { normalizeJobUrgency, normalizeQuoteScope } from "@/src/lib/marketplaceContracts";
 
 const iconMap: Record<string, any> = {
   Droplets, Zap, Thermometer, Home, Layout, Palette, Wrench, Maximize, Grid, Leaf, Box, Sparkles, Lock
@@ -1935,8 +1936,20 @@ export default function PostJobWizard() {
             city: asset?.city || finalCity || null,
             area: asset?.area || finalArea || null,
             fullAddress: asset?.fullAddress || formData.fullAddress || null,
+            houseNumber: formData.houseNumber || null,
+            locationInstructions: formData.locationInstructions || null,
             postcode: (asset?.postcode || finalPostcode).toUpperCase(),
-            urgency: formData.urgency,
+            urgency: normalizeJobUrgency(formData.urgency),
+            urgencyLabel: formData.urgency || "standard",
+            preferredDate: formData.jobDate || null,
+            jobDate: formData.jobDate || null,
+            paymentPreference: formData.paymentPreference || "negotiable",
+            quoteScope: normalizeQuoteScope(formData.quoteScope),
+            estimatedCompletionTime: formData.estimatedCompletionTime || null,
+            estimatedCompletionTimeUnit: formData.estimatedCompletionTimeUnit || "hours",
+            photos: formData.photos || [],
+            videos: formData.videos || [],
+            documents: formData.documents || [],
             budget: formData.selectedBudget || null,
             estimateMin: estimate?.min ?? editJob.estimateMin ?? null,
             estimateMax: estimate?.max ?? editJob.estimateMax ?? null,
@@ -1951,27 +1964,52 @@ export default function PostJobWizard() {
           });
         } else {
           // Authoritative server-command job creation (Task 2)
+          const directTargetId = targetTradespersonId || claimedDeal?.traderId || null;
           const commandPayload: Record<string, any> = {
             title: formData.title,
             description: finalDescription,
             category: formData.category,
             subCategory: (formData as any).subCategory || formData.subcategory || null,
+            subcategory: formData.subcategory || null,
             postcode: (asset?.postcode || finalPostcode).toUpperCase(),
             city: asset?.city || finalCity || null,
             area: asset?.area || finalArea || null,
             address: asset?.fullAddress || formData.fullAddress || null,
-            urgency: (formData.urgency || "standard") as any,
+            fullAddress: asset?.fullAddress || formData.fullAddress || null,
+            houseNumber: formData.houseNumber || null,
+            locationInstructions: formData.locationInstructions || null,
+            urgency: normalizeJobUrgency(formData.urgency),
+            urgencyLabel: formData.urgency || "standard",
+            isEmergency: formData.urgency === "emergency",
+            preferredDate: formData.jobDate || null,
+            jobDate: formData.jobDate || null,
+            paymentPreference: formData.paymentPreference || "negotiable",
+            quoteScope: normalizeQuoteScope(formData.quoteScope),
+            estimatedCompletionTime: formData.estimatedCompletionTime || null,
+            estimatedCompletionTimeUnit: formData.estimatedCompletionTimeUnit || "hours",
             budget: formData.selectedBudget || null,
             estimateMin: estimate?.min || (formData.selectedBudget ? Math.floor(Number(formData.selectedBudget) * 0.9) : null),
             estimateMax: estimate?.max || (formData.selectedBudget ? Math.floor(Number(formData.selectedBudget) * 1.1) : null),
             propertyId: asset?.id || (location.state as any)?.linkedPropertyId || null,
+            linkedPropertyId: asset?.id || (location.state as any)?.linkedPropertyId || null,
             propertyPassportId: (location.state as any)?.linkedPropertyId || null,
-            directTraderId: targetTradespersonId || claimedDeal?.traderId || null,
-            targetTraderId: targetTradespersonId || claimedDeal?.traderId || null,
-            isDirectQuote: Boolean(targetTradespersonId || claimedDeal?.traderId),
+            assetId: asset?.id || null,
+            assetName: asset?.name || null,
+            directTraderId: directTargetId,
+            targetTraderId: directTargetId,
+            targetTradespersonId: directTargetId,
+            targetTradespersonName: targetTradespersonName || claimedDeal?.traderBusinessName || claimedDeal?.traderName || null,
+            isDirectQuote: Boolean(directTargetId),
+            isDirectJob: Boolean(directTargetId),
+            visibility: directTargetId ? "direct" : "public",
+            claimedDeal: claimedDeal || null,
             photos: formData.photos || [],
+            videos: formData.videos || [],
+            documents: formData.documents || [],
             voiceNoteUrl: (formData as any).voiceNoteUrl || null,
             notes: (formData as any).notes || null,
+            mobileNumber: formData.mobileNumber || null,
+            isInstantMatch: Boolean(formData.isInstantMatch),
             metadata: {
               assetId: asset?.id || null,
               assetName: asset?.name || null,
@@ -1991,9 +2029,10 @@ export default function PostJobWizard() {
         }
         
         // Handle specific tradesperson invitation (only for first job if bulk)
-        if (targetTradespersonId && asset === assetsToPost[0]) {
+        const invitedTraderId = targetTradespersonId || claimedDeal?.traderId || null;
+        if (invitedTraderId && asset === assetsToPost[0]) {
           try {
-            const conversationId = `${currentJobId}_${targetTradespersonId}`;
+            const conversationId = `${currentJobId}_${invitedTraderId}`;
             const conversationRef = doc(db, "conversations", conversationId);
             
             const dealNote = claimedDeal 
@@ -2002,20 +2041,29 @@ export default function PostJobWizard() {
 
             await setDoc(conversationRef, {
               id: conversationId,
-              participants: [user.uid, targetTradespersonId],
+              participants: [user.uid, invitedTraderId],
+              participantNames: {
+                [user.uid]: profile?.name || profile?.displayName || "Homeowner",
+                [invitedTraderId]: targetTradespersonName || claimedDeal?.traderBusinessName || "Tradesperson",
+              },
               jobId: currentJobId,
               jobTitle: formData.title,
               lastMessage: claimedDeal 
                 ? `⚡ Claimed Flash Deal for: ${formData.title}${dealNote}`
                 : `Invitation to quote for: ${formData.title}`,
+              lastSenderId: user.uid,
+              unreadCounts: {
+                [user.uid]: 0,
+                [invitedTraderId]: 1,
+              },
               lastMessageAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
               createdAt: serverTimestamp()
             });
 
             const initialMessageText = claimedDeal
-              ? `Hi ${targetTradespersonName}, I've claimed your Flash Deal (${claimedDeal.discountPercentage || 0}% OFF - Pre-Agreed Rate: £${claimedDeal.discountedPrice || claimedDeal.targetRate || claimedDeal.price}) for my job: "${formData.title}". Please review the job specs and confirm our booking!`
-              : `Hi ${targetTradespersonName}, I'd like to invite you to quote for my new job: "${formData.title}". Please take a look at the details and let me know if you're interested!`;
+              ? `Hi ${targetTradespersonName || claimedDeal.traderBusinessName || "there"}, I've claimed your Flash Deal (${claimedDeal.discountPercentage || 0}% OFF - Pre-Agreed Rate: £${claimedDeal.discountedPrice || claimedDeal.targetRate || claimedDeal.price}) for my job: "${formData.title}". Please review the job specs and confirm our booking!`
+              : `Hi ${targetTradespersonName || "there"}, I'd like to invite you to quote for my new job: "${formData.title}". Please take a look at the details and let me know if you're interested!`;
 
             await addDoc(collection(db, "conversations", conversationId, "messages"), {
               senderId: user.uid,
@@ -2023,10 +2071,10 @@ export default function PostJobWizard() {
               createdAt: serverTimestamp()
             });
 
-            // If a flash deal was claimed, increment the deal claimedCount and check limit
+            // If a flash deal was claimed, increment the deal claimedCount in canonical `flash_deals` collection
             if (claimedDeal?.id) {
               try {
-                const dealRef = doc(db, "trader_flash_deals", claimedDeal.id);
+                const dealRef = doc(db, "flash_deals", claimedDeal.id);
                 const dealSnap = await getDoc(dealRef);
                 if (dealSnap.exists()) {
                   const dData = dealSnap.data();
@@ -2046,7 +2094,7 @@ export default function PostJobWizard() {
             }
 
             await sendNotification(
-              targetTradespersonId,
+              invitedTraderId,
               claimedDeal ? "⚡ Flash Deal Claimed! 🎉" : "New Quote Request! 📝",
               claimedDeal
                 ? `${profile?.name || 'A homeowner'} claimed your Flash Deal (${claimedDeal.discountPercentage || 0}% OFF) for "${formData.title}"`
@@ -2058,7 +2106,7 @@ export default function PostJobWizard() {
             if (assetsToPost.length === 1) {
               setIsSubmitting(false);
               navigate(`/chat/${conversationId}`, { 
-                state: { recipientName: targetTradespersonName, jobTitle: formData.title } 
+                state: { recipientName: targetTradespersonName || claimedDeal?.traderBusinessName, jobTitle: formData.title } 
               });
               return;
             }
@@ -2067,17 +2115,19 @@ export default function PostJobWizard() {
           }
         }
 
-        // Trigger matching system for the new job (standard broadcast)
-        try {
-          await distributeJobNotifications(
-            currentJobId,
-            formData.category,
-            asset?.postcode || formData.postcode,
-            formData.urgency,
-            Boolean(formData.isEmergencyBoost || formData.isInstantMatch)
-          );
-        } catch (notifErr) {
-          console.error("Error distributing job notifications:", notifErr);
+        // Trigger matching system strictly for public/standard broadcast jobs (never leak private 1-to-1 / Flash Deal jobs)
+        if (!invitedTraderId) {
+          try {
+            await distributeJobNotifications(
+              currentJobId,
+              formData.category,
+              asset?.postcode || formData.postcode,
+              normalizeJobUrgency(formData.urgency),
+              Boolean(formData.isEmergencyBoost || formData.isInstantMatch)
+            );
+          } catch (notifErr) {
+            console.error("Error distributing job notifications:", notifErr);
+          }
         }
       }
 

@@ -46,6 +46,8 @@ export default function AdminSearchDemandTab() {
   const [newTradeTitle, setNewTradeTitle] = useState("");
   const [newKeywords, setNewKeywords] = useState("");
   const [toastMessage, setToastMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [pendingDeleteTerm, setPendingDeleteTerm] = useState<string | null>(null);
+  const [isDeletingTerm, setIsDeletingTerm] = useState(false);
 
   const showToast = (text: string, type: "success" | "error" = "success") => {
     setToastMessage({ text, type });
@@ -153,16 +155,27 @@ export default function AdminSearchDemandTab() {
     }
   };
 
-  const handleDeleteSynonym = async (term: string) => {
-    if (!confirm(`Are you sure you want to remove dynamic synonym "${term}"?`)) return;
+  const handleDeleteSynonym = (term: string) => {
+    setPendingDeleteTerm(term);
+  };
+
+  const confirmDeleteSynonym = async () => {
+    if (!pendingDeleteTerm) return;
+    const term = pendingDeleteTerm;
+    setIsDeletingTerm(true);
     try {
       const res = await deleteDynamicSynonym(term);
       if (res.success) {
         showToast(`Removed synonym "${term}"`, "success");
+        setPendingDeleteTerm(null);
         await loadData();
+      } else {
+        showToast("Failed to delete synonym", "error");
       }
     } catch (err: any) {
-      showToast("Failed to delete synonym", "error");
+      showToast(err?.message || "Failed to delete synonym", "error");
+    } finally {
+      setIsDeletingTerm(false);
     }
   };
 
@@ -603,6 +616,35 @@ export default function AdminSearchDemandTab() {
           </div>
         )}
       </AnimatePresence>
+      {/* Delete Synonym Confirmation Modal */}
+      {pendingDeleteTerm && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">Remove Dynamic Synonym?</h3>
+            <p className="text-sm text-black">
+              Are you sure you want to remove dynamic synonym &ldquo;{pendingDeleteTerm}&rdquo;?
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingTerm}
+                onClick={() => setPendingDeleteTerm(null)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingTerm}
+                onClick={confirmDeleteSynonym}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
+              >
+                {isDeletingTerm ? "Removing..." : "Remove"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

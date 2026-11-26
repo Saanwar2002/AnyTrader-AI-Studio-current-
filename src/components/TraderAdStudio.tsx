@@ -3,11 +3,20 @@ import { Link } from "react-router-dom";
 import { collection, query, where, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
 import { useAuth } from "./AuthProvider";
+import { useCategories } from "../lib/CategoryProvider";
 import { toast } from "sonner";
 import { Zap, Plus, ArrowLeft, Loader2, CreditCard, LayoutGrid, AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Sparkles, Target, Flame, HelpCircle } from "lucide-react";
 
 export default function TraderAdStudio() {
   const { user, profile } = useAuth();
+  const { categories } = useCategories();
+  const sortedCategoryNames = React.useMemo(
+    () =>
+      Array.from(new Set((categories || []).map((c) => c.name).filter(Boolean))).sort((a, b) =>
+        a.localeCompare(b)
+      ),
+    [categories]
+  );
   const [adverts, setAdverts] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [showRequestModal, setShowRequestModal] = useState(false);
@@ -481,16 +490,11 @@ export default function TraderAdStudio() {
                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Target Trade Category</label>
                 <select name="targetCategory" className="w-full bg-slate-50 border border-black rounded-xl px-4 h-12 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all font-medium text-slate-800">
                   <option value="all">All Trade Categories</option>
-                  <option value="Plumbing">Plumbing</option>
-                  <option value="Electrical">Electrical</option>
-                  <option value="Roofing">Roofing</option>
-                  <option value="Joinery & Carpentry">Joinery & Carpentry</option>
-                  <option value="Building & Construction">Building & Construction</option>
-                  <option value="Painting & Decorating">Painting & Decorating</option>
-                  <option value="Heating & Gas">Heating & Gas</option>
-                  <option value="Landscaping & Gardening">Landscaping & Gardening</option>
-                  <option value="Tiling">Tiling</option>
-                  <option value="Handyman">Handyman</option>
+                  {sortedCategoryNames.map((catName) => (
+                    <option key={catName} value={catName}>
+                      {catName}
+                    </option>
+                  ))}
                 </select>
                 <div className="mt-1.5">
                   <button

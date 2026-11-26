@@ -197,6 +197,8 @@ const ALLOWED_REDIRECT_PATHS = new Set([
   "/portfolio",
   "/profile",
   "/banner-ads",
+  "/trader/banner-ads",
+  "/ad-studio",
   "/billing",
   "/payment-success",
   "/payment-failed",

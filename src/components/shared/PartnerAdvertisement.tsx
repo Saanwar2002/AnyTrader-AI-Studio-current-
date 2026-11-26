@@ -7,21 +7,21 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
-  collection, query, where, onSnapshot, doc, setDoc, updateDoc, increment, 
-  addDoc, serverTimestamp 
+  collection, query, where, limit, onSnapshot, doc 
 } from "firebase/firestore";
 import { db, auth } from "../../firebase";
-import { cn } from "../../lib/utils";
+import { cn, getOutwardPostcode } from "../../lib/utils";
 import { openSafeExternalUrl } from "../../lib/safeExternalUrl";
+import { FlexiPayMode, resolveFlexiPayMode } from "../../lib/marketplaceContracts";
 import { useAuth } from "../AuthProvider";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { INITIAL_MOCK_TRADERS, Tradesperson } from "../../services/seedService";
+import type { Tradesperson } from "../../services/seedService";
 import { IllustratedAdTicker } from "./IllustratedAdTicker";
 
 const iconMap: Record<string, any> = {
   Zap, Briefcase, ShieldCheck, Star, Gift, ShieldAlert, Award, 
-  FileText, Tag, Percent, Wrench, Flame, ShoppingBag, CreditCard, UserCheck
+  FileText, Tag, Percent, Wrench, Flame, ShoppingBag, CreditCard, UserCheck, Sparkles
 };
 
 export interface PartnerAdItem {
@@ -42,6 +42,7 @@ export interface PartnerAdItem {
   advertiserName?: string;
   advertiserId?: string;
   advertiserUid?: string;
+  targetProfileId?: string;
   imageUrl?: string;
   clicks?: number;
   bannerClicks?: number;
@@ -58,251 +59,115 @@ export interface PartnerAdItem {
   endDate?: any;
 }
 
-// Built-in Default Homeowner Advertisements & Deals (Curated for Domestic Homeowners)
+// First-party fallback cards shown only when no live paid campaigns match (zero fictional profiles or fake promo codes)
 const DEFAULT_HOMEOWNER_ADVERTS: PartnerAdItem[] = [
   {
-    id: "homeowner-trader-1",
-    advertiserUid: "seed-promoted-plumber",
-    title: "Elite Pro Plumbing & Heating 24/7",
-    description: "Gas Safe Master Plumber. 24/7 emergency burst pipe, boiler & leak repairs in 45 mins.",
-    url: "/profile/seed-promoted-plumber",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-sky-950 to-slate-900",
-    iconName: "Flame",
-    targetRole: "homeowner",
-    targetCategories: ["Plumbing", "Gas & Heating", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "⚡ 45-Min Emergency Arrival",
-    advertiserName: "Marcus Vance"
-  },
-  {
-    id: "homeowner-trader-2",
-    advertiserUid: "seed-promoted-builder",
-    title: "Apex Master Builders & Roofing",
-    description: "Master Builder extensions, loft conversions, structural steel & roof restorations.",
-    url: "/profile/seed-promoted-builder",
+    id: "homeowner-discover-1",
+    title: "Browse Verified Local Tradespeople",
+    description: "Compare verified UK trades across 96+ categories with transparent reviews, badges, and direct quote requests.",
+    url: "/find-trades",
     bgColor: "bg-slate-900",
     gradient: "from-slate-950 via-blue-950 to-slate-900",
-    iconName: "Briefcase",
-    targetRole: "homeowner",
-    targetCategories: ["Builder", "Roofing Services", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "⭐ Federation of Master Builders",
-    advertiserName: "Liam Gallagher"
-  },
-  {
-    id: "homeowner-trader-3",
-    advertiserUid: "seed-promoted-electrician",
-    title: "VoltMaster Electrical & EV Charging",
-    description: "NICEIC Approved Contractors. EV charger installations & 18th edition consumer unit upgrades.",
-    url: "/profile/seed-promoted-electrician",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-indigo-950 to-slate-900",
-    iconName: "Zap",
-    targetRole: "homeowner",
-    targetCategories: ["Electrical", "Smart Home & Automation", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "⚡ NICEIC Approved & EV Specialist",
-    advertiserName: "Sarah Jenkins"
-  },
-  {
-    id: "homeowner-trader-4",
-    advertiserUid: "seed-promoted-locksmith",
-    title: "24/7 Rapid Master Locksmiths",
-    description: "20-minute emergency lockout assistance, Ultion anti-snap cylinders & high security upgrades.",
-    url: "/profile/seed-promoted-locksmith",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-amber-950 to-slate-900",
     iconName: "ShieldCheck",
     targetRole: "homeowner",
-    targetCategories: ["Locksmith", "Security Systems", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "⚡ 20-Min Mobile Lockout Arrival",
-    advertiserName: "James Miller"
+    targetCategories: ["all"],
+    type: "verified_pro",
+    badgeLabel: "ANYTRADER PROS",
+    perkText: "Verified ID, Qualifications & Insurance",
+    advertiserName: "AnyTrader Directory"
   },
   {
-    id: "homeowner-trader-5",
-    advertiserUid: "seed-promoted-decorator",
-    title: "Heritage Luxe Painting & Decorating",
-    description: "City & Guilds master painters. Heritage preservation, Farrow & Ball paint and airless spray finishes.",
-    url: "/profile/seed-promoted-decorator",
+    id: "homeowner-postjob-2",
+    title: "Post a Job Free & Get AI Price Guides",
+    description: "Describe your project once to see UK benchmark cost ranges and receive structured quotes from local trades.",
+    url: "/post-job",
     bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-rose-950 to-slate-900",
-    iconName: "Paintbrush",
-    targetRole: "homeowner",
-    targetCategories: ["Painting & Decorating", "Wallpapering", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "✨ Farrow & Ball Approved",
-    advertiserName: "Elena Rostova"
-  },
-  {
-    id: "homeowner-trader-6",
-    advertiserUid: "seed-promoted-cleaner",
-    title: "Pristine Shine Eco Cleaners",
-    description: "100% deposit-back guaranteed end of tenancy cleaning, eco carpet steam & commercial sanitation.",
-    url: "/profile/seed-promoted-cleaner",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-emerald-950 to-slate-900",
+    gradient: "from-slate-950 via-indigo-950 to-slate-900",
     iconName: "Sparkles",
     targetRole: "homeowner",
-    targetCategories: ["Domestic & Commercial Cleaning", "Carpet & Upholstery Cleaning", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "🛡️ Deposit-Back Guarantee",
-    advertiserName: "David O'Connor"
-  },
-  {
-    id: "homeowner-trader-7",
-    advertiserUid: "seed-promoted-baker",
-    title: "Artisan Sweet & Savoury Creations",
-    description: "5-Star hygiene rated luxury wedding cakes, corporate event grazing tables & private chef dining.",
-    url: "/profile/seed-promoted-baker",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-fuchsia-950 to-slate-900",
-    iconName: "Cake",
-    targetRole: "homeowner",
-    targetCategories: ["Cake Maker & Baker", "Catering & Private Chef", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "🍰 5-Star FSA Hygiene Rated",
-    advertiserName: "Chloe Dupont"
-  },
-  {
-    id: "homeowner-trader-8",
-    advertiserUid: "seed-promoted-tailor",
-    title: "Savile & Stitch Master Tailoring & Alterations",
-    description: "Savile Row trained master tailor & seamstress. Bespoke suit fitting, bridal alterations, leather repairs & steam pressing.",
-    url: "/profile/seed-promoted-tailor",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-teal-950 to-slate-900",
-    iconName: "Scissors",
-    targetRole: "homeowner",
-    targetCategories: ["Tailoring, Alterations & Laundry Services", "Bespoke Tailoring", "Garment Alterations", "all"],
-    type: "trader_promo",
-    badgeLabel: "FEATURED PRO",
-    perkText: "🧵 Savile Row Trained Master Tailor",
-    advertiserName: "Amira Hassan"
-  },
-  {
-    id: "homeowner-bg-1",
-    title: "British Gas HomeCare & Boiler Cover",
-    description: "24/7 emergency heating & plumbing breakdown cover from £13/mo. Zero excess on first callout.",
-    url: "https://www.britishgas.co.uk/homecare",
-    bgColor: "bg-slate-900",
-    gradient: "from-slate-950 via-sky-950 to-slate-900",
-    iconName: "Flame",
-    targetRole: "homeowner",
-    targetCategories: ["Heating & Gas", "Boiler Service & Repair", "Plumbing", "Central Heating"],
+    targetCategories: ["all"],
     type: "partner",
-    voucherCode: "HOMECARE24",
-    badgeLabel: "PROMOTED AD",
-    perkText: "0% Excess First Callout",
-    advertiserName: "British Gas"
+    badgeLabel: "FREE TO POST",
+    perkText: "Milestone Escrow Payment Protection",
+    advertiserName: "AnyTrader"
   },
   {
-    id: "homeowner-bnq-2",
-    title: "B&Q Club · Home & Garden Savings",
-    description: "Get £10 off your next £75+ purchase on home decor, bathroom suites, and garden power tools.",
-    url: "https://www.diy.com",
-    bgColor: "bg-orange-950",
-    gradient: "from-orange-950 via-amber-950 to-slate-950",
-    iconName: "ShoppingBag",
+    id: "homeowner-passport-3",
+    title: "Digital Property Passport & Compliance",
+    description: "Track EPC, CP12 Gas Safety & EICR certificates, maintenance history, and 1-tap trade dispatch in one place.",
+    url: "/portfolio",
+    bgColor: "bg-slate-900",
+    gradient: "from-slate-950 via-emerald-950 to-slate-900",
+    iconName: "FileText",
     targetRole: "homeowner",
-    targetCategories: ["Gardening & Landscaping", "Bathrooms", "Kitchens", "Painting & Decorating"],
-    type: "voucher",
-    voucherCode: "ANYHOME10",
-    badgeLabel: "PARTNER OFFER",
-    perkText: "£10 Off £75+ Spend",
-    advertiserName: "B&Q"
+    targetCategories: ["all"],
+    type: "partner",
+    badgeLabel: "HOME TOOLKIT",
+    perkText: "Automated Renewal Alerts",
+    advertiserName: "AnyTrader Passports"
   },
   {
     id: "homeowner-flexipay-4",
-    title: "FlexiPay 0% Repair Financing",
-    description: "Spread urgent boiler, roofing, or electrical repair costs (£1,000+) over 3-12 months at 0% APR.",
-    url: "/post-job",
+    title: "FlexiPay Major Repair Financing",
+    description: "Spread eligible £1,000+ home repair costs over manageable monthly instalments.",
+    url: "/billing",
     bgColor: "bg-emerald-950",
     gradient: "from-emerald-950 via-teal-950 to-slate-950",
     iconName: "CreditCard",
     targetRole: "homeowner",
-    targetCategories: ["Roofing", "Electrical", "Heating & Gas", "Building & Construction"],
+    targetCategories: ["Roofing", "Electrical", "Heating & Gas", "Building & Construction", "all"],
     type: "financing",
-    voucherCode: "FLEXI0APR",
-    badgeLabel: "PROMOTED AD",
-    perkText: "0% APR on 3-12 Mos",
-    advertiserName: "FlexiPay"
+    badgeLabel: "FLEXIPAY",
+    perkText: "Monthly Instalment Plans",
+    advertiserName: "AnyTrader FlexiPay"
   }
 ];
 
-// Built-in Default Tradesperson Advertisements & Supplies (For Contractors & Trades)
 const DEFAULT_TRADESPERSON_ADVERTS: PartnerAdItem[] = [
   {
-    id: "trade-toolstation-1",
-    title: "Toolstation Next Day Trade Delivery",
-    description: "Get 10% off your first Trade Account order + free next day site delivery over £25.",
-    url: "https://www.toolstation.com",
+    id: "trade-zerolead-1",
+    title: "Zero Upfront Lead Fees on AnyTrader",
+    description: "Quote directly on local homeowner jobs without buying leads. Pay platform fees only when jobs complete.",
+    url: "/job-feed",
     bgColor: "bg-blue-950",
     gradient: "from-blue-950 via-slate-900 to-sky-950",
     iconName: "Briefcase",
     targetRole: "tradesperson",
     targetCategories: ["all"],
-    type: "voucher",
-    voucherCode: "TOOLTRADE10",
-    badgeLabel: "PROMOTED AD",
-    perkText: "10% Off 1st Order",
-    advertiserName: "Toolstation"
+    type: "partner",
+    badgeLabel: "TRADEOS",
+    perkText: "Direct Client Messaging & Escrow",
+    advertiserName: "AnyTrader TradeOS"
   },
   {
-    id: "trade-screwfix-2",
-    title: "Screwfix Trade Pro Exclusive",
-    description: "Unlock trade exclusive pricing, Sprint 60-min rapid courier delivery & bulk volume discounts.",
-    url: "https://www.screwfix.com",
-    bgColor: "bg-red-950",
-    gradient: "from-red-950 via-slate-900 to-amber-950",
+    id: "trade-promote-2",
+    title: "Feature Your Business at the Top",
+    description: "Launch a flat-rate £2.00/day local banner promotion or CPC search campaign with full click analytics.",
+    url: "/trader/banner-ads",
+    bgColor: "bg-slate-900",
+    gradient: "from-slate-950 via-amber-950 to-slate-900",
     iconName: "Zap",
     targetRole: "tradesperson",
     targetCategories: ["all"],
-    type: "partner",
-    voucherCode: "SCREWPRO",
-    badgeLabel: "PROMOTED AD",
-    perkText: "Sprint 60m Delivery",
-    advertiserName: "Screwfix"
+    type: "business",
+    badgeLabel: "AD STUDIO",
+    perkText: "Pause or Adjust Anytime",
+    advertiserName: "AnyTrader Ad Studio"
   },
   {
-    id: "trade-selco-3",
-    title: "Selco Builders Warehouse",
-    description: "Huge savings on bulk plasterboard, C16/C24 timber, bricks, sand & ready-mix cement bags.",
-    url: "https://www.selcobw.com",
+    id: "trade-verify-3",
+    title: "Boost Trust with Video Verification",
+    description: "Upload a short credential intro video and verified compliance documents to stand out on homeowner quotes.",
+    url: "/profile",
     bgColor: "bg-emerald-950",
     gradient: "from-emerald-950 via-slate-900 to-teal-950",
     iconName: "ShieldCheck",
     targetRole: "tradesperson",
-    targetCategories: ["Building & Construction", "Plastering", "Carpentry & Joinery"],
-    type: "partner",
-    voucherCode: "SELCOTRADE",
-    badgeLabel: "PROMOTED AD",
-    perkText: "Free Site Delivery > £100",
-    advertiserName: "Selco"
-  },
-  {
-    id: "trade-tradepoint-4",
-    title: "TradePoint at B&Q · Pro Cards",
-    description: "Exclusive member trade rates across power tools, fixings, building materials & plumbing packs.",
-    url: "https://www.trade-point.co.uk",
-    bgColor: "bg-orange-950",
-    gradient: "from-orange-950 via-slate-900 to-amber-950",
-    iconName: "Tag",
-    targetRole: "tradesperson",
     targetCategories: ["all"],
-    type: "partner",
-    voucherCode: "TRADEPOINT",
-    badgeLabel: "PROMOTED AD",
-    perkText: "Pro Card Discounts",
-    advertiserName: "TradePoint"
+    type: "verified_pro",
+    badgeLabel: "VERIFIED PRO",
+    perkText: "Stand Out in Local Search",
+    advertiserName: "AnyTrader Verification"
   }
 ];
 
@@ -323,15 +188,10 @@ export default function PartnerAdvertisement({
   const [currentIndex, setCurrentIndex] = useState(0);
   const [rotationSpeed, setRotationSpeed] = useState(7000); // 7s comfortable read time
   const [isBannerAdsEnabled, setIsBannerAdsEnabled] = useState(true);
+  const [flexiPayMode, setFlexiPayMode] = useState<FlexiPayMode>("coming_soon");
   const [isPaused, setIsPaused] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-  const [tradersMap, setTradersMap] = useState<Record<string, Tradesperson>>(() => {
-    const initialMap: Record<string, Tradesperson> = {};
-    INITIAL_MOCK_TRADERS.forEach((t: any) => {
-      if (t.uid) initialMap[t.uid] = t;
-    });
-    return initialMap;
-  });
+  const [tradersMap, setTradersMap] = useState<Record<string, Tradesperson>>({});
 
   // Touch Swipe Handling
   const touchStartXRef = useRef<number | null>(null);
@@ -340,13 +200,10 @@ export default function PartnerAdvertisement({
   useEffect(() => {
     let isMounted = true;
 
-    // 0. Fetch live tradespeople to enrich promoted trader profiles
-    const unsubTraders = onSnapshot(query(collection(db, "public_profiles")), (snapshot) => {
+    // 0. Fetch bounded set of live tradespeople to enrich promoted trader profiles
+    const unsubTraders = onSnapshot(query(collection(db, "public_profiles"), limit(150)), (snapshot) => {
       if (!isMounted) return;
       const map: Record<string, Tradesperson> = {};
-      INITIAL_MOCK_TRADERS.forEach((t: any) => {
-        if (t.uid) map[t.uid] = t;
-      });
       snapshot.docs.forEach(d => {
         map[d.id] = { uid: d.id, ...d.data() } as Tradesperson;
       });
@@ -355,7 +212,7 @@ export default function PartnerAdvertisement({
       console.warn("Tradespeople query notice:", error);
     });
 
-    // 1. Global config (ad rotation speed)
+    // 1. Global config (ad rotation speed & launch flags)
     const unsubConfig = onSnapshot(doc(db, "platform_config", "global"), (docSnapshot) => {
       if (!isMounted) return;
       if (docSnapshot.exists()) {
@@ -363,6 +220,7 @@ export default function PartnerAdvertisement({
         if (config.adRotationSpeedSeconds) {
           setRotationSpeed(Math.max(5, config.adRotationSpeedSeconds) * 1000);
         }
+        setFlexiPayMode(resolveFlexiPayMode(config));
       }
     }, (error) => {
       console.warn("Platform Config Notice:", error);
@@ -381,7 +239,8 @@ export default function PartnerAdvertisement({
     // 3. Live public advertisements projection query (non-sensitive public fields only)
     const adsQuery = query(
       collection(db, "public_ads"),
-      where("isActive", "==", true)
+      where("isActive", "==", true),
+      limit(50)
     );
     const unsubs = onSnapshot(adsQuery, (snapshot) => {
       if (!isMounted) return;
@@ -425,8 +284,10 @@ export default function PartnerAdvertisement({
     };
   }, [role, category]);
 
-  // Combine live database ads with curated default promotions
-  const defaultList = role === "homeowner" ? DEFAULT_HOMEOWNER_ADVERTS : DEFAULT_TRADESPERSON_ADVERTS;
+  // Combine live database ads with honest first-party defaults (respecting FlexiPay launch control)
+  const defaultList = (role === "homeowner" ? DEFAULT_HOMEOWNER_ADVERTS : DEFAULT_TRADESPERSON_ADVERTS).filter(
+    (ad) => ad.type !== "financing" || flexiPayMode === "live"
+  );
   
   // Intelligent Job-Status & Category Targeting Engine:
   // Sorts ads so that offers matching the homeowner's active posted jobs or viewed categories appear first!
@@ -475,9 +336,9 @@ export default function PartnerAdvertisement({
   if (!isBannerAdsEnabled || displayAdverts.length === 0) return null;
 
   const currentAd = displayAdverts[currentIndex % displayAdverts.length];
-  const linkedTraderUid = currentAd.advertiserUid || currentAd.advertiserId;
-  const linkedTrader = linkedTraderUid ? (tradersMap[linkedTraderUid] || INITIAL_MOCK_TRADERS.find((t: any) => t.uid === linkedTraderUid)) : undefined;
-  const isPromotedTrader = !!linkedTrader || currentAd.isTraderAd || !!currentAd.advertiserUid;
+  const linkedTraderUid = currentAd.targetProfileId || currentAd.advertiserUid || currentAd.advertiserId;
+  const linkedTrader = linkedTraderUid ? tradersMap[linkedTraderUid] : undefined;
+  const isPromotedTrader = !!linkedTrader || currentAd.isTraderAd || !!currentAd.targetProfileId || !!currentAd.advertiserUid;
 
   const displayTitle = currentAd.title || linkedTrader?.businessName || linkedTrader?.name || "Verified Trade Specialist";
   const displayTagline = currentAd.description || (currentAd as any).tagline || linkedTrader?.bio || (linkedTrader as any)?.miniProfileSettings?.extraInfo || "Top-rated local verified trade professional with upfront pricing and guaranteed workmanship.";
@@ -523,9 +384,9 @@ export default function PartnerAdvertisement({
     }
 
     // Instant zero-latency navigation logic: internal app routes vs external websites
-    const traderUid = clickedAd.advertiserUid || (clickedAd as any).advertiserId;
+    const traderUid = clickedAd.targetProfileId || clickedAd.advertiserUid || (clickedAd as any).advertiserId;
     const isTraderAd = !!traderUid || clickedAd.isTraderAd || clickedAd.type === "trader_promo";
-    const resolvedTrader = traderUid ? (tradersMap[traderUid] || INITIAL_MOCK_TRADERS.find((t: any) => t.uid === traderUid)) : linkedTrader;
+    const resolvedTrader = traderUid ? tradersMap[traderUid] : linkedTrader;
 
     // 1. If it's a trader ad or has a traderUid, navigate directly to their public profile with pre-hydrated profile!
     if (isTraderAd && traderUid) {
@@ -537,13 +398,13 @@ export default function PartnerAdvertisement({
     if (targetUrl.includes("/profile/")) {
       const profilePart = targetUrl.substring(targetUrl.indexOf("/profile/"));
       const extractedUid = profilePart.replace("/profile/", "").split("?")[0].split("#")[0];
-      const extractedTrader = extractedUid ? (tradersMap[extractedUid] || INITIAL_MOCK_TRADERS.find((t: any) => t.uid === extractedUid)) : resolvedTrader;
+      const extractedTrader = extractedUid ? tradersMap[extractedUid] : resolvedTrader;
       navigate(profilePart, { state: { initialProfile: extractedTrader } });
       return;
     }
 
     if (!targetUrl) {
-      targetUrl = isTraderAd ? `/profile/${traderUid || 'seed-promoted-plumber'}` : "/find-trades";
+      targetUrl = traderUid ? `/profile/${traderUid}` : "/find-trades";
     }
 
     if (targetUrl.startsWith("/")) {
@@ -797,7 +658,7 @@ export default function PartnerAdvertisement({
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" /> 
                     <span className="truncate">
                       Verified Pro
-                      {linkedTrader?.postcode ? ` · ${linkedTrader.postcode.substring(0, 4)}` : ""}
+                      {linkedTrader?.postcode ? ` · ${getOutwardPostcode(linkedTrader.postcode)}` : ""}
                       {(linkedTrader as any)?.miniProfileSettings?.callOutFee ? ` · £${(linkedTrader as any).miniProfileSettings.callOutFee} Callout` : " · Free Quote"}
                     </span>
                   </span>

@@ -1,15 +1,17 @@
 import React, { useEffect, useState } from "react";
-import { db, collection, collectionGroup, query, where, orderBy, onSnapshot, handleFirestoreError, OperationType, doc, getDoc, updateDoc, serverTimestamp, arrayUnion } from "@/src/firebase";
+import { db, collection, collectionGroup, query, where, orderBy, onSnapshot, handleFirestoreError, OperationType, doc, getDoc } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
-import { withdrawQuoteViaCommand } from "../services/quoteCommandService.ts";
+import { withdrawQuoteViaCommand, deleteQuoteViaCommand } from "../services/quoteCommandService.ts";
 import { motion, AnimatePresence } from "motion/react";
 import { PoundSterling, Clock, MapPin, ChevronRight, AlertCircle, CheckCircle2, XCircle, Briefcase, Trash2, Sparkles, Calendar, FileSpreadsheet } from "lucide-react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { cn } from "@/src/lib/utils";
+import { formatQuoteScopeLabel } from "@/src/lib/marketplaceContracts";
 import { exportInvoicesToSheets } from "@/src/services/googleSheetsService";
+import { toast } from "sonner";
 
 export default function MyQuotes() {
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
   const [quotes, setQuotes] = useState<any[]>([]);
   const [recurringSchedules, setRecurringSchedules] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -29,17 +31,23 @@ export default function MyQuotes() {
   const handleExportQuotesToSheets = async () => {
     if (quotes.length === 0) return;
     setIsExportingSheets(true);
+    const isVatRegistered = Boolean(profile?.vatRegistered || profile?.vatNumber);
 
-    const formatted = quotes.map(q => ({
-      dateCreated: q.createdAt?.toDate ? new Date(q.createdAt.toDate()).toISOString() : new Date().toISOString(),
-      ref: q.id || 'QUOTE-REF',
-      clientName: jobs[q.jobId]?.clientName || 'Client',
-      serviceDescription: jobs[q.jobId]?.title || q.quoteScope || 'Trade Service',
-      subtotal: parseFloat(q.amount) || 0,
-      vat: Math.round((parseFloat(q.amount) || 0) * 0.2 * 100) / 100,
-      total: Math.round((parseFloat(q.amount) || 0) * 1.2 * 100) / 100,
-      status: q.status || 'Pending',
-    }));
+    const formatted = quotes.map(q => {
+      const subtotal = parseFloat(q.amount) || 0;
+      const vat = isVatRegistered ? Math.round(subtotal * 0.2 * 100) / 100 : 0;
+      const total = Math.round((subtotal + vat) * 100) / 100;
+      return {
+        dateCreated: q.createdAt?.toDate ? new Date(q.createdAt.toDate()).toISOString() : new Date().toISOString(),
+        ref: q.id || 'QUOTE-REF',
+        clientName: jobs[q.jobId]?.clientName || 'Client',
+        serviceDescription: jobs[q.jobId]?.title || formatQuoteScopeLabel(q.quoteScope) || 'Trade Service',
+        subtotal,
+        vat,
+        total,
+        status: q.status || 'Pending',
+      };
+    });
 
     const res = await exportInvoicesToSheets(formatted);
     setIsExportingSheets(false);
@@ -54,21 +62,17 @@ export default function MyQuotes() {
     setIsDeleting(true);
     
     try {
-      if (!deletingQuote.status || deletingQuote.status === "pending" || deletingQuote.status === "submitted" || deletingQuote.status === "requoted" || deletingQuote.status === "requote_requested") {
-        await withdrawQuoteViaCommand({
-          user: user as any,
-          jobId: deletingQuote.jobId,
-          quoteId: deletingQuote.id,
-          reason: "Deleted by tradesperson",
-        });
-      }
-      
-      // Update local state to remove the quote immediately
+      await deleteQuoteViaCommand({
+        user: user as any,
+        jobId: deletingQuote.jobId,
+        quoteId: deletingQuote.id,
+        reason: "Deleted by tradesperson",
+      });
       setQuotes(prev => prev.filter(q => q.id !== deletingQuote.id));
-    } catch (error) {
-      console.error("Error withdrawing/deleting quote:", error);
-      // Still update local UI optimistically
-      setQuotes(prev => prev.filter(q => q.id !== deletingQuote.id));
+      toast.success("Quote permanently deleted.");
+    } catch (error: any) {
+      console.error("Error deleting quote:", error);
+      toast.error(error?.message || "Failed to delete quote. Please try again.");
     } finally {
       setIsDeleting(false);
       setDeletingQuote(null);
@@ -90,7 +94,7 @@ export default function MyQuotes() {
       setQuotes(prev => prev.map(q => q.id === withdrawingQuote.id ? { ...q, status: "withdrawn", withdrawReason: withdrawReason.trim() } : q));
     } catch (error: any) {
       console.error("Error withdrawing quote:", error);
-      alert(error?.message || "Failed to withdraw quote. Please try again.");
+      toast.error(error?.message || "Failed to withdraw quote. Please try again.");
     } finally {
       setWithdrawingQuote(null);
       setWithdrawReason("");
@@ -168,8 +172,19 @@ export default function MyQuotes() {
           }
           setJobsLoading(false);
         },
-        (error) => {
-          console.error(`Error listening to parent job ${jobId}:`, error);
+        async () => {
+          // Non-assigned traders cannot read private jobs/{jobId}; fall back cleanly to public_job_cards/{jobId}
+          try {
+            const cardSnap = await getDoc(doc(db, "public_job_cards", jobId));
+            if (cardSnap.exists()) {
+              setJobs((prev) => ({
+                ...prev,
+                [jobId]: { id: cardSnap.id, ...cardSnap.data() },
+              }));
+            }
+          } catch {
+            // Card may no longer be public (e.g. awarded to another trader)
+          }
           setJobsLoading(false);
         }
       )
@@ -434,7 +449,7 @@ export default function MyQuotes() {
                     )}
                     {quote.quoteScope && (
                       <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full uppercase tracking-tight border border-indigo-100">
-                        {quote.quoteScope.replace('_', ' ')}
+                        {formatQuoteScopeLabel(quote.quoteScope)}
                       </span>
                     )}
                   </div>
@@ -460,7 +475,7 @@ export default function MyQuotes() {
               <div className="hidden sm:block">
                 <ChevronRight className="w-6 h-6 text-slate-300 group-hover:text-blue-600 transition-colors" />
               </div>
-              {quote.status === "pending" && (
+              {["pending", "requoted", "requote_requested"].includes(quote.status) && (
                 <button
                   onClick={(e) => {
                     e.preventDefault();

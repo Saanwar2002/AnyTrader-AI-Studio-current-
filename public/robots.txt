@@ -1,5 +1,6 @@
 User-agent: *
 Allow: /
-
-# Sitemaps
-Sitemap: https://anytrader.uk/sitemap.xml
+Disallow: /admin
+Disallow: /login
+Disallow: /api/
+Disallow: /ad-report/

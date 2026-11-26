@@ -1,4 +1,5 @@
 import React, { useState, useEffect, lazy, Suspense } from "react";
+import { useSearchParams } from "react-router-dom";
 const AnyTraderAdmin = lazy(() => import("./AnyTraderAdmin"));
 const AnyRollerAdmin = lazy(() => import("./AnyRollerAdmin"));
 import { useAuth } from "./AuthProvider";
@@ -19,15 +20,8 @@ import {
 export default function MasterAdminLayout() {
   const { user, profile } = useAuth();
   
-  // Admin auth config state
-  const [adminConfig, setAdminConfig] = useState<MasterAdminAuthConfig>(() => {
-    try {
-      const cached = localStorage.getItem("master_admin_auth_config");
-      return cached ? JSON.parse(cached) : DEFAULT_MASTER_ADMIN_CONFIG;
-    } catch {
-      return DEFAULT_MASTER_ADMIN_CONFIG;
-    }
-  });
+  // Admin auth config state (loaded strictly from Firestore system_settings/master_admin_auth — never localStorage)
+  const [adminConfig, setAdminConfig] = useState<MasterAdminAuthConfig>(DEFAULT_MASTER_ADMIN_CONFIG);
 
   // Strict admin authorization and custom claim check
   const [hasAdminClaim, setHasAdminClaim] = useState<boolean>(false);
@@ -73,7 +67,15 @@ export default function MasterAdminLayout() {
   const [loginAudits, setLoginAudits] = useState<AdminLoginAudit[]>([]);
 
   // Tabs: 'super_admin', 'anytrader', 'anyroller'
+  const [searchParams] = useSearchParams();
+  const urlTab = searchParams.get("tab");
   const [activePortal, setActivePortal] = useState<"super_admin" | "anytrader" | "anyroller">("anytrader");
+
+  useEffect(() => {
+    if (urlTab && activePortal !== "anytrader") {
+      setActivePortal("anytrader");
+    }
+  }, [urlTab]);
 
   const [metrics, setMetrics] = useState({
     totalUsers: 0,
@@ -106,7 +108,7 @@ export default function MasterAdminLayout() {
         // Fresh if authenticated in the last 10 minutes (600s)
         const isFresh = authTimeSec > 0 && (nowSec - authTimeSec) < 600;
         setAuthFresh(isFresh);
-        if (isFresh && (isAdmin || isAuthorizedAdminEmail(user.email, adminConfig))) {
+        if (isFresh && isAdmin) {
           setIsUnlocked(true);
         }
       } catch (err) {
@@ -116,7 +118,7 @@ export default function MasterAdminLayout() {
       }
     };
     checkClaimsAndFreshness();
-  }, [user, adminConfig]);
+  }, [user]);
 
   // Presentation-only UI authorization flag for Master Admin Console.
   // CRITICAL SECURITY BOUNDARY: This boolean controls client route presentation and navigation ONLY.
@@ -126,14 +128,13 @@ export default function MasterAdminLayout() {
   const canRenderAdminUi = Boolean(
     hasAdminClaim ||
     profile?.role === "admin" ||
-    profile?.role === "ecosystem_manager" ||
-    isAuthorizedAdminEmail(user?.email, adminConfig)
+    profile?.role === "ecosystem_manager"
   );
   const isAuthorizedAdmin = canRenderAdminUi;
 
-  // Load configured Admin Auth from Firestore or local fallback
+  // Load configured Admin Auth strictly from Firestore (no browser localStorage trust)
   useEffect(() => {
-    if (!user) return;
+    if (!user || !canRenderAdminUi) return;
 
     const unsubAdminConfig = onSnapshot(doc(db, "system_settings", "master_admin_auth"), (docSnap) => {
       if (docSnap.exists()) {
@@ -153,14 +154,13 @@ export default function MasterAdminLayout() {
         setPrimaryEmail(merged.primaryAdminEmail);
         setAdditionalEmails(merged.additionalAdminEmails);
         setEnableLoginEmailAlert(merged.enableLoginEmailAlert);
-        localStorage.setItem("master_admin_auth_config", JSON.stringify(merged));
       }
     }, (err) => {
       console.debug("Admin config listener fallback note:", err);
     });
 
     return () => unsubAdminConfig();
-  }, [user]);
+  }, [user, canRenderAdminUi]);
 
   // Load platform_config / global settings
   useEffect(() => {
@@ -176,10 +176,30 @@ export default function MasterAdminLayout() {
 
   const handleSavePlatformLaunchConfig = async (newConfig: any) => {
     setIsSavingPlatformConfig(true);
+    setConfigSaveError(null);
     try {
-      await setDoc(doc(db, "platform_config", "global"), newConfig, { merge: true });
-      setPlatformConfig(newConfig);
-      setConfigSaveSuccess("Taxi launch & 'Coming Soon' settings successfully updated across the platform!");
+      const idToken = user ? await user.getIdToken() : null;
+      if (!idToken) {
+        throw new Error("Admin authentication required to publish launch controls.");
+      }
+      // Send only the changed launch control fields so the server merges cleanly
+      // without clobbering existing feeTiers, businessTiers, or paidAddons.
+      const res = await fetch("/api/admin/pricing-config/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          tempConfig: newConfig,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Failed to publish launch settings (${res.status})`);
+      }
+      setPlatformConfig((prev: any) => ({ ...(prev || {}), ...newConfig }));
+      setConfigSaveSuccess("Launch & 'Coming Soon' settings atomically published across the platform!");
       setTimeout(() => setConfigSaveSuccess(null), 4000);
     } catch (err: any) {
       handleFirestoreError(err, OperationType.WRITE, "platform_config/global");
@@ -359,26 +379,12 @@ export default function MasterAdminLayout() {
       };
 
       await setDoc(doc(db, "system_settings", "master_admin_auth"), updatedConfig, { merge: true });
-      localStorage.setItem("master_admin_auth_config", JSON.stringify(updatedConfig));
       setAdminConfig(updatedConfig);
       setConfigSaveSuccess("Admin emails and notification preferences saved successfully!");
       setTimeout(() => setConfigSaveSuccess(null), 4000);
     } catch (err: any) {
       console.error("Failed to save admin config in cloud:", err);
-      // Fallback local update
-      const updatedConfig: MasterAdminAuthConfig = {
-        ...adminConfig,
-        primaryAdminEmail: cleanPrimary,
-        additionalAdminEmails: additionalEmails.map(e => e.trim().toLowerCase()).filter(Boolean),
-        enableLoginEmailAlert,
-        alertEmailRecipients: [cleanPrimary, ...additionalEmails.map(e => e.trim().toLowerCase()).filter(Boolean)],
-        lastUpdated: new Date().toISOString(),
-        updatedBy: user?.email || cleanPrimary
-      };
-      localStorage.setItem("master_admin_auth_config", JSON.stringify(updatedConfig));
-      setAdminConfig(updatedConfig);
-      setConfigSaveSuccess("Admin settings updated locally!");
-      setTimeout(() => setConfigSaveSuccess(null), 4000);
+      setConfigSaveError("Failed to persist admin email settings: " + (err?.message || "Super Admin permissions required."));
     } finally {
       setIsSavingConfig(false);
     }
@@ -877,7 +883,7 @@ export default function MasterAdminLayout() {
                     <div className="p-4 bg-blue-50/60 border border-blue-200 rounded-2xl space-y-1">
                       <p className="text-xs font-black text-blue-900">Admin Email Access Control</p>
                       <p className="text-xs text-blue-700 leading-relaxed">
-                        Authorized admin emails can authenticate into the Master Admin Console and receive security login alerts. Changes sync across cloud and local storage.
+                        Authorized admin notification emails receive security login alerts. Changes are persisted strictly in Firestore.
                       </p>
                     </div>
 
@@ -894,7 +900,7 @@ export default function MasterAdminLayout() {
                           required
                           value={primaryEmail}
                           onChange={(e) => setPrimaryEmail(e.target.value)}
-                          placeholder="e.g. admin@tradequote.uk"
+                          placeholder="e.g. ops@anytrader.co.uk"
                           className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-black rounded-xl text-sm font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-black"
                         />
                       </div>

@@ -19,6 +19,9 @@ import { SERVER_OWNED_PROTECTED_KEYS } from "./authorization.ts";
 import { validateJobTransition, JobStatus } from "./stateMachine.ts";
 import { domainEvents } from "./domainEvents.ts";
 import { coordinateJobCancellationFinancials } from "./cancellationCoordination.ts";
+import { isCategoryRegulated } from "../lib/traderCompliance.ts";
+import { dispatchAuthoritativeFcmPush } from "./notificationEngine.ts";
+import { enqueueWhatsAppFallback } from "./whatsappNotificationEngine.ts";
 
 /**
  * Server-owned & privileged fields that clients are strictly forbidden from supplying
@@ -105,6 +108,7 @@ export interface ExecuteJobLifecycleCommandOptions {
   /** When true (e.g. HTTP server routes), require a stored users/{traderId} document to exist before StartJob */
   strictTraderProfileRequired?: boolean;
   stripe?: any;
+  messagingClient?: any;
 }
 
 export interface JobLifecycleCommandResult {
@@ -176,11 +180,24 @@ function assertAssignedTraderEligibleForStart(
     throw new ForbiddenError(`Assigned tradesperson verification status '${verificationStatus}' is not eligible to start this job.`);
   }
 
-  const explicitlyUnverified =
-    verificationStatus === "unverified" ||
-    (traderData.isVerified === false && traderData.verified === false && traderData.verifiedTrader === false);
-  if (explicitlyUnverified) {
-    throw new ForbiddenError("Assigned tradesperson lacks active verified credentials to start this job.");
+  const isProvisional = verificationStatus === "provisional";
+  if (isProvisional) {
+    if (
+      traderData.requiresAdminVerification === true ||
+      traderData.duplicatePhoneFingerprintDetected === true ||
+      isCategoryRegulated(jobData.category)
+    ) {
+      throw new ForbiddenError(
+        "Admin document verification is required before starting a regulated or flagged job."
+      );
+    }
+  } else {
+    const explicitlyUnverified =
+      verificationStatus === "unverified" ||
+      (traderData.isVerified === false && traderData.verified === false && traderData.verifiedTrader === false);
+    if (explicitlyUnverified) {
+      throw new ForbiddenError("Assigned tradesperson lacks active verified credentials to start this job.");
+    }
   }
 
   const nowMs = Date.now();
@@ -216,7 +233,7 @@ function assertAssignedTraderEligibleForStart(
 export async function executeJobLifecycleCommand(
   options: ExecuteJobLifecycleCommandOptions
 ): Promise<JobLifecycleCommandResult> {
-  const { db, identity, command, idempotencyKey, strictTraderProfileRequired = false, stripe } = options;
+  const { db, identity, command, idempotencyKey, strictTraderProfileRequired = false, stripe, messagingClient } = options;
 
   if (!db) {
     throw new BadRequestError("Database service is not initialized");
@@ -404,6 +421,25 @@ export async function executeJobLifecycleCommand(
           traderRevalidatedAt: nowIso,
           updatedAt: nowIso,
         };
+
+        // Atomic homeowner start notification (Slice 4)
+        if (ownerUid && ownerUid !== identity.uid) {
+          pendingExtraWrites.push(() => {
+            transaction.set(
+              db.collection("notifications").doc(`job_start_${jobId}_${ownerUid}`),
+              {
+                userId: ownerUid,
+                title: "Job Started!",
+                message: `Your assigned tradesperson has started work on "${jobData.title || `#${jobId}`}".`,
+                type: "status",
+                read: false,
+                jobId,
+                link: `/job/${jobId}`,
+                createdAt: nowIso,
+              }
+            );
+          });
+        }
         break;
       }
 
@@ -479,6 +515,31 @@ export async function executeJobLifecycleCommand(
             }
           });
         }
+
+        // Atomic counterparty completion notification (Slice 4)
+        const completeRecipients = [ownerUid, assignedTraderId].filter(
+          (uid) => uid && uid !== identity.uid
+        );
+        for (const recipientUid of new Set(completeRecipients)) {
+          const isRecipientTrader = recipientUid === assignedTraderId;
+          pendingExtraWrites.push(() => {
+            transaction.set(
+              db.collection("notifications").doc(`job_complete_${jobId}_${recipientUid}`),
+              {
+                userId: recipientUid,
+                title: isRecipientTrader ? "Job Completed!" : "Work Completed & Payment Requested",
+                message: isRecipientTrader
+                  ? `The homeowner has marked "${jobData.title || `#${jobId}`}" as completed. You can now leave a review.`
+                  : `The tradesperson has marked "${jobData.title || `#${jobId}`}" as completed. Please review the work and complete payment.`,
+                type: "status",
+                read: false,
+                jobId,
+                link: `/job/${jobId}`,
+                createdAt: nowIso,
+              }
+            );
+          });
+        }
         break;
       }
 
@@ -532,16 +593,24 @@ export async function executeJobLifecycleCommand(
         validateJobTransition(currentStatus, targetStatus);
 
         const disputeReason = (rawPayload.reason || rawPayload.disputeReason || "Dispute raised by participant").toString().substring(0, 1000);
+        const technicalFaultReport = rawPayload.technicalFaultReport
+          ? String(rawPayload.technicalFaultReport).trim().substring(0, 2000)
+          : undefined;
+        const existingDispute =
+          jobData.dispute && typeof jobData.dispute === "object" ? jobData.dispute : {};
 
         updateData = {
           status: targetStatus,
-          disputedAt: nowIso,
+          disputedAt: jobData.disputedAt || nowIso,
           disputeReason,
+          ...(technicalFaultReport ? { technicalFaultReport } : {}),
           dispute: {
-            status: "opened",
-            raisedBy: identity.uid,
+            ...existingDispute,
+            status: existingDispute.status && existingDispute.status !== "none" ? existingDispute.status : "opened",
+            raisedBy: existingDispute.raisedBy || identity.uid,
             reason: disputeReason,
-            createdAt: nowIso,
+            ...(technicalFaultReport ? { technicalFaultReport } : {}),
+            createdAt: existingDispute.createdAt || nowIso,
           },
           updatedAt: nowIso,
         };
@@ -651,6 +720,60 @@ export async function executeJobLifecycleCommand(
       rawIdempotencyKey,
       db
     );
+
+    // Non-blocking FCM push & WhatsApp fallback for StartJob / CompleteJob
+    if (commandType === "StartJob" || commandType === "CompleteJob") {
+      try {
+        const jobSnapData = transactionResult.job || {};
+        const ownerId = jobSnapData.homeownerId || jobSnapData.userId || jobSnapData.ownerId || "";
+        const traderId =
+          jobSnapData.acceptedTradespersonId || jobSnapData.acceptedTraderId || jobSnapData.tradespersonId || jobSnapData.traderId || "";
+        const targets =
+          commandType === "StartJob"
+            ? [ownerId].filter((u) => u && u !== identity.uid)
+            : [ownerId, traderId].filter((u) => u && u !== identity.uid);
+
+        for (const recipientUid of new Set(targets)) {
+          const isStart = commandType === "StartJob";
+          const isRecipientTrader = recipientUid === traderId;
+          const title = isStart
+            ? "Job Started!"
+            : isRecipientTrader
+              ? "Job Completed!"
+              : "Work Completed & Payment Requested";
+          const body = isStart
+            ? `Your assigned tradesperson has started work on "${jobSnapData.title || `#${jobId}`}".`
+            : isRecipientTrader
+              ? `The homeowner has marked "${jobSnapData.title || `#${jobId}`}" as completed. You can now leave a review.`
+              : `The tradesperson has marked "${jobSnapData.title || `#${jobId}`}" as completed. Please review the work and complete payment.`;
+          const notifId = isStart ? `job_start_${jobId}_${recipientUid}` : `job_complete_${jobId}_${recipientUid}`;
+
+          if (messagingClient) {
+            dispatchAuthoritativeFcmPush(db, messagingClient, {
+              recipientId: recipientUid,
+              title,
+              body,
+              channelId: "job_leads",
+              notificationId: notifId,
+              eventType: "status",
+              data: { link: `/job/${jobId}`, jobId, type: "status" },
+            }).catch(() => {});
+          }
+          enqueueWhatsAppFallback(db, {
+            recipientUid,
+            senderUid: identity.uid,
+            senderLabel: title,
+            contextId: jobId,
+            contextType: "anytrader_job",
+            contextSummary: body,
+            deepLinkPath: `/job/${jobId}`,
+            notificationId: notifId,
+          }).catch(() => {});
+        }
+      } catch {
+        // Non-blocking external push dispatch
+      }
+    }
   }
 
   return transactionResult;
@@ -740,4 +863,291 @@ export const executeStartJobCommand = startJobViaCommand;
 export const executeCompleteJobCommand = completeJobViaCommand;
 export const executeCancelJobCommand = cancelJobViaCommand;
 export const executeDisputeJobCommand = disputeJobViaCommand;
+
+export type JobScheduleActionType =
+  | "propose_reschedule"
+  | "accept_reschedule"
+  | "reject_reschedule"
+  | "confirm_booking";
+
+export interface ExecuteJobScheduleActionOptions {
+  db: any;
+  identity: CanonicalIdentity;
+  jobId: string;
+  action: JobScheduleActionType;
+  proposedDate?: string;
+  reason?: string;
+  messagingClient?: any;
+}
+
+/**
+ * Server-Authoritative Job Scheduling & Reschedule Command (Slice 3)
+ * Atomically updates job schedule status AND the assigned tradesperson's
+ * calendar `dateOverrides` via Admin SDK (preventing client cross-user
+ * permission-denied failures) and dispatches counterparty notifications.
+ */
+export async function executeJobScheduleActionCommand(
+  options: ExecuteJobScheduleActionOptions
+): Promise<{
+  success: true;
+  jobId: string;
+  action: JobScheduleActionType;
+  scheduledDate?: string | null;
+  isConfirmedByTradesperson?: boolean;
+  rescheduleProposal?: Record<string, any> | null;
+  calendarSynced: boolean;
+}> {
+  const { db, identity, jobId, action, proposedDate, reason, messagingClient } = options;
+
+  if (!db) {
+    throw new BadRequestError("Database service is not initialized.");
+  }
+  if (!identity || !identity.uid) {
+    throw new ForbiddenError("Authentication required.");
+  }
+  if (!jobId || typeof jobId !== "string") {
+    throw new BadRequestError("Valid jobId is required.");
+  }
+
+  const validActions = new Set<JobScheduleActionType>([
+    "propose_reschedule",
+    "accept_reschedule",
+    "reject_reschedule",
+    "confirm_booking",
+  ]);
+  if (!validActions.has(action)) {
+    throw new BadRequestError(
+      "action must be one of 'propose_reschedule', 'accept_reschedule', 'reject_reschedule', or 'confirm_booking'."
+    );
+  }
+
+  const isAdmin =
+    identity.accountType === "admin" ||
+    (identity as any).isAdmin === true ||
+    (identity as any).role === "admin";
+  const nowIso = new Date().toISOString();
+  const jobRef = db.collection("jobs").doc(jobId);
+
+  const txResult = await db.runTransaction(async (transaction: any) => {
+    const jobSnap = await transaction.get(jobRef);
+    if (!jobSnap.exists) {
+      throw new NotFoundError(`Job '${jobId}' was not found.`);
+    }
+
+    const jobData = jobSnap.data() || {};
+    const homeownerId = jobData.homeownerId || jobData.userId || jobData.ownerId || jobData.customerId;
+    const tradespersonId = jobData.acceptedTradespersonId || jobData.acceptedTraderId || jobData.tradespersonId;
+    const isHomeowner = Boolean(homeownerId && identity.uid === homeownerId);
+    const isTradesperson = Boolean(tradespersonId && identity.uid === tradespersonId);
+
+    if (!isHomeowner && !isTradesperson && !isAdmin) {
+      throw new ForbiddenError("Only the job homeowner or assigned tradesperson can manage scheduling.");
+    }
+
+    const jobStatus = String(jobData.status || "").toLowerCase();
+    if (!["accepted", "in_progress"].includes(jobStatus)) {
+      throw new ConflictError(`Scheduling actions are not allowed while job is in '${jobStatus}' status.`);
+    }
+
+    const traderRef = tradespersonId ? db.collection("users").doc(tradespersonId) : null;
+    const traderSnap =
+      traderRef && (action === "accept_reschedule" || action === "confirm_booking")
+        ? await transaction.get(traderRef)
+        : null;
+
+    let calendarSynced = false;
+    let notifyRecipientId: string | null = null;
+    let notifyTitle = "";
+    let notifyMessage = "";
+    let resultingScheduledDate = jobData.scheduledDate || null;
+    let resultingConfirmed = Boolean(jobData.isConfirmedByTradesperson);
+    let resultingProposal = jobData.rescheduleProposal || null;
+
+    if (action === "propose_reschedule") {
+      const cleanDate = String(proposedDate || "").trim();
+      const cleanReason = String(reason || "").trim().slice(0, 500);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) {
+        throw new BadRequestError("proposedDate must be a valid YYYY-MM-DD date.");
+      }
+      if (cleanReason.length < 2) {
+        throw new BadRequestError("Please provide a brief reason for rescheduling.");
+      }
+
+      resultingProposal = {
+        proposedDate: cleanDate,
+        reason: cleanReason,
+        proposedBy: identity.uid,
+        status: "pending",
+        createdAt: nowIso,
+      };
+      transaction.update(jobRef, {
+        rescheduleProposal: resultingProposal,
+        updatedAt: nowIso,
+      });
+
+      notifyRecipientId = isTradesperson ? homeownerId : tradespersonId;
+      notifyTitle = "New Reschedule Proposal";
+      notifyMessage = `${isTradesperson ? "Your tradesperson" : "The homeowner"} proposed moving "${jobData.title || "your job"}" to ${cleanDate}. Reason: ${cleanReason}`;
+    } else if (action === "accept_reschedule") {
+      const currentProposal = jobData.rescheduleProposal;
+      if (!currentProposal || currentProposal.status !== "pending" || !currentProposal.proposedDate) {
+        throw new ConflictError("There is no pending reschedule proposal to accept.");
+      }
+      if (currentProposal.proposedBy === identity.uid && !isAdmin) {
+        throw new ForbiddenError("You cannot accept your own reschedule proposal.");
+      }
+
+      const oldDate = jobData.scheduledDate;
+      const newDate = String(currentProposal.proposedDate);
+      resultingScheduledDate = newDate;
+      resultingConfirmed = true;
+      resultingProposal = {
+        ...currentProposal,
+        status: "accepted",
+        respondedAt: nowIso,
+        respondedBy: identity.uid,
+      };
+
+      transaction.update(jobRef, {
+        scheduledDate: newDate,
+        isConfirmedByTradesperson: true,
+        rescheduleProposal: resultingProposal,
+        updatedAt: nowIso,
+      });
+
+      if (traderRef && traderSnap?.exists) {
+        const traderData = traderSnap.data() || {};
+        const dateOverrides: Record<string, string> = { ...(traderData.dateOverrides || {}) };
+        if (oldDate && dateOverrides[oldDate] === "booked") {
+          delete dateOverrides[oldDate];
+        }
+        dateOverrides[newDate] = "booked";
+        transaction.update(traderRef, { dateOverrides, updatedAt: nowIso });
+        calendarSynced = true;
+      }
+
+      notifyRecipientId = currentProposal.proposedBy || (isHomeowner ? tradespersonId : homeownerId);
+      notifyTitle = "Reschedule Accepted! 📅";
+      notifyMessage = `Your proposal to move "${jobData.title || "the job"}" to ${newDate} has been accepted.`;
+    } else if (action === "reject_reschedule") {
+      const currentProposal = jobData.rescheduleProposal;
+      if (!currentProposal || currentProposal.status !== "pending") {
+        throw new ConflictError("There is no pending reschedule proposal to decline.");
+      }
+      if (currentProposal.proposedBy === identity.uid && !isAdmin) {
+        throw new ForbiddenError("You cannot decline your own reschedule proposal.");
+      }
+
+      resultingProposal = {
+        ...currentProposal,
+        status: "rejected",
+        respondedAt: nowIso,
+        respondedBy: identity.uid,
+      };
+
+      transaction.update(jobRef, {
+        rescheduleProposal: resultingProposal,
+        updatedAt: nowIso,
+      });
+
+      notifyRecipientId = currentProposal.proposedBy || (isHomeowner ? tradespersonId : homeownerId);
+      notifyTitle = "Reschedule Declined";
+      notifyMessage = `Your reschedule proposal for "${jobData.title || "the job"}" was declined. The original scheduled date remains active.`;
+    } else if (action === "confirm_booking") {
+      if (!isTradesperson && !isAdmin) {
+        throw new ForbiddenError("Only the assigned tradesperson can confirm the scheduled booking.");
+      }
+      if (jobStatus !== "accepted") {
+        throw new ConflictError("Only accepted jobs can be confirmed.");
+      }
+
+      resultingConfirmed = true;
+      transaction.update(jobRef, {
+        isConfirmedByTradesperson: true,
+        confirmedAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      if (traderRef && traderSnap?.exists && jobData.scheduledDate) {
+        const traderData = traderSnap.data() || {};
+        const dateOverrides: Record<string, string> = { ...(traderData.dateOverrides || {}) };
+        dateOverrides[String(jobData.scheduledDate)] = "booked";
+        transaction.update(traderRef, { dateOverrides, updatedAt: nowIso });
+        calendarSynced = true;
+      }
+
+      notifyRecipientId = homeownerId;
+      notifyTitle = "Booking Confirmed! ✅";
+      notifyMessage = `Your tradesperson confirmed the booking for "${jobData.title || "your job"}"${jobData.scheduledDate ? ` on ${jobData.scheduledDate}` : ""}.`;
+    }
+
+    return {
+      scheduledDate: resultingScheduledDate,
+      isConfirmedByTradesperson: resultingConfirmed,
+      rescheduleProposal: resultingProposal,
+      calendarSynced,
+      notifyRecipientId,
+      notifyTitle,
+      notifyMessage,
+    };
+  });
+
+  // Post-transaction non-blocking counterparty notification + Push + WhatsApp fallback
+  if (txResult.notifyRecipientId && txResult.notifyRecipientId !== identity.uid) {
+    try {
+      const notifCol = db.collection("notifications");
+      if (notifCol && typeof notifCol.doc === "function") {
+        const notifRef = notifCol.doc();
+        await notifRef.set({
+          userId: txResult.notifyRecipientId,
+          senderId: identity.uid,
+          title: txResult.notifyTitle,
+          message: txResult.notifyMessage,
+          type: "status",
+          link: `/job/${jobId}`,
+          actionPath: `/job/${jobId}`,
+          jobId,
+          read: false,
+          isRead: false,
+          createdAt: nowIso,
+        });
+
+        if (messagingClient) {
+          dispatchAuthoritativeFcmPush(db, messagingClient, {
+            recipientId: txResult.notifyRecipientId,
+            title: txResult.notifyTitle,
+            body: txResult.notifyMessage,
+            channelId: "job_leads",
+            notificationId: notifRef.id,
+            eventType: "status",
+            data: { link: `/job/${jobId}`, jobId, type: "status" },
+          }).catch(() => {});
+        }
+
+        enqueueWhatsAppFallback(db, {
+          recipientUid: txResult.notifyRecipientId,
+          senderUid: identity.uid,
+          senderLabel: txResult.notifyTitle,
+          contextId: jobId,
+          contextType: "anytrader_job",
+          contextSummary: txResult.notifyMessage,
+          deepLinkPath: `/job/${jobId}`,
+          notificationId: notifRef.id,
+        }).catch(() => {});
+      }
+    } catch (notifErr) {
+      console.warn("[JobScheduleAction] Non-blocking notification failed:", notifErr);
+    }
+  }
+
+  return {
+    success: true,
+    jobId,
+    action,
+    scheduledDate: txResult.scheduledDate,
+    isConfirmedByTradesperson: txResult.isConfirmedByTradesperson,
+    rescheduleProposal: txResult.rescheduleProposal,
+    calendarSynced: txResult.calendarSynced,
+  };
+}
 

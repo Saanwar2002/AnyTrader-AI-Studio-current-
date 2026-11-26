@@ -1,25 +1,44 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useAuth } from "./AuthProvider";
 import { useSearchParams } from "react-router-dom";
-import { db, doc, setDoc, serverTimestamp, handleFirestoreError, OperationType, collection, query, where, getDocs, updateDoc, onSnapshot, auth, logout, increment } from "@/src/firebase";
+import { db, doc, setDoc, serverTimestamp, handleFirestoreError, OperationType, collection, query, where, getDocs, updateDoc, onSnapshot, auth, logout, increment, storage, ref, uploadBytes, getDownloadURL } from "@/src/firebase";
 import { RecaptchaVerifier, linkWithPhoneNumber, PhoneAuthProvider } from "firebase/auth";
 import { motion } from "motion/react";
-import { User, Briefcase, Loader2, MapPin, Shield, CheckCircle2, ChevronRight, ChevronLeft, Upload, AlertCircle, Info, PoundSterling, Award, Gift, Home, Building2, Star, CarFront, Check, LogOut, Search, X } from "lucide-react";
+import { User, Briefcase, Loader2, MapPin, Shield, CheckCircle2, ChevronRight, ChevronLeft, Upload, AlertCircle, Info, PoundSterling, Award, Gift, Home, Building2, Star, CarFront, Check, LogOut, Search, X, Wrench } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 import { toast } from "sonner";
 import { useCategories } from "../lib/CategoryProvider";
 import { lookupPostcode } from "@/src/services/postcodeService";
 import { generateMemberId } from "@/src/services/memberIdService";
-import { BLOCKED_DOMAINS, UNSORTED_TRADE_CATEGORIES, CONSULTANCY_CATEGORIES } from "@/src/constants";
-import { performInitialPublicRecordCheck } from "../services/verificationService";
-import { scoreCategorySearchMatch } from "@/src/lib/fuzzyMatch";
+import { BLOCKED_DOMAINS, CONSULTANCY_CATEGORIES } from "@/src/constants";
+import { shortlistTradeCategories } from "@/src/lib/tradeCategoryShortlist";
+import { isServiceProviderProfile } from "@/src/lib/accountRoles";
+import { tokenize, tokenMatches } from "@/src/lib/fuzzyMatch";
+import { getOnboardingStepProgress, getPreviousOnboardingStep } from "@/src/lib/onboardingSteps";
+import {
+  DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS,
+  DEFAULT_PROVISIONAL_MAX_QUOTES,
+  TRADER_COMPLIANCE_DECLARATION_SUMMARY,
+} from "@/src/lib/traderCompliance";
+import { CURRENT_TERMS_VERSION } from "@/src/constants/termsAndPrivacy";
+import { TermsModal } from "./TermsModal";
+
+const PROPERTY_BUSINESS_CATEGORIES = [
+  { id: "private_landlord", name: "Private Landlord", icon: "🏠", description: "Manage 1–5 residential rental properties" },
+  { id: "portfolio_landlord", name: "Portfolio Landlord", icon: "🏘️", description: "Multi-property residential & HMO portfolios" },
+  { id: "letting_estate_agency", name: "Letting & Estate Agency", icon: "🔑", description: "Managed tenancies, maintenance & compliance" },
+  { id: "block_property_management", name: "Block & Property Management", icon: "🏢", description: "Leasehold blocks, estates & communal repairs" },
+  { id: "housing_association_council", name: "Housing Association / Local Council", icon: "🏛️", description: "Social housing stock, SLAs & Awaab's Law compliance" },
+  { id: "commercial_asset_manager", name: "Commercial Property & Asset Manager", icon: "🏗️", description: "Offices, retail units, warehouses & facilities" },
+  { id: "property_developer", name: "Property Developer & Investor", icon: "📐", description: "Refurbishments, flips & new-build projects" },
+] as const;
 
 export default function Onboarding() {
   const { user } = useAuth();
   const { categories } = useCategories();
   const [searchParams] = useSearchParams();
   const [step, setStep] = useState(1);
-  const [role, setRole] = useState<"homeowner" | "business" | "admin" | "fleet_driver" | null>(null);
+  const [role, setRole] = useState<"homeowner" | "tradesperson" | "business" | "admin" | "fleet_driver" | null>(null);
   const [businessLayer, setBusinessLayer] = useState<"properties" | "field_services" | "consultancy" | null>(null);
   const [homeownerType, setHomeownerType] = useState<"homeowner" | "business" | null>(null); // Keep temporarily to not break types
   const [businessCategory, setBusinessCategory] = useState<string | null>(null);
@@ -37,7 +56,14 @@ export default function Onboarding() {
   const [county, setCounty] = useState("");
   const [selectedTrades, setSelectedTrades] = useState<string[]>([]);
   const [selectedSubcategories, setSelectedSubcategories] = useState<string[]>([]);
-  const [verificationDocs, setVerificationDocs] = useState<any[]>([]);
+  const [verificationDocs, setVerificationDocs] = useState<Array<{
+    type: string;
+    fileUrl: string;
+    fileName?: string;
+    storagePath?: string;
+    uploadedAt?: string;
+  }>>([]);
+  const [uploadingCert, setUploadingCert] = useState<string | null>(null);
   const [selectedTier, setSelectedTier] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [checkingInvite, setCheckingInvite] = useState(true);
@@ -49,6 +75,8 @@ export default function Onboarding() {
   const [verificationCode, setVerificationCode] = useState("");
   const [phoneError, setPhoneError] = useState("");
   const [bypassPhoneAuth, setBypassPhoneAuth] = useState(false);
+  const [acceptedComplianceDeclaration, setAcceptedComplianceDeclaration] = useState(false);
+  const [showTermsModal, setShowTermsModal] = useState(false);
 
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "platform_config", "global"), (doc) => {
@@ -59,26 +87,14 @@ export default function Onboarding() {
     return () => unsub();
   }, []);
 
-  const relevantCategories = businessLayer === "consultancy" ? CONSULTANCY_CATEGORIES : categories;
+  const relevantCategories =
+    role === "business" && businessLayer === "consultancy" ? CONSULTANCY_CATEGORIES : categories;
 
-  const filteredTradeCategories = useMemo(() => {
-    const query = tradeSearch.trim().toLowerCase();
-    if (!query) return relevantCategories;
-
-    return relevantCategories
-      .map((t: any) => ({
-        category: t,
-        score: scoreCategorySearchMatch(t, query)
-      }))
-      .filter(({ score, category }) => {
-        if (score > 0) return true;
-        const certMatch = category.requiredCertifications?.some((c: string) => c.toLowerCase().includes(query));
-        const subCertMatch = category.subcategoryCertifications && Object.keys(category.subcategoryCertifications).some((sub: string) => sub.toLowerCase().includes(query));
-        return certMatch || subCertMatch;
-      })
-      .sort((a, b) => b.score - a.score)
-      .map(({ category }) => category);
+  const shortlistedTradeResults = useMemo(() => {
+    return shortlistTradeCategories(relevantCategories as any[], tradeSearch);
   }, [relevantCategories, tradeSearch]);
+
+  const queryTokensForHighlight = useMemo(() => tokenize(tradeSearch), [tradeSearch]);
 
   const requiredCerts = relevantCategories
     .filter((t: any) => selectedTrades.includes(t.name))
@@ -98,6 +114,17 @@ export default function Onboarding() {
     ...requiredCerts,
     ...(role === "fleet_driver" ? ["Driver License", "Private Hire Vehicle (PHV) Licence", "MOT / Vehicle Insurance"] : [])
   ]));
+
+  const stepProgress = useMemo(
+    () =>
+      getOnboardingStepProgress({
+        step,
+        role,
+        businessLayer,
+        requiresVerification: uniqueRequiredCerts.length > 0,
+      }),
+    [step, role, businessLayer, uniqueRequiredCerts.length]
+  );
 
   useEffect(() => {
     const checkInvitation = async () => {
@@ -193,8 +220,65 @@ export default function Onboarding() {
     checkInvitation();
   }, [user, searchParams]);
 
-  const handleSubmit = async () => {
+  const handleCertificationUpload = async (cert: string, file: File) => {
+    if (!user) {
+      setError("Please sign in before uploading verification documents.");
+      return;
+    }
+
+    const maxBytes = 10 * 1024 * 1024; // 10 MB
+    const isAllowedType = file.type === "application/pdf" || file.type.startsWith("image/");
+    if (!isAllowedType) {
+      const msg = "Please upload a PDF or image file (JPG, PNG, WebP).";
+      setError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (file.size > maxBytes) {
+      const msg = "Document file must be 10 MB or smaller.";
+      setError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    setUploadingCert(cert);
+    setError(null);
+    try {
+      const safeType = cert.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48) || "certificate";
+      const safeFileName = file.name.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 80) || "document";
+      const storagePath = `verifications/${user.uid}/onboarding/${safeType}_${Date.now()}_${safeFileName}`;
+      const storageRef = ref(storage, storagePath);
+      const snapshot = await uploadBytes(storageRef, file, {
+        contentType: file.type || "application/octet-stream",
+      });
+      const downloadUrl = await getDownloadURL(snapshot.ref);
+      const uploadedAt = new Date().toISOString();
+
+      setVerificationDocs((prev) => [
+        ...prev.filter((d) => d.type !== cert),
+        {
+          type: cert,
+          fileUrl: downloadUrl,
+          fileName: file.name,
+          storagePath,
+          uploadedAt,
+        },
+      ]);
+      toast.success(`${cert} uploaded securely.`);
+    } catch (uploadErr: any) {
+      console.error("[Onboarding] Certification upload failed:", uploadErr);
+      const msg = "Could not upload document to secure storage. Please check your connection and try again.";
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setUploadingCert(null);
+    }
+  };
+
+  const handleSubmit = async (submitOptions?: { skipVerificationDocs?: boolean; overrideTier?: string }) => {
     console.log("handleSubmit called. State:", { user: !!user, role, name, postcode, phone });
+    const effectiveDocs = submitOptions?.skipVerificationDocs ? [] : verificationDocs;
+    const effectiveTier = submitOptions?.overrideTier || selectedTier;
     // Administrators can skip providing phone/postcode initially if needed,
     // but the db still requires name to exist for users.
     if (!user || !role || (role !== 'admin' && (!name || !postcode || (!user?.isAnonymous && !phone)))) {
@@ -266,7 +350,7 @@ export default function Onboarding() {
     setLoading(true);
     setError(null);
 
-    const isBusiness = role === "business";
+    const isBusiness = role === "business" || role === "tradesperson";
 
     // Temporarily disabled for development testing
     if (!user) return;
@@ -308,15 +392,14 @@ export default function Onboarding() {
         if (err.code === "auth/credential-already-in-use") {
           setError("This phone number is already linked to another account. Please use a different number.");
         } else if (err.code === "auth/operation-not-allowed" || err.code === "auth/billing-not-enabled") {
-           console.error("Phone Auth is disabled or billing is missing in Firebase Console.");
-           setError("Phone Authentication requires billing to be enabled in Firebase. If you are developing, click 'Complete Setup' again to bypass.");
-           if (window.confirm("Phone Auth is missing or billing is not enabled in Firebase. Would you like to bypass this check? (This should only be done for local development testing)")) {
-              setBypassPhoneAuth(true);
-              setLoading(false);
-              setTimeout(() => alert("Bypass enabled. Click 'Complete Setup' again to proceed."), 300);
-           }
+          console.error("Phone Auth is disabled or billing is missing in Firebase Console.");
+          const phoneConfigMsg = "SMS verification is currently unavailable. Please contact support or try again shortly.";
+          setError(phoneConfigMsg);
+          toast.error(phoneConfigMsg);
         } else {
-          setError(err.message || "Failed to send verification SMS.");
+          const fallbackMsg = err.message || "Failed to send verification SMS.";
+          setError(fallbackMsg);
+          toast.error(fallbackMsg);
         }
         if ((window as any).recaptchaVerifier) {
           (window as any).recaptchaVerifier.clear();
@@ -356,19 +439,12 @@ export default function Onboarding() {
         }
       }
 
-      // Fetch real IP address for fraud detection
-      let detectedIp = "0.0.0.0";
-      try {
-        const ipRes = await fetch("https://api64.ipify.org?format=json");
-        const ipData = await ipRes.json();
-        if (ipData.ip) detectedIp = ipData.ip;
-      } catch (err) {
-        console.warn("Could not fetch IP address", err);
-      }
+      // IP address is captured authoritatively server-side inside /api/account/bootstrap-profile
+      const deviceId = btoa(
+        `${navigator.userAgent}|${navigator.language}|${screen.width}x${screen.height}`
+      ).slice(0, 256);
 
-      const deviceId = btoa(navigator.userAgent + navigator.language + screen.width + screen.height);
-      
-      // Generate Member ID
+      // Generate Member ID (validated and persisted server-side)
       const { memberId, memberSequence } = await generateMemberId(isBusiness ? "business" : "homeowner");
 
       // Fraud/duplicate checks run authoritatively server-side inside /api/account/bootstrap-profile
@@ -392,6 +468,13 @@ export default function Onboarding() {
                 : ["homeowner"])
             : (effectiveRole === "fleet_driver" ? ["fleet_driver", "homeowner"] : (effectiveRole === "tradesperson" ? ["tradesperson", "homeowner"] : ["homeowner"])));
 
+      const isPropertyOnlyBusiness = effectiveRole === "business" && businessLayer === "properties";
+      const profileTrades = isPropertyOnlyBusiness
+        ? []
+        : selectedTrades.length > 0
+        ? selectedTrades
+        : (businessCategory ? [businessCategory] : []);
+
       const profile = {
         uid: user.uid,
         email: user.email,
@@ -408,18 +491,23 @@ export default function Onboarding() {
         // Legacy Compatibility Fields
         role: finalRole,
         businessLayer: role === "business" ? businessLayer : null,
-        tierId: selectedTier || (
-          role === "homeowner" 
+        tierId: effectiveTier || (
+          role === "homeowner"
             ? (homeownerType === "business" ? "Business Professional" : "Standard Homeowner")
+            : isPropertyOnlyBusiness
+            ? "Business Professional"
             : (platformConfig?.feeTiers?.[0]?.name || "Free Explorer")
         ),
         subscriptionType: role === "business" ? "business" : null,
         businessCategory: role === "business" ? businessCategory : null,
-        category: businessCategory || selectedTrades[0] || "General Trades",
-        primaryTrade: selectedTrades[0] || businessCategory || "General Trades",
+        category: isPropertyOnlyBusiness
+          ? (businessCategory || "Property & Asset Management")
+          : (businessCategory || selectedTrades[0] || (role === "homeowner" ? "" : "General Trades")),
+        primaryTrade: isPropertyOnlyBusiness
+          ? ""
+          : (selectedTrades[0] || businessCategory || (role === "homeowner" ? "" : "General Trades")),
         permissions: finalPermissions,
         deviceId,
-        ipAddress: detectedIp,
         accountFlags,
         memberId,
         memberSequence,
@@ -429,19 +517,22 @@ export default function Onboarding() {
         postcode: finalRole === "admin" && !postcode ? "N/A" : postcode.toUpperCase().replace(/\s/g, ""),
         city,
         county,
-        trades: selectedTrades.length > 0 ? selectedTrades : (businessCategory ? [businessCategory] : []),
-        subcategories: selectedSubcategories,
+        trades: profileTrades,
+        subcategories: isPropertyOnlyBusiness ? [] : selectedSubcategories,
         vehicleCategories: finalRole === "fleet_driver" ? vehicleCategories : null,
         isPetFriendly: finalRole === "fleet_driver" ? isPetFriendly : false,
         referralCode: user.uid.slice(0, 8).toUpperCase(), // Generate a simple referral code
         referredBy: referrerUid,
         affiliateId: appliedAffiliateCode,
-        verificationStatus: uniqueRequiredCerts.length > 0 ? "pending" : "unverified",
-        verificationDocs: verificationDocs.map(d => ({
+        verificationStatus: effectiveDocs.length > 0 ? "pending" : "unverified",
+        verificationDocs: effectiveDocs.map(d => ({
           type: d.type,
           status: "pending",
           fileUrl: d.fileUrl,
-          createdAt: new Date().toISOString()
+          ...(d.fileName ? { fileName: d.fileName } : {}),
+          ...(d.storagePath ? { storagePath: d.storagePath } : {}),
+          uploadedAt: d.uploadedAt || new Date().toISOString(),
+          createdAt: d.uploadedAt || new Date().toISOString(),
         })),
         createdAt: serverTimestamp(),
       };
@@ -463,15 +554,31 @@ export default function Onboarding() {
             postcode: postcode ? postcode.toUpperCase().replace(/\s/g, "") : undefined,
             city: city || undefined,
             county: county || undefined,
-            trades: selectedTrades.length > 0 ? selectedTrades : (businessCategory ? [businessCategory] : []),
-            subcategories: selectedSubcategories,
+            trades: profileTrades,
+            subcategories: isPropertyOnlyBusiness ? [] : selectedSubcategories,
             businessLayer: role === "business" ? businessLayer : null,
             businessCategory: role === "business" ? businessCategory : null,
             vehicleCategories: finalRole === "fleet_driver" ? vehicleCategories : null,
             isPetFriendly: finalRole === "fleet_driver" ? isPetFriendly : false,
+            verificationDocs: effectiveDocs.map((d) => ({
+              type: d.type,
+              fileUrl: d.fileUrl,
+              ...(d.fileName ? { fileName: d.fileName } : {}),
+              ...(d.storagePath ? { storagePath: d.storagePath } : {}),
+              ...(d.uploadedAt ? { uploadedAt: d.uploadedAt } : {}),
+            })),
             referralCode: rawReferralCode || null,
             referrerUid: null,
-            affiliateCode: null,
+            affiliateCode: appliedAffiliateCode || null,
+            memberId: memberId || undefined,
+            memberSequence: typeof memberSequence === "number" ? memberSequence : undefined,
+            deviceId: deviceId || undefined,
+            ...(finalRole === "tradesperson" || (finalRole === "business" && businessLayer === "field_services")
+              ? {
+                  acceptedComplianceDeclaration,
+                  termsVersion: CURRENT_TERMS_VERSION,
+                }
+              : {}),
           }),
         });
 
@@ -514,10 +621,12 @@ export default function Onboarding() {
             ? normalizedRole
             : "homeowner";
         const clientFallbackProfile = {
+          id: user.uid,
           uid: user.uid,
           email: user.email || "",
           isAnonymous: Boolean(user.isAnonymous),
           name: profile.name,
+          displayName: profile.name,
           phone: profile.phone,
           role: safeClientRole,
           businessLayer: profile.businessLayer,
@@ -534,44 +643,43 @@ export default function Onboarding() {
           referralCode: profile.referralCode,
           verificationDocs: profile.verificationDocs,
           createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
         };
         await setDoc(doc(db, "users", user.uid), clientFallbackProfile, { merge: true });
       }
 
-      // Sync non-PII public profile for trader discovery
-      if (role === "business" || (finalRole as string) === "tradesperson") {
+      // Sync non-PII public profile from client ONLY when server bootstrap fell back to client
+      // and strictly for verified-eligible trade execution profiles (matching firestore.rules allowlist).
+      if (!profileSavedServerSide && canonicalCapabilities.includes("tradesperson") && isServiceProviderProfile(profile)) {
         try {
           await setDoc(doc(db, "public_profiles", user.uid), {
+            id: user.uid,
             uid: user.uid,
             name: profile.name,
+            displayName: profile.name,
             role: profile.role,
-            trade: (profile as any).trade || "",
-            trades: (profile as any).trades || [],
-            category: (profile as any).category || "",
-            categories: (profile as any).categories || [],
-            subcategories: (profile as any).subcategories || [],
-            services: (profile as any).services || [],
-            skills: (profile as any).skills || [],
-            city: (profile as any).city || "",
+            primaryTrade: profile.primaryTrade || "",
+            trades: profile.trades || [],
+            category: profile.category || "",
+            categories: profile.trades || [],
+            subcategories: profile.subcategories || [],
+            city: profile.city || "",
             rating: 0,
             trustScore: 0,
             totalReviews: 0,
             verifiedTrader: false,
             isVerified: false,
             videoVerified: false,
-            createdAt: serverTimestamp()
+            verificationStatus: "unverified",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
           }, { merge: true });
         } catch (pubErr) {
           console.warn("Public profile creation skipped:", pubErr);
         }
       }
       
-      // Trigger automated public record checks for each uploaded document
-      console.log("Checking verification docs");
-      verificationDocs.forEach(d => {
-        performInitialPublicRecordCheck(user.uid, d.type);
-      });
-      console.log("Verification docs check skipped or finished");
+      // Uploaded verification documents enter the authoritative Admin Verification Queue as "pending"
 
       if (invitationId && inviteToken) {
         try {
@@ -589,15 +697,7 @@ export default function Onboarding() {
         }
       }
 
-      if (appliedAffiliateCode) {
-        try {
-          await updateDoc(doc(db, "affiliates", appliedAffiliateCode), {
-            uses: increment(1)
-          });
-        } catch (e) {
-          console.error("Failed to increment affiliate uses:", e);
-        }
-      }
+      // Affiliate usage attribution is incremented atomically server-side inside /api/account/bootstrap-profile
 
       console.log("Profile saved successfully.");
       // No need to reload, AuthProvider is listening to onSnapshot
@@ -687,15 +787,15 @@ export default function Onboarding() {
                   <LogOut className="w-3.5 h-3.5 text-slate-500" />
                   <span>Switch Account</span>
                 </button>
-                <span className="text-[11px] font-black uppercase tracking-wider text-slate-400 bg-slate-100 px-2.5 py-1 rounded-full">
-                  Step 1 of 3
+                <span className="text-[11px] font-black uppercase tracking-wider text-black bg-slate-100 border border-black/20 px-2.5 py-1 rounded-lg">
+                  {stepProgress.label}
                 </span>
               </div>
 
               <div className="space-y-3">
                 <div>
-                  <h2 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">Select your role</h2>
-                  <p className="text-xs text-slate-500 font-medium">Choose how you plan to use AnyTrader & TradeOS</p>
+                  <h2 className="text-xl sm:text-2xl font-black text-black tracking-tight">Select your role</h2>
+                  <p className="text-xs text-slate-600 font-medium">Choose how you plan to use AnyTrader & TradeOS</p>
                 </div>
                 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -703,6 +803,9 @@ export default function Onboarding() {
                     type="button"
                     onClick={() => {
                       setRole("homeowner");
+                      setBusinessLayer(null);
+                      setBusinessCategory(null);
+                      setSelectedTier(null);
                     }}
                     className={cn(
                       "w-full p-3.5 rounded-2xl border text-left transition-all duration-200 flex items-center gap-3 relative group cursor-pointer",
@@ -718,8 +821,8 @@ export default function Onboarding() {
                       <Home className="w-5 h-5" />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <span className="font-black text-sm text-slate-900 block leading-tight">Homeowner</span>
-                      <span className="text-[11px] text-slate-500 block leading-tight mt-0.5">Post jobs & hire trades</span>
+                      <span className="font-black text-sm text-black block leading-tight">Homeowner / Customer</span>
+                      <span className="text-[11px] text-slate-600 block leading-tight mt-0.5">Post jobs, hire trades & book rides</span>
                     </div>
                     <div className={cn(
                       "w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-all",
@@ -732,33 +835,33 @@ export default function Onboarding() {
                   <button
                     type="button"
                     onClick={() => {
-                      setRole("business");
+                      setRole("tradesperson");
                       setBusinessLayer(null);
                       setBusinessCategory(null);
                       setSelectedTier(null);
                     }}
                     className={cn(
                       "w-full p-3.5 rounded-2xl border text-left transition-all duration-200 flex items-center gap-3 relative group cursor-pointer",
-                      role === "business" 
-                        ? "border-2 border-orange-500 bg-orange-50/40 shadow-sm" 
+                      role === "tradesperson"
+                        ? "border-2 border-orange-500 bg-orange-50/40 shadow-sm"
                         : "border-black bg-white hover:bg-slate-50"
                     )}
                   >
                     <div className={cn(
                       "w-11 h-11 rounded-xl flex items-center justify-center shrink-0 transition-colors",
-                      role === "business" ? "bg-orange-500 text-white" : "bg-slate-100 text-slate-600 group-hover:bg-slate-200"
+                      role === "tradesperson" ? "bg-orange-500 text-white" : "bg-slate-100 text-slate-600 group-hover:bg-slate-200"
                     )}>
-                      <Building2 className="w-5 h-5" />
+                      <Wrench className="w-5 h-5" />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <span className="font-black text-sm text-slate-900 block leading-tight">Business & Trade</span>
-                      <span className="text-[11px] text-slate-500 block leading-tight mt-0.5">Services & TradeOS</span>
+                      <span className="font-black text-sm text-black block leading-tight">Tradesperson</span>
+                      <span className="text-[11px] text-slate-600 block leading-tight mt-0.5">Solo trader & side-hustle — quote jobs & TradeOS</span>
                     </div>
                     <div className={cn(
                       "w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-all",
-                      role === "business" ? "border-orange-500 bg-orange-500" : "border-slate-300"
+                      role === "tradesperson" ? "border-orange-500 bg-orange-500" : "border-slate-300"
                     )}>
-                      {role === "business" && <Check className="w-3 h-3 text-white stroke-[3]" />}
+                      {role === "tradesperson" && <Check className="w-3 h-3 text-white stroke-[3]" />}
                     </div>
                   </button>
 
@@ -772,8 +875,8 @@ export default function Onboarding() {
                     }}
                     className={cn(
                       "w-full p-3.5 rounded-2xl border text-left transition-all duration-200 flex items-center gap-3 relative group cursor-pointer",
-                      role === "fleet_driver" 
-                        ? "border-2 border-orange-500 bg-orange-50/40 shadow-sm" 
+                      role === "fleet_driver"
+                        ? "border-2 border-orange-500 bg-orange-50/40 shadow-sm"
                         : "border-black bg-white hover:bg-slate-50"
                     )}
                   >
@@ -784,14 +887,47 @@ export default function Onboarding() {
                       <CarFront className="w-5 h-5" />
                     </div>
                     <div className="flex-1 min-w-0">
-                      <span className="font-black text-sm text-slate-900 block leading-tight">Driver (Rides)</span>
-                      <span className="text-[11px] text-slate-500 block leading-tight mt-0.5">Transport & deliveries</span>
+                      <span className="font-black text-sm text-black block leading-tight">Driver</span>
+                      <span className="text-[11px] text-slate-600 block leading-tight mt-0.5">AnyRoller rides & deliveries</span>
                     </div>
                     <div className={cn(
                       "w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-all",
                       role === "fleet_driver" ? "border-orange-500 bg-orange-500" : "border-slate-300"
                     )}>
                       {role === "fleet_driver" && <Check className="w-3 h-3 text-white stroke-[3]" />}
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRole("business");
+                      setBusinessLayer(null);
+                      setBusinessCategory(null);
+                      setSelectedTier(null);
+                    }}
+                    className={cn(
+                      "w-full p-3.5 rounded-2xl border text-left transition-all duration-200 flex items-center gap-3 relative group cursor-pointer",
+                      role === "business"
+                        ? "border-2 border-orange-500 bg-orange-50/40 shadow-sm"
+                        : "border-black bg-white hover:bg-slate-50"
+                    )}
+                  >
+                    <div className={cn(
+                      "w-11 h-11 rounded-xl flex items-center justify-center shrink-0 transition-colors",
+                      role === "business" ? "bg-orange-500 text-white" : "bg-slate-100 text-slate-600 group-hover:bg-slate-200"
+                    )}>
+                      <Building2 className="w-5 h-5" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <span className="font-black text-sm text-black block leading-tight">Business</span>
+                      <span className="text-[11px] text-slate-600 block leading-tight mt-0.5">Multi-staff firms, landlords & agencies</span>
+                    </div>
+                    <div className={cn(
+                      "w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-all",
+                      role === "business" ? "border-orange-500 bg-orange-500" : "border-slate-300"
+                    )}>
+                      {role === "business" && <Check className="w-3 h-3 text-white stroke-[3]" />}
                     </div>
                   </button>
 
@@ -805,9 +941,9 @@ export default function Onboarding() {
                         setSelectedTier(null);
                       }}
                       className={cn(
-                        "w-full p-3.5 rounded-2xl border text-left transition-all duration-200 flex items-center gap-3 relative group cursor-pointer",
-                        role === "admin" 
-                          ? "border-2 border-red-500 bg-red-50/40 shadow-sm" 
+                        "w-full p-3.5 rounded-2xl border text-left transition-all duration-200 flex items-center gap-3 relative group cursor-pointer sm:col-span-2",
+                        role === "admin"
+                          ? "border-2 border-red-500 bg-red-50/40 shadow-sm"
                           : "border-black bg-white hover:bg-slate-50 border-dashed"
                       )}
                     >
@@ -818,8 +954,8 @@ export default function Onboarding() {
                         <Shield className="w-5 h-5" />
                       </div>
                       <div className="flex-1 min-w-0">
-                        <span className="font-black text-sm text-slate-900 block leading-tight">Master Admin</span>
-                        <span className="text-[11px] text-slate-500 block leading-tight mt-0.5">Platform management</span>
+                        <span className="font-black text-sm text-black block leading-tight">Master Admin</span>
+                        <span className="text-[11px] text-slate-600 block leading-tight mt-0.5">Platform management</span>
                       </div>
                       <div className={cn(
                         "w-5 h-5 rounded-full border flex items-center justify-center shrink-0 transition-all",
@@ -833,7 +969,7 @@ export default function Onboarding() {
               </div>
 
               {/* Personal Info Fields */}
-              {(role === "business" || role === "fleet_driver" || role === "homeowner") && (
+              {(role === "tradesperson" || role === "business" || role === "fleet_driver" || role === "homeowner") && (
                 <motion.div 
                   initial={{ opacity: 0, y: 8 }}
                   animate={{ opacity: 1, y: 0 }}
@@ -986,26 +1122,25 @@ export default function Onboarding() {
                 <button
                   type="button"
                   onClick={() => {
-                    console.log("Button clicked. Role:", role, "HomeownerType:", homeownerType);
                     if (role === "fleet_driver") {
-                      setStep(3); // Go straight to verification
+                      setStep(3); // Go straight to driver verification
                       return;
                     }
-                    
-                    if (platformConfig?.paywallEnabled === false) {
-                      // In beta mode, skip complex setup and go straight to submission
-                      handleSubmit();
-                    } else {
-                      if (role === "business") {
-                        setStep(1.5);
-                      } else {
-                        handleSubmit();
-                      }
+                    if (role === "tradesperson") {
+                      setStep(2); // Go straight to trade category selection
+                      return;
                     }
+                    if (role === "business") {
+                      // Always let business accounts select their business type & categories,
+                      // even when Free Beta Mode (paywallEnabled === false) is active.
+                      setStep(1.5);
+                      return;
+                    }
+                    handleSubmit();
                   }}
                   disabled={
                     !role || 
-                    loading ||
+                    loading || 
                     (role !== "admin" && (!name || !postcode || (!user?.isAnonymous && !phone))) ||
                     (role === "fleet_driver" && vehicleCategories.length === 0)
                   }
@@ -1015,7 +1150,7 @@ export default function Onboarding() {
                     <Loader2 className="w-5 h-5 animate-spin" />
                   ) : (
                     <>
-                      <span>{role === "business" || role === "fleet_driver" ? "Continue" : "Complete Setup"}</span>
+                      <span>{role === "tradesperson" || role === "business" || role === "fleet_driver" ? "Continue" : "Complete Setup"}</span>
                       <ChevronRight className="w-5 h-5 group-hover:translate-x-0.5 transition-transform" />
                     </>
                   )}
@@ -1040,17 +1175,24 @@ export default function Onboarding() {
           {/* Step 1.5: Business Layer Selection */}
           {step === 1.5 && role === "business" && (
             <div className="space-y-8">
-              <div 
-                onClick={() => setStep(1)}
-                className="absolute top-6 left-6 text-slate-500 hover:text-slate-800 p-2.5 z-[60] cursor-pointer bg-white rounded-2xl shadow hover:shadow-md transition-all group border border-black"
-              >
-                  <ChevronLeft className="w-8 h-8 group-hover:-translate-x-0.5 transition-transform" />
+              <div className="flex items-center justify-between pb-2 border-b border-black/10">
+                <button
+                  type="button"
+                  onClick={() => setStep(getPreviousOnboardingStep(1.5, role))}
+                  className="flex items-center gap-1.5 text-xs font-black text-black hover:bg-slate-100 px-3 py-2 rounded-xl bg-white transition-all border border-black cursor-pointer"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                  <span>Back</span>
+                </button>
+                <span className="text-[11px] font-black uppercase tracking-wider text-black bg-slate-100 border border-black/20 px-2.5 py-1 rounded-lg">
+                  {stepProgress.label}
+                </span>
               </div>
-              <div className="text-center space-y-2 pt-10">
-                <h1 className="text-3xl font-display font-black text-slate-900 tracking-tight">
+              <div className="text-center space-y-2">
+                <h1 className="text-3xl font-display font-black text-black tracking-tight">
                   Select Business Type
                 </h1>
-                <p className="text-slate-500 font-medium text-sm">
+                <p className="text-slate-600 font-medium text-sm">
                   Choose how you will use the platform.
                 </p>
               </div>
@@ -1150,44 +1292,101 @@ export default function Onboarding() {
             </div>
           )}
 
-          {/* Step 2: Tradesperson or Consultancy - Select Categories */}
-          {step === 2 && role === "business" && (businessLayer === "field_services" || businessLayer === "consultancy") && (
-            <div className="space-y-8">
+          {/* Step 2: Tradesperson, Field Services Business, or Consultancy - Select Categories */}
+          {step === 2 && (role === "tradesperson" || (role === "business" && (businessLayer === "field_services" || businessLayer === "consultancy"))) && (
+            <div className="space-y-6">
+              <div className="flex justify-end">
+                <span className="text-[11px] font-black uppercase tracking-wider text-black bg-slate-100 border border-black/20 px-2.5 py-1 rounded-lg">
+                  {stepProgress.label}
+                </span>
+              </div>
               <div className="text-center space-y-2">
-                <h1 className="text-3xl font-display font-black text-slate-900 tracking-tight">
-                  {businessLayer === "consultancy" ? "Select Your Professional Categories" : "Select Your Trades"}
+                <h1 className="text-3xl font-display font-black text-black tracking-tight">
+                  {role === "business" && businessLayer === "consultancy" ? "Select Your Professional Categories" : "Select Your Trades"}
                 </h1>
-                <p className="text-slate-500 font-medium text-sm">
-                  Tell us what you're an expert in.
+                <p className="text-slate-600 font-medium text-sm">
+                  Type a few words of your trade to shortlist matching categories — you can select multiple.
                 </p>
               </div>
 
-              <div className="bg-primary/5 border border-primary/10 p-5 rounded-[2rem] flex gap-4">
+              <div className="bg-primary/5 border border-black p-4 rounded-2xl flex gap-3.5">
                 <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center shrink-0">
                   <Info className="w-5 h-5 text-primary" />
                 </div>
-                <div className="space-y-1">
-                  <p className="text-sm font-black text-primary uppercase tracking-tight">Get More Job Offers</p>
-                  <p className="text-xs text-slate-600 leading-relaxed">Select multiple {businessLayer === "consultancy" ? "categories" : "trades"} below to see more jobs. You can also add or edit your specializations later in your Profile.</p>
+                <div className="space-y-0.5">
+                  <p className="text-sm font-black text-black uppercase tracking-tight">Get More Job Offers</p>
+                  <p className="text-xs text-black leading-relaxed">
+                    Search by trade name, skill, or service (e.g. "boiler leak", "garden fence", "van courier") to shortlist categories, then tap as many as apply.
+                  </p>
                 </div>
               </div>
 
-              {/* Search Bar for Trades */}
-              <div className="space-y-3">
+              {/* Pinned Multi-Category Selection Bar */}
+              {selectedTrades.length > 0 && (
+                <div className="p-3.5 bg-slate-50 border border-black rounded-2xl space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-black uppercase tracking-wider text-black">
+                      Selected Categories ({selectedTrades.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedTrades([]);
+                        setSelectedSubcategories([]);
+                      }}
+                      className="text-[11px] font-bold text-slate-600 hover:text-black underline cursor-pointer"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {selectedTrades.map((tradeName) => (
+                      <span
+                        key={tradeName}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-black rounded-lg text-xs font-bold text-black shadow-2xs"
+                      >
+                        <span>{tradeName}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const matchedCat = (relevantCategories as any[]).find((c) => c.name === tradeName);
+                            const catSubs = new Set<string>(matchedCat?.subcategories || []);
+                            setSelectedTrades((prev) => prev.filter((name) => name !== tradeName));
+                            if (catSubs.size > 0) {
+                              setSelectedSubcategories((prev) => prev.filter((sub) => !catSubs.has(sub)));
+                            }
+                          }}
+                          className="p-0.5 rounded hover:bg-slate-100 text-black cursor-pointer"
+                          aria-label={`Remove ${tradeName}`}
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Smart Multi-Word Search Bar for Shortlisting Trades */}
+              <div className="space-y-2.5">
                 <div className="relative">
-                  <Search className="w-5 h-5 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <Search className="w-5 h-5 text-slate-500 absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     type="text"
                     value={tradeSearch}
                     onChange={(e) => setTradeSearch(e.target.value)}
-                    placeholder={`Search ${businessLayer === "consultancy" ? "categories" : "trades or services"} (e.g. Plumber, Van Hire, Electrician, Tyres, Roofer...)`}
+                    placeholder={
+                      role === "business" && businessLayer === "consultancy"
+                        ? "Type words to shortlist categories (e.g. tutor, accountant, event planner...)"
+                        : "Type words of your trade (e.g. boiler leak, electrical rewire, fence garden, tyres...)"
+                    }
                     className="w-full pl-11 pr-10 py-3.5 bg-white border border-black rounded-xl text-black font-medium text-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all shadow-sm"
                   />
                   {tradeSearch && (
                     <button
                       type="button"
                       onClick={() => setTradeSearch("")}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-black hover:bg-slate-100 rounded-full transition-all"
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-500 hover:text-black hover:bg-slate-100 rounded-full transition-all cursor-pointer"
                       title="Clear search"
                     >
                       <X className="w-4 h-4" />
@@ -1195,113 +1394,127 @@ export default function Onboarding() {
                   )}
                 </div>
 
-                <div className="flex items-center justify-between text-xs text-slate-600 px-1">
+                <div className="flex items-center justify-between text-xs text-black px-1">
                   <span>
                     {tradeSearch.trim() ? (
                       <>
-                        Showing <strong className="text-black font-bold">{filteredTradeCategories.length}</strong> matching {filteredTradeCategories.length === 1 ? 'category' : 'categories'}
+                        Shortlisted <strong className="font-black">{shortlistedTradeResults.length}</strong> matching {shortlistedTradeResults.length === 1 ? "category" : "categories"}
                       </>
                     ) : (
                       <>
-                        <strong className="text-black font-bold">{relevantCategories.length}</strong> total categories available
+                        <strong className="font-black">{relevantCategories.length}</strong> categories available — type keywords above to shortlist
                       </>
                     )}
                   </span>
                   {selectedTrades.length > 0 && (
-                    <span className="bg-primary/10 text-primary font-bold px-2.5 py-0.5 rounded-full border border-primary/20 text-[11px]">
+                    <span className="bg-primary/10 text-primary font-black px-2.5 py-0.5 rounded-lg border border-black text-[11px]">
                       {selectedTrades.length} selected
                     </span>
                   )}
                 </div>
               </div>
 
-              {filteredTradeCategories.length === 0 ? (
+              {shortlistedTradeResults.length === 0 ? (
                 <div className="p-8 text-center bg-slate-50 border border-black rounded-2xl space-y-3">
-                  <p className="text-sm font-bold text-slate-900">
-                    No {businessLayer === "consultancy" ? "categories" : "trades"} found matching "{tradeSearch}"
+                  <p className="text-sm font-bold text-black">
+                    No {role === "business" && businessLayer === "consultancy" ? "categories" : "trades"} shortlisted for "{tradeSearch}"
                   </p>
-                  <p className="text-xs text-slate-500">
-                    Try searching a different trade name, service keyword, or clear your search to browse all categories.
+                  <p className="text-xs text-slate-600">
+                    Try typing shorter keywords (e.g. "boiler", "roof", "paint", "van") or clear your search to browse all categories.
                   </p>
                   <button
                     type="button"
                     onClick={() => setTradeSearch("")}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-white border border-black rounded-xl text-xs font-black text-black hover:bg-slate-100 transition-all shadow-sm"
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-white border border-black rounded-xl text-xs font-black text-black hover:bg-slate-100 transition-all shadow-sm cursor-pointer"
                   >
                     <X className="w-3.5 h-3.5" /> Clear Search
                   </button>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-3 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
-                  {filteredTradeCategories.map((t: any) => {
+                  {shortlistedTradeResults.map(({ category: t, matchedSubcategories, matchedReasons, matchedTokenCount, totalQueryTokens }) => {
                     const isSelected = selectedTrades.includes(t.name);
-                    const matchingSubs = tradeSearch.trim()
-                      ? (t.subcategories || []).filter((sub: string) =>
-                          sub.toLowerCase().includes(tradeSearch.trim().toLowerCase())
-                        )
-                      : [];
+                    const hasActiveQuery = tradeSearch.trim().length > 0;
 
                     return (
                       <div key={t.id} className="space-y-2">
                         <button
                           type="button"
                           onClick={() => {
-                            setSelectedTrades(prev => 
-                              prev.includes(t.name) ? prev.filter(name => name !== t.name) : [...prev, t.name]
-                            );
+                            setSelectedTrades(prev => {
+                              if (prev.includes(t.name)) {
+                                const catSubs = new Set<string>(t.subcategories || []);
+                                if (catSubs.size > 0) {
+                                  setSelectedSubcategories((curr) => curr.filter((sub) => !catSubs.has(sub)));
+                                }
+                                return prev.filter(name => name !== t.name);
+                              }
+                              return [...prev, t.name];
+                            });
                           }}
                           className={cn(
-                            "w-full p-4 rounded-2xl border-2 text-left flex items-center justify-between transition-all duration-300 group",
-                            isSelected 
-                              ? "bg-primary/5 border-primary text-primary shadow-lg shadow-primary/5" 
-                              : "bg-white border-black text-slate-600 hover:border-black"
+                            "w-full p-4 rounded-2xl border text-left flex items-center justify-between gap-3 transition-all duration-200 group cursor-pointer",
+                            isSelected
+                              ? "bg-primary/5 border-2 border-primary text-black shadow-md shadow-primary/5"
+                              : "bg-white border-black text-black hover:bg-slate-50"
                           )}
                         >
-                          <div className="flex items-center gap-4">
+                          <div className="flex items-center gap-3.5 min-w-0">
                             <div className={cn(
-                              "w-10 h-10 rounded-xl flex items-center justify-center text-xl transition-colors shrink-0",
+                              "w-10 h-10 rounded-xl flex items-center justify-center text-xl transition-colors shrink-0 border border-black/15",
                               isSelected ? "bg-primary text-white" : "bg-slate-50"
                             )}>
                               {t.icon}
                             </div>
-                            <div>
-                              <span className="font-black text-sm tracking-tight text-black block">{t.name}</span>
-                              {matchingSubs.length > 0 && !isSelected && (
-                                <span className="text-[11px] text-slate-500 line-clamp-1 mt-0.5">
-                                  Includes: {matchingSubs.slice(0, 2).join(", ")}{matchingSubs.length > 2 ? ` +${matchingSubs.length - 2} more` : ""}
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-black text-sm tracking-tight text-black block">{t.name}</span>
+                                {hasActiveQuery && totalQueryTokens > 1 && matchedTokenCount > 1 && (
+                                  <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-black/20">
+                                    {matchedTokenCount}/{totalQueryTokens} words matched
+                                  </span>
+                                )}
+                              </div>
+                              {hasActiveQuery && !isSelected && (matchedSubcategories.length > 0 || matchedReasons.length > 0) && (
+                                <span className="text-[11px] text-slate-600 line-clamp-1 mt-0.5 block">
+                                  Matches: {(matchedSubcategories.length > 0 ? matchedSubcategories : matchedReasons).slice(0, 3).join(", ")}
                                 </span>
                               )}
                             </div>
                           </div>
-                          {isSelected && (
-                            <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }}>
-                              <CheckCircle2 className="w-5 h-5 text-primary shrink-0" />
-                            </motion.div>
-                          )}
+                          <div className={cn(
+                            "w-6 h-6 rounded-lg border flex items-center justify-center shrink-0 transition-all",
+                            isSelected ? "bg-primary border-primary text-white" : "bg-white border-black text-transparent"
+                          )}>
+                            <Check className="w-3.5 h-3.5 stroke-[3]" />
+                          </div>
                         </button>
                         {isSelected && t.subcategories && t.subcategories.length > 0 && (
-                          <motion.div 
-                            initial={{ opacity: 0, height: 0 }} 
-                            animate={{ opacity: 1, height: 'auto' }}
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: "auto" }}
                             className="ml-4 p-4 bg-slate-50 border border-black rounded-2xl space-y-3"
                           >
-                            <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Select Specific Services:</p>
+                            <p className="text-xs font-black text-black uppercase tracking-wider">Select Specific Services (Optional):</p>
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                               {t.subcategories.map((sub: string, subIdx: number) => {
-                                const isSubMatched = tradeSearch.trim() && sub.toLowerCase().includes(tradeSearch.trim().toLowerCase());
+                                const subTokens = tokenize(sub);
+                                const isSubMatched =
+                                  hasActiveQuery &&
+                                  queryTokensForHighlight.some((qt) => subTokens.some((st) => tokenMatches(qt, st)));
                                 return (
-                                  <label 
-                                    key={`${t.id}-${sub}-${subIdx}`} 
+                                  <label
+                                    key={`${t.id}-${sub}-${subIdx}`}
                                     className={cn(
                                       "flex items-center gap-3 p-2 rounded-xl transition-colors cursor-pointer border group",
-                                      isSubMatched 
-                                        ? "bg-primary/10 border-primary/40 font-semibold" 
+                                      isSubMatched
+                                        ? "bg-primary/10 border-primary/40 font-semibold"
                                         : "hover:bg-white border-transparent hover:border-black"
                                     )}
                                   >
                                     <div className="relative flex items-center">
-                                      <input 
-                                        type="checkbox" 
+                                      <input
+                                        type="checkbox"
                                         className="w-5 h-5 rounded-md border-2 border-black text-primary focus:ring-primary focus:ring-offset-0 transition-all cursor-pointer peer"
                                         checked={selectedSubcategories.includes(sub)}
                                         onChange={(e) => {
@@ -1310,7 +1523,7 @@ export default function Onboarding() {
                                         }}
                                       />
                                     </div>
-                                    <span className="text-sm font-medium text-slate-800 group-hover:text-black transition-colors">{sub}</span>
+                                    <span className="text-sm font-medium text-black transition-colors">{sub}</span>
                                   </label>
                                 );
                               })}
@@ -1323,27 +1536,87 @@ export default function Onboarding() {
                 </div>
               )}
 
+              {(role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                uniqueRequiredCerts.length === 0 && (
+                  <div className="space-y-3 rounded-2xl border border-black bg-amber-50/70 p-4">
+                    <div className="flex items-start gap-2.5">
+                      <Shield className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                      <div className="text-xs text-black space-y-1">
+                        <p className="font-black uppercase tracking-tight">
+                          {Number(platformConfig?.documentGracePeriodDays ?? DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS)}-Day Provisional Start ({Number(platformConfig?.provisionalMaxQuotes ?? DEFAULT_PROVISIONAL_MAX_QUOTES)} Quotes)
+                        </p>
+                        <p className="font-medium leading-relaxed text-slate-800">
+                          Start matching with local jobs straight away for up to{" "}
+                          <strong>{Number(platformConfig?.provisionalMaxQuotes ?? DEFAULT_PROVISIONAL_MAX_QUOTES)} quotes</strong>{" "}
+                          during your{" "}
+                          <strong>{Number(platformConfig?.documentGracePeriodDays ?? DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS)}-day</strong>{" "}
+                          provisional cooling-off window while you upload your ID and insurance documents in your Profile.
+                        </p>
+                      </div>
+                    </div>
+                    <label className="flex items-start gap-3 p-3 rounded-xl bg-white border border-black cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={acceptedComplianceDeclaration}
+                        onChange={(e) => {
+                          setAcceptedComplianceDeclaration(e.target.checked);
+                          if (e.target.checked) setError(null);
+                        }}
+                        className="mt-0.5 w-5 h-5 rounded border-2 border-black text-primary focus:ring-primary cursor-pointer shrink-0"
+                      />
+                      <span className="text-xs font-medium text-black leading-relaxed">
+                        {TRADER_COMPLIANCE_DECLARATION_SUMMARY}{" "}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            setShowTermsModal(true);
+                          }}
+                          className="font-black text-primary underline hover:text-primary-hover cursor-pointer"
+                        >
+                          Read Terms &amp; Conditions
+                        </button>
+                      </span>
+                    </label>
+                  </div>
+                )}
+
               <div className="flex gap-4">
                 <button
-                  onClick={() => setStep(1)}
-                  className="flex-1 p-5 rounded-[2rem] border-2 border-black font-black text-slate-600 hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
+                  type="button"
+                  onClick={() => setStep(getPreviousOnboardingStep(2, role))}
+                  className="flex-1 p-4 rounded-2xl border border-black font-black text-black hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <ChevronLeft className="w-5 h-5" /> Back
                 </button>
                 <button
+                  type="button"
                   onClick={() => {
+                    const needsComplianceHere =
+                      (role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                      uniqueRequiredCerts.length === 0;
+                    if (needsComplianceHere && !acceptedComplianceDeclaration) {
+                      setError("Please tick the compliance declaration and accept the Terms & Conditions to continue.");
+                      return;
+                    }
                     if (uniqueRequiredCerts.length > 0) setStep(3);
                     else handleSubmit();
                   }}
-                  disabled={selectedTrades.length === 0 || loading}
-                  className="flex-[2] bg-primary text-white p-5 rounded-[2rem] font-black text-lg hover:bg-primary-hover transition-all shadow-2xl shadow-primary/30 disabled:opacity-50 flex items-center justify-center gap-2 active:scale-95 group"
+                  disabled={
+                    selectedTrades.length === 0 ||
+                    loading ||
+                    ((role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                      uniqueRequiredCerts.length === 0 &&
+                      !acceptedComplianceDeclaration)
+                  }
+                  className="flex-[2] bg-primary text-white p-4 rounded-2xl font-black text-base hover:bg-primary-hover transition-all shadow-xl shadow-primary/25 disabled:opacity-50 flex items-center justify-center gap-2 active:scale-95 group cursor-pointer"
                 >
                   {loading ? (
                     <Loader2 className="w-6 h-6 animate-spin" />
                   ) : (
                     <>
                       {uniqueRequiredCerts.length > 0 ? "Next: Verification" : "Complete Setup"}
-                      <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                      <ChevronRight className="w-5 h-5 group-hover:translate-x-0.5 transition-transform" />
                     </>
                   )}
                 </button>
@@ -1351,127 +1624,108 @@ export default function Onboarding() {
             </div>
           )}
 
-          {/* Step 2: Business Homeowner - Category Setup */}
+          {/* Step 2: Property & Asset Management Business Setup */}
           {step === 2 && role === "business" && businessLayer === "properties" && (
-            <div className="space-y-8">
+            <div className="space-y-6">
+              <div className="flex justify-end">
+                <span className="text-[11px] font-black uppercase tracking-wider text-black bg-slate-100 border border-black/20 px-2.5 py-1 rounded-lg">
+                  {stepProgress.label}
+                </span>
+              </div>
               <div className="text-center space-y-2">
-                <h1 className="text-3xl font-display font-black text-slate-900 tracking-tight">
-                  Business Setup
+                <h1 className="text-3xl font-display font-black text-black tracking-tight">
+                  Property Business Setup
                 </h1>
-                <p className="text-slate-500 font-medium text-sm">
-                  Configure your business profile to get started.
+                <p className="text-slate-600 font-medium text-sm">
+                  Select your property or asset management organisation type.
                 </p>
               </div>
 
               {!businessCategory ? (
                 <div className="space-y-3">
-                  <label className="text-sm font-bold text-slate-700 uppercase tracking-tight">Search Business Category</label>
+                  <label className="text-xs font-black text-black uppercase tracking-wider block">Select Property Organisation Type</label>
                   <input
                     type="text"
-                    placeholder="e.g. Landlord, Fleet, Garden..."
+                    placeholder="Filter e.g. Landlord, Letting Agency, Housing Association..."
                     value={categorySearch}
                     onChange={(e) => setCategorySearch(e.target.value)}
-                    className="w-full p-4 rounded-xl border border-black focus:border-primary focus:ring-1 focus:ring-primary outline-none text-sm"
+                    className="w-full p-3.5 rounded-xl border border-black bg-white text-black focus:border-primary focus:ring-1 focus:ring-primary outline-none text-sm"
                   />
-                  <div className="max-h-60 overflow-y-auto grid grid-cols-1 gap-2 custom-scrollbar">
-                    {UNSORTED_TRADE_CATEGORIES
-                      .filter(cat => cat.name.toLowerCase().includes(categorySearch.toLowerCase()))
+                  <div className="max-h-72 overflow-y-auto grid grid-cols-1 gap-2.5 custom-scrollbar">
+                    {PROPERTY_BUSINESS_CATEGORIES
+                      .filter(cat =>
+                        cat.name.toLowerCase().includes(categorySearch.toLowerCase()) ||
+                        cat.description.toLowerCase().includes(categorySearch.toLowerCase())
+                      )
                       .map(cat => (
                         <button
                           key={cat.id}
+                          type="button"
                           onClick={() => setBusinessCategory(cat.name)}
-                          className={cn(
-                            "p-3 rounded-lg border text-left font-bold text-sm transition-all flex items-center gap-3",
-                            businessCategory === cat.name 
-                              ? "bg-primary/5 border-primary text-primary" 
-                              : "bg-white border-black text-slate-600 hover:border-black"
-                          )}
+                          className="p-3.5 rounded-xl border border-black bg-white hover:bg-slate-50 text-left transition-all flex items-center gap-3 cursor-pointer"
                         >
-                          <span className="text-xl">{cat.icon}</span>
-                          {cat.name}
+                          <span className="text-2xl shrink-0">{cat.icon}</span>
+                          <div className="min-w-0">
+                            <span className="font-black text-sm text-black block">{cat.name}</span>
+                            <span className="text-xs text-slate-600 block">{cat.description}</span>
+                          </div>
                         </button>
                       ))}
+                  </div>
+                  <div className="pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setStep(getPreviousOnboardingStep(2, role))}
+                      className="w-full p-3.5 rounded-2xl border border-black font-black text-black hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <ChevronLeft className="w-5 h-5" /> Back to Business Type
+                    </button>
                   </div>
                 </div>
               ) : (
                 <div className="space-y-6">
-                  <div className="p-6 bg-primary/5 rounded-[2rem] border border-primary/10 space-y-4">
+                  <div className="p-5 bg-slate-50 rounded-2xl border border-black space-y-4">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <div className="w-10 h-10 rounded-xl bg-primary text-white flex items-center justify-center">
                           <Building2 className="w-5 h-5" />
                         </div>
                         <div>
-                          <p className="text-xs font-black text-slate-400 uppercase tracking-widest">Business Category</p>
-                          <p className="font-black text-slate-900">{businessCategory}</p>
+                          <p className="text-[11px] font-black text-slate-500 uppercase tracking-widest">Organisation Type</p>
+                          <p className="font-black text-black">{businessCategory}</p>
                         </div>
                       </div>
-                      <button onClick={() => setBusinessCategory(null)} className="text-xs text-primary font-bold">Edit</button>
+                      <button type="button" onClick={() => setBusinessCategory(null)} className="text-xs text-primary font-black underline cursor-pointer">Change</button>
                     </div>
-                    
-                    <div className="flex items-start gap-3 bg-white/50 p-4 rounded-2xl border border-primary/10">
+
+                    <div className="flex items-start gap-3 bg-white p-4 rounded-xl border border-black">
                       <Gift className="w-5 h-5 text-orange-500 shrink-0 mt-0.5" />
                       <div>
-                        <p className="text-[10px] font-black text-orange-600 uppercase tracking-widest leading-none mb-1">Introductory Offer</p>
-                        <p className="text-xs text-slate-600 leading-tight">Your first 10 job posts are completely free. Test the platform and see the quality of our traders before you subscribe.</p>
+                        <p className="text-[10px] font-black text-orange-600 uppercase tracking-widest leading-none mb-1">Property Hub Ready</p>
+                        <p className="text-xs text-black leading-tight">Manage property passports, compliance alerts (CP12 & EICR), hire verified trades, and book rides on AnyRoller from one account.</p>
                       </div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-2">Select Subscription Tier</p>
-                    <div className="grid grid-cols-1 gap-3">
-                      {(platformConfig?.businessTiers || []).map((tier: any) => (
-                        <button
-                          key={tier.name}
-                          onClick={() => setSelectedTier(tier.name)}
-                          className={cn(
-                            "p-4 rounded-2xl border-2 text-left transition-all relative",
-                            selectedTier === tier.name 
-                              ? "bg-primary/5 border-primary shadow-sm" 
-                              : "bg-white border-black hover:border-black"
-                          )}
-                        >
-                          <div className="flex justify-between items-start mb-1">
-                            <p className="font-black text-slate-900 leading-none">{tier.name}</p>
-                            <p className="text-sm font-black text-primary">£{tier.price}</p>
-                          </div>
-                          <p className="text-[10px] text-slate-500 mb-2 font-medium leading-tight">{tier.description}</p>
-                          <div className="flex items-center gap-2">
-                            <div className="px-2 py-0.5 bg-blue-100 rounded text-[8px] font-black text-blue-700 uppercase tracking-wider">
-                              {tier.commission || 0}% Comm
-                            </div>
-                            {tier.jobPostsLimit && (
-                              <div className="px-2 py-0.5 bg-slate-100 rounded text-[8px] font-black text-slate-600 uppercase tracking-wider">
-                                {tier.jobPostsLimit === 9999 ? "Unlimited" : tier.jobPostsLimit} Posts
-                              </div>
-                            )}
-                          </div>
-                          {selectedTier === tier.name && (
-                            <CheckCircle2 className="absolute top-4 right-4 w-4 h-4 text-primary" />
-                          )}
-                        </button>
-                      ))}
                     </div>
                   </div>
 
                   <div className="flex gap-4">
                     <button
+                      type="button"
                       onClick={() => {
-                        setStep(1);
                         setBusinessCategory(null);
                       }}
-                      className="flex-1 p-5 rounded-[2rem] border-2 border-black font-black text-slate-600 hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
+                      className="flex-1 p-4 rounded-2xl border border-black font-black text-black hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
                     >
                       <ChevronLeft className="w-5 h-5" /> Back
                     </button>
                     <button
+                      type="button"
                       onClick={() => {
-                        if (!selectedTier) setSelectedTier("Business Professional");
-                        setTimeout(() => handleSubmit(), 100);
+                        const chosenTier = selectedTier || "Business Professional";
+                        if (!selectedTier) setSelectedTier(chosenTier);
+                        handleSubmit({ overrideTier: chosenTier });
                       }}
                       disabled={loading}
-                      className="flex-[2] flex items-center justify-center gap-3 bg-primary text-white p-5 rounded-[2rem] font-black text-lg hover:bg-primary-hover transition-all shadow-2xl shadow-primary/30 disabled:opacity-50 active:scale-95 group"
+                      className="flex-[2] flex items-center justify-center gap-3 bg-primary text-white p-4 rounded-2xl font-black text-base hover:bg-primary-hover transition-all shadow-xl shadow-primary/25 disabled:opacity-50 active:scale-95 group cursor-pointer"
                     >
                       {loading ? (
                         <Loader2 className="w-6 h-6 animate-spin" />
@@ -1491,11 +1745,16 @@ export default function Onboarding() {
           {/* Step 3: Tradesperson - Verification */}
           {step === 3 && (
             <div className="space-y-8">
+              <div className="flex justify-end">
+                <span className="text-[11px] font-black uppercase tracking-wider text-black bg-slate-100 border border-black/20 px-2.5 py-1 rounded-lg">
+                  {stepProgress.label}
+                </span>
+              </div>
               <div className="text-center space-y-2">
-                <h1 className="text-3xl font-display font-black text-slate-900 tracking-tight">
+                <h1 className="text-3xl font-display font-black text-black tracking-tight">
                   Verification Required
                 </h1>
-                <p className="text-slate-500 font-medium text-sm">
+                <p className="text-slate-600 font-medium text-sm">
                   Some of your trades require certification to ensure platform safety.
                 </p>
               </div>
@@ -1521,49 +1780,102 @@ export default function Onboarding() {
               )}
 
               <div className="space-y-4">
-                {uniqueRequiredCerts.map((cert, idx) => (
-                  <div key={idx} className="p-5 rounded-[2rem] border-2 border-black bg-slate-50/50 space-y-4">
-                    <div className="flex items-center justify-between">
-                      <p className="text-sm font-black text-slate-900 tracking-tight">{cert}</p>
-                      {verificationDocs.find(d => d.type === cert) ? (
-                        <span className="text-[10px] bg-green-500 text-white px-3 py-1 rounded-full font-black uppercase tracking-widest">Uploaded</span>
-                      ) : (
-                        <span className="text-[10px] bg-slate-200 text-slate-500 px-3 py-1 rounded-full font-black uppercase tracking-widest">Required</span>
-                      )}
+                {uniqueRequiredCerts.map((cert, idx) => {
+                  const uploadedDoc = verificationDocs.find(d => d.type === cert);
+                  const isUploadingThis = uploadingCert === cert;
+                  return (
+                    <div key={idx} className="p-5 rounded-2xl border border-black bg-slate-50/50 space-y-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="text-sm font-black text-black tracking-tight">{cert}</p>
+                          {uploadedDoc?.fileName && (
+                            <p className="text-[11px] font-bold text-green-700 truncate mt-0.5">
+                              File: {uploadedDoc.fileName}
+                            </p>
+                          )}
+                        </div>
+                        {isUploadingThis ? (
+                          <span className="text-[10px] bg-blue-600 text-white px-3 py-1 rounded-full font-black uppercase tracking-widest flex items-center gap-1 shrink-0">
+                            <Loader2 className="w-3 h-3 animate-spin" /> Uploading
+                          </span>
+                        ) : uploadedDoc ? (
+                          <span className="text-[10px] bg-green-600 text-white px-3 py-1 rounded-full font-black uppercase tracking-widest shrink-0">Uploaded</span>
+                        ) : (
+                          <span className="text-[10px] bg-slate-200 text-black px-3 py-1 rounded-full font-black uppercase tracking-widest shrink-0">Required</span>
+                        )}
+                      </div>
+                      <label 
+                        htmlFor={`cert-upload-${idx}`}
+                        className={cn(
+                          "w-full flex items-center justify-center gap-3 p-4 rounded-xl border border-dashed border-black bg-white text-xs font-black text-black hover:border-primary hover:text-primary hover:bg-primary/5 transition-all group",
+                          isUploadingThis || Boolean(uploadingCert) ? "opacity-60 cursor-wait pointer-events-none" : "cursor-pointer"
+                        )}
+                      >
+                        {isUploadingThis ? (
+                          <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                        ) : (
+                          <Upload className="w-4 h-4 group-hover:-translate-y-0.5 transition-transform" />
+                        )}
+                        <span>
+                          {isUploadingThis
+                            ? "Uploading securely to storage..."
+                            : uploadedDoc
+                              ? "Replace Document"
+                              : "Choose / Upload Document (PDF or Image, max 10MB)"}
+                        </span>
+                        <input
+                          id={`cert-upload-${idx}`}
+                          type="file"
+                          accept="image/*,application/pdf"
+                          disabled={Boolean(uploadingCert) || loading}
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = "";
+                            if (file) {
+                              void handleCertificationUpload(cert as string, file);
+                            }
+                          }}
+                        />
+                      </label>
                     </div>
-                    <label 
-                      htmlFor={`cert-upload-${idx}`}
-                      className="w-full flex items-center justify-center gap-3 p-4 rounded-2xl border-2 border-dashed border-black bg-white text-xs font-black text-slate-500 hover:border-primary hover:text-primary hover:bg-primary/5 transition-all group cursor-pointer"
-                    >
-                      <Upload className="w-4 h-4 group-hover:-translate-y-1 transition-transform" />
-                      <span>{verificationDocs.find(d => d.type === cert) ? "Replace Document" : "Choose / Upload Document"}</span>
-                      <input
-                        id={`cert-upload-${idx}`}
-                        type="file"
-                        accept="image/*,application/pdf"
-                        className="hidden"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) {
-                            const reader = new FileReader();
-                            reader.onloadend = () => {
-                              const mockUrl = reader.result as string || `https://example.com/docs/${(cert as string).replace(/\s/g, '_')}.pdf`;
-                              setVerificationDocs(prev => [...prev.filter(d => d.type !== cert), { type: cert, fileUrl: mockUrl }]);
-                            };
-                            reader.readAsDataURL(file);
-                          }
-                        }}
-                      />
-                    </label>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
+
+              {(role === "tradesperson" || (role === "business" && businessLayer === "field_services")) && (
+                <label className="flex items-start gap-3 p-4 rounded-2xl bg-slate-50 border border-black cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={acceptedComplianceDeclaration}
+                    onChange={(e) => {
+                      setAcceptedComplianceDeclaration(e.target.checked);
+                      if (e.target.checked) setError(null);
+                    }}
+                    className="mt-0.5 w-5 h-5 rounded border-2 border-black text-primary focus:ring-primary cursor-pointer shrink-0"
+                  />
+                  <span className="text-xs font-medium text-black leading-relaxed">
+                    {TRADER_COMPLIANCE_DECLARATION_SUMMARY}{" "}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setShowTermsModal(true);
+                      }}
+                      className="font-black text-primary underline hover:text-primary-hover cursor-pointer"
+                    >
+                      Read Terms &amp; Conditions
+                    </button>
+                  </span>
+                </label>
+              )}
 
               <div className="flex flex-col sm:flex-row gap-4">
                 <button
                   type="button"
-                  onClick={() => setStep(role === "fleet_driver" ? 1 : 2)}
-                  className="w-full sm:w-auto p-5 rounded-[2rem] border-2 border-black font-black text-slate-600 hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  onClick={() => setStep(getPreviousOnboardingStep(3, role))}
+                  disabled={loading || Boolean(uploadingCert)}
+                  className="w-full sm:w-auto p-5 rounded-2xl border border-black font-black text-black hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                 >
                   <ChevronLeft className="w-5 h-5" /> Back
                 </button>
@@ -1571,26 +1883,58 @@ export default function Onboarding() {
                   <button
                     type="button"
                     onClick={() => {
+                      if (
+                        (role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                        !acceptedComplianceDeclaration
+                      ) {
+                        setError("Please tick the compliance declaration and accept the Terms & Conditions to continue.");
+                        return;
+                      }
                       setError(null);
-                      setSelectedTier(platformConfig?.feeTiers?.[0]?.name || "Free Trial");
-                      handleSubmit();
+                      const defaultTier = platformConfig?.feeTiers?.[0]?.name || "Free Explorer";
+                      setSelectedTier(defaultTier);
+                      void handleSubmit({ skipVerificationDocs: true, overrideTier: defaultTier });
                     }}
-                    disabled={loading}
-                    className="flex-1 bg-white border-2 border-black text-slate-700 p-5 rounded-[2rem] font-black text-sm sm:text-base hover:border-black hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-95 disabled:opacity-50"
+                    disabled={
+                      loading ||
+                      Boolean(uploadingCert) ||
+                      ((role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                        !acceptedComplianceDeclaration)
+                    }
+                    className="flex-1 bg-white border border-black text-black p-5 rounded-2xl font-black text-sm sm:text-base hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-95 disabled:opacity-50"
                   >
-                    {loading ? <Loader2 className="w-5 h-5 animate-spin text-slate-600" /> : "I'll do this later"}
+                    {loading ? <Loader2 className="w-5 h-5 animate-spin text-black" /> : "I'll do this later"}
                   </button>
                   <button
                     type="button"
                     onClick={() => {
+                      if (
+                        (role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                        !acceptedComplianceDeclaration
+                      ) {
+                        setError("Please tick the compliance declaration and accept the Terms & Conditions to continue.");
+                        return;
+                      }
                       setError(null);
-                      setSelectedTier(platformConfig?.feeTiers?.[0]?.name || "Free Trial");
-                      handleSubmit();
+                      const defaultTier = platformConfig?.feeTiers?.[0]?.name || "Free Explorer";
+                      setSelectedTier(defaultTier);
+                      void handleSubmit({ skipVerificationDocs: false, overrideTier: defaultTier });
                     }}
-                    disabled={loading}
-                    className="flex-1 bg-primary text-white p-5 rounded-[2rem] font-black text-sm sm:text-base hover:bg-primary-hover transition-all shadow-xl shadow-primary/30 disabled:opacity-50 flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
+                    disabled={
+                      loading ||
+                      Boolean(uploadingCert) ||
+                      ((role === "tradesperson" || (role === "business" && businessLayer === "field_services")) &&
+                        !acceptedComplianceDeclaration)
+                    }
+                    className="flex-1 bg-primary text-white p-5 rounded-2xl font-black text-sm sm:text-base hover:bg-primary-hover transition-all shadow-xl shadow-primary/30 disabled:opacity-50 flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
                   >
-                    {loading ? <Loader2 className="w-6 h-6 animate-spin" /> : "Complete Setup"}
+                    {loading ? (
+                      <Loader2 className="w-6 h-6 animate-spin" />
+                    ) : verificationDocs.length > 0 ? (
+                      `Submit ${verificationDocs.length} Doc${verificationDocs.length === 1 ? "" : "s"} & Complete`
+                    ) : (
+                      "Complete Setup"
+                    )}
                   </button>
                 </div>
               </div>
@@ -1605,11 +1949,16 @@ export default function Onboarding() {
           {/* Step 4: SMS Verification */}
           {step === 4 && (
             <div className="space-y-8">
+              <div className="flex justify-end">
+                <span className="text-[11px] font-black uppercase tracking-wider text-black bg-slate-100 border border-black/20 px-2.5 py-1 rounded-lg">
+                  {stepProgress.label}
+                </span>
+              </div>
               <div className="text-center space-y-2">
-                <h1 className="text-3xl font-display font-black text-slate-900 tracking-tight">
+                <h1 className="text-3xl font-display font-black text-black tracking-tight">
                   Verify Phone Number
                 </h1>
-                <p className="text-slate-500 font-medium text-sm">
+                <p className="text-slate-600 font-medium text-sm">
                   We've sent a 6-digit code to {phone.startsWith("0") ? "+44" + phone.slice(1) : phone}
                 </p>
               </div>
@@ -1634,11 +1983,12 @@ export default function Onboarding() {
 
               <div className="flex gap-4">
                 <button
+                  type="button"
                   onClick={() => {
-                    setStep(1); // Go back to start
+                    setStep(getPreviousOnboardingStep(4, role));
                     setConfirmationResult(null);
                   }}
-                  className="flex-1 p-5 rounded-[2rem] border-2 border-black font-black text-slate-600 hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
+                  className="flex-1 p-5 rounded-2xl border border-black font-black text-black hover:bg-slate-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <ChevronLeft className="w-5 h-5" /> Cancel
                 </button>
@@ -1669,6 +2019,7 @@ export default function Onboarding() {
       </div>
 
       <div id="recaptcha-container"></div>
+      <TermsModal isOpen={showTermsModal} onClose={() => setShowTermsModal(false)} />
     </div>
   );
 }

@@ -39,6 +39,8 @@ export default function AdminAdvertsTab() {
   const [recurringPrice, setRecurringPrice] = useState("0");
 
   const [isSaving, setIsSaving] = useState(false);
+  const [pendingDeleteAdId, setPendingDeleteAdId] = useState<string | null>(null);
+  const [isDeletingAd, setIsDeletingAd] = useState(false);
 
   // Search and Filter
   const [searchQuery, setSearchQuery] = useState("");
@@ -117,6 +119,25 @@ export default function AdminAdvertsTab() {
     setShowModal(true);
   };
 
+  const syncPublicAdsProjection = async () => {
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) return;
+      const res = await fetch("/api/admin/sync-public-ads", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (!res.ok) {
+        toast.warning("Advert saved, but public banner cache sync failed — run resync in System Tools.");
+      }
+    } catch {
+      toast.warning("Advert saved, but public banner cache sync failed — run resync in System Tools.");
+    }
+  };
+
   const handleSave = async () => {
     if (!title || !url) return;
     setIsSaving(true);
@@ -143,17 +164,33 @@ export default function AdminAdvertsTab() {
         updatedAt: serverTimestamp()
       }, { merge: true });
       setShowModal(false);
-    } catch (e) {
+      toast.success(editingAd ? "Advertisement updated" : "Advertisement created");
+      void syncPublicAdsProjection();
+    } catch (e: any) {
       console.error(e);
-      alert("Error saving advert");
+      toast.error(e?.message || "Failed to save advertisement");
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (confirm("Delete this advertisement?")) {
-      await deleteDoc(doc(db, "advertisements", id));
+  const handleDelete = (id: string) => {
+    setPendingDeleteAdId(id);
+  };
+
+  const confirmDeleteAdvert = async () => {
+    if (!pendingDeleteAdId) return;
+    setIsDeletingAd(true);
+    try {
+      await deleteDoc(doc(db, "advertisements", pendingDeleteAdId));
+      setPendingDeleteAdId(null);
+      toast.success("Advertisement deleted");
+      void syncPublicAdsProjection();
+    } catch (e: any) {
+      console.error(e);
+      toast.error(e?.message || "Failed to delete advertisement");
+    } finally {
+      setIsDeletingAd(false);
     }
   };
 
@@ -255,7 +292,7 @@ export default function AdminAdvertsTab() {
                  <img src={ad.imageUrl} alt={ad.title} className="w-full h-full object-cover" />
                </div>
              ) : (
-               <div className={cn("w-full h-16 rounded-xl mb-4 relative overflow-hidden flex items-center p-3 text-white", ad.bgColor)} style={{ background: ad.bgColor.includes("bg-") ? undefined : ad.bgColor }}>
+               <div className={cn("w-full h-16 rounded-xl mb-4 relative overflow-hidden flex items-center p-3 text-white", (ad.bgColor || "bg-slate-900").includes("bg-") ? (ad.bgColor || "bg-slate-900") : undefined)} style={{ background: (ad.bgColor || "bg-slate-900").includes("bg-") ? undefined : ad.bgColor }}>
                   <div className="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center shrink-0 mr-3">
                     <AdIcon className="w-5 h-5 text-white" />
                   </div>
@@ -272,7 +309,7 @@ export default function AdminAdvertsTab() {
                   <p className="text-xs text-slate-500 mb-1">
                     Advertiser: 
                     {ad.isTraderAd && ad.advertiserId ? (
-                      <Link to={`/profile/${ad.advertiserId}`} target="_blank" className="font-bold text-blue-600 hover:text-blue-800 ml-1">
+                      <Link to={`/profile/${ad.advertiserId}`} className="font-bold text-blue-600 hover:text-blue-800 ml-1">
                         {ad.advertiserName || "Trader Profile"}
                       </Link>
                     ) : (
@@ -517,6 +554,34 @@ export default function AdminAdvertsTab() {
               <button disabled={isSaving} onClick={() => setShowModal(false)} className="px-6 h-12 rounded-xl font-bold bg-slate-100 text-slate-600 hover:bg-slate-200">Cancel</button>
               <button disabled={isSaving || !title || !url} onClick={handleSave} className="px-6 h-12 rounded-xl font-bold bg-blue-600 text-white hover:bg-blue-700 flex items-center gap-2">
                 {isSaving ? <Loader2 className="w-5 h-5 animate-spin" /> : <Save className="w-5 h-5" />} Save Advert
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {pendingDeleteAdId && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">Delete Advertisement?</h3>
+            <p className="text-sm text-black">
+              This removes the advertisement and refreshes the public banner feed.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingAd}
+                onClick={() => setPendingDeleteAdId(null)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingAd}
+                onClick={confirmDeleteAdvert}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
+              >
+                {isDeletingAd ? "Deleting..." : "Delete"}
               </button>
             </div>
           </div>

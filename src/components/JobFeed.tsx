@@ -15,8 +15,19 @@ import { SEO } from "./SEO";
 import { useEntitlements } from "../lib/useEntitlements";
 import { toast } from "sonner";
 import { PullToRefresh } from "./common/PullToRefresh";
-import { calculateTraderMatchScore, type MatchEngineResult } from "@/src/services/matchingEngine";
+import { calculateJobFitForTrader, type MatchEngineResult } from "@/src/services/matchingEngine";
 import { QuickQuoteModal } from "./job-feed/QuickQuoteModal";
+import { PUBLIC_OPEN_JOB_STATUSES, isOpenJobStatus } from "@/src/lib/marketplaceContracts";
+import { isTradeProviderAccount } from "@/src/lib/accountRoles";
+import {
+  computeJobTraderDistance,
+  extractJobDate,
+  extractJobSubCategory,
+  extractTraderCategories,
+  hasExclusiveLeadAccess,
+  isTraderCalendarAvailableForDate,
+  isWithinExclusiveWindow,
+} from "@/src/lib/unifiedJobMatching";
 
 const iconMap: Record<string, any> = {
   Wrench, Briefcase, Clock, MapPin, Search, Filter, X
@@ -515,9 +526,10 @@ export default function JobFeed() {
     if (autoShowFilters) setShowFilters(true);
   };
 
-  // Listen for the tradesperson's submitted quotes to display active quote status
+  // Listen for the tradesperson / trade business submitted quotes to display active quote status
+  const isTradeProvider = isTradeProviderAccount(profile);
   useEffect(() => {
-    if (!user || profile?.role !== "tradesperson") {
+    if (!user || !isTradeProvider) {
       setMyQuotes({});
       return;
     }
@@ -547,40 +559,71 @@ export default function JobFeed() {
     } catch (e) {
       console.warn("Error setting up quotes listener:", e);
     }
-  }, [user?.uid, profile?.role]);
+  }, [user?.uid, isTradeProvider]);
+
+  // Stable list of up to 10 registered categories for Firestore category-scoped queries
+  const traderRegisteredCategoriesKey = useMemo(() => {
+    if (!isTradeProvider || !profile) return "";
+    return extractTraderCategories(profile).slice(0, 10).join("||");
+  }, [isTradeProvider, profile]);
 
   useEffect(() => {
-    // Fetch up to current limitCount posted public job cards with optimized composite ordering and fallback
-    let q = query(
-      collection(db, "public_job_cards"),
-      where("status", "==", "posted"),
-      orderBy("postedDate", "desc"),
-      limit(limitCount)
-    );
+    // When a tradesperson has "Best Match Only" ON and registered categories, scope the Firestore query
+    // by `category in [...]` so niche trades are NEVER starved by a global limit(50)!
+    // (Note: Firestore allows at most one `in` filter per query; public_job_cards only mirrors open jobs,
+    // and we double-check `isOpenJobStatus` in memory.)
+    const openStatuses = [...PUBLIC_OPEN_JOB_STATUSES];
+    const traderCats = traderRegisteredCategoriesKey ? traderRegisteredCategoriesKey.split("||").filter(Boolean) : [];
+    const shouldScopeByCategory = Boolean(isTradeProvider && showMatchedOnly && traderCats.length > 0 && selectedCategories.length === 0);
 
-    let unsubscribe = onSnapshot(q, (snapshot) => {
+    const buildPrimaryQuery = () =>
+      shouldScopeByCategory
+        ? query(
+            collection(db, "public_job_cards"),
+            where("category", "in", traderCats),
+            orderBy("postedDate", "desc"),
+            limit(limitCount)
+          )
+        : query(
+            collection(db, "public_job_cards"),
+            where("status", "in", openStatuses),
+            orderBy("postedDate", "desc"),
+            limit(limitCount)
+          );
+
+    const buildFallbackQuery = () =>
+      shouldScopeByCategory
+        ? query(
+            collection(db, "public_job_cards"),
+            where("category", "in", traderCats),
+            limit(limitCount)
+          )
+        : query(
+            collection(db, "public_job_cards"),
+            where("status", "in", openStatuses),
+            limit(limitCount)
+          );
+
+    const normalizeSnapshotJobs = (snap: any) => {
       const uniqueJobsMap = new Map<string, any>();
-      snapshot.docs.forEach(doc => {
-        uniqueJobsMap.set(doc.id, { id: doc.id, ...doc.data() });
+      snap.docs.forEach((docSnap: any) => {
+        const data = docSnap.data();
+        if (isOpenJobStatus(data?.status)) {
+          uniqueJobsMap.set(docSnap.id, { id: docSnap.id, ...data });
+        }
       });
-      setJobs(Array.from(uniqueJobsMap.values()));
+      return Array.from(uniqueJobsMap.values()).sort(
+        (a: any, b: any) => new Date(b.postedDate || b.createdAt || 0).getTime() - new Date(a.postedDate || a.createdAt || 0).getTime()
+      );
+    };
+
+    let unsubscribe = onSnapshot(buildPrimaryQuery(), (snapshot) => {
+      setJobs(normalizeSnapshotJobs(snapshot));
       setLoading(false);
     }, (error) => {
       console.warn("Ordered public job card query error or indexing in progress, running resilient fallback query:", error);
-      // Resilient fallback query without explicit orderBy in case composite index is building
-      const fallbackQ = query(
-        collection(db, "public_job_cards"),
-        where("status", "==", "posted"),
-        limit(limitCount)
-      );
-      unsubscribe = onSnapshot(fallbackQ, (fallbackSnapshot) => {
-        const uniqueJobsMap = new Map<string, any>();
-        fallbackSnapshot.docs.forEach(doc => {
-          uniqueJobsMap.set(doc.id, { id: doc.id, ...doc.data() });
-        });
-        const jobsData = Array.from(uniqueJobsMap.values())
-          .sort((a: any, b: any) => new Date(b.postedDate || b.createdAt || 0).getTime() - new Date(a.postedDate || a.createdAt || 0).getTime());
-        setJobs(jobsData);
+      unsubscribe = onSnapshot(buildFallbackQuery(), (fallbackSnapshot) => {
+        setJobs(normalizeSnapshotJobs(fallbackSnapshot));
         setLoading(false);
       }, (fallbackErr) => {
         console.error("Error fetching public job cards fallback:", fallbackErr);
@@ -590,22 +633,37 @@ export default function JobFeed() {
     });
 
     return () => unsubscribe();
-  }, [user, limitCount]);
+  }, [user, limitCount, isTradeProvider, showMatchedOnly, traderRegisteredCategoriesKey, selectedCategories.length]);
 
   const handleManualRefresh = async () => {
     try {
-      const q = query(
-        collection(db, "public_job_cards"),
-        where("status", "==", "posted"),
-        orderBy("postedDate", "desc"),
-        limit(limitCount)
-      );
-      const snapshot = await getDocs(q);
+      const openStatuses = [...PUBLIC_OPEN_JOB_STATUSES];
+      const traderCats = traderRegisteredCategoriesKey ? traderRegisteredCategoriesKey.split("||").filter(Boolean) : [];
+      const shouldScopeByCategory = Boolean(isTradeProvider && showMatchedOnly && traderCats.length > 0 && selectedCategories.length === 0);
+
+      let snapshot;
+      try {
+        const q = shouldScopeByCategory
+          ? query(collection(db, "public_job_cards"), where("category", "in", traderCats), orderBy("postedDate", "desc"), limit(limitCount))
+          : query(collection(db, "public_job_cards"), where("status", "in", openStatuses), orderBy("postedDate", "desc"), limit(limitCount));
+        snapshot = await getDocs(q);
+      } catch {
+        const fallbackQ = shouldScopeByCategory
+          ? query(collection(db, "public_job_cards"), where("category", "in", traderCats), limit(limitCount))
+          : query(collection(db, "public_job_cards"), where("status", "in", openStatuses), limit(limitCount));
+        snapshot = await getDocs(fallbackQ);
+      }
       const uniqueJobsMap = new Map<string, any>();
-      snapshot.docs.forEach(doc => {
-        uniqueJobsMap.set(doc.id, { id: doc.id, ...doc.data() });
+      snapshot.docs.forEach(docSnap => {
+        const data = docSnap.data();
+        if (isOpenJobStatus(data?.status)) {
+          uniqueJobsMap.set(docSnap.id, { id: docSnap.id, ...data });
+        }
       });
-      setJobs(Array.from(uniqueJobsMap.values()));
+      const sorted = Array.from(uniqueJobsMap.values()).sort(
+        (a: any, b: any) => new Date(b.postedDate || b.createdAt || 0).getTime() - new Date(a.postedDate || a.createdAt || 0).getTime()
+      );
+      setJobs(sorted);
       toast.success("Job feed refreshed");
     } catch (err) {
       console.error("Error refreshing job feed:", err);
@@ -613,19 +671,22 @@ export default function JobFeed() {
     }
   };
 
-  // Pre-calculate 40+ signal intelligent match scores for tradespeople
+  // Pre-calculate honest trader-facing Job Fit scores (every dimension differentiates Job A vs Job B)
   const traderMatchScores = useMemo(() => {
-    if (!profile || profile.role !== "tradesperson") return {};
+    if (!profile || !isTradeProvider) return {};
     const scores: Record<string, MatchEngineResult> = {};
     jobs.forEach(job => {
       try {
-        scores[job.id] = calculateTraderMatchScore(profile, job);
+        scores[job.id] = calculateJobFitForTrader(profile, job, {
+          explicitTraderCoords: userCoords,
+          mode: showMatchedOnly ? "strict" : "relaxed",
+        });
       } catch (err) {
         console.warn(`Error computing match score for job ${job.id}:`, err);
       }
     });
     return scores;
-  }, [jobs, profile]);
+  }, [jobs, profile, isTradeProvider, userCoords, showMatchedOnly]);
 
   const filteredJobs = jobs.filter(job => {
     // 1. Direct 1-on-1 Quote Request & Claimed Flash Deal Isolation Security
@@ -675,12 +736,9 @@ export default function JobFeed() {
       }
     }
 
-    // Time-Gate Security Check
-    const jobExclusiveUntil = job.exclusiveUntil?.toDate ? job.exclusiveUntil.toDate() : (job.exclusiveUntil ? new Date(job.exclusiveUntil) : null);
-    const isCurrentlyExclusive = jobExclusiveUntil && jobExclusiveUntil > new Date();
-    
-    // Hide if it's currently exclusive and the user DOES NOT have active fast pass AND the paywall is active
-    if (isCurrentlyExclusive && (!profile?.hasExclusiveAddon || profile?.isExclusiveActive === false) && sysConfig?.paywallEnabled !== false) {
+    // Time-Gate Security Check (unified exclusiveUntil + Priority Offers access check)
+    const isCurrentlyExclusive = isWithinExclusiveWindow(job);
+    if (isCurrentlyExclusive && !hasExclusiveLeadAccess(profile) && sysConfig?.paywallEnabled !== false) {
       return false;
     }
 
@@ -713,12 +771,12 @@ export default function JobFeed() {
         const now = new Date();
         const thirtyDaysFromNow = new Date();
         thirtyDaysFromNow.setDate(now.getDate() + 30);
+        const resolvedJobDate = extractJobDate(job);
         
-        if (job.jobDate) {
-          const jobDate = new Date(job.jobDate);
-          matchesUrgency = jobDate >= now && jobDate <= thirtyDaysFromNow;
+        if (resolvedJobDate) {
+          const jobDate = new Date(resolvedJobDate);
+          matchesUrgency = !Number.isNaN(jobDate.getTime()) && jobDate >= now && jobDate <= thirtyDaysFromNow;
         } else {
-          // If no specific date, treat "flexible", "routine" or "this_week" as potentially within this month
           matchesUrgency = job.urgency === "flexible" || job.urgency === "routine" || job.urgency === "this_week" || job.urgency === "asap";
         }
       }
@@ -735,26 +793,20 @@ export default function JobFeed() {
       else if (priceFilter === "over_5000") matchesPrice = min >= 5000;
     }
 
-    // Distance Calculation & Filter
-    let calculatedDistance: number | null = null;
-    const jobLat = job.lat || job.latitude || job.location?.lat;
-    const jobLng = job.lng || job.longitude || job.location?.lng;
-
-    if (userCoords && jobLat && jobLng) {
-      calculatedDistance = calculateDistanceMiles(userCoords.lat, userCoords.lng, jobLat, jobLng);
-    } else if (profile?.postcode && job.postcode) {
-      const p1 = profile.postcode.split(" ")[0].toUpperCase();
-      const p2 = job.postcode.split(" ")[0].toUpperCase();
-      if (p1 === p2) calculatedDistance = 1.5;
-      else if (p1.slice(0, 2) === p2.slice(0, 2)) calculatedDistance = 6.0;
-      else calculatedDistance = 18.0;
-    }
+    // Unified Geodesic + UK Postcode-Centroid Distance Calculation & Filter (works on public_job_cards.postcodeArea!)
+    const distEval = computeJobTraderDistance(profile, job, userCoords);
+    const calculatedDistance = distEval.distanceMiles;
 
     let matchesDistance = true;
     if (distanceFilter !== "any") {
       const maxDist = Number(distanceFilter);
-      if (!isNaN(maxDist) && calculatedDistance !== null) {
-        matchesDistance = calculatedDistance <= maxDist;
+      if (!isNaN(maxDist)) {
+        if (calculatedDistance !== null) {
+          matchesDistance = calculatedDistance <= maxDist;
+        } else {
+          // If trader has a location configured and selected a strict distance cap, do not pass unlocatable jobs
+          matchesDistance = !(userCoords || profile?.postcode);
+        }
       }
     }
 
@@ -789,7 +841,7 @@ export default function JobFeed() {
     const userTags: string[] = rawTags.filter(Boolean).map((t: string) => t.trim());
 
     const jCat = (job.category || "").toLowerCase();
-    const jSub = (job.subcategory || "").toLowerCase();
+    const jSub = extractJobSubCategory(job).toLowerCase();
     const jTitle = (job.title || "").toLowerCase();
     const jDesc = (job.description || "").toLowerCase();
 
@@ -879,14 +931,9 @@ export default function JobFeed() {
       matchesService || 
       matchesTagOrSkill;
     
-    // Filter out jobs scheduled for dates the tradesperson is busy or booked
-    let matchesAvailability = true;
-    if (job.urgency === "specific_date" && job.jobDate && profile?.dateOverrides) {
-      const overrideStatus = profile.dateOverrides[job.jobDate];
-      if (overrideStatus === "busy" || overrideStatus === "booked") {
-        matchesAvailability = false;
-      }
-    }
+    // Filter out jobs scheduled for dates the tradesperson is busy/booked/unavailable (supports preferredDate + jobDate + weekly schedule)
+    const resolvedTargetDate = extractJobDate(job);
+    const matchesAvailability = !resolvedTargetDate || isTraderCalendarAvailableForDate(profile, resolvedTargetDate);
 
     // If any saved filter tabs are selected, check if job matches AT LEAST ONE selected saved filter
     let matchesSelectedSavedFilters = true;

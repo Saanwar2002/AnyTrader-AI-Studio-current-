@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { db, doc, getDoc, collection, query, where, getDocs } from "@/src/firebase";
+import { auth } from "@/src/firebase";
 import { QRCodeSVG } from "qrcode.react";
 import { 
   Home, ShieldCheck, CheckCircle2, AlertCircle, Wrench, Calendar, 
@@ -43,7 +43,15 @@ export default function PublicPropertyPassportView() {
       setError(null);
       try {
         // AT-PASS-02: Load strictly from the canonical server-projected public passport endpoint
-        const res = await fetch(`/api/properties/${encodeURIComponent(activeId)}/public-passport`);
+        // Attach Firebase ID token when signed in so owners/admins can preview private passports
+        const headers: Record<string, string> = {};
+        if (auth.currentUser) {
+          const token = await auth.currentUser.getIdToken().catch(() => null);
+          if (token) headers.Authorization = `Bearer ${token}`;
+        }
+        const res = await fetch(`/api/properties/${encodeURIComponent(activeId)}/public-passport`, {
+          headers,
+        });
         const payload = await res.json().catch(() => ({}));
         if (!res.ok || !payload.property) {
           setError(payload.error || "Property passport record not found or public sharing is not enabled.");
@@ -53,18 +61,7 @@ export default function PublicPropertyPassportView() {
 
         setProperty(payload.property);
         setProvenance(payload.provenance || null);
-
-        // Load public completed jobs for this property
-        try {
-          const jobsQ = query(collection(db, "public_job_cards"), where("propertyId", "==", activeId));
-          const jobsSnapshot = await getDocs(jobsQ);
-          const j = jobsSnapshot.docs
-            .map(d => ({ id: d.id, ...d.data() }))
-            .filter((job: any) => job.status === "completed");
-          setCompletedJobs(j);
-        } catch (e) {
-          console.warn("Could not load public jobs list:", e);
-        }
+        setCompletedJobs(Array.isArray(payload.completedJobs) ? payload.completedJobs : []);
       } catch (err) {
         console.error("Error loading public property passport:", err);
         setError("Failed to load property passport. Please try again.");
@@ -272,7 +269,7 @@ export default function PublicPropertyPassportView() {
               <div>
                 <h4 className="font-black text-slate-900 text-sm">Buying or Conveyancing this Property?</h4>
                 <p className="text-xs text-slate-600 font-medium">
-                  Ask the seller for the 8-character Transfer Code to claim this complete digital maintenance record on completion.
+                  Ask the seller for their Transfer Code (e.g. TRF-8K92X4) to claim this complete digital maintenance record on completion.
                 </p>
               </div>
             </div>

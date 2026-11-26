@@ -1,5 +1,7 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { db, doc, onSnapshot } from "@/src/firebase";
+import { resolveFlexiPayMode, type FlexiPayMode } from "@/src/lib/marketplaceContracts";
 import { 
   Flame, 
   Zap, 
@@ -84,7 +86,7 @@ const CATEGORY_POOL: TickerItem[] = [
     iconClass: "text-red-600",
     iconBgClass: "bg-red-50 border-red-200",
     term: "Emergency Plumber",
-    highlight: "14m Avg Dispatch",
+    highlight: "24/7 Rapid Dispatch",
     link: "/find-trades?search=Emergency Plumber",
   },
   {
@@ -281,7 +283,7 @@ const FEATURE_POOL: TickerItem[] = [
     iconBgClass: "bg-purple-50 border-purple-200",
     term: "Property Passport",
     highlight: "Instant Digital Specs & CP12 Expiry",
-    link: "/property-passports",
+    link: "/portfolio",
   },
   {
     id: "feat-flexipay",
@@ -293,7 +295,7 @@ const FEATURE_POOL: TickerItem[] = [
     iconBgClass: "bg-emerald-50 border-emerald-200",
     term: "FlexiPay Repair BNPL",
     highlight: "Spread Costs 3–12 Mo (0% APR)",
-    link: "/payment-protection",
+    link: "/billing",
   },
   {
     id: "feat-ai-quote",
@@ -365,7 +367,7 @@ const FEATURE_POOL: TickerItem[] = [
     iconBgClass: "bg-indigo-50 border-indigo-200",
     term: "Gotham B2B Housing Layer",
     highlight: "2h SLA Dispatch & Portfolio SaaS",
-    link: "/corporate",
+    link: "/gotham-portal",
   },
   {
     id: "feat-materials-ai",
@@ -389,7 +391,7 @@ const FEATURE_POOL: TickerItem[] = [
     iconBgClass: "bg-amber-100 border-amber-300",
     term: "AnyRoller Rides & Taxis",
     highlight: "12% Flat Commission • Zero Shift Fees",
-    link: "/rides",
+    link: "/book-ride",
   }
 ];
 
@@ -405,7 +407,7 @@ const FUNCTION_POOL: TickerItem[] = [
     iconBgClass: "bg-emerald-50 border-emerald-200",
     term: "TradeOS Zero Lead Fees",
     highlight: "Traders Only Pay on Completed Work",
-    link: "/pricing",
+    link: "/billing",
   },
   {
     id: "func-tax-reserve",
@@ -441,7 +443,7 @@ const FUNCTION_POOL: TickerItem[] = [
     iconBgClass: "bg-emerald-50 border-emerald-200",
     term: "Milestone Escrow Protection",
     highlight: "Funds Held Securely Until Job Approval",
-    link: "/payment-protection",
+    link: "/billing",
   },
   {
     id: "func-compliance",
@@ -453,7 +455,7 @@ const FUNCTION_POOL: TickerItem[] = [
     iconBgClass: "bg-yellow-50 border-yellow-200",
     term: "EICR & CP12 Safety Checks",
     highlight: "1-Click Landlord Compliance Auto-Booking",
-    link: "/property-passports",
+    link: "/portfolio",
   },
   {
     id: "func-driver-ratings",
@@ -465,7 +467,7 @@ const FUNCTION_POOL: TickerItem[] = [
     iconBgClass: "bg-sky-50 border-sky-200",
     term: "Post-Ride Mutual Reviews",
     highlight: "5-Star Driver & Passenger Fairness Engine",
-    link: "/rides",
+    link: "/book-ride",
   }
 ];
 
@@ -481,14 +483,44 @@ function shuffleArray<T>(array: T[]): T[] {
 
 export function IllustratedAdTicker({ role = "homeowner" }: IllustratedAdTickerProps) {
   const navigate = useNavigate();
+  const [flexiPayMode, setFlexiPayMode] = useState<FlexiPayMode>("coming_soon");
+  const [taxiPortalMode, setTaxiPortalMode] = useState<string>("off");
+
+  useEffect(() => {
+    const unsub = onSnapshot(
+      doc(db, "platform_config", "global"),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() || {};
+          setFlexiPayMode(resolveFlexiPayMode(data));
+          setTaxiPortalMode(String(data.taxiPortalMode || "off").toLowerCase());
+        }
+      },
+      () => {
+        setFlexiPayMode("coming_soon");
+        setTaxiPortalMode("off");
+      }
+    );
+    return () => unsub();
+  }, []);
 
   const isTrader = role === "tradesperson";
 
-  // Dynamically assemble and randomize categories, features, and functions
+  // Dynamically assemble and randomize categories, features, and functions (respecting launch controls)
   const tickerItems: TickerItem[] = useMemo(() => {
+    const allowedFeatures = FEATURE_POOL.filter((item) => {
+      if (item.id === "feat-flexipay") return flexiPayMode === "live";
+      if (item.id === "feat-rides") return taxiPortalMode === "live";
+      return true;
+    });
+    const allowedFunctions = FUNCTION_POOL.filter((item) => {
+      if (item.id === "func-driver-ratings") return taxiPortalMode === "live";
+      return true;
+    });
+
     const shuffledCategories = shuffleArray(CATEGORY_POOL);
-    const shuffledFeatures = shuffleArray(FEATURE_POOL);
-    const shuffledFunctions = shuffleArray(FUNCTION_POOL);
+    const shuffledFeatures = shuffleArray(allowedFeatures);
+    const shuffledFunctions = shuffleArray(allowedFunctions);
 
     // Trader-specific priority items if in tradesperson mode
     const traderCallouts: TickerItem[] = isTrader
@@ -503,7 +535,7 @@ export function IllustratedAdTicker({ role = "homeowner" }: IllustratedAdTickerP
             iconBgClass: "bg-emerald-50 border-emerald-200",
             term: "TradeOS Zero Lead Fees",
             highlight: "Only Pay On Completed Jobs",
-            link: "/pricing",
+            link: "/billing",
           },
           {
             id: "trader-priority-video",
@@ -531,7 +563,7 @@ export function IllustratedAdTicker({ role = "homeowner" }: IllustratedAdTickerP
     }
 
     return combinedList;
-  }, [isTrader]);
+  }, [isTrader, flexiPayMode, taxiPortalMode]);
 
   const handleItemClick = (item: TickerItem, e: React.MouseEvent) => {
     e.stopPropagation();

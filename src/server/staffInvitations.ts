@@ -41,6 +41,39 @@ export function hashInvitationToken(rawToken: string): string {
   return crypto.createHash('sha256').update(rawToken).digest('hex');
 }
 
+export type DerivedStaffAdminTier = 'support_readonly' | 'financial_operator' | 'super_admin';
+
+/**
+ * Maps explicit staff invitation permissions to the least-privileged server capability tier.
+ * View-only staff (e.g. ['view_logs']) NEVER receive elevated super_admin or financial_operator capabilities.
+ */
+export function deriveAdminTierFromPermissions(permissions: string[]): DerivedStaffAdminTier {
+  const normalized = new Set(
+    (Array.isArray(permissions) ? permissions : [])
+      .map((p) => String(p || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (
+    normalized.has('manage_team') ||
+    normalized.has('manage_settings') ||
+    normalized.has('super_admin') ||
+    normalized.has('all')
+  ) {
+    return 'super_admin';
+  }
+  if (
+    normalized.has('manage_payouts') ||
+    normalized.has('manage_users') ||
+    normalized.has('manage_jobs') ||
+    normalized.has('manage_disputes') ||
+    normalized.has('manage_adverts') ||
+    normalized.has('manage_categories')
+  ) {
+    return 'financial_operator';
+  }
+  return 'support_readonly';
+}
+
 /**
  * Persists a durable, expiring, SHA-256 token-hashed staff invitation in `invitations/{id}`
  * and dispatches the actual invitation email link via the configured server email provider.
@@ -197,7 +230,12 @@ export async function acceptStaffInvitationToken(params: {
   callerUid: string;
   callerEmail?: string;
   emailVerified?: boolean;
-}): Promise<{ invitationId: string; status: 'accepted'; permissions: string[] }> {
+}): Promise<{
+  invitationId: string;
+  status: 'accepted';
+  permissions: string[];
+  adminTier: DerivedStaffAdminTier;
+}> {
   const { db, invitationId, token, callerUid, callerEmail, emailVerified } = params;
   if (!db) throw new StaffInvitationError('Database unavailable', 503);
   if (!invitationId || !token) {
@@ -232,6 +270,8 @@ export async function acceptStaffInvitationToken(params: {
     const nowIso = new Date().toISOString();
     const adminRef = db.collection('admins').doc(callerUid);
     const userRef = db.collection('users').doc(callerUid);
+    const grantedPermissions = Array.isArray(inv.permissions) ? inv.permissions : [];
+    const derivedTier = deriveAdminTierFromPermissions(grantedPermissions);
 
     await tx.set(invRef, { status: 'accepted', acceptedBy: callerUid, acceptedAt: nowIso, updatedAt: nowIso }, { merge: true });
     await tx.set(
@@ -240,7 +280,8 @@ export async function acceptStaffInvitationToken(params: {
         uid: callerUid,
         email: callerEmail.toLowerCase(),
         role: 'admin',
-        permissions: Array.isArray(inv.permissions) ? inv.permissions : [],
+        adminTier: derivedTier,
+        permissions: grantedPermissions,
         invitationId,
         grantedBy: inv.invitedBy,
         grantedAt: nowIso,
@@ -251,7 +292,9 @@ export async function acceptStaffInvitationToken(params: {
       userRef,
       {
         role: 'admin',
-        adminPermissions: Array.isArray(inv.permissions) ? inv.permissions : [],
+        adminTier: derivedTier,
+        permissions: grantedPermissions,
+        adminPermissions: grantedPermissions,
         updatedAt: nowIso,
       },
       { merge: true }
@@ -260,7 +303,8 @@ export async function acceptStaffInvitationToken(params: {
     return {
       invitationId,
       status: 'accepted' as const,
-      permissions: Array.isArray(inv.permissions) ? inv.permissions : [],
+      permissions: grantedPermissions,
+      adminTier: derivedTier,
     };
   });
 }

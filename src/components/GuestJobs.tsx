@@ -1,8 +1,11 @@
-import React from "react";
-import { db, doc, deleteDoc } from "@/src/firebase";
+import React, { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { auth } from "@/src/firebase";
 import { Trash2, AlertTriangle, Calendar, MapPin, Eye, CheckCircle2 } from "lucide-react";
 
 export default function GuestJobs({ jobs, users, showToast }: { jobs: any[], users: any[], showToast: (title: string, message: string, type?: "success" | "error") => void }) {
+  const navigate = useNavigate();
+  const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
   const filteredGuestJobs = jobs.filter(j => {
     const homeowner = users.find(u => u.id === j.homeownerId);
     return !homeowner || homeowner.isAnonymous || !homeowner.email;
@@ -27,18 +30,48 @@ export default function GuestJobs({ jobs, users, showToast }: { jobs: any[], use
     ["draft", "open", "cancelled"].includes(job.status)
   );
 
-  const handleDeleteAll = async () => {
-    // Custom confirm logic is better for mobile than window.confirm
-    if (window.confirm("Are you sure you want to delete ALL guest jobs? This cannot be undone.")) {
+  const handleDeleteAll = () => {
+    setShowDeleteAllConfirm(true);
+  };
+
+  const deleteJobViaServer = async (id: string) => {
+    const token = await auth.currentUser?.getIdToken();
+    if (!token) {
+      throw new Error("Admin session required to delete jobs.");
+    }
+    const res = await fetch(`/api/admin/jobs/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Failed to delete job (${res.status})`);
+    }
+  };
+
+  const confirmDeleteAll = async () => {
+    setShowDeleteAllConfirm(false);
+    const deletableJobs = filteredGuestJobs.filter(isJobDeletable);
+    let deletedCount = 0;
+    let failedCount = 0;
+    for (const job of deletableJobs) {
       try {
-        const deletableJobs = filteredGuestJobs.filter(isJobDeletable);
-        for (const job of deletableJobs) {
-          await deleteDoc(doc(db, "jobs", job.id));
-        }
-        showToast("Success", `Deleted ${deletableJobs.length} guest jobs`, "success");
-      } catch (error) {
-        showToast("Error", "Failed to delete jobs", "error");
+        await deleteJobViaServer(job.id);
+        deletedCount++;
+      } catch {
+        failedCount++;
       }
+    }
+    if (failedCount > 0) {
+      showToast(
+        deletedCount > 0 ? "Partial Success" : "Error",
+        `Deleted ${deletedCount} guest jobs; ${failedCount} could not be deleted.`,
+        deletedCount > 0 ? "success" : "error"
+      );
+    } else {
+      showToast("Success", `Deleted ${deletedCount} guest jobs`, "success");
     }
   };
 
@@ -49,10 +82,10 @@ export default function GuestJobs({ jobs, users, showToast }: { jobs: any[], use
       return;
     }
     try {
-      await deleteDoc(doc(db, "jobs", id));
+      await deleteJobViaServer(id);
       showToast("Success", "Deleted job", "success");
-    } catch (error) {
-      showToast("Error", "Failed to delete job", "error");
+    } catch (error: any) {
+      showToast("Error", error?.message || "Failed to delete job", "error");
     }
   };
 
@@ -116,7 +149,7 @@ export default function GuestJobs({ jobs, users, showToast }: { jobs: any[], use
                 <td className="p-4 text-right">
                    <div className="flex items-center justify-end gap-2">
                     <button 
-                      onClick={() => window.open(`/job/${j.id}`, '_blank')}
+                      onClick={() => navigate(`/job/${j.id}`)}
                       className="p-2.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all"
                     >
                       <Eye className="w-4 h-4" />
@@ -165,7 +198,7 @@ export default function GuestJobs({ jobs, users, showToast }: { jobs: any[], use
 
               <div className="grid grid-cols-2 gap-3">
                 <button 
-                  onClick={() => window.open(`/job/${j.id}`, '_blank')}
+                  onClick={() => navigate(`/job/${j.id}`)}
                   className="py-3.5 rounded-2xl bg-slate-50 text-slate-600 font-black text-[10px] uppercase tracking-widest flex items-center justify-center gap-2"
                 >
                   <Eye className="w-4 h-4" />
@@ -193,6 +226,31 @@ export default function GuestJobs({ jobs, users, showToast }: { jobs: any[], use
           )}
         </div>
       </div>
+
+      {showDeleteAllConfirm && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">Delete All Guest Jobs?</h3>
+            <p className="text-sm text-black">
+              Are you sure you want to delete all deletable guest jobs? Funded, assigned, or disputed jobs will remain protected.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowDeleteAllConfirm(false)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteAll}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 rounded-lg hover:bg-red-700"
+              >
+                Delete All
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-export type SubscriptionProduct = "membership" | "landlord" | "gold_driver" | "exclusive_leads" | "video_pro" | "gotham_saas";
+export type SubscriptionProduct = "membership" | "landlord" | "gold_driver" | "exclusive_leads" | "video_pro" | "gotham_saas" | "appointments";
 
 export function buildSubscriptionLifecyclePatch(product: SubscriptionProduct, subscription: Record<string, any>, isDeleted = false): Record<string, any> {
   const status = isDeleted ? "canceled" : String(subscription.status || "unknown");
@@ -11,12 +11,27 @@ export function buildSubscriptionLifecyclePatch(product: SubscriptionProduct, su
   if (product === "landlord") {
     patch.homeownerSubscriptionStatus = status;
     patch.homeownerCancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
+    if (entitled) {
+      patch.isLandlord = true;
+      patch.homeownerTierId = "landlord";
+    } else if (terminal) {
+      patch.isLandlord = false;
+      patch.homeownerTierId = "standard";
+    }
     if (periodEndIso) patch.homeownerCurrentPeriodEnd = periodEndIso;
   } else if (product === "membership") {
     patch.subscriptionStatus = status;
     patch.cancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
-    if (entitled) { patch.isPro = true; patch.isProInvoiceSubscriber = true; }
-    else if (terminal) { patch.isPro = false; patch.isProInvoiceSubscriber = false; }
+    if (entitled) {
+      patch.isPro = true;
+      patch.isProInvoiceSubscriber = true;
+    } else if (terminal) {
+      patch.isPro = false;
+      patch.isProInvoiceSubscriber = false;
+      patch.tier = "payg";
+      patch.tierId = "Free Explorer";
+      patch.subscriptionType = "standard";
+    }
     if (periodEndIso) patch.currentPeriodEnd = periodEndIso;
   } else if (product === "gold_driver") {
     patch.driverSubscriptionStatus = status;
@@ -25,21 +40,32 @@ export function buildSubscriptionLifecyclePatch(product: SubscriptionProduct, su
     else if (terminal) patch.isGoldDriver = false;
     if (periodEndIso) patch.driverCurrentPeriodEnd = periodEndIso;
   } else if (product === "exclusive_leads") {
+    patch.exclusiveSubscriptionStatus = status;
     patch.exclusiveCancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
     if (entitled) { patch.hasExclusiveAddon = true; patch.isExclusiveActive = true; }
     else if (terminal) { patch.hasExclusiveAddon = false; patch.isExclusiveActive = false; }
     if (periodEndIso) patch.exclusiveCurrentPeriodEnd = periodEndIso;
   } else if (product === "video_pro") {
+    patch.videoProSubscriptionStatus = status;
     patch.videoProCancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
     if (entitled) patch.hasVerifiedVideoProSubscription = true;
     else if (terminal) patch.hasVerifiedVideoProSubscription = false;
     // Video verification is an independent credential; never mutate it here.
     if (periodEndIso) patch.videoProCurrentPeriodEnd = periodEndIso;
+  } else if (product === "appointments") {
+    patch.appointmentsSubscriptionStatus = status;
+    patch.appointmentsCancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
+    if (entitled) patch.hasAppointmentsAddon = true;
+    else if (terminal) patch.hasAppointmentsAddon = false;
+    if (periodEndIso) patch.appointmentsCurrentPeriodEnd = periodEndIso;
   } else {
     patch.gothamSubscriptionStatus = status;
     patch.gothamCancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
     if (entitled) patch.isGothamSubscriber = true;
-    else if (terminal) patch.isGothamSubscriber = false;
+    else if (terminal) {
+      patch.isGothamSubscriber = false;
+      patch.subscriptionType = "standard";
+    }
     if (periodEndIso) patch.gothamCurrentPeriodEnd = periodEndIso;
     // Purchased door count is not derived from Stripe's aggregate line quantity.
   }
@@ -53,8 +79,7 @@ export function buildLandlordCheckoutFulfillmentPatch(
 ): Record<string, any> {
   if (!subscriptionId) throw new Error("Landlord checkout fulfillment requires a Stripe subscription ID.");
   return {
-    subscriptionId,
-    subscriptionType: "landlord",
+    landlordSubscriptionId: subscriptionId,
     isLandlord: true,
     homeownerTierId: "landlord",
     ...buildSubscriptionLifecyclePatch("landlord", subscription)
@@ -106,6 +131,8 @@ export function resolveSubscriptionProductMatch(
   const userData = generic.userDoc.data ? generic.userDoc.data() : {};
   const legacyType = String(userData.subscriptionType || "");
   if (legacyType === "landlord") {
+    // A newer dedicated landlordSubscriptionId supersedes this legacy generic ID.
+    if (userData.landlordSubscriptionId && userData.landlordSubscriptionId !== userData.subscriptionId) return null;
     return {
       ...generic,
       product: {

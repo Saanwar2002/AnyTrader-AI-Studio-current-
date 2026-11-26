@@ -2,6 +2,7 @@ import admin from 'firebase-admin';
 import Stripe from 'stripe';
 import { randomUUID } from 'crypto';
 import { evaluateInstantMatchCandidate } from './src/server/instantMatchEligibility.ts';
+import { extractJobPostcode, extractJobSubCategory, isTraderInQuietHours } from './src/lib/unifiedJobMatching.ts';
 
 let stripeClient: Stripe | null = null;
 function getStripeClient(): Stripe | null {
@@ -18,10 +19,24 @@ let globalConfig: any = {
   imMaxAttempts: 10,
   imAttemptIntervalSeconds: 60,
   imRequireEmergencyToggle: false,
-  imRequireVerified: false,
-  imRequireCategoryMatch: false,
-  imRequireTagMatch: false
+  imRequireVerified: true,
+  imRequireCategoryMatch: true,
+  imRequireTagMatch: false,
 };
+
+export interface InstantMatchAlertDispatchHooks {
+  dispatchFcmPush?: (payload: {
+    recipientId: string;
+    title: string;
+    body: string;
+    channelId: string;
+    eventType: string;
+    data: Record<string, string>;
+  }) => Promise<any>;
+}
+
+let registeredAlertHooks: InstantMatchAlertDispatchHooks = {};
+const processingMatches = new Set<string>();
 
 export async function expireAndRefundInstantMatch(db: admin.firestore.Firestore, matchRef: admin.firestore.DocumentReference, stripe: Stripe | null, reason: string): Promise<void> {
   const refundRef = db.collection("instant_match_refunds").doc(matchRef.id);
@@ -131,8 +146,6 @@ export async function expireAndRefundInstantMatch(db: admin.firestore.Firestore,
         stripeRefundId: typeof refund.id === "string" ? refund.id : null,
         stripeRefundStatus: refund.status || null,
         claimToken: admin.firestore.FieldValue.delete(),
-        // A non-terminal Stripe refund response remains processing; cool down before
-        // retrying the same idempotency key rather than polling Stripe on every trigger.
         leaseExpiresAtMs: status === "processing" ? Date.now() + leaseMs : 0,
         ...(!responseMatchesOperation ? { error: "stripe_refund_response_mismatch" } : {}),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -161,8 +174,108 @@ export async function expireAndRefundInstantMatch(db: admin.firestore.Firestore,
     console.error("Instant Match refund outcome requires reconciliation:", err);
   }
 }
-export function startInstantMatchEngine(db: admin.firestore.Firestore) {
+
+/**
+ * Evaluates a single searching Instant Match session and advances it cleanly:
+ * - Creates Attempt #1 if none exist
+ * - Advances immediately when latest attempt was DECLINED (fixes P0 stall bug!)
+ * - Marks timed-out pending/notified attempts as `timeout` and advances
+ * - Expires & triggers idempotent Stripe refund once `imMaxAttempts` is exhausted
+ */
+export async function processSearchingInstantMatch(
+  db: admin.firestore.Firestore | any,
+  matchRef: any,
+  matchData: Record<string, any>,
+  config: Record<string, any> = globalConfig
+): Promise<{ action: "created_attempt" | "expired" | "waiting" | "skipped"; attemptNumber?: number }> {
+  if (!matchData || matchData.status !== "searching") {
+    return { action: "skipped" };
+  }
+
+  const attemptsSnap = await db.collection("instant_match_attempts")
+    .where("instantMatchId", "==", matchRef.id)
+    .get();
+
+  const attemptDocs = [...(attemptsSnap.docs || [])].sort((a: any, b: any) => {
+    const numA = Number(a.data()?.attemptNumber || 0);
+    const numB = Number(b.data()?.attemptNumber || 0);
+    return numB - numA;
+  });
+
+  const latestDoc = attemptDocs[0];
+  const latestAttempt = latestDoc?.data();
+  const latestAttemptRef = latestDoc?.ref;
+  const now = new Date();
+  const maxAttempts = config.imMaxAttempts ?? 10;
+
+  if (!latestAttempt) {
+    const created = await initiateNextAttempt(db, matchRef, matchData, 1, config);
+    return created ? { action: "created_attempt", attemptNumber: 1 } : { action: "expired" };
+  }
+
+  // Case 1: Latest attempt was explicitly DECLINED -> advance immediately!
+  if (latestAttempt.status === "declined" || latestAttempt.status === "timeout") {
+    const nextAttemptNum = Number(latestAttempt.attemptNumber || 1) + 1;
+    if (nextAttemptNum > maxAttempts) {
+      await expireAndRefundInstantMatch(db, matchRef, getStripeClient(), "attempts_exhausted");
+      return { action: "expired" };
+    }
+    const created = await initiateNextAttempt(db, matchRef, matchData, nextAttemptNum, config);
+    return created ? { action: "created_attempt", attemptNumber: nextAttemptNum } : { action: "expired" };
+  }
+
+  // Case 2: Latest attempt is pending/notified and timed out -> mark timeout and advance
+  if (['pending', 'notified'].includes(latestAttempt.status)) {
+    const expiresAt = new Date(latestAttempt.expiresAt);
+    if (!Number.isNaN(expiresAt.getTime()) && expiresAt < now) {
+      await latestAttemptRef.update({
+        status: "timeout",
+        respondedAt: now.toISOString(),
+      });
+
+      const nextAttemptNum = Number(latestAttempt.attemptNumber || 1) + 1;
+      if (nextAttemptNum > maxAttempts) {
+        await expireAndRefundInstantMatch(db, matchRef, getStripeClient(), "attempts_exhausted");
+        return { action: "expired" };
+      }
+      const created = await initiateNextAttempt(db, matchRef, matchData, nextAttemptNum, config);
+      return created ? { action: "created_attempt", attemptNumber: nextAttemptNum } : { action: "expired" };
+    }
+  }
+
+  return { action: "waiting" };
+}
+
+/**
+ * Explicit server helper invoked by `POST /api/instant-match/respond` right after a trader
+ * declines an attempt, guaranteeing immediate progression to Candidate #2 with zero polling delay.
+ */
+export async function advanceInstantMatchAfterDecline(
+  db: admin.firestore.Firestore | any,
+  instantMatchId: string,
+  config: Record<string, any> = globalConfig
+): Promise<{ action: "created_attempt" | "expired" | "waiting" | "skipped"; attemptNumber?: number }> {
+  if (!db || !instantMatchId) return { action: "skipped" };
+  if (processingMatches.has(instantMatchId)) return { action: "skipped" };
+  processingMatches.add(instantMatchId);
+  try {
+    const matchRef = db.collection("instant_matches").doc(instantMatchId);
+    const matchSnap = await matchRef.get();
+    if (!matchSnap.exists) return { action: "skipped" };
+    return await processSearchingInstantMatch(db, matchRef, matchSnap.data() || {}, config);
+  } finally {
+    processingMatches.delete(instantMatchId);
+  }
+}
+
+export function startInstantMatchEngine(
+  db: admin.firestore.Firestore,
+  hooks?: InstantMatchAlertDispatchHooks
+) {
   if (!db) return;
+  if (hooks) {
+    registeredAlertHooks = hooks;
+  }
   console.log("Starting Instant Match Engine...");
 
   // Cache platform config
@@ -172,7 +285,7 @@ export function startInstantMatchEngine(db: admin.firestore.Firestore) {
       if (doc.exists) {
         const data = doc.data();
         if (data) {
-           globalConfig = { ...globalConfig, ...data };
+          globalConfig = { ...globalConfig, ...data };
         }
       }
     },
@@ -188,56 +301,17 @@ export function startInstantMatchEngine(db: admin.firestore.Firestore) {
     }
   );
 
-  const processingMatches = new Set<string>();
-
-  // Real-time listener for searching matches instead of polling
+  // Real-time listener for searching matches (fires on new match AND on decline timestamp update!)
   let matchesUnsubscribe: (() => void) | null = null;
   matchesUnsubscribe = db.collection("instant_matches")
     .where("status", "==", "searching")
     .onSnapshot(async (matchesSnap) => {
       try {
-        const now = new Date();
         for (const matchDoc of matchesSnap.docs) {
           if (processingMatches.has(matchDoc.id)) continue;
           processingMatches.add(matchDoc.id);
-
           try {
-            const match = matchDoc.data();
-            
-            // Find latest attempt array
-            const attemptsSnap = await db.collection("instant_match_attempts")
-              .where("instantMatchId", "==", matchDoc.id)
-              .orderBy("attemptNumber", "desc")
-              .limit(1)
-              .get();
-
-            const latestAttempt = attemptsSnap.docs[0]?.data();
-            const latestAttemptRef = attemptsSnap.docs[0]?.ref;
-
-            if (!latestAttempt) {
-              // No attempts yet, find top traders and create the first attempt
-              await initiateNextAttempt(db, matchDoc.ref, match, 1);
-            } else {
-              // Check if attempt timed out
-              const expiresAt = new Date(latestAttempt.expiresAt);
-              if (['pending', 'notified'].includes(latestAttempt.status) && expiresAt < now) {
-                // Expired!
-                await latestAttemptRef.update({
-                  status: "timeout",
-                  respondedAt: now.toISOString()
-                });
-
-                // Initiate next attempt
-                const nextAttemptNum = latestAttempt.attemptNumber + 1;
-                const maxAttempts = globalConfig.imMaxAttempts ?? 10;
-                if (nextAttemptNum > maxAttempts) {
-                  // Expire the match entirely if we tried max times
-                  await expireAndRefundInstantMatch(db, matchDoc.ref, getStripeClient(), "attempts_exhausted");
-                } else {
-                  await initiateNextAttempt(db, matchDoc.ref, match, nextAttemptNum);
-                }
-              }
-            }
+            await processSearchingInstantMatch(db, matchDoc.ref, matchDoc.data() || {}, globalConfig);
           } finally {
             processingMatches.delete(matchDoc.id);
           }
@@ -259,42 +333,52 @@ export function startInstantMatchEngine(db: admin.firestore.Firestore) {
       console.warn("Instant match listener error:", err);
     });
 
-  // We still need a very lightweight interval to check for timeouts on existing active attempts,
-  // since timeouts are based on time progressing, not firestore writes. 
-  // We can query attempts that are pending/notified and where expiresAt < now.
+  // Lightweight 10-second sweeper handling both timed-out attempts AND any declined searching matches
   const timeoutCheckInterval = setInterval(async () => {
-     try {
-       const now = new Date().toISOString();
-       const expiredAttemptsSnap = await db.collection("instant_match_attempts")
+    try {
+      const now = new Date().toISOString();
+      const [expiredAttemptsSnap, searchingMatchesSnap] = await Promise.all([
+        db.collection("instant_match_attempts")
           .where("status", "in", ["pending", "notified"])
           .where("expiresAt", "<", now)
-          .get();
+          .limit(50)
+          .get(),
+        db.collection("instant_matches")
+          .where("status", "==", "searching")
+          .limit(50)
+          .get()
+          .catch(() => ({ docs: [] })),
+      ]);
 
-       for (const attemptDoc of expiredAttemptsSnap.docs) {
-          const attempt = attemptDoc.data();
-          const matchDoc = await db.collection("instant_matches").doc(attempt.instantMatchId).get();
-          if (!matchDoc.exists || matchDoc.data()?.status !== "searching") continue;
+      const matchIdsToCheck = new Set<string>();
+      for (const attemptDoc of expiredAttemptsSnap.docs || []) {
+        const matchId = attemptDoc.data()?.instantMatchId;
+        if (matchId) matchIdsToCheck.add(String(matchId));
+      }
+      for (const mDoc of searchingMatchesSnap.docs || []) {
+        matchIdsToCheck.add(mDoc.id);
+      }
 
-          await attemptDoc.ref.update({
-             status: "timeout",
-             respondedAt: new Date().toISOString()
-          });
-
-          const nextAttemptNum = attempt.attemptNumber + 1;
-          const maxAttempts = globalConfig.imMaxAttempts ?? 10;
-          if (nextAttemptNum > maxAttempts) {
-             await expireAndRefundInstantMatch(db, matchDoc.ref, getStripeClient(), "attempts_exhausted");
-          } else {
-             await initiateNextAttempt(db, matchDoc.ref, matchDoc.data(), nextAttemptNum);
+      for (const matchId of matchIdsToCheck) {
+        if (processingMatches.has(matchId)) continue;
+        processingMatches.add(matchId);
+        try {
+          const matchRef = db.collection("instant_matches").doc(matchId);
+          const matchSnap = await matchRef.get();
+          if (matchSnap.exists && matchSnap.data()?.status === "searching") {
+            await processSearchingInstantMatch(db, matchRef, matchSnap.data() || {}, globalConfig);
           }
-       }
-     } catch (err: any) {
-        const msg = err?.message || String(err);
-        if (!msg.includes("PERMISSION_DENIED") && !msg.includes("UNAUTHENTICATED")) {
-          console.error("Error in Instant Match Engine timeout interval:", err);
+        } finally {
+          processingMatches.delete(matchId);
         }
-     }
-  }, 10000); // Check timeouts every 10 seconds (efficient query)
+      }
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      if (!msg.includes("PERMISSION_DENIED") && !msg.includes("UNAUTHENTICATED")) {
+        console.error("Error in Instant Match Engine timeout interval:", err);
+      }
+    }
+  }, 10000);
 
   return () => {
     configUnsubscribe();
@@ -307,25 +391,118 @@ export async function createInstantMatchAttempt(
   db: any,
   matchRef: any,
   attemptNumber: number,
-  trader: { id: string; score?: number; scheduleSignalApplied?: boolean },
-  intervalSeconds: number
+  trader: { id: string; score?: number; scheduleSignalApplied?: boolean; distanceMiles?: number | null; phone?: string | null; userData?: Record<string, any> },
+  intervalSeconds: number,
+  jobSummary?: {
+    jobId?: string;
+    jobTitle?: string;
+    jobCategory?: string;
+    jobPostcodeArea?: string;
+    jobUrgency?: string;
+    jobDescription?: string;
+  }
 ): Promise<boolean> {
   const attemptRef = db.collection("instant_match_attempts").doc(matchRef.id + "_" + attemptNumber);
   const expiresAt = new Date(Date.now() + intervalSeconds * 1000);
-  return db.runTransaction(async (tx: any) => {
+  const created = await db.runTransaction(async (tx: any) => {
     const [latestMatchSnap, existingAttemptSnap] = await Promise.all([tx.get(matchRef), tx.get(attemptRef)]);
     if (!latestMatchSnap.exists || existingAttemptSnap.exists) return false;
     const latestMatch = latestMatchSnap.data() || {};
     if (latestMatch.status !== "searching" || Number(latestMatch.currentAttempt || 0) !== attemptNumber - 1) return false;
     tx.create(attemptRef, {
-      id: attemptRef.id, instantMatchId: matchRef.id, attemptNumber, traderId: trader.id,
+      id: attemptRef.id,
+      instantMatchId: matchRef.id,
+      attemptNumber,
+      traderId: trader.id,
+      jobId: jobSummary?.jobId || latestMatch.jobId || null,
+      jobTitle: jobSummary?.jobTitle || null,
+      jobCategory: jobSummary?.jobCategory || null,
+      jobPostcodeArea: jobSummary?.jobPostcodeArea || null,
+      jobUrgency: jobSummary?.jobUrgency || "emergency",
+      jobDescription: jobSummary?.jobDescription || null,
       traderCompositeScore: Number.isFinite(Number(trader.score)) ? Number(trader.score) : 0,
+      distanceMiles: typeof trader.distanceMiles === "number" ? trader.distanceMiles : null,
       smartScheduleFitApplied: Boolean(trader.scheduleSignalApplied),
-      status: "pending", createdAt: new Date().toISOString(), expiresAt: expiresAt.toISOString()
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      expiresAt: expiresAt.toISOString()
     });
     tx.update(matchRef, { currentAttempt: attemptNumber });
     return true;
   });
+
+  if (created) {
+    const distLabel = typeof trader.distanceMiles === "number" ? ` (~${trader.distanceMiles.toFixed(1)} mi)` : "";
+    const title = `Instant Match Offer: ${jobSummary?.jobCategory || "Urgent Job"}`;
+    const body = `${jobSummary?.jobTitle || "An urgent customer job"} in ${jobSummary?.jobPostcodeArea || "your area"}${distLabel} needs an immediate response (${intervalSeconds}s window).`;
+
+    try {
+      const notifColl = db.collection("notifications");
+      if (notifColl && typeof notifColl.doc === "function") {
+        await notifColl.doc().set({
+          userId: trader.id,
+          type: "instant_match_offer",
+          title: `⚡ ${title}`,
+          message: body,
+          jobId: jobSummary?.jobId || null,
+          instantMatchAttemptId: attemptRef.id,
+          distanceMiles: typeof trader.distanceMiles === "number" ? trader.distanceMiles : null,
+          link: `/trades-dashboard?instantMatchAttempt=${attemptRef.id}`,
+          actionPath: `/trades-dashboard?instantMatchAttempt=${attemptRef.id}`,
+          read: false,
+          isRead: false,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    } catch {
+      // Non-blocking notification failure
+    }
+
+    // Multi-channel push & emergency SMS so trader actually sees the 60s Instant Match offer!
+    const traderInQuiet = trader.userData ? isTraderInQuietHours(trader.userData) : false;
+    const emergencyOptIn = Boolean(
+      trader.userData?.isAvailableForEmergency === true || trader.userData?.isAvailableForInstantMatch === true
+    );
+
+    if (registeredAlertHooks.dispatchFcmPush && (!traderInQuiet || emergencyOptIn)) {
+      await registeredAlertHooks
+        .dispatchFcmPush({
+          recipientId: trader.id,
+          title,
+          body,
+          channelId: "instant_match_offers",
+          eventType: "instant_match_offer",
+          data: {
+            jobId: String(jobSummary?.jobId || ""),
+            instantMatchAttemptId: attemptRef.id,
+            type: "instant_match_offer",
+          },
+        })
+        .catch(() => {});
+    }
+
+    const traderPhone = trader.phone || trader.userData?.phone || trader.userData?.phoneNumber;
+    if (traderPhone && (!traderInQuiet || emergencyOptIn)) {
+      try {
+        const smsColl = db.collection("sms_queue");
+        if (smsColl && typeof smsColl.doc === "function") {
+          await smsColl.doc().set({
+            to: traderPhone,
+            toUserId: trader.id,
+            jobId: jobSummary?.jobId || null,
+            instantMatchAttemptId: attemptRef.id,
+            body: `INSTANT MATCH (${intervalSeconds}s): ${jobSummary?.jobCategory || "Trade"} job in ${jobSummary?.jobPostcodeArea || "your area"}${distLabel}. Open AnyTrader now to accept!`,
+            status: "pending",
+            createdAt: new Date().toISOString(),
+          });
+        }
+      } catch {
+        // Non-blocking SMS enqueue failure
+      }
+    }
+  }
+
+  return created;
 }
 
 export async function selectNextInstantMatchCandidate(
@@ -333,40 +510,126 @@ export async function selectNextInstantMatchCandidate(
   match: any,
   triedTraderIds: string[],
   config: Record<string, any> = globalConfig
-): Promise<{ id: string; score: number; scheduleSignalApplied: boolean } | null> {
+): Promise<{
+  id: string;
+  score: number;
+  scheduleSignalApplied: boolean;
+  distanceMiles?: number | null;
+  phone?: string | null;
+  userData?: Record<string, any>;
+} | null> {
   let jobCategory: string | null = null;
+  let jobSubCategory: string | null = null;
   let jobText = "";
   let jobPostcode = "";
+  let jobLat: number | null = null;
+  let jobLng: number | null = null;
+  let requiredCertifications: string[] | undefined;
+
   if (match?.jobId) {
     const jobSnap = await db.collection("jobs").doc(match.jobId).get();
     if (jobSnap.exists) {
-      const jobData = jobSnap.data();
-      jobCategory = jobData?.category || null;
-      jobPostcode = jobData?.postcode || "";
-      jobText = `${jobData?.title || ""} ${jobData?.description || ""}`.toLowerCase();
+      const jobData = jobSnap.data() || {};
+      jobCategory = jobData.category || null;
+      jobSubCategory = extractJobSubCategory(jobData) || null;
+      jobPostcode = extractJobPostcode(jobData) || jobData.postcode || "";
+      jobText = `${jobData.title || ""} ${jobData.description || ""}`.toLowerCase();
+      const parsedLat = Number(jobData.lat ?? jobData.latitude ?? jobData.coordinates?.lat ?? jobData.location?.lat);
+      const parsedLng = Number(jobData.lng ?? jobData.longitude ?? jobData.coordinates?.lng ?? jobData.location?.lng);
+      if (Number.isFinite(parsedLat) && Number.isFinite(parsedLng)) {
+        jobLat = parsedLat;
+        jobLng = parsedLng;
+      }
+      if (Array.isArray(jobData.requiredCertifications)) {
+        requiredCertifications = jobData.requiredCertifications;
+      }
     }
   }
 
-  const [allTradersSnap, publicProfilesSnap] = await Promise.all([
-    db.collection("users").where("role", "==", "tradesperson").get(),
-    db.collection("public_profiles").get().catch(() => ({ docs: [] })),
-  ]);
+  // Category-indexed candidate fetch first + bounded role fallback (no unbounded full-table scans!)
+  const candidateQueryPromises: Array<Promise<any>> = [];
+  if (jobCategory && jobCategory.toLowerCase() !== "general" && jobCategory.toLowerCase() !== "all") {
+    candidateQueryPromises.push(
+      db.collection("users").where("trades", "array-contains", jobCategory).limit(250).get().catch(() => ({ docs: [] }))
+    );
+  }
+  candidateQueryPromises.push(
+    db.collection("users").where("role", "==", "tradesperson").limit(250).get().catch(() => ({ docs: [] })),
+    db.collection("users").where("role", "==", "business").limit(250).get().catch(() => ({ docs: [] }))
+  );
 
+  const querySnaps = await Promise.all(candidateQueryPromises);
+  const candidateMap = new Map<string, Record<string, any>>();
+  for (const snap of querySnaps) {
+    for (const d of snap?.docs || []) {
+      if (candidateMap.has(d.id)) continue;
+      const userData = typeof d.data === "function" ? d.data() : d.data;
+      if (!userData) continue;
+      const role = String(userData.role || "").trim().toLowerCase();
+      if (role !== "tradesperson" && role !== "business") continue;
+      if (role === "business" && String(userData.businessLayer || "").toLowerCase() === "properties") {
+        continue;
+      }
+      candidateMap.set(d.id, userData);
+    }
+  }
+
+  // Targeted public_profiles fetch (only for candidate IDs rather than scanning entire collection!)
   const publicProfileById = new Map<string, Record<string, any>>();
-  for (const pDoc of publicProfilesSnap?.docs || []) {
-    const pData = typeof pDoc.data === "function" ? pDoc.data() : pDoc.data;
-    if (pData) publicProfileById.set(pDoc.id, pData);
+  const candidateIds = Array.from(candidateMap.keys());
+  if (candidateIds.length > 0) {
+    if (typeof db.getAll === "function") {
+      // Batch getAll in chunks of 100 for real Firestore Admin SDK
+      for (let i = 0; i < candidateIds.length; i += 100) {
+        const refs = candidateIds.slice(i, i + 100).map((id) => db.collection("public_profiles").doc(id));
+        const snaps = await db.getAll(...refs).catch(() => []);
+        for (const pSnap of snaps) {
+          if (pSnap?.exists) {
+            const pData = typeof pSnap.data === "function" ? pSnap.data() : pSnap.data;
+            if (pData) publicProfileById.set(pSnap.id, pData);
+          }
+        }
+      }
+    } else {
+      // Fallback for mock in-memory DBs in unit tests
+      const pSnaps = await Promise.all(
+        candidateIds.map((id) => db.collection("public_profiles").doc(id).get().catch(() => ({ exists: false })))
+      );
+      for (let i = 0; i < candidateIds.length; i++) {
+        const pSnap = pSnaps[i];
+        if (pSnap?.exists) {
+          const pData = typeof pSnap.data === "function" ? pSnap.data() : pSnap.data;
+          if (pData) publicProfileById.set(candidateIds[i], pData);
+        }
+      }
+    }
   }
   const hasPublicProfilesProjection = publicProfileById.size > 0;
 
-  const jobContext = { jobCategory, jobText, jobPostcode, triedTraderIds };
-  const rankedCandidates: Array<{ id: string; score: number; scheduleSignalApplied: boolean }> = [];
+  const jobContext = {
+    jobCategory,
+    jobSubCategory,
+    jobText,
+    jobPostcode,
+    jobLat,
+    jobLng,
+    requiredCertifications,
+    triedTraderIds,
+  };
 
-  for (const d of allTradersSnap.docs || []) {
-    const userData = typeof d.data === "function" ? d.data() : d.data;
-    const publicProfile = publicProfileById.get(d.id) || null;
+  const rankedCandidates: Array<{
+    id: string;
+    score: number;
+    scheduleSignalApplied: boolean;
+    distanceMiles?: number | null;
+    phone?: string | null;
+    userData: Record<string, any>;
+  }> = [];
+
+  for (const [id, userData] of candidateMap.entries()) {
+    const publicProfile = publicProfileById.get(id) || null;
     const evaluation = evaluateInstantMatchCandidate(
-      d.id,
+      id,
       userData,
       publicProfile,
       config,
@@ -375,28 +638,79 @@ export async function selectNextInstantMatchCandidate(
     );
     if (evaluation.eligible) {
       rankedCandidates.push({
-        id: d.id,
+        id,
         score: evaluation.score,
         scheduleSignalApplied: evaluation.scheduleSignalApplied,
+        distanceMiles: evaluation.distanceMiles ?? null,
+        phone: userData.phone || userData.phoneNumber || null,
+        userData,
       });
     }
   }
 
   if (rankedCandidates.length === 0) return null;
-  rankedCandidates.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+  rankedCandidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const dA = a.distanceMiles ?? 9999;
+    const dB = b.distanceMiles ?? 9999;
+    if (dA !== dB) return dA - dB;
+    return a.id.localeCompare(b.id);
+  });
   return rankedCandidates[0];
 }
 
-async function initiateNextAttempt(db: admin.firestore.Firestore, matchRef: admin.firestore.DocumentReference, match: any, attemptNumber: number) {
+async function initiateNextAttempt(
+  db: admin.firestore.Firestore | any,
+  matchRef: any,
+  match: any,
+  attemptNumber: number,
+  config: Record<string, any> = globalConfig
+): Promise<boolean> {
   const previouslyTriedSnap = await db.collection("instant_match_attempts").where("instantMatchId", "==", matchRef.id).get();
-  const triedTraderIds = previouslyTriedSnap.docs.map(d => d.data().traderId);
+  const triedTraderIds = (previouslyTriedSnap.docs || []).map((d: any) => d.data().traderId);
 
-  const nextTrader = await selectNextInstantMatchCandidate(db, match, triedTraderIds, globalConfig);
+  const nextTrader = await selectNextInstantMatchCandidate(db, match, triedTraderIds, config);
 
   if (!nextTrader) {
     await expireAndRefundInstantMatch(db, matchRef, getStripeClient(), "no_eligible_traders");
-    return;
+    return false;
   }
 
-  await createInstantMatchAttempt(db, matchRef, attemptNumber, nextTrader, globalConfig.imAttemptIntervalSeconds ?? 60);
+  let jobSummary: {
+    jobId?: string;
+    jobTitle?: string;
+    jobCategory?: string;
+    jobPostcodeArea?: string;
+    jobUrgency?: string;
+    jobDescription?: string;
+  } = { jobId: match?.jobId };
+  if (match?.jobId) {
+    try {
+      const jobSnap = await db.collection("jobs").doc(match.jobId).get();
+      if (jobSnap.exists) {
+        const jd = jobSnap.data() || {};
+        const rawPc = String(jd.postcode || "").trim().toUpperCase();
+        const outward = rawPc.includes(" ") ? rawPc.split(" ")[0] : rawPc.slice(0, 4);
+        jobSummary = {
+          jobId: match.jobId,
+          jobTitle: String(jd.title || `Emergency ${jd.category || "Trade"} Job`).slice(0, 120),
+          jobCategory: String(jd.category || "General"),
+          jobPostcodeArea: outward || String(jd.city || jd.area || "Local area"),
+          jobUrgency: String(jd.urgency || "emergency"),
+          jobDescription: String(jd.description || "").slice(0, 280),
+        };
+      }
+    } catch {
+      // Fall back to minimal summary
+    }
+  }
+
+  return await createInstantMatchAttempt(
+    db,
+    matchRef,
+    attemptNumber,
+    nextTrader,
+    config.imAttemptIntervalSeconds ?? 60,
+    jobSummary
+  );
 }

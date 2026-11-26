@@ -455,7 +455,7 @@ describe("Task 3: Canonical Quote Commands Test Suite", () => {
   });
 
   describe("3. Authoritative Server Financial Calculations & Milestones", () => {
-    it("calculates 12% standard platform commission and net payout deterministically", async () => {
+    it("calculates canonical 5% PAYG platform commission and net payout deterministically", async () => {
       const result = await executeQuoteCommand({
         db,
         identity: traderIdentity,
@@ -472,8 +472,10 @@ describe("Task 3: Canonical Quote Commands Test Suite", () => {
 
       expect(result.quote).toBeDefined();
       expect(result.quote?.amount).toBe(1000);
-      expect(result.quote?.platformFee).toBe(120); // 12% of £1000
-      expect(result.quote?.netPayout).toBe(880); // £1000 - £120
+      expect(result.quote?.platformFee).toBe(50); // 5% PAYG of £1000
+      expect(result.quote?.netPayout).toBe(950); // £1000 - £50
+      expect(result.quote?.appliedCommissionRate).toBe(0.05);
+      expect(result.quote?.commissionCapGbp).toBe(250);
       expect(result.quote?.milestones).toHaveLength(1);
       expect(result.quote?.milestones[0].amount).toBe(1000);
     });
@@ -585,8 +587,8 @@ describe("Task 3: Canonical Quote Commands Test Suite", () => {
       });
       expect(respondRes.status).toBe("requoted");
       expect(respondRes.quote?.amount).toBe(550);
-      expect(respondRes.quote?.platformFee).toBe(66); // 12% of 550
-      expect(respondRes.quote?.netPayout).toBe(484);
+      expect(respondRes.quote?.platformFee).toBe(27.5); // 5% PAYG of 550
+      expect(respondRes.quote?.netPayout).toBe(522.5);
       expect(respondRes.quote?.revisionCount).toBe(2);
 
       // 4. WithdrawQuote by Trader Dave

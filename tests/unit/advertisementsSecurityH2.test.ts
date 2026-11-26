@@ -13,7 +13,8 @@ describe("Security Remediation H2 — Advertisements Budget & State Integrity Au
   describe("1. Firestore Security Rules Hardening for /advertisements/{adId}", () => {
     it("restricts direct advertisement creation to admins only (non-admin campaigns must use server API) and scopes private reads to owner/admin", () => {
       expect(rulesCode).toContain("match /advertisements/{adId}");
-      expect(rulesCode).toContain("allow create: if isAdmin();");
+      const adBlock = rulesCode.split("match /advertisements/{adId}")[1].split("match /public_ads/{adId}")[0];
+      expect(adBlock).toContain("allow create: if isMutatingAdmin();");
       expect(rulesCode).toContain("resource.data.get('advertiserUid', '') == request.auth.uid");
       expect(rulesCode).toContain("match /public_ads/{adId}");
     });
@@ -38,7 +39,7 @@ describe("Security Remediation H2 — Advertisements Budget & State Integrity Au
     });
 
     it("strictly validates ownership on ad deletion", () => {
-      expect(rulesCode).toMatch(/allow delete: if isAdmin\(\) \|\| \(\s*isSignedIn\(\) && \(resource\.data\.advertiserUid == request\.auth\.uid \|\| resource\.data\.get\('advertiserId', ''\) == request\.auth\.uid\)\s*\);/);
+      expect(rulesCode).toMatch(/allow delete: if isMutatingAdmin\(\) \|\| \(\s*isSignedIn\(\) && \(resource\.data\.advertiserUid == request\.auth\.uid \|\| resource\.data\.get\('advertiserId', ''\) == request\.auth\.uid\)\s*\);/);
     });
   });
 

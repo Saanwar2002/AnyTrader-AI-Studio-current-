@@ -21,6 +21,14 @@ import { TermsAcceptancePrompt } from "./TermsAcceptancePrompt";
 import { ScrollToTopButton } from "./shared/ScrollToTopButton";
 import { HeaderAccountSearch } from "./HeaderAccountSearch";
 import { TaxiComingSoonModal } from "./shared/TaxiComingSoonModal";
+import { EmailVerificationBanner } from "./shared/EmailVerificationBanner";
+import {
+  getAllowedBusinessLayers,
+  getDefaultBusinessTab,
+  isAdminAccount,
+  isEcosystemManagerAccount,
+  isTradeProviderAccount,
+} from "@/src/lib/accountRoles";
 
 const getIconComponent = (iconName: string) => {
   const icons: any = { Wrench, Hammer, HardHat, Shield, Zap, Droplets, Paintbrush, Truck, Scissors, Wind, Thermometer, Briefcase, PenTool, Box };
@@ -107,6 +115,7 @@ export default function Layout() {
   const [platformConfig, setPlatformConfig] = useState<any>(null);
   const [showMaintenanceBanner, setShowMaintenanceBanner] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [blockDriverTarget, setBlockDriverTarget] = useState<{ driverId: string; driverName: string } | null>(null);
   
   // AI Shop States
   const [showShopPopover, setShowShopPopover] = useState(false);
@@ -286,8 +295,8 @@ export default function Layout() {
         snapshot.docChanges().forEach(change => {
           if (change.type === 'added') {
             const data = change.doc.data();
-            // Skip stale Gemini API Error notifications
-            if (data.title && (data.title.includes("Gemini") || data.title.includes("Error"))) {
+            // Skip legacy Gemini API Error notifications only (never suppress legitimate user payment/booking errors)
+            if (typeof data.title === "string" && data.title.includes("Gemini API Error")) {
               if (change.doc.ref) {
                  import("firebase/firestore").then(({ updateDoc }) => {
                     updateDoc(change.doc.ref, { read: true });
@@ -299,12 +308,26 @@ export default function Layout() {
             const visibleAt = data.visibleAt ? (data.visibleAt.toDate ? data.visibleAt.toDate() : new Date(data.visibleAt)) : now;
             if (visibleAt <= now) {
               playSound('notification');
+              const rawDest =
+                data.actionPath ||
+                data.link ||
+                data.actionUrl ||
+                data.url ||
+                (data.jobId ? `/job/${data.jobId}` : data.conversationId ? `/chat/${data.conversationId}` : data.chatId ? `/chat/${data.chatId}` : "/notifications");
+              const resolvedDest = typeof rawDest === "string"
+                ? rawDest.trim().replace(/^\/jobs\//i, "/job/")
+                : "/notifications";
               toast.info(data.title || "New Notification", {
                 description: data.message || "You have a new alert.",
                 duration: 5000,
                 action: {
                   label: "View",
-                  onClick: () => navigate("/notifications")
+                  onClick: () => {
+                    if (change.doc.ref) {
+                      updateDoc(change.doc.ref, { read: true }).catch(() => {});
+                    }
+                    navigate(resolvedDest || "/notifications");
+                  }
                 }
               });
             }
@@ -388,6 +411,7 @@ export default function Layout() {
     { name: "Portfolio", path: "/portfolio", icon: LayoutGrid, isCta: false },
     { name: "Projects", path: "/my-jobs", icon: Briefcase, isCta: false },
     { name: "Post Project", path: "/post-job", icon: PlusCircle, isCta: true },
+    { name: "Team", path: "/team", icon: Users, isCta: false },
     { name: "Analytics", path: "/analytics", icon: BarChart3, isCta: false },
     { name: "Messages", path: "/messages", icon: MessageSquare, isCta: false },
   ];
@@ -422,6 +446,7 @@ export default function Layout() {
     { name: "Calendar", path: "/trader/calendar", icon: Calendar, isCta: false },
     { name: "Quotes", path: "/my-quotes", icon: PoundSterling, isCta: false },
     { name: "Trade Jobs", path: "/trade-jobs", icon: Briefcase, isCta: false },
+    { name: "Team", path: "/team", icon: Users, isCta: false },
     { name: "Messages", path: "/messages", icon: MessageSquare, isCta: false },
   ];
 
@@ -466,6 +491,13 @@ export default function Layout() {
     ];
   }
 
+  const allowedBusinessLayers = getAllowedBusinessLayers(profile);
+  const effectiveBusinessTab = allowedBusinessLayers.includes(activeTab)
+    ? activeTab
+    : getDefaultBusinessTab(profile);
+  const canUseTraderQuickActions =
+    isTradeProviderAccount(profile) || isAdminAccount(profile) || isEcosystemManagerAccount(profile);
+
   let navItems: any[] = homeownerNav;
   if (activeRole === "admin") {
     navItems = adminNav;
@@ -475,13 +507,13 @@ export default function Layout() {
     navItems = activeRole === "driver" ? driverNav : passengerNav;
   } else {
     if (activeRole === "business") {
-      if (activeTab === "field_services") {
+      if (effectiveBusinessTab === "field_services") {
         if (activeSubTab === "work_hub") {
           navItems = businessWorkHubNav;
         } else {
           navItems = hireB2bNav;
         }
-      } else if (activeTab === "consultancy") {
+      } else if (effectiveBusinessTab === "consultancy") {
         navItems = consultancyNav;
       } else {
         navItems = businessNav;
@@ -594,6 +626,9 @@ export default function Layout() {
               </Link>
             </div>
           )}
+
+          {/* Email Verification Banner (Non-blocking, email/password accounts only) */}
+          <EmailVerificationBanner hasTopOffset={!isAnonymous && !showMaintenanceBanner} />
 
           {/* Cross-Portal Activity Banner */}
           <CrossPortalBanner />
@@ -727,7 +762,7 @@ export default function Layout() {
                     const isActive = location.pathname + location.search === item.path || (item.path === "/admin" && location.pathname === "/admin" && (!location.search || location.search === "?tab=users"));
                     
                     let hasUnread = false;
-                    if (item.path === "/job-feed" && unreadTypes.has("system")) hasUnread = true;
+                    if (item.path === "/job-feed" && (unreadTypes.has("system") || unreadTypes.has("job_lead") || unreadTypes.has("emergency_alert"))) hasUnread = true;
                     if (item.path === "/messages" && unreadTypes.has("message")) hasUnread = true;
                     if (item.path.startsWith("/my-quotes") && unreadTypes.has("quote")) hasUnread = true;
                     if (item.path === "/my-jobs" && (unreadTypes.has("quote") || unreadTypes.has("status"))) hasUnread = true;
@@ -887,7 +922,7 @@ export default function Layout() {
             )}
 
               {/* Quick Actions (Plus & Schedule) */}
-              {(profile?.role === "tradesperson" || profile?.subscriptionType === "business" || profile?.role === "admin" || profile?.role === "ecosystem_manager") && (activePortal as string) !== "anyroller" && (
+              {(profile?.role === "tradesperson" || profile?.role === "business" || profile?.subscriptionType === "business" || profile?.role === "admin" || profile?.role === "ecosystem_manager") && (activePortal as string) !== "anyroller" && (
                 <>
                   <div className="relative" ref={quickActionsRef}>
                      <button 
@@ -911,36 +946,44 @@ export default function Layout() {
                              <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shrink-0"><Briefcase className="w-4 h-4"/></div>
                              <span className="text-sm font-bold text-slate-800">Post a Job</span>
                            </Link>
-                           <Link onClick={() => setShowQuickActions(false)} to="/job-feed" className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors">
-                             <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 shrink-0"><Search className="w-4 h-4"/></div>
-                             <span className="text-sm font-bold text-slate-800">Find Work</span>
-                           </Link>
+                           {canUseTraderQuickActions && (
+                             <Link onClick={() => setShowQuickActions(false)} to="/job-feed" className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors">
+                               <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 shrink-0"><Search className="w-4 h-4"/></div>
+                               <span className="text-sm font-bold text-slate-800">Find Work</span>
+                             </Link>
+                           )}
                            <button onClick={() => { setShowQuickActions(false); loadShopRecommendations(); }} className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors w-full text-left">
                              <div className="w-8 h-8 rounded-full bg-purple-100 flex items-center justify-center text-purple-600 shrink-0"><ShoppingCart className="w-4 h-4"/></div>
                              <span className="text-sm font-bold text-slate-800">AI Equipment Shop</span>
                            </button>
-                           <Link onClick={() => setShowQuickActions(false)} to="/availability" className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors">
-                             <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center text-orange-600 shrink-0"><Calendar className="w-4 h-4"/></div>
-                             <span className="text-sm font-bold text-slate-800">Set Availability</span>
-                           </Link>
-                           <Link onClick={() => setShowQuickActions(false)} to="/trader/banner-ads" className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors">
-                             <div className="w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center text-amber-600 shrink-0"><Star className="w-4 h-4"/></div>
-                             <span className="text-sm font-bold text-slate-800">Advertise</span>
-                           </Link>
+                           {canUseTraderQuickActions && (
+                             <>
+                               <Link onClick={() => setShowQuickActions(false)} to="/availability" className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors">
+                                 <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center text-orange-600 shrink-0"><Calendar className="w-4 h-4"/></div>
+                                 <span className="text-sm font-bold text-slate-800">Set Availability</span>
+                               </Link>
+                               <Link onClick={() => setShowQuickActions(false)} to="/trader/banner-ads" className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 transition-colors">
+                                 <div className="w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center text-amber-600 shrink-0"><Star className="w-4 h-4"/></div>
+                                 <span className="text-sm font-bold text-slate-800">Advertise</span>
+                               </Link>
+                             </>
+                           )}
                          </motion.div>
                        )}
                      </AnimatePresence>
                   </div>
                   
-                  <Link 
-                    to="/availability" 
-                    id="header-calendar-btn"
-                    className="hidden md:flex w-10 h-10 sm:w-11 sm:h-11 rounded-[14px] bg-white border border-black shadow-sm flex flex-col items-center justify-center text-black hover:bg-slate-50 hover:text-blue-600 transition-all active:scale-95 shrink-0"
-                    title="Schedule & Availability"
-                  >
-                    <Calendar className="w-4 h-4 sm:w-5 sm:h-5 text-black" />
-                    <span className="text-[7.5px] font-black uppercase text-black tracking-tight leading-none mt-0.5">Cal</span>
-                  </Link>
+                  {canUseTraderQuickActions && (
+                    <Link 
+                      to="/availability" 
+                      id="header-calendar-btn"
+                      className="hidden md:flex w-10 h-10 sm:w-11 sm:h-11 rounded-[14px] bg-white border border-black shadow-sm flex flex-col items-center justify-center text-black hover:bg-slate-50 hover:text-blue-600 transition-all active:scale-95 shrink-0"
+                      title="Schedule & Availability"
+                    >
+                      <Calendar className="w-4 h-4 sm:w-5 sm:h-5 text-black" />
+                      <span className="text-[7.5px] font-black uppercase text-black tracking-tight leading-none mt-0.5">Cal</span>
+                    </Link>
+                  )}
                 </>
               )}
 
@@ -1299,12 +1342,12 @@ export default function Layout() {
                                   <Heart className="w-3 h-3" fill={preferredDrivers.some(d => d.uid === ride.driverId) ? "currentColor" : "none"} />
                                </button>
                                <button 
-                                 onClick={async () => {
+                                 onClick={() => {
                                    if (!user || !ride.driverId) return;
-                                   if (confirm("Block this driver from future rides?")) {
-                                     await updateDoc(doc(db, "users", user.uid), { blockedDrivers: arrayUnion(ride.driverId) });
-                                     toast.success("Driver blocked");
-                                   }
+                                   setBlockDriverTarget({
+                                     driverId: ride.driverId,
+                                     driverName: ride.driverName || "this driver",
+                                   });
                                  }} 
                                  className="p-1.5 bg-slate-50 rounded-lg text-slate-400 hover:text-red-500 transition-colors" 
                                  title="Block Driver"
@@ -1424,7 +1467,7 @@ export default function Layout() {
             
             let hasUnread = false;
             // Removed other types for brevity if not strictly needed or keep original
-            if (item.path === "/job-feed" && unreadTypes.has("system")) hasUnread = true;
+            if (item.path === "/job-feed" && (unreadTypes.has("system") || unreadTypes.has("job_lead") || unreadTypes.has("emergency_alert"))) hasUnread = true;
             if (item.path === "/messages" && unreadTypes.has("message")) hasUnread = true;
             if (item.path.startsWith("/my-quotes") && unreadTypes.has("quote")) hasUnread = true;
             if (item.path === "/my-jobs" && (unreadTypes.has("quote") || unreadTypes.has("status"))) hasUnread = true;
@@ -1487,6 +1530,49 @@ export default function Layout() {
         customTitle={platformConfig?.taxiComingSoonTitle}
         customMessage={platformConfig?.taxiComingSoonMessage}
       />
+
+      {/* Block Driver Confirmation Modal */}
+      {blockDriverTarget && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[120] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="text-center space-y-2">
+              <div className="w-12 h-12 bg-red-50 rounded-2xl border border-black flex items-center justify-center mx-auto">
+                <Ban className="w-6 h-6 text-red-600" />
+              </div>
+              <h3 className="text-base font-black text-black">Block Driver?</h3>
+              <p className="text-xs text-black leading-relaxed">
+                Are you sure you want to block <strong>{blockDriverTarget.driverName}</strong> from future rides?
+              </p>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setBlockDriverTarget(null)}
+                className="flex-1 p-2.5 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!user || !blockDriverTarget) return;
+                  try {
+                    await updateDoc(doc(db, "users", user.uid), { blockedDrivers: arrayUnion(blockDriverTarget.driverId) });
+                    toast.success("Driver blocked from future rides.");
+                  } catch {
+                    toast.error("Unable to block driver right now.");
+                  } finally {
+                    setBlockDriverTarget(null);
+                  }
+                }}
+                className="flex-1 p-2.5 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 cursor-pointer"
+              >
+                Block Driver
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

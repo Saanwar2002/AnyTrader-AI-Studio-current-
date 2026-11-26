@@ -10,6 +10,8 @@ import { getTraderBadges, BadgeOverlay } from "@/src/lib/badges";
 import { calculateTraderMatchScore } from "@/src/services/matchingEngine";
 import BnplFinancingModal from "./BnplFinancingModal";
 import { useDialogA11y } from "@/src/lib/useDialogA11y";
+import { db, doc, onSnapshot } from "@/src/firebase";
+import { formatQuoteScopeLabel, resolveFlexiPayMode, type FlexiPayMode } from "@/src/lib/marketplaceContracts";
 
 interface QuoteComparisonModalProps {
   isOpen: boolean;
@@ -39,9 +41,18 @@ export default function QuoteComparisonModal({
   const [isAcceptingId, setIsAcceptingId] = React.useState<string | null>(null);
   const [expandedBreakdownId, setExpandedBreakdownId] = React.useState<string | null>(null);
 
-  // BNPL Financing state
+  // BNPL Financing state & Admin-controlled FlexiPay switch
   const [showBnplModal, setShowBnplModal] = React.useState(false);
   const [selectedQuoteForBnpl, setSelectedQuoteForBnpl] = React.useState<any>(null);
+  const [flexiPayMode, setFlexiPayMode] = React.useState<FlexiPayMode>("coming_soon");
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const unsub = onSnapshot(doc(db, "platform_config", "global"), (snap) => {
+      setFlexiPayMode(resolveFlexiPayMode(snap.exists() ? snap.data() : null));
+    }, () => {});
+    return () => unsub();
+  }, [isOpen]);
 
   // Video preview state
   const [activeVideoUrl, setActiveVideoUrl] = React.useState<string | null>(null);
@@ -53,18 +64,26 @@ export default function QuoteComparisonModal({
 
   if (!isOpen) return null;
 
-  const activeQuotes = quotes.filter(q => q.status !== "rejected");
+  const activeQuotes = quotes.filter(q => q.status !== "rejected" && q.status !== "withdrawn");
 
   const sortedQuotes = [...activeQuotes].sort((a, b) => {
     // 1. Accepted first
     if (a.status === "accepted" && b.status !== "accepted") return -1;
     if (b.status === "accepted" && a.status !== "accepted") return 1;
 
-    // 2. Verified Video Pro Priority Positioning (£15/mo Subscribers & Video Verified)
+    // 2. Verified Video Pro Priority Positioning (strictly requires verified video status)
     const profileA = tradespersonProfiles[a.tradespersonId];
     const profileB = tradespersonProfiles[b.tradespersonId];
-    const isVideoProA = Boolean(profileA?.hasVerifiedVideoProSubscription || profileA?.videoVerificationStatus === "verified" || profileA?.videoVerificationUrl);
-    const isVideoProB = Boolean(profileB?.hasVerifiedVideoProSubscription || profileB?.videoVerificationStatus === "verified" || profileB?.videoVerificationUrl);
+    const isVideoProA = Boolean(
+      profileA?.hasVerifiedVideoProSubscription ||
+      profileA?.videoVerificationStatus === "verified" ||
+      profileA?.isVideoVerified === true
+    );
+    const isVideoProB = Boolean(
+      profileB?.hasVerifiedVideoProSubscription ||
+      profileB?.videoVerificationStatus === "verified" ||
+      profileB?.isVideoVerified === true
+    );
     if (isVideoProA && !isVideoProB) return -1;
     if (isVideoProB && !isVideoProA) return 1;
 
@@ -275,10 +294,15 @@ export default function QuoteComparisonModal({
                           </div>
 
                           <div className="flex flex-col text-left min-w-0 flex-1">
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <h3 className="font-black text-slate-900 text-base leading-tight truncate">
                                 {tpProfile?.name || "Tradesperson"}
                               </h3>
+                              {tpProfile?.verificationStatus === "provisional" && (
+                                <span className="bg-amber-50 text-amber-900 border border-black text-[9px] font-black px-1.5 py-0.5 rounded-md uppercase">
+                                  Provisional
+                                </span>
+                              )}
                               {tpProfile?.trustScore && (
                                 <span className="bg-emerald-50 text-emerald-800 border border-emerald-300 text-[9px] font-black px-1.5 py-0.5 rounded-md">
                                   {tpProfile.trustScore}%
@@ -287,15 +311,23 @@ export default function QuoteComparisonModal({
                             </div>
 
                             <div className="flex items-center gap-2 mt-1">
-                              <div className="flex items-center gap-1 bg-amber-50 px-2 py-0.5 rounded-md text-amber-700 border border-amber-200">
-                                <Star className="w-3.5 h-3.5 fill-current text-amber-500" />
-                                <span className="text-xs font-black">
-                                  {tpProfile?.rating ? tpProfile.rating.toFixed(1) : "5.0"}
+                              {Number(tpProfile?.totalReviews || tpProfile?.reviewsCount || 0) > 0 && Number(tpProfile?.rating || 0) > 0 ? (
+                                <>
+                                  <div className="flex items-center gap-1 bg-amber-50 px-2 py-0.5 rounded-md text-amber-700 border border-amber-200">
+                                    <Star className="w-3.5 h-3.5 fill-current text-amber-500" />
+                                    <span className="text-xs font-black">
+                                      {Number(tpProfile.rating).toFixed(1)}
+                                    </span>
+                                  </div>
+                                  <span className="text-[11px] font-bold text-slate-600">
+                                    ({tpProfile.totalReviews || tpProfile.reviewsCount} reviews)
+                                  </span>
+                                </>
+                              ) : (
+                                <span className="text-[11px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200">
+                                  New (0 reviews)
                                 </span>
-                              </div>
-                              <span className="text-[11px] font-bold text-slate-600">
-                                ({tpProfile?.totalReviews || 0} reviews)
-                              </span>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -315,7 +347,7 @@ export default function QuoteComparisonModal({
                                   </span>
                                   {matchResult && (
                                     <span className="text-xs font-black text-amber-300">
-                                      {matchResult.compositeScore}% ({matchResult.rankTier})
+                                      {matchResult.compositeScore}% ({matchResult.matchTier})
                                     </span>
                                   )}
                                 </div>
@@ -377,7 +409,7 @@ export default function QuoteComparisonModal({
                                 {quote.paymentPreference?.replace('_', ' ') || "Fixed Price"}
                               </span>
                               <span className="bg-white text-slate-800 border border-black text-[10px] font-black px-2.5 py-0.5 rounded-lg uppercase">
-                                {quote.quoteScope?.replace('_', ' ') || "Complete Package"}
+                                {formatQuoteScopeLabel(quote.quoteScope)}
                               </span>
                             </div>
 
@@ -402,7 +434,7 @@ export default function QuoteComparisonModal({
                               >
                                 <div className="flex items-center justify-between">
                                   <span className="text-slate-500 font-bold">Scope Coverage:</span>
-                                  <span className="font-black text-slate-900 uppercase">{quote.quoteScope?.replace('_', ' ') || "Complete"}</span>
+                                  <span className="font-black text-slate-900 uppercase">{formatQuoteScopeLabel(quote.quoteScope)}</span>
                                 </div>
                                 <div className="flex items-center justify-between">
                                   <span className="text-slate-500 font-bold">Deposit Structure:</span>
@@ -439,21 +471,26 @@ export default function QuoteComparisonModal({
                               </motion.div>
                             )}
 
-                            {/* BNPL Financing option for £1,000+ */}
-                            {quote.amount >= 1000 && (
+                            {/* BNPL Financing option for £1,000+ (Admin-controlled) */}
+                            {quote.amount >= 1000 && flexiPayMode !== "off" && (
                               <div className="pt-2 border-t border-slate-200 flex items-center justify-between gap-2">
                                 <div className="text-[10px] text-indigo-900 font-black flex items-center gap-1">
                                   <CreditCard className="w-3.5 h-3.5 text-indigo-600" />
-                                  <span>From £{Math.round(quote.amount / 12)}/mo (0% APR)</span>
+                                  <span>
+                                    {flexiPayMode === "coming_soon"
+                                      ? "FlexiPay Monthly Plans (Coming Soon)"
+                                      : `Illustrative from £${Math.round(quote.amount / 12)}/mo`}
+                                  </span>
                                 </div>
                                 <button
+                                  type="button"
                                   onClick={() => {
                                     setSelectedQuoteForBnpl(quote);
                                     setShowBnplModal(true);
                                   }}
                                   className="text-[9px] font-black uppercase bg-indigo-600 hover:bg-indigo-700 text-white px-2.5 py-1 rounded-lg transition shadow-2xs"
                                 >
-                                  FlexiPay
+                                  {flexiPayMode === "coming_soon" ? "Coming Soon" : "FlexiPay"}
                                 </button>
                               </div>
                             )}
@@ -667,10 +704,14 @@ export default function QuoteComparisonModal({
                           return (
                             <td key={quote.id} className="p-3 text-center border-l border-slate-200">
                               <div className="flex flex-col items-center gap-0.5">
-                                <span className="font-bold text-amber-600 flex items-center gap-1">
-                                  <Star className="w-3.5 h-3.5 fill-current" />
-                                  {tpProfile?.rating ? tpProfile.rating.toFixed(1) : "5.0"} ({tpProfile?.totalReviews || 0})
-                                </span>
+                                {Number(tpProfile?.totalReviews || tpProfile?.reviewsCount || 0) > 0 && Number(tpProfile?.rating || 0) > 0 ? (
+                                  <span className="font-bold text-amber-600 flex items-center gap-1">
+                                    <Star className="w-3.5 h-3.5 fill-current" />
+                                    {Number(tpProfile.rating).toFixed(1)} ({tpProfile.totalReviews || tpProfile.reviewsCount})
+                                  </span>
+                                ) : (
+                                  <span className="font-bold text-slate-600 text-[11px]">New (0 reviews)</span>
+                                )}
                                 {tpProfile?.trustScore && (
                                   <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
                                     Trust Score: {tpProfile.trustScore}%
@@ -691,7 +732,7 @@ export default function QuoteComparisonModal({
                           <td key={quote.id} className="p-3 text-center border-l border-slate-200">
                             <div className="flex flex-col items-center gap-1">
                               <span className="bg-slate-100 text-slate-800 font-bold px-2 py-0.5 rounded-md uppercase text-[10px]">
-                                {quote.quoteScope?.replace('_', ' ') || "Complete Package"}
+                                {formatQuoteScopeLabel(quote.quoteScope)}
                               </span>
                               <span className="text-slate-500 font-medium text-[10px]">
                                 {quote.paymentPreference?.replace('_', ' ') || "Fixed Price"}

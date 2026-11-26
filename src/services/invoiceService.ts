@@ -1,5 +1,5 @@
-import { db, sendNotification } from "@/src/firebase";
-import { collection, doc, setDoc, getDoc, getDocs, query, where, serverTimestamp } from "firebase/firestore";
+import { auth, db, sendNotification } from "@/src/firebase";
+import { doc, getDoc } from "firebase/firestore";
 import { calculatePayoutBreakdown, normalizeTraderTier } from "./stripeIntegrationService";
 import { exportInvoicesToSheets } from "./googleSheetsService";
 import { evaluateVatEligibility } from "../lib/vatValidation";
@@ -76,13 +76,29 @@ export interface InvoiceSummaryMath {
 export function calculateInvoiceSummary(
   acceptedQuote: any,
   job: any,
-  tradespersonProfile: any
+  tradespersonProfile: any,
+  pricingOverrides?: { commissionRate?: number; commissionCapGbp?: number }
 ): InvoiceSummaryMath {
   const rawTier = tradespersonProfile?.tierId || tradespersonProfile?.tier || "payg";
   const laborAmount = Math.round(Number(acceptedQuote?.amount || 0) * 100) / 100;
   const materialsAmount = Math.round(Number(job?.materialsCost || acceptedQuote?.materialsCost || 0) * 100) / 100;
-  const payoutBreakdown = calculatePayoutBreakdown(laborAmount, rawTier);
-  const platformFee = Math.round(Number(payoutBreakdown.platformCommission || 0) * 100) / 100;
+  const explicitQuoteFee = Number(acceptedQuote?.platformFee);
+  const hasAuthoritativeQuoteFee =
+    acceptedQuote?.platformFee !== undefined &&
+    acceptedQuote?.platformFee !== null &&
+    Number.isFinite(explicitQuoteFee) &&
+    explicitQuoteFee >= 0 &&
+    explicitQuoteFee <= laborAmount;
+  const effectiveRate =
+    pricingOverrides?.commissionRate ??
+    (typeof acceptedQuote?.appliedCommissionRate === "number" ? acceptedQuote.appliedCommissionRate : undefined);
+  const effectiveCap =
+    pricingOverrides?.commissionCapGbp ??
+    (typeof acceptedQuote?.commissionCapGbp === "number" ? acceptedQuote.commissionCapGbp : undefined);
+  const payoutBreakdown = calculatePayoutBreakdown(laborAmount, rawTier, effectiveRate, effectiveCap);
+  const platformFee = hasAuthoritativeQuoteFee
+    ? Math.round(explicitQuoteFee * 100) / 100
+    : Math.round(Number(payoutBreakdown.platformCommission || 0) * 100) / 100;
   const netLaborLine =
     platformFee > 0 && laborAmount >= platformFee
       ? Math.round((laborAmount - platformFee) * 100) / 100
@@ -117,26 +133,101 @@ export async function createOrGetJobInvoice(
 ): Promise<InvoiceData> {
   const jobId = job.id || job.jobId;
   const invoiceDocId = `INV_${jobId}`;
-  const invoiceRef = doc(db, "invoices", invoiceDocId);
 
-  // Check if invoice already exists
+  // Primary path: server-authoritative invoice creation / retrieval & paid-status sync
+  try {
+    const token = await auth.currentUser?.getIdToken();
+    if (token && jobId) {
+      const response = await fetch(`/api/invoices/job/${encodeURIComponent(String(jobId))}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        if (data?.invoice) {
+          const authoritativeInvoice: InvoiceData = {
+            id: data.id || invoiceDocId,
+            ...data.invoice,
+          };
+
+          if (data.created) {
+            try {
+              const isPro = Boolean(authoritativeInvoice.isBrandedPro);
+              if (job.homeownerId) {
+                await sendNotification(
+                  job.homeownerId,
+                  `🧾 Invoice Ready: ${authoritativeInvoice.invoiceNumber}`,
+                  `Your invoice for "${job.title}" (£${Number(authoritativeInvoice.totalAmount || 0).toFixed(2)}) is now available to download.`,
+                  "system",
+                  `/job/${jobId}`
+                );
+              }
+              if (acceptedQuote?.tradespersonId) {
+                await sendNotification(
+                  acceptedQuote.tradespersonId,
+                  `🧾 Invoice Generated: ${authoritativeInvoice.invoiceNumber}`,
+                  `An official ${isPro ? "Pro Branded" : "Free Standard"} invoice for "${job.title}" (£${Number(authoritativeInvoice.totalAmount || 0).toFixed(2)}) was generated.`,
+                  "system",
+                  `/job/${jobId}`
+                );
+              }
+
+              if (isPro && tradespersonProfile?.autoSyncGoogleSheets) {
+                await exportInvoicesToSheets([{
+                  dateCreated: new Date().toLocaleDateString("en-GB"),
+                  ref: authoritativeInvoice.invoiceNumber,
+                  clientName: authoritativeInvoice.homeownerName,
+                  serviceDescription: authoritativeInvoice.jobTitle,
+                  subtotal: authoritativeInvoice.subtotal,
+                  vat: authoritativeInvoice.vatAmount,
+                  total: authoritativeInvoice.totalAmount,
+                  status: authoritativeInvoice.status
+                }]);
+              }
+            } catch (notifErr) {
+              console.warn("Invoice notification failed non-blockingly:", notifErr);
+            }
+          }
+
+          return authoritativeInvoice;
+        }
+      }
+    }
+  } catch (apiErr) {
+    console.warn("Authoritative invoice API unavailable, falling back to read-only local invoice view:", apiErr);
+  }
+
+  // Fallback 1: Read existing invoice directly if permitted
+  const invoiceRef = doc(db, "invoices", invoiceDocId);
   try {
     const existingSnap = await getDoc(invoiceRef);
     if (existingSnap.exists()) {
       return { id: existingSnap.id, ...existingSnap.data() } as InvoiceData;
     }
   } catch (err) {
-    console.warn("Error reading existing invoice, generating fresh:", err);
+    console.warn("Error reading existing invoice, generating read-only local preview:", err);
   }
 
-  // Determine tier & calculations (rounded strictly to pence so line items === subtotal & total)
+  // Fallback 2: Compute read-only local invoice object without attempting restricted client writes
+  // or fabricating placeholder bank details.
   const isPro = isProInvoiceUser(tradespersonProfile);
   const summary = calculateInvoiceSummary(acceptedQuote, job, tradespersonProfile);
   const { laborAmount, materialsAmount, platformFee, subtotal, vatAmount, totalAmount } = summary;
   const vatEvaluation = { eligible: summary.vatEligible, vatNumber: summary.vatNumber };
 
-  const invoiceNumber = `INV-${new Date().getFullYear()}-${jobId.slice(-6).toUpperCase()}`;
+  const invoiceNumber = `INV-${new Date().getFullYear()}-${String(jobId || "").slice(-6).toUpperCase()}`;
   const dueDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+
+  const bankName = typeof tradespersonProfile?.bankName === "string" ? tradespersonProfile.bankName.trim() : "";
+  const sortCode = typeof tradespersonProfile?.sortCode === "string" ? tradespersonProfile.sortCode.trim() : "";
+  const accountNumber = typeof tradespersonProfile?.accountNumber === "string" ? tradespersonProfile.accountNumber.trim() : "";
+  const verifiedBankDetails =
+    isPro && bankName && sortCode && accountNumber
+      ? { bankName, sortCode, accountNumber }
+      : undefined;
 
   const invoiceData: InvoiceData = {
     invoiceNumber,
@@ -148,17 +239,13 @@ export async function createOrGetJobInvoice(
     homeownerName: homeownerProfile?.name || job.homeownerName || "Homeowner",
     homeownerEmail: homeownerProfile?.email || job.homeownerEmail || "",
     homeownerAddress: job.address || job.postcode || "",
-    tradespersonId: acceptedQuote.tradespersonId,
+    tradespersonId: acceptedQuote?.tradespersonId,
     tradespersonName: tradespersonProfile?.name || tradespersonProfile?.businessName || "Tradesperson",
     tradespersonBusinessName: tradespersonProfile?.businessName || tradespersonProfile?.companyName || tradespersonProfile?.name || "Independent Tradesperson",
     tradespersonVatNumber: vatEvaluation.eligible ? vatEvaluation.vatNumber : "",
     tradespersonLogoUrl: tradespersonProfile?.photoURL || tradespersonProfile?.logoUrl || "",
     tradespersonPhone: tradespersonProfile?.phone || tradespersonProfile?.phoneNumber || "",
-    tradespersonBankDetails: isPro ? {
-      bankName: tradespersonProfile?.bankName || "Barclays Bank UK",
-      sortCode: tradespersonProfile?.sortCode || "20-00-00",
-      accountNumber: tradespersonProfile?.accountNumber || "12345678"
-    } : undefined,
+    ...(verifiedBankDetails ? { tradespersonBankDetails: verifiedBankDetails } : {}),
     tier: isPro ? "pro" : "free",
     status: job.isPaid || job.paymentStatus === "paid" || job.paymentStatus === "handshake_complete" ? "paid" : "unpaid",
     createdAt: new Date().toISOString(),
@@ -174,50 +261,6 @@ export async function createOrGetJobInvoice(
       ? (tradespersonProfile?.customInvoiceNotes || "Thank you for choosing a Verified AnyTrader Pro! Payment due within 14 days.")
       : "Automated standard invoice generated via AnyTrader Platform."
   };
-
-  try {
-    await setDoc(invoiceRef, { ...invoiceData, createdAt: serverTimestamp() });
-  } catch (err) {
-    console.error("Failed to store invoice doc:", err);
-  }
-
-  // Trigger Notifications
-  try {
-    if (job.homeownerId) {
-      await sendNotification(
-        job.homeownerId,
-        `🧾 Invoice Ready: ${invoiceNumber}`,
-        `Your invoice for "${job.title}" (£${totalAmount.toFixed(2)}) is now available to download.`,
-        "system",
-        `/job/${jobId}`
-      );
-    }
-    if (acceptedQuote.tradespersonId) {
-      await sendNotification(
-        acceptedQuote.tradespersonId,
-        `🧾 Invoice Generated: ${invoiceNumber}`,
-        `An official ${isPro ? "Pro Branded" : "Free Standard"} invoice for "${job.title}" (£${totalAmount.toFixed(2)}) was generated.`,
-        "system",
-        `/job/${jobId}`
-      );
-    }
-
-    // Auto-sync for Pro users if configured
-    if (isPro && tradespersonProfile?.autoSyncGoogleSheets) {
-      await exportInvoicesToSheets([{
-        dateCreated: new Date().toLocaleDateString("en-GB"),
-        ref: invoiceNumber,
-        clientName: invoiceData.homeownerName,
-        serviceDescription: invoiceData.jobTitle,
-        subtotal: invoiceData.subtotal,
-        vat: invoiceData.vatAmount,
-        total: totalAmount,
-        status: invoiceData.status
-      }]);
-    }
-  } catch (notifErr) {
-    console.warn("Invoice notification failed non-blockingly:", notifErr);
-  }
 
   return { id: invoiceDocId, ...invoiceData };
 }
@@ -410,13 +453,16 @@ export async function downloadInvoicePDF(invoice: InvoiceData): Promise<void> {
   doc.setFont("helvetica", "bold");
   doc.setFontSize(11);
   doc.setTextColor(255, 255, 255);
-  doc.text("TOTAL DUE:", totalX, y + 3);
+  doc.text(invoice.status === "paid" ? "TOTAL PAID:" : "TOTAL DUE:", totalX, y + 3);
   doc.text(`£${totalAmount.toFixed(2)}`, 185, y + 3, { align: "right" });
 
   y += 20;
 
-  // Pro Bank Details & Notes
-  if (isPro && invoice.tradespersonBankDetails) {
+  // Pro Bank Details (only render when trader has saved genuine bank details)
+  const bankName = invoice.tradespersonBankDetails?.bankName?.trim();
+  const sortCode = invoice.tradespersonBankDetails?.sortCode?.trim();
+  const accountNumber = invoice.tradespersonBankDetails?.accountNumber?.trim();
+  if (isPro && bankName && sortCode && accountNumber) {
     doc.setFillColor(241, 245, 249);
     doc.roundedRect(15, y, 180, 22, 2, 2, "F");
 
@@ -428,9 +474,9 @@ export async function downloadInvoicePDF(invoice: InvoiceData): Promise<void> {
     doc.setFont("helvetica", "normal");
     doc.setFontSize(9);
     doc.setTextColor(51, 65, 85);
-    doc.text(`Bank: ${invoice.tradespersonBankDetails.bankName || "Barclays Bank UK"}`, 20, y + 12);
-    doc.text(`Sort Code: ${invoice.tradespersonBankDetails.sortCode || "20-00-00"}`, 80, y + 12);
-    doc.text(`Account No: ${invoice.tradespersonBankDetails.accountNumber || "12345678"}`, 140, y + 12);
+    doc.text(`Bank: ${bankName}`, 20, y + 12);
+    doc.text(`Sort Code: ${sortCode}`, 80, y + 12);
+    doc.text(`Account No: ${accountNumber}`, 140, y + 12);
     doc.text(`Reference: ${invoice.invoiceNumber}`, 20, y + 17);
 
     y += 28;

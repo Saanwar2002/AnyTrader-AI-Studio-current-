@@ -63,10 +63,10 @@ export default function AdminMaterialsArbitrageTab({ onShowNotice }: AdminMateri
         setBroadcastedIds(prev => new Set(prev).add(item.id));
         onShowNotice?.(res.outcomeMessage, "success");
       } else {
-        onShowNotice?.("Failed to broadcast alert", "error");
+        onShowNotice?.(res.outcomeMessage || "Material arbitrage broadcasts must be sent from the authoritative Broadcasts console.", "info");
       }
-    } catch (err) {
-      onShowNotice?.("Error dispatching broadcast", "error");
+    } catch (err: any) {
+      onShowNotice?.(err?.message || "Material arbitrage broadcasts must be sent from the authoritative Broadcasts console.", "info");
     } finally {
       setExecutingId(null);
     }

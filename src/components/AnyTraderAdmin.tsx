@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
-import { db, collection, query, onSnapshot, doc, updateDoc, deleteDoc, setDoc, serverTimestamp, orderBy, limit, startAfter, sendNotification, getDoc, addDoc, getDocs, handleFirestoreError as handleGlobalFirestoreError, OperationType } from "@/src/firebase";
+import { db, collection, query, where, onSnapshot, doc, updateDoc, deleteDoc, setDoc, serverTimestamp, orderBy, limit, startAfter, sendNotification, getDoc, addDoc, getDocs, handleFirestoreError as handleGlobalFirestoreError, OperationType } from "@/src/firebase";
+import { getCountFromServer } from "firebase/firestore";
 import { useAuth } from "./AuthProvider";
 import { useCategories } from "../lib/CategoryProvider";
 import { TRADE_CATEGORIES } from "@/src/constants";
@@ -16,7 +17,8 @@ import {
   Settings, Settings2, BarChart3, PieChart, DollarSign, Percent, Clock, MapPin, CreditCard,
   AlertCircle, Zap, Sparkles, ShieldAlert, ShieldCheck, RefreshCw, Medal,
   Plus, Edit2, Calendar, Award, Info, Key, Building2, Globe, Database, Download,
-  Command, ChevronRightSquare, MousePointer2, Ghost, ArrowRight, ShoppingBag, Car, Cpu, Link as LinkIcon, Bot
+  Command, ChevronRightSquare, MousePointer2, Ghost, ArrowRight, ShoppingBag, Car, Cpu, Link as LinkIcon, Bot,
+  Video, Menu, Scale, FileCheck2
 } from "lucide-react";
 import { CURRENT_APP_VERSION } from "@/src/lib/version";
 import { AppUpdateModal } from "./common/AppUpdateModal";
@@ -29,6 +31,9 @@ import AdminAiAgentsTab from "./AdminAiAgentsTab";
 import AdminFlashDealsAndAiAnalyticsTab from "./AdminFlashDealsAndAiAnalyticsTab";
 import AdminFinancialReconciliationTab from "./AdminFinancialReconciliationTab";
 import AdminOperationalHealthTab from "./AdminOperationalHealthTab";
+import AdminSystemToolsTab from "./admin/AdminSystemToolsTab";
+import AdminReviewsModerationTab from "./admin/AdminReviewsModerationTab";
+import AdminGdprRequestsTab from "./admin/AdminGdprRequestsTab";
 import AdminAlertToastContainer from "./AdminAlertToastContainer";
 import AdminAlertThresholdsModal from "./AdminAlertThresholdsModal";
 import { startAdminThresholdBreachListener, ActiveBreachAlert } from "../services/adminAlertThresholdService";
@@ -38,22 +43,39 @@ import {
   Cell, PieChart as RePieChart, Pie
 } from "recharts";
 
-import { performInitialPublicRecordCheck } from "../services/verificationService";
 import { getPlatformHealthInsights, PlatformHealthInsights, generateBroadcastDraft, summarizeDisputeChat, analyzeFraudRisk, RiskAlert, analyzeDocument, suggestNewCategories, CategorySuggestion, getAiModelRecommendations, AiModelRecommendation } from "../services/gemini";
 import { normalizeTraderTier } from "../services/stripeIntegrationService";
+import {
+  DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS,
+  DEFAULT_PROVISIONAL_MAX_QUOTES,
+  evaluateTraderDocumentCompliance,
+} from "@/src/lib/traderCompliance";
+import { isServiceProviderProfile } from "@/src/lib/accountRoles";
+
+const VALID_ADMIN_TABS = [
+  "users", "jobs", "disputes", "logs", "team", "broadcast", "analytics",
+  "settings", "verifications", "insights", "risk", "trends", "categories",
+  "security", "guest_jobs", "monetization", "advertising", "affiliates",
+  "ai_agents", "sentinel_analytics", "subscriptions", "reconciliation",
+  "ops_health", "reviews", "gdpr"
+] as const;
+
+type AdminTabId = (typeof VALID_ADMIN_TABS)[number];
 
 export default function AnyTraderAdmin() {
   const { user, profile } = useAuth();
   const { categories } = useCategories();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   
-  const tabFromUrl = searchParams.get("tab") as any;
-  const initialTab = ["users", "jobs", "disputes", "logs", "team", "broadcast", "analytics", "settings", "verifications", "insights", "risk", "trends", "categories", "monetization", "advertising", "affiliates", "ai_agents", "sentinel_analytics", "subscriptions", "reconciliation", "ops_health"].includes(tabFromUrl) ? tabFromUrl : "users";
+  const tabFromUrl = searchParams.get("tab") as AdminTabId | null;
+  const initialTab: AdminTabId = tabFromUrl && (VALID_ADMIN_TABS as readonly string[]).includes(tabFromUrl) ? tabFromUrl : "users";
   
-  const [activeTab, setActiveTab] = useState<"users" | "jobs" | "disputes" | "logs" | "team" | "broadcast" | "analytics" | "settings" | "verifications" | "insights" | "risk" | "trends" | "categories" | "security" | "guest_jobs" | "monetization" | "advertising" | "affiliates" | "ai_agents" | "sentinel_analytics" | "subscriptions" | "reconciliation" | "ops_health">(initialTab as any);
+  const [activeTab, setActiveTab] = useState<AdminTabId>(initialTab);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   
   useEffect(() => {
-    const validTab = ["users", "jobs", "disputes", "logs", "team", "broadcast", "analytics", "settings", "verifications", "insights", "risk", "trends", "categories", "security", "guest_jobs", "monetization", "advertising", "affiliates", "ai_agents", "sentinel_analytics", "subscriptions", "reconciliation", "ops_health"].includes(tabFromUrl) ? tabFromUrl : "users";
+    const validTab: AdminTabId = tabFromUrl && (VALID_ADMIN_TABS as readonly string[]).includes(tabFromUrl) ? tabFromUrl : "users";
     if (validTab !== activeTab) {
       setActiveTab(validTab);
       setFilter(validTab === "jobs" ? "emergency" : "all");
@@ -72,6 +94,14 @@ export default function AnyTraderAdmin() {
   const [loading, setLoading] = useState(true);
   const [users, setUsers] = useState<any[]>([]);
   const [jobs, setJobs] = useState<any[]>([]);
+  const [disputedJobs, setDisputedJobs] = useState<any[]>([]);
+  const [kycPendingUsers, setKycPendingUsers] = useState<any[]>([]);
+  const [videoKycUsers, setVideoKycUsers] = useState<any[]>([]);
+  const [accurateCounts, setAccurateCounts] = useState<{ totalUsers: number | null; totalJobs: number | null }>({ totalUsers: null, totalJobs: null });
+  const [disputeNotes, setDisputeNotes] = useState<Record<string, string>>({});
+  const [resolvingDisputeId, setResolvingDisputeId] = useState<string | null>(null);
+  const [reviewingVideoUid, setReviewingVideoUid] = useState<string | null>(null);
+  const [overridingProvisionalUid, setOverridingProvisionalUid] = useState<string | null>(null);
   const [logs, setLogs] = useState<any[]>([]);
   const [usersPageSize, setUsersPageSize] = useState(50);
   const [jobsPageSize, setJobsPageSize] = useState(50);
@@ -181,6 +211,10 @@ export default function AnyTraderAdmin() {
   const [exportRole, setExportRole] = useState("homeowner");
   const [exportCategory, setExportCategory] = useState("Plumbing");
 
+  // Verification Queue Document Review State
+  const [rejectingDoc, setRejectingDoc] = useState<{ userId: string; docType: string; reason: string } | null>(null);
+  const [reviewingDocKey, setReviewingDocKey] = useState<string | null>(null);
+
   const ADMIN_FEATURES = [
     { title: "App Version & OTA Update Prompt", tab: "settings", elementId: "app-update-control", keywords: ["ota", "version", "update prompt", "release notes", "force update", "store url", "app store", "play store"], icon: <Sparkles className="w-4 h-4" /> },
     { title: "User Management", tab: "users", keywords: ["people", "homeowner", "trader", "delete", "suspend"], icon: <Users className="w-4 h-4" /> },
@@ -204,7 +238,11 @@ export default function AnyTraderAdmin() {
     { title: "Flush Audit Logs", tab: "settings", elementId: "quick-actions", keywords: ["delete logs", "purge", "clear history"], icon: <Trash2 className="w-4 h-4" /> },
     { title: "Platform Health (AI)", tab: "insights", keywords: ["gemini", "smart", "advice"], icon: <Sparkles className="w-4 h-4" /> },
     { title: "Risk Monitor (AI)", tab: "risk", keywords: ["fraud", "suspicious", "safety"], icon: <ShieldAlert className="w-4 h-4" /> },
+    { title: "Category Trends (AI)", tab: "trends", keywords: ["suggestions", "demand", "new trades", "search logs"], icon: <TrendingUp className="w-4 h-4" /> },
     { title: "Guest Job Control", tab: "guest_jobs", keywords: ["unregistered", "anonymous"], icon: <Ghost className="w-4 h-4" /> },
+    { title: "Reviews Moderation", tab: "reviews", keywords: ["ratings", "hide", "delete", "spam", "feedback"], icon: <Star className="w-4 h-4" /> },
+    { title: "GDPR & Privacy Requests", tab: "gdpr", keywords: ["erasure", "export", "compliance", "art 17", "data subject"], icon: <FileCheck2 className="w-4 h-4" /> },
+    { title: "Production Audit & Projection Sync", tab: "security", keywords: ["preflight", "resync", "config history", "projections", "audit"], icon: <Database className="w-4 h-4" /> },
   ];
 
   const filteredFeatures = featureSearchTerm.trim() === "" 
@@ -321,6 +359,39 @@ export default function AnyTraderAdmin() {
       (error) => handleGlobalFirestoreError(error, OperationType.GET, "jobs")
     );
 
+    // Dedicated unfiltered live listeners so KYC, Video KYC, and Disputes never hide beyond the 50-doc page cap
+    const unsubDisputedJobs = onSnapshot(
+      query(collection(db, "jobs"), where("status", "==", "disputed"), limit(100)),
+      (snapshot) => {
+        setDisputedJobs(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+      },
+      (error) => handleGlobalFirestoreError(error, OperationType.GET, "jobs(disputed)")
+    );
+
+    const unsubKycPending = onSnapshot(
+      query(collection(db, "users"), where("verificationStatus", "in", ["pending", "provisional"]), limit(100)),
+      (snapshot) => {
+        setKycPendingUsers(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+      },
+      (error) => handleGlobalFirestoreError(error, OperationType.GET, "users(kyc_pending)")
+    );
+
+    const unsubVideoKyc = onSnapshot(
+      query(collection(db, "users"), where("videoVerificationStatus", "==", "pending"), limit(100)),
+      (snapshot) => {
+        setVideoKycUsers(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+      },
+      (error) => handleGlobalFirestoreError(error, OperationType.GET, "users(video_kyc)")
+    );
+
+    // Exact aggregate counts for top KPI cards (non-blocking fallback to loaded arrays)
+    Promise.all([
+      getCountFromServer(collection(db, "users")).then((s) => s.data().count).catch(() => null),
+      getCountFromServer(collection(db, "jobs")).then((s) => s.data().count).catch(() => null),
+    ]).then(([totalUsers, totalJobs]) => {
+      setAccurateCounts({ totalUsers, totalJobs });
+    }).catch(() => {});
+
     const unsubLogs = onSnapshot(
       query(collection(db, "audit_logs"), orderBy("createdAt", "desc"), limit(logsPageSize)), 
       (snapshot) => {
@@ -426,6 +497,11 @@ export default function AnyTraderAdmin() {
               homeownerMediationStake: 25.00,
               traderMediationStake: 25.00,
               description: "Stripe Connect milestone stage payments & dispute mediation staking"
+            },
+            appointments: {
+              enabled: true,
+              price: 9.99,
+              description: "Real-time customer appointment booking & calendar slots"
             }
           },
           businessTiers: [
@@ -445,6 +521,9 @@ export default function AnyTraderAdmin() {
     return () => {
       unsubUsers();
       unsubJobs();
+      unsubDisputedJobs();
+      unsubKycPending();
+      unsubVideoKyc();
       unsubLogs();
       unsubInvites();
       unsubBroadcasts();
@@ -481,46 +560,79 @@ export default function AnyTraderAdmin() {
   };
 
   const handleApproveDoc = async (userId: string, docType: string) => {
+    const key = `${userId}_${docType}`;
+    setReviewingDocKey(key);
     try {
-      const userRef = doc(db, "users", userId);
-      const userDoc = users.find(u => u.id === userId);
-      if (!userDoc) return;
+      const idToken = await user?.getIdToken();
+      if (!idToken) {
+        throw new Error("Admin authentication required to review documents.");
+      }
 
-      const updatedDocs = userDoc.verificationDocs.map((d: any) => 
-        d.type === docType ? { ...d, status: "approved" } : d
-      );
-
-      const allApproved = updatedDocs.every((d: any) => d.status === "approved");
-
-      await updateDoc(userRef, {
-        verificationDocs: updatedDocs,
-        verificationStatus: allApproved ? "verified" : "pending"
+      const res = await fetch(`/api/admin/traders/${encodeURIComponent(userId)}/documents/review`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ docType, decision: "approved" }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || `Failed to approve document (${res.status})`);
+      }
 
-      await createAuditLog("approve_document", userId, "user", `Approved ${docType} for ${userDoc.name}`);
-    } catch (err) {
-      console.error(err);
+      if (rejectingDoc?.userId === userId && rejectingDoc?.docType === docType) {
+        setRejectingDoc(null);
+      }
+      showToast(
+        data.allApproved ? "Trader Verified" : "Document Approved",
+        data.allApproved
+          ? `${docType} approved and trader account promoted to Verified.`
+          : `${docType} approved. Remaining documents still pending review.`,
+        "success"
+      );
+    } catch (err: any) {
+      console.error("Approve document error:", err);
+      showToast("Error", err?.message || "Failed to approve document.", "error");
+    } finally {
+      setReviewingDocKey(null);
     }
   };
 
   const handleRejectDoc = async (userId: string, docType: string, reason: string) => {
+    const cleanReason = reason.trim();
+    if (!cleanReason) {
+      showToast("Reason Required", "Please enter a clear rejection reason for the trader.", "error");
+      return;
+    }
+    const key = `${userId}_${docType}`;
+    setReviewingDocKey(key);
     try {
-      const userRef = doc(db, "users", userId);
-      const userDoc = users.find(u => u.id === userId);
-      if (!userDoc) return;
+      const idToken = await user?.getIdToken();
+      if (!idToken) {
+        throw new Error("Admin authentication required to review documents.");
+      }
 
-      const updatedDocs = userDoc.verificationDocs.map((d: any) => 
-        d.type === docType ? { ...d, status: "rejected", rejectionReason: reason } : d
-      );
-
-      await updateDoc(userRef, {
-        verificationDocs: updatedDocs,
-        verificationStatus: "rejected"
+      const res = await fetch(`/api/admin/traders/${encodeURIComponent(userId)}/documents/review`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ docType, decision: "rejected", reason: cleanReason }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || `Failed to reject document (${res.status})`);
+      }
 
-      await createAuditLog("reject_document", userId, "user", `Rejected ${docType} for ${userDoc.name}: ${reason}`);
-    } catch (err) {
-      console.error(err);
+      setRejectingDoc(null);
+      showToast("Document Rejected", `${docType} rejected and trader notified.`, "success");
+    } catch (err: any) {
+      console.error("Reject document error:", err);
+      showToast("Error", err?.message || "Failed to reject document.", "error");
+    } finally {
+      setReviewingDocKey(null);
     }
   };
 
@@ -558,30 +670,26 @@ export default function AnyTraderAdmin() {
     
     try {
       const idToken = user ? await user.getIdToken() : "";
-      if (idToken) {
-        const res = await fetch("/api/admin/maintenance", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify({ maintenanceMode: newStatus }),
-        });
-        if (res.ok) {
-          showToast("System Updated", `Maintenance mode is now ${newStatus ? "ON" : "OFF"}`, newStatus ? "error" : "success");
-          return;
-        }
+      if (!idToken) {
+        throw new Error("Admin authentication required to toggle maintenance mode.");
       }
-      await setDoc(doc(db, "platform_config", "global"), {
-        ...updatedConfig,
-        updatedAt: serverTimestamp(),
-        updatedBy: user?.uid
+      const res = await fetch("/api/admin/maintenance", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ maintenanceMode: newStatus }),
       });
-      await createAuditLog("toggle_maintenance", "global", "config", `Turned maintenance mode ${newStatus ? "ON" : "OFF"}`);
+      const resData = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(resData?.error || `Failed to update maintenance mode (${res.status})`);
+      }
       showToast("System Updated", `Maintenance mode is now ${newStatus ? "ON" : "OFF"}`, newStatus ? "error" : "success");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error saving maintenance status:", err);
-      showToast("Error", "Failed to update maintenance status", "error");
+      setTempConfig((prev: any) => ({ ...prev, maintenanceMode: !newStatus }));
+      showToast("Error", err?.message || "Failed to update maintenance status", "error");
     }
   };
 
@@ -601,20 +709,53 @@ export default function AnyTraderAdmin() {
     setShowPaywallConfirm(false);
     
     try {
-      await setDoc(doc(db, "platform_config", "global"), {
-        ...updatedConfig,
-        updatedAt: serverTimestamp(),
-        updatedBy: user?.uid
+      const idToken = user ? await user.getIdToken() : "";
+      const paidAddons = updatedConfig.paidAddons || {
+        exclusiveLeads: { enabled: true, price: 29.00, earlyAccessMinutes: 30, description: "Exclusive leads add-on with 30-min priority notifications" },
+        verifiedVideoPro: { enabled: true, monthlyPrice: 15.00, annualPrice: 144.00, matchScoreBonus: 35, description: "Verified Video Pro credential badge, priority quotes & +35 match score points" },
+        emergencyBoost: { enabled: true, price: 5.00, durationHours: 4, description: "Top-of-feed emergency red banner & instant SMS alert" },
+        instantMatch: { enabled: true, price: 2.99, slaMinutes: 15, description: "Guaranteed priority matchmaking algorithm for local traders" },
+        milestoneEscrow: { enabled: true, homeownerMediationStake: 25.00, traderMediationStake: 25.00, description: "Stripe Connect milestone stage payments & dispute mediation staking" },
+        appointments: { enabled: true, price: 9.99, description: "Real-time customer appointment booking & calendar slots" }
+      };
+
+      if (!idToken) {
+        throw new Error("Admin authentication required to publish monetization status.");
+      }
+      const res = await fetch("/api/admin/pricing-config/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          tempConfig: updatedConfig,
+          feeTiers: updatedConfig.feeTiers || [],
+          businessTiers: updatedConfig.businessTiers || [],
+          paidAddons,
+          commissionCapGbp:
+            updatedConfig.commissionCapGbp !== undefined && updatedConfig.commissionCapGbp !== ""
+              ? Number(updatedConfig.commissionCapGbp)
+              : 250,
+        }),
       });
+      if (!res.ok) {
+        const errPayload = await res.json().catch(() => ({}));
+        throw new Error(errPayload?.error || `Failed to publish monetization mode (${res.status})`);
+      }
+
       await createAuditLog("toggle_paywall", "global", "config", `Turned monetization ${newStatus ? "ON" : "OFF (BETA MODE)"}`);
       showToast(
         newStatus ? "Monetization Live" : "Beta Mode Active",
-        newStatus ? "Subscription tiers and job limits are now active." : "Paywall disabled. All users have unlimited free access.",
+        newStatus
+          ? "Free Explorer (5% PAYG), paid tiers, and add-on paywalls are live immediately."
+          : "Free Beta Mode active. Paid tier paywalls are relaxed while full trade onboarding remains enabled.",
         "success"
       );
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error saving paywall status:", err);
-      showToast("Error", "Failed to update monetization status", "error");
+      setTempConfig((prev: any) => ({ ...prev, paywallEnabled: !newStatus }));
+      showToast("Error", err?.message || "Failed to update monetization status", "error");
     }
   };
 
@@ -643,30 +784,30 @@ export default function AnyTraderAdmin() {
 
     // Validation
     if (feeTiers.length === 0) {
-      alert("At least one provider fee tier is required.");
+      showToast("Validation Error", "At least one provider fee tier is required.", "error");
       return;
     }
 
     for (const tier of feeTiers) {
       if (!tier.name?.trim()) {
-        alert("All provider tiers must have a name.");
+        showToast("Validation Error", "All provider tiers must have a name.", "error");
         return;
       }
       const price = parseFloat(String(tier.price));
       if (isNaN(price) || price < 0) {
-        alert(`Invalid price for tier: ${tier.name}`);
+        showToast("Validation Error", `Invalid price for tier: ${tier.name}`, "error");
         return;
       }
     }
 
     for (const tier of businessTiers) {
       if (!tier.name?.trim()) {
-        alert("All business tiers must have a name.");
+        showToast("Validation Error", "All business tiers must have a name.", "error");
         return;
       }
       const price = parseFloat(String(tier.price));
       if (isNaN(price) || price < 0) {
-        alert(`Invalid price for business tier: ${tier.name}`);
+        showToast("Validation Error", `Invalid price for business tier: ${tier.name}`, "error");
         return;
       }
     }
@@ -678,7 +819,8 @@ export default function AnyTraderAdmin() {
         verifiedVideoPro: { enabled: true, monthlyPrice: 15.00, annualPrice: 144.00, matchScoreBonus: 35, description: "Verified Video Pro credential badge, priority quotes & +35 match score points" },
         emergencyBoost: { enabled: true, price: 5.00, durationHours: 4, description: "Top-of-feed emergency red banner & instant SMS alert" },
         instantMatch: { enabled: true, price: 2.99, slaMinutes: 15, description: "Guaranteed priority matchmaking algorithm for local traders" },
-        milestoneEscrow: { enabled: true, homeownerMediationStake: 25.00, traderMediationStake: 25.00, description: "Stripe Connect milestone stage payments & dispute mediation staking" }
+        milestoneEscrow: { enabled: true, homeownerMediationStake: 25.00, traderMediationStake: 25.00, description: "Stripe Connect milestone stage payments & dispute mediation staking" },
+        appointments: { enabled: true, price: 9.99, description: "Real-time customer appointment booking & calendar slots" }
       };
 
       const idToken = await user.getIdToken();
@@ -693,6 +835,10 @@ export default function AnyTraderAdmin() {
           feeTiers,
           businessTiers,
           paidAddons,
+          commissionCapGbp:
+            tempConfig.commissionCapGbp !== undefined && tempConfig.commissionCapGbp !== ""
+              ? Number(tempConfig.commissionCapGbp)
+              : 250,
         }),
       });
       const data = await res.json().catch(() => ({} as any));
@@ -715,7 +861,7 @@ export default function AnyTraderAdmin() {
 
   const handleGenerateBroadcastDraft = async () => {
     if (!broadcastTitle) {
-      alert("Please enter a rough idea or topic in the Message Title field first.");
+      showToast("Title Required", "Please enter a rough idea or topic in the Message Title field first.", "error");
       return;
     }
     setIsDraftingBroadcast(true);
@@ -726,7 +872,7 @@ export default function AnyTraderAdmin() {
       setBroadcastContent(draft);
     } catch (err) {
       console.error(err);
-      alert("Failed to generate draft. Please try again.");
+      showToast("Draft Failed", "Failed to generate draft. Please try again.", "error");
     } finally {
       setIsDraftingBroadcast(false);
     }
@@ -822,10 +968,22 @@ export default function AnyTraderAdmin() {
 
   const handleCancelInvite = async (inviteId: string) => {
     try {
-      await deleteDoc(doc(db, "invitations", inviteId));
-      await createAuditLog("cancel_invitation", inviteId, "user", "Invitation cancelled");
-    } catch (err) {
+      const idToken = user ? await user.getIdToken() : "";
+      if (!idToken) throw new Error("Admin authentication required.");
+      const res = await fetch(`/api/admin/invitations/${encodeURIComponent(inviteId)}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Failed to cancel invitation (${res.status})`);
+      }
+      showToast("Invitation Cancelled", "Staff invitation revoked and audited.");
+    } catch (err: any) {
       console.error(err);
+      showToast("Error", err?.message || "Failed to cancel invitation", "error");
     }
   };
 
@@ -922,10 +1080,40 @@ export default function AnyTraderAdmin() {
         throw new Error(verifyPayload?.error || `Verification update failed (${verifyRes.status})`);
       }
 
+      const userData = userSnap.exists() ? userSnap.data() : null;
+      const isTradeAccount = Boolean(
+        userData &&
+        (
+          userData.role === "tradesperson" ||
+          (userData.role === "business" && (
+            userData.businessLayer === "trades" ||
+            userData.businessLayer === "field_services" ||
+            !userData.businessLayer
+          ))
+        )
+      );
+
+      // Notify the trader about their updated verification status
+      if (userData) {
+        try {
+          const isApprovedStatus = status !== "rejected";
+          await sendNotification(
+            userId,
+            isApprovedStatus ? "Account Verification Approved!" : "Account Verification Update",
+            isApprovedStatus
+              ? `Your AnyTrader account status is now ${status.toUpperCase()}. You can now quote and appear as a verified professional.`
+              : "Your verification could not be approved at this time. Please review and re-upload your documents in your Profile.",
+            "system",
+            "/profile"
+          );
+        } catch (notifyErr) {
+          console.warn("Could not send verification notification:", notifyErr);
+        }
+      }
+
       // Handle Founding Member ID Assignment if upgraded to at least verified
-      if (status !== "rejected" && userSnap.exists()) {
-        const userData = userSnap.data();
-        if (userData.role === "tradesperson" && !userData.isFoundingMember) {
+      if (status !== "rejected" && userData) {
+        if (isTradeAccount && !userData.isFoundingMember) {
           const foundingId = await assignFoundingId(userId);
           if (foundingId) {
             console.log(`Assigned Founding ID ${foundingId} to ${userData.name}`);
@@ -942,9 +1130,8 @@ export default function AnyTraderAdmin() {
       }
 
       // Handle Referral Reward if verified
-      if (status === "verified" && userSnap.exists()) {
-        const userData = userSnap.data();
-        if (userData.role === "tradesperson" && userData.referredBy && !userData.referralRewardProcessed) {
+      if (status !== "rejected" && userData) {
+        if (isTradeAccount && userData.referredBy && !userData.referralRewardProcessed) {
           try {
             // Get platform config for boost duration
             const configRef = doc(db, "platform_config", "global");
@@ -981,22 +1168,126 @@ export default function AnyTraderAdmin() {
       }
 
       await createAuditLog(`verify_tradesperson_${status}`, userId, "user", `Verification status set to ${status}`);
-    } catch (err) {
+      showToast(
+        "Verification Updated",
+        `Account verification set to ${status.toUpperCase()}.`,
+        status === "rejected" ? "error" : "success"
+      );
+    } catch (err: any) {
       console.error(err);
+      showToast("Error", err?.message || "Failed to update verification status.", "error");
     }
   };
 
   const handleResolveDispute = async (jobId: string, resolution: "resolved" | "mediated") => {
+    if (!user) return;
+    setResolvingDisputeId(jobId);
     try {
-      await updateDoc(doc(db, "jobs", jobId), {
-        "dispute.status": resolution,
-        status: resolution === "resolved" ? "completed" : "cancelled",
-        hasReview: resolution === "resolved" ? false : false, // Default to false for consistency
-        updatedAt: serverTimestamp()
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/admin/disputes/${encodeURIComponent(jobId)}/resolve`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          resolution,
+          notes: (disputeNotes[jobId] || "").trim(),
+        }),
       });
-      await createAuditLog(`resolve_dispute_${resolution}`, jobId, "job", `Dispute resolved as ${resolution}`);
-    } catch (err) {
-      console.error(err);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Failed to resolve dispute (${res.status})`);
+      }
+      setDisputeNotes((prev) => {
+        const next = { ...prev };
+        delete next[jobId];
+        return next;
+      });
+      showToast(
+        "Dispute Resolved",
+        resolution === "resolved"
+          ? "Dispute marked resolved (job completed) and both parties notified."
+          : "Dispute mediated (job force-cancelled) and both parties notified.",
+        "success"
+      );
+    } catch (err: any) {
+      console.error("Resolve dispute error:", err);
+      showToast("Dispute Resolution Failed", err?.message || "Could not resolve dispute.", "error");
+    } finally {
+      setResolvingDisputeId(null);
+    }
+  };
+
+  const handleVideoVerification = async (
+    targetUid: string,
+    decision: "verified" | "rejected",
+    reason?: string
+  ) => {
+    if (!user) return;
+    setReviewingVideoUid(targetUid);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/admin/traders/${encodeURIComponent(targetUid)}/video-verification`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ decision, reason: reason || "" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Video verification review failed (${res.status})`);
+      }
+      showToast(
+        decision === "verified" ? "Video Credential Approved" : "Video Credential Rejected",
+        decision === "verified"
+          ? "Trader awarded Verified Video Pro badge and notified."
+          : "Video verification rejected and trader notified.",
+        decision === "verified" ? "success" : "error"
+      );
+    } catch (err: any) {
+      console.error("Video verification review error:", err);
+      showToast("Review Failed", err?.message || "Failed to review video verification.", "error");
+    } finally {
+      setReviewingVideoUid(null);
+    }
+  };
+
+  const handleProvisionalOverride = async (
+    targetUid: string,
+    action: "extend_grace" | "clear_duplicate_phone",
+    extendDays = 14
+  ) => {
+    if (!user) return;
+    setOverridingProvisionalUid(targetUid);
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/admin/traders/${encodeURIComponent(targetUid)}/provisional-override`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ action, extendDays }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Provisional override failed (${res.status})`);
+      }
+      showToast(
+        "Provisional Override Applied",
+        action === "extend_grace"
+          ? `Document grace period extended by ${extendDays} days.`
+          : "Duplicate phone flag cleared and account compliance refreshed.",
+        "success"
+      );
+    } catch (err: any) {
+      console.error("Provisional override error:", err);
+      showToast("Override Blocked", err?.message || "Could not apply provisional override.", "error");
+    } finally {
+      setOverridingProvisionalUid(null);
     }
   };
 
@@ -1019,7 +1310,7 @@ export default function AnyTraderAdmin() {
       setDisputeSummaries(prev => ({ ...prev, [job.id]: summary }));
     } catch (err) {
       console.error("Error summarizing dispute:", err);
-      alert("Failed to summarize dispute chat. " + (err instanceof Error ? err.message : ""));
+      showToast("Summary Failed", "Failed to summarize dispute chat. " + (err instanceof Error ? err.message : ""), "error");
     } finally {
       setIsSummarizingDispute(prev => ({ ...prev, [job.id]: false }));
     }
@@ -1034,7 +1325,7 @@ export default function AnyTraderAdmin() {
       await createAuditLog("analyze_risk", "platform", "system", "Ran AI Fraud & Risk Monitor");
     } catch (err) {
       console.error("Error analyzing risk:", err);
-      alert("Failed to analyze risk. Please try again.");
+      showToast("Risk Analysis Failed", "Failed to analyze risk. Please try again.", "error");
     } finally {
       setIsAnalyzingRisk(false);
     }
@@ -1052,7 +1343,7 @@ export default function AnyTraderAdmin() {
       await createAuditLog("analyze_trends", "platform", "system", "Ran AI Category Trends Analysis (Google + Internal)");
     } catch (err) {
       console.error("Error suggesting categories:", err);
-      alert("Failed to generate category suggestions. Please try again.");
+      showToast("Trends Analysis Failed", "Failed to generate category suggestions. Please try again.", "error");
     } finally {
       setIsGeneratingCategories(false);
     }
@@ -1077,6 +1368,27 @@ export default function AnyTraderAdmin() {
       };
 
       await setDoc(doc(db, "platform_categories", safeName), categoryData);
+
+      // Immediately sync updated category catalog into the server Gemini registry
+      try {
+        const idToken = user ? await user.getIdToken() : "";
+        if (idToken) {
+          const nextCategories = [
+            ...categories.filter((c: any) => c.name !== safeName),
+            categoryData,
+          ];
+          await fetch("/api/gemini/sync-categories", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({ categories: nextCategories }),
+          });
+        }
+      } catch (syncErr) {
+        console.warn("Non-blocking Gemini category sync warning:", syncErr);
+      }
       
       await createAuditLog(
         editingCategory ? "edit_category" : "add_category",
@@ -1102,6 +1414,22 @@ export default function AnyTraderAdmin() {
   const handleDeleteCategory = async (catId: string, catName: string) => {
     try {
       await deleteDoc(doc(db, "platform_categories", catId));
+      try {
+        const idToken = user ? await user.getIdToken() : "";
+        if (idToken) {
+          const nextCategories = categories.filter((c: any) => c.id !== catId && c.name !== catId);
+          await fetch("/api/gemini/sync-categories", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({ categories: nextCategories }),
+          });
+        }
+      } catch (syncErr) {
+        console.warn("Non-blocking Gemini category sync warning:", syncErr);
+      }
       await createAuditLog("delete_category", catId, "category", `Deleted category: ${catName}`);
       showToast("Success", "Category deleted successfully.");
       setDeleteConfirm(null);
@@ -1173,7 +1501,7 @@ export default function AnyTraderAdmin() {
       }
     } catch (err) {
       console.error("Error analyzing document:", err);
-      alert("Failed to analyze document. " + (err instanceof Error ? err.message : ""));
+      showToast("Error", "Failed to analyze document. " + (err instanceof Error ? err.message : ""), "error");
     } finally {
       setIsAnalyzingDoc(prev => ({ ...prev, [`${userId}_${docType}`]: false }));
     }
@@ -1194,13 +1522,24 @@ export default function AnyTraderAdmin() {
       : [...currentRecs, categoryName];
 
     try {
-      await updateDoc(doc(db, "users", userId), {
-        recommendedCategories: newRecs
+      const idToken = user ? await user.getIdToken() : "";
+      if (!idToken) throw new Error("Admin authentication required.");
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/attributes`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ recommendedCategories: newRecs }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `Failed to update recommendations (${res.status})`);
+      }
       showToast("Success", `Updated recommendations for ${userToUpdate.name}`);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      showToast("Error", "Failed to update recommendations", "error");
+      showToast("Error", err?.message || "Failed to update recommendations", "error");
     }
   };
 
@@ -1215,16 +1554,15 @@ export default function AnyTraderAdmin() {
   };
 
   const handleBulkDelete = async () => {
-    if (selectedUserIds.length === 0) return;
-    console.log("Current User Email:", user?.email);
+    if (selectedUserIds.length === 0 || !user) return;
     setIsSubmitting(true);
     let deletedCount = 0;
+    let failedCount = 0;
     try {
-      // Filter out protected accounts just in case
       const idsToDelete = selectedUserIds.filter(id => {
         const u = users.find(userObj => userObj.id === id);
-        if (id === user?.uid) return false;
-        if (u?.role === "admin" || u?.role === "ecosystem_manager") return false; // Protect all staff from deletion
+        if (id === user.uid) return false;
+        if (u?.role === "admin" || u?.role === "ecosystem_manager") return false;
         return true;
       });
 
@@ -1235,51 +1573,84 @@ export default function AnyTraderAdmin() {
         return;
       }
 
+      const idToken = await user.getIdToken();
       for (const id of idsToDelete) {
         try {
-          await deleteDoc(doc(db, "users", id));
-          deletedCount++;
-          // Try to create audit log, but don't fail the whole operation if it fails
-          try {
-            await createAuditLog("delete_user", id, "user", "User account deleted via bulk action");
-          } catch (auditErr) {
-            console.error("Failed to create audit log for", id, auditErr);
+          const res = await fetch(`/api/admin/users/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({ reason: "Bulk account deletion via Admin Console" }),
+          });
+          const data = await res.json().catch(() => ({} as any));
+          if (!res.ok || !data?.success) {
+            failedCount++;
+            console.error(`Bulk delete failed for ${id}:`, data?.error || res.status);
+          } else {
+            deletedCount++;
           }
         } catch (err) {
-          handleFirestoreError(err, "delete", `users/${id}`);
-          // If we've deleted some, show partial success
-          if (deletedCount > 0) {
-            showToast("Partial Success", `Deleted ${deletedCount} users before encountering an error.`, "error");
-          }
-          throw err;
+          failedCount++;
+          console.error(`Bulk delete network error for ${id}:`, err);
         }
       }
-      showToast("Success", `Successfully deleted ${deletedCount} users`);
+
+      if (deletedCount > 0 && failedCount === 0) {
+        showToast("Bulk Delete Complete", `Revoked & deleted ${deletedCount} account(s) cleanly via server cascade.`);
+      } else if (deletedCount > 0) {
+        showToast("Partial Success", `Deleted ${deletedCount} account(s); ${failedCount} failed.`, "error");
+      } else {
+        showToast("Bulk Delete Failed", "No selected accounts could be deleted.", "error");
+      }
       setSelectedUserIds([]);
       setShowBulkDeleteModal(false);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Bulk delete error:", err);
+      showToast("Error", err?.message || "Bulk delete failed.", "error");
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleDeleteAllGuests = async () => {
+    if (!user) return;
     setIsSubmitting(true);
+    let count = 0;
+    let failed = 0;
     try {
-      let count = 0;
+      const idToken = await user.getIdToken();
       for (const u of filteredGuestUsers) {
-        // Double check it's not a protected account
-        if (u.id === user?.uid || u.role === "admin" || u.role === "ecosystem_manager") continue;
-        
-        await deleteDoc(doc(db, "users", u.id));
-        count++;
+        if (u.id === user.uid || u.role === "admin" || u.role === "ecosystem_manager") continue;
+        try {
+          const res = await fetch(`/api/admin/users/${encodeURIComponent(u.id)}`, {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({ reason: "Guest account purge via Admin Console" }),
+          });
+          const data = await res.json().catch(() => ({} as any));
+          if (res.ok && data?.success) {
+            count++;
+          } else {
+            failed++;
+          }
+        } catch {
+          failed++;
+        }
       }
-      showToast("Success", `Successfully deleted ${count} guest users`);
+      if (failed === 0) {
+        showToast("Guest Purge Complete", `Revoked & deleted ${count} guest account(s) cleanly.`);
+      } else {
+        showToast("Partial Guest Purge", `Deleted ${count} guest account(s); ${failed} failed.`, "error");
+      }
       setShowGuestDeleteModal(false);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Delete all guests error:", err);
-      showToast("Error", "Failed to delete some guest users", "error");
+      showToast("Error", err?.message || "Failed to purge guest accounts.", "error");
     } finally {
       setIsSubmitting(false);
     }
@@ -1496,7 +1867,7 @@ export default function AnyTraderAdmin() {
       setAiRecommendations(recs);
     } catch (err) {
       console.error(err);
-      alert("Failed to generate AI recommendations");
+      showToast("AI Model Error", "Failed to generate AI model recommendations.", "error");
     } finally {
       setIsGeneratingAiRecs(false);
     }
@@ -1505,13 +1876,14 @@ export default function AnyTraderAdmin() {
   const applyAiModel = async (modelId: string) => {
     setTempConfig({...tempConfig, aiModel: modelId});
     setShowAiRecsModal(false);
-    alert("AI Model Selected. Don't forget to save platform configuration!");
+    showToast("AI Model Selected", "Remember to click Save Configuration to publish this change.");
   };
 
   const syncWithUnifiedPricing = () => {
     if (!tempConfig) return;
     const unifiedConfig = {
       ...tempConfig,
+      commissionCapGbp: 250,
       feeTiers: [
         { 
           name: "Free Explorer", 
@@ -1593,6 +1965,11 @@ export default function AnyTraderAdmin() {
           homeownerMediationStake: 25.00,
           traderMediationStake: 25.00,
           description: "Stripe Connect milestone stage payments & dispute mediation staking"
+        },
+        appointments: {
+          enabled: true,
+          price: 9.99,
+          description: "Real-time customer appointment booking & calendar slots"
         }
       },
       businessTiers: [
@@ -1683,12 +2060,54 @@ export default function AnyTraderAdmin() {
 
   const filteredGuestUsers = users.filter(u => u.isAnonymous || !u.email);
 
+  // Deduplicated live queues merging dedicated Firestore listeners + loaded pages
+  const allDisputedJobs = React.useMemo(() => {
+    const map = new Map<string, any>();
+    for (const j of jobs) {
+      if (j.status === "disputed") map.set(j.id, j);
+    }
+    for (const j of disputedJobs) {
+      map.set(j.id, j);
+    }
+    return Array.from(map.values());
+  }, [jobs, disputedJobs]);
+
+  const kycQueueUsers = React.useMemo(() => {
+    const map = new Map<string, any>();
+    for (const u of users) {
+      const hasPendingDocs = Array.isArray(u.verificationDocs) && u.verificationDocs.some((d: any) => d.status === "pending");
+      if (u.verificationStatus === "pending" || u.verificationStatus === "provisional" || hasPendingDocs) {
+        map.set(u.id, u);
+      }
+    }
+    for (const u of kycPendingUsers) {
+      map.set(u.id, u);
+    }
+    return Array.from(map.values());
+  }, [users, kycPendingUsers]);
+
+  const staffCount = users.filter(u => u.role === "admin" || u.role === "ecosystem_manager").length;
+
   const stats = {
-    totalUsers: users.filter(u => u.role !== "admin" && u.role !== "ecosystem_manager").length,
-    totalJobs: jobs.length,
-    activeDisputes: jobs.filter(j => j.status === "disputed").length,
-    pendingVerifications: users.filter(u => u.verificationStatus === "pending").length,
-    staffCount: users.filter(u => u.role === "admin" || u.role === "ecosystem_manager").length
+    totalUsers: accurateCounts.totalUsers !== null
+      ? Math.max(0, accurateCounts.totalUsers - staffCount)
+      : users.filter(u => u.role !== "admin" && u.role !== "ecosystem_manager").length,
+    totalJobs: accurateCounts.totalJobs !== null ? accurateCounts.totalJobs : jobs.length,
+    activeDisputes: allDisputedJobs.length,
+    pendingVerifications: kycQueueUsers.length + videoKycUsers.length,
+    staffCount,
+  };
+
+  const formatAdminDate = (val: any) => {
+    if (!val) return "Date unavailable";
+    try {
+      if (typeof val?.seconds === "number") return new Date(val.seconds * 1000).toLocaleDateString();
+      if (typeof val?.toDate === "function") return val.toDate().toLocaleDateString();
+      const d = new Date(val);
+      return Number.isNaN(d.getTime()) ? "Date unavailable" : d.toLocaleDateString();
+    } catch {
+      return "Date unavailable";
+    }
   };
 
   return (
@@ -1897,40 +2316,50 @@ export default function AnyTraderAdmin() {
             </AnimatePresence>
           </div>
 
-          {/* Navigation Tabs - Moved below search as per screenshot context */}
+          {/* Compact Top Action Bar (Mobile Nav Drawer Toggle + Alert Thresholds) */}
           <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div className="flex items-center gap-2 bg-white/80 backdrop-blur-md p-2 rounded-[28px] border border-black shadow-xl shadow-slate-100/50 overflow-x-auto no-scrollbar snap-x touch-pan-x max-w-full flex-1">
-              <div className="flex items-center gap-2 pr-4">
-                <TabButton active={activeTab === "sentinel_analytics"} onClick={() => handleTabChange("sentinel_analytics")} icon={<ShieldAlert className="w-4 h-4 text-amber-500" />} label="Deals & AI Sentinel" />
-                <TabButton active={activeTab === "ai_agents"} onClick={() => handleTabChange("ai_agents")} icon={<Bot className="w-4 h-4 text-indigo-500" />} label="AI Agents" />
-                <TabButton active={activeTab === "users"} onClick={() => handleTabChange("users")} icon={<Users className="w-4 h-4" />} label="Users" />
-                <TabButton active={activeTab === "jobs"} onClick={() => handleTabChange("jobs")} icon={<Briefcase className="w-4 h-4" />} label="Jobs" />
-                <TabButton active={activeTab === "disputes"} onClick={() => handleTabChange("disputes")} icon={<AlertTriangle className="w-4 h-4" />} label="Disputes" />
-                <TabButton active={activeTab === "team"} onClick={() => handleTabChange("team")} icon={<Shield className="w-4 h-4" />} label="Staff" />
-                <TabButton active={activeTab === "verifications"} onClick={() => handleTabChange("verifications")} icon={<CheckCircle2 className="w-4 h-4" />} label="KYC" />
-                <TabButton active={activeTab === "broadcast"} onClick={() => handleTabChange("broadcast")} icon={<Megaphone className="w-4 h-4" />} label="Broadcast" />
-                <TabButton active={activeTab === "advertising"} onClick={() => handleTabChange("advertising")} icon={<Tag className="w-4 h-4" />} label="Banner Ads" />
-                <TabButton active={activeTab === "affiliates"} onClick={() => handleTabChange("affiliates")} icon={<LinkIcon className="w-4 h-4" />} label="Affiliates" />
-                <TabButton active={activeTab === "settings"} onClick={() => handleTabChange("settings")} icon={<Settings className="w-4 h-4" />} label="Configs" />
-                <TabButton active={activeTab === "categories"} onClick={() => handleTabChange("categories")} icon={<Tags className="w-4 h-4" />} label="Categories" />
-                <TabButton active={activeTab === "logs"} onClick={() => handleTabChange("logs")} icon={<FileText className="w-4 h-4" />} label="Audit" />
-                <TabButton active={activeTab === "security"} onClick={() => handleTabChange("security")} icon={<Key className="w-4 h-4" />} label="API Keys" />
-                <TabButton active={activeTab === "analytics"} onClick={() => handleTabChange("analytics")} icon={<BarChart3 className="w-4 h-4" />} label="Stats" />
-                <TabButton active={activeTab === "insights"} onClick={() => handleTabChange("insights")} icon={<Sparkles className="w-4 h-4" />} label="Insights" />
-                <TabButton active={activeTab === "monetization"} onClick={() => handleTabChange("monetization")} icon={<DollarSign className="w-4 h-4" />} label="Tiers" />
-                <TabButton active={activeTab === "subscriptions"} onClick={() => handleTabChange("subscriptions")} icon={<CreditCard className="w-4 h-4 text-emerald-500" />} label="Subscriptions" />
-                <TabButton active={activeTab === "reconciliation"} onClick={() => handleTabChange("reconciliation")} icon={<ShieldCheck className="w-4 h-4 text-emerald-700" />} label="Reconcile" />
-                <TabButton active={activeTab === "ops_health"} onClick={() => handleTabChange("ops_health")} icon={<Activity className="w-4 h-4 text-blue-700" />} label="Ops Health & Flags" />
-              </div>
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen((prev) => !prev)}
+              className="lg:hidden px-4 py-2.5 bg-white text-black font-black rounded-xl border border-black flex items-center gap-2 text-xs active:scale-95"
+            >
+              <Menu className="w-4 h-4" />
+              <span>Admin Sections ({activeTab.replace(/_/g, " ")})</span>
+              <ChevronDown className={cn("w-4 h-4 transition-transform", mobileNavOpen && "rotate-180")} />
+            </button>
+
+            <div className="hidden lg:flex items-center gap-2 text-xs font-bold text-black">
+              <span className="px-2.5 py-1 rounded-lg bg-white border border-black uppercase tracking-wider text-[10px] font-black">
+                Active Section: {activeTab.replace(/_/g, " ")}
+              </span>
+              {stats.activeDisputes > 0 && (
+                <button
+                  type="button"
+                  onClick={() => handleTabChange("disputes")}
+                  className="px-2.5 py-1 rounded-lg bg-red-50 text-red-700 border border-black text-[10px] font-black uppercase"
+                >
+                  {stats.activeDisputes} Open Dispute{stats.activeDisputes === 1 ? "" : "s"}
+                </button>
+              )}
+              {stats.pendingVerifications > 0 && (
+                <button
+                  type="button"
+                  onClick={() => handleTabChange("verifications")}
+                  className="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 border border-black text-[10px] font-black uppercase"
+                >
+                  {stats.pendingVerifications} Pending KYC / Video
+                </button>
+              )}
             </div>
 
             {/* Quick Trigger for Alert Threshold Rules */}
             <button
+              type="button"
               onClick={() => setShowThresholdModal(true)}
-              className="px-4 py-3 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black rounded-[22px] border border-black shadow-lg transition-all flex items-center gap-2 text-xs shrink-0 active:scale-95"
+              className="px-4 py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-black rounded-xl border border-black shadow-sm transition-all flex items-center gap-2 text-xs shrink-0 active:scale-95"
               title="Configure Real-Time Security Thresholds & Alert Notifications"
             >
-              <Zap className="w-4 h-4 text-slate-950 fill-current animate-bounce" />
+              <Zap className="w-4 h-4 text-black fill-current" />
               <span>Alert Thresholds</span>
             </button>
           </div>
@@ -1950,38 +2379,229 @@ export default function AnyTraderAdmin() {
           onTestBreachTriggered={(breach) => setActiveBreachToasts(prev => [breach, ...prev])}
         />
 
-        {/* Stats Grid - Optimized for Mobile Viewport */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 sm:gap-6">
-          <StatCard label="Total Users" value={stats.totalUsers} icon={<Users className="w-5 h-5 text-blue-500" />} color="blue" />
-          <StatCard label="Live Jobs" value={stats.totalJobs} icon={<Briefcase className="w-5 h-5 text-purple-500" />} color="purple" />
-          <StatCard label="Hot Disputes" value={stats.activeDisputes} icon={<AlertTriangle className="w-5 h-5 text-red-500" />} color="red" />
-          <StatCard label="Pending KYC" value={stats.pendingVerifications} icon={<ShieldCheck className="w-5 h-5 text-amber-500" />} color="amber" />
+        {/* Clickable KPI Stats Grid */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 sm:gap-5">
+          <StatCard label="Total Users" value={stats.totalUsers} icon={<Users className="w-5 h-5 text-blue-600" />} color="blue" onClick={() => handleTabChange("users")} />
+          <StatCard label="Live Jobs" value={stats.totalJobs} icon={<Briefcase className="w-5 h-5 text-purple-600" />} color="purple" onClick={() => handleTabChange("jobs")} />
+          <StatCard label="Hot Disputes" value={stats.activeDisputes} icon={<AlertTriangle className="w-5 h-5 text-red-600" />} color="red" onClick={() => handleTabChange("disputes")} />
+          <StatCard label="Pending KYC & Video" value={stats.pendingVerifications} icon={<ShieldCheck className="w-5 h-5 text-amber-600" />} color="amber" onClick={() => handleTabChange("verifications")} />
           <div className="hidden xl:block">
-            <StatCard label="System Staff" value={stats.staffCount} icon={<Lock className="w-5 h-5 text-slate-500" />} color="indigo" />
+            <StatCard label="System Staff" value={stats.staffCount} icon={<Lock className="w-5 h-5 text-slate-700" />} color="indigo" onClick={() => handleTabChange("team")} />
           </div>
         </div>
 
+        {/* Grouped Sidebar + Main Workspace Layout */}
+        {(() => {
+          const navGroups: Array<{
+            title: string;
+            items: Array<{ id: AdminTabId; label: string; icon: React.ReactNode; badge?: number }>;
+          }> = [
+            {
+              title: "Operations",
+              items: [
+                { id: "users", label: "Users", icon: <Users className="w-4 h-4" /> },
+                { id: "jobs", label: "Jobs", icon: <Briefcase className="w-4 h-4" /> },
+                { id: "guest_jobs", label: "Guest Jobs", icon: <Ghost className="w-4 h-4" /> },
+                { id: "verifications", label: "KYC & Video", icon: <CheckCircle2 className="w-4 h-4" />, badge: stats.pendingVerifications },
+                { id: "disputes", label: "Disputes", icon: <Scale className="w-4 h-4" />, badge: stats.activeDisputes },
+                { id: "reviews", label: "Reviews", icon: <Star className="w-4 h-4" /> },
+              ],
+            },
+            {
+              title: "Commerce & Growth",
+              items: [
+                { id: "monetization", label: "Tiers & Fees", icon: <DollarSign className="w-4 h-4" /> },
+                { id: "subscriptions", label: "Subscriptions", icon: <CreditCard className="w-4 h-4" /> },
+                { id: "advertising", label: "Banner Ads", icon: <Tag className="w-4 h-4" /> },
+                { id: "affiliates", label: "Affiliates", icon: <LinkIcon className="w-4 h-4" /> },
+                { id: "categories", label: "Categories", icon: <Tags className="w-4 h-4" /> },
+                { id: "broadcast", label: "Broadcast", icon: <Megaphone className="w-4 h-4" /> },
+              ],
+            },
+            {
+              title: "Finance & Risk",
+              items: [
+                { id: "reconciliation", label: "Reconcile", icon: <ShieldCheck className="w-4 h-4" /> },
+                { id: "risk", label: "Risk Monitor", icon: <ShieldAlert className="w-4 h-4" /> },
+                { id: "sentinel_analytics", label: "Deals & Sentinel", icon: <Zap className="w-4 h-4" /> },
+              ],
+            },
+            {
+              title: "Analytics & AI",
+              items: [
+                { id: "analytics", label: "Stats", icon: <BarChart3 className="w-4 h-4" /> },
+                { id: "insights", label: "AI Insights", icon: <Sparkles className="w-4 h-4" /> },
+                { id: "trends", label: "Category Trends", icon: <TrendingUp className="w-4 h-4" /> },
+                { id: "ai_agents", label: "AI Agents", icon: <Bot className="w-4 h-4" /> },
+              ],
+            },
+            {
+              title: "System & Governance",
+              items: [
+                { id: "settings", label: "Configs", icon: <Settings className="w-4 h-4" /> },
+                { id: "ops_health", label: "Ops Health & Flags", icon: <Activity className="w-4 h-4" /> },
+                { id: "security", label: "System & Security", icon: <Key className="w-4 h-4" /> },
+                { id: "gdpr", label: "GDPR & Privacy", icon: <FileCheck2 className="w-4 h-4" /> },
+                { id: "team", label: "Staff", icon: <Shield className="w-4 h-4" /> },
+                { id: "logs", label: "Audit Logs", icon: <FileText className="w-4 h-4" /> },
+              ],
+            },
+          ];
+
+          return mobileNavOpen ? (
+            <div className="lg:hidden bg-white rounded-2xl border border-black p-4 space-y-4">
+              {navGroups.map((group) => (
+                <div key={group.title} className="space-y-1.5">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-600 px-2">{group.title}</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                    {group.items.map((item) => {
+                      const isActive = activeTab === item.id;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            handleTabChange(item.id);
+                            setMobileNavOpen(false);
+                          }}
+                          className={cn(
+                            "flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-xs font-bold border transition-all text-left",
+                            isActive
+                              ? "bg-slate-900 text-white border-black"
+                              : "bg-slate-50 text-black border-black hover:bg-slate-100"
+                          )}
+                        >
+                          <span className="flex items-center gap-1.5 truncate">
+                            {item.icon}
+                            <span className="truncate">{item.label}</span>
+                          </span>
+                          {item.badge && item.badge > 0 ? (
+                            <span className={cn("px-1.5 py-0.5 rounded-md text-[10px] font-black", isActive ? "bg-red-500 text-white" : "bg-red-600 text-white")}>
+                              {item.badge}
+                            </span>
+                          ) : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null;
+        })()}
+
+        <div className="flex flex-col lg:flex-row gap-6 items-start">
+          {/* Desktop Grouped Sidebar */}
+          <aside className="hidden lg:flex w-60 shrink-0 sticky top-6 bg-white rounded-2xl border border-black p-3 flex-col gap-4 max-h-[calc(100vh-3rem)] overflow-y-auto">
+            {([
+              {
+                title: "Operations",
+                items: [
+                  { id: "users" as AdminTabId, label: "Users", icon: <Users className="w-4 h-4" /> },
+                  { id: "jobs" as AdminTabId, label: "Jobs", icon: <Briefcase className="w-4 h-4" /> },
+                  { id: "guest_jobs" as AdminTabId, label: "Guest Jobs", icon: <Ghost className="w-4 h-4" /> },
+                  { id: "verifications" as AdminTabId, label: "KYC & Video", icon: <CheckCircle2 className="w-4 h-4" />, badge: stats.pendingVerifications },
+                  { id: "disputes" as AdminTabId, label: "Disputes", icon: <Scale className="w-4 h-4" />, badge: stats.activeDisputes },
+                  { id: "reviews" as AdminTabId, label: "Reviews", icon: <Star className="w-4 h-4" /> },
+                ],
+              },
+              {
+                title: "Commerce & Growth",
+                items: [
+                  { id: "monetization" as AdminTabId, label: "Tiers & Fees", icon: <DollarSign className="w-4 h-4" /> },
+                  { id: "subscriptions" as AdminTabId, label: "Subscriptions", icon: <CreditCard className="w-4 h-4" /> },
+                  { id: "advertising" as AdminTabId, label: "Banner Ads", icon: <Tag className="w-4 h-4" /> },
+                  { id: "affiliates" as AdminTabId, label: "Affiliates", icon: <LinkIcon className="w-4 h-4" /> },
+                  { id: "categories" as AdminTabId, label: "Categories", icon: <Tags className="w-4 h-4" /> },
+                  { id: "broadcast" as AdminTabId, label: "Broadcast", icon: <Megaphone className="w-4 h-4" /> },
+                ],
+              },
+              {
+                title: "Finance & Risk",
+                items: [
+                  { id: "reconciliation" as AdminTabId, label: "Reconcile", icon: <ShieldCheck className="w-4 h-4" /> },
+                  { id: "risk" as AdminTabId, label: "Risk Monitor", icon: <ShieldAlert className="w-4 h-4" /> },
+                  { id: "sentinel_analytics" as AdminTabId, label: "Deals & Sentinel", icon: <Zap className="w-4 h-4" /> },
+                ],
+              },
+              {
+                title: "Analytics & AI",
+                items: [
+                  { id: "analytics" as AdminTabId, label: "Stats", icon: <BarChart3 className="w-4 h-4" /> },
+                  { id: "insights" as AdminTabId, label: "AI Insights", icon: <Sparkles className="w-4 h-4" /> },
+                  { id: "trends" as AdminTabId, label: "Category Trends", icon: <TrendingUp className="w-4 h-4" /> },
+                  { id: "ai_agents" as AdminTabId, label: "AI Agents", icon: <Bot className="w-4 h-4" /> },
+                ],
+              },
+              {
+                title: "System & Governance",
+                items: [
+                  { id: "settings" as AdminTabId, label: "Configs", icon: <Settings className="w-4 h-4" /> },
+                  { id: "ops_health" as AdminTabId, label: "Ops Health & Flags", icon: <Activity className="w-4 h-4" /> },
+                  { id: "security" as AdminTabId, label: "System & Security", icon: <Key className="w-4 h-4" /> },
+                  { id: "gdpr" as AdminTabId, label: "GDPR & Privacy", icon: <FileCheck2 className="w-4 h-4" /> },
+                  { id: "team" as AdminTabId, label: "Staff", icon: <Shield className="w-4 h-4" /> },
+                  { id: "logs" as AdminTabId, label: "Audit Logs", icon: <FileText className="w-4 h-4" /> },
+                ],
+              },
+            ]).map((group) => (
+              <div key={group.title} className="space-y-1">
+                <p className="px-2.5 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                  {group.title}
+                </p>
+                {group.items.map((item) => {
+                  const isActive = activeTab === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => handleTabChange(item.id)}
+                      className={cn(
+                        "w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl text-xs font-bold transition-all text-left",
+                        isActive
+                          ? "bg-slate-900 text-white border border-black shadow-sm"
+                          : "text-black hover:bg-slate-100 border border-transparent"
+                      )}
+                    >
+                      <span className="flex items-center gap-2 truncate">
+                        <span className={cn(isActive ? "text-blue-400" : "text-slate-600")}>{item.icon}</span>
+                        <span className="truncate">{item.label}</span>
+                      </span>
+                      {item.badge && item.badge > 0 ? (
+                        <span className="px-1.5 py-0.5 rounded-md text-[10px] font-black bg-red-600 text-white shrink-0">
+                          {item.badge}
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+          </aside>
+
         {/* Dynamic Interface Container */}
-        <div className="bg-white rounded-[40px] border border-black shadow-2xl shadow-slate-200/50 overflow-hidden flex flex-col min-h-[700px]">
-          {/* Action & Filter Bar */}
-          <div className="p-5 sm:p-8 border-b border-slate-50 flex flex-col md:flex-row gap-5 items-stretch md:items-center bg-slate-50/30">
+        <div className="flex-1 min-w-0 w-full bg-white rounded-3xl border border-black shadow-xl shadow-slate-200/50 overflow-hidden flex flex-col min-h-[700px]">
+          {/* Contextual Action & Filter Bar (only rendered on list tabs that consume search/filter) */}
+          {(activeTab === "users" || activeTab === "jobs" || activeTab === "logs") && (
+          <div className="p-5 sm:p-6 border-b border-black flex flex-col md:flex-row gap-4 items-stretch md:items-center bg-slate-50/40">
             <div className="relative flex-1 group">
-              <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 group-focus-within:text-blue-500 transition-colors" />
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500 group-focus-within:text-blue-600 transition-colors" />
               <input 
                 type="text" 
-                placeholder={activeTab === 'jobs' ? "Search title or Job ID..." : `Find in ${activeTab}...`}
-                className="w-full pl-14 pr-6 py-4 rounded-[22px] bg-white border border-black focus:outline-none focus:ring-4 focus:ring-blue-600/5 focus:border-blue-600 transition-all text-base font-bold text-slate-700 shadow-sm"
+                placeholder={activeTab === 'jobs' ? "Search title or Job ID..." : activeTab === "logs" ? "Search audit actions or target IDs..." : "Find users by name, email, or role..."}
+                className="w-full pl-12 pr-5 py-3 rounded-xl bg-white border border-black focus:outline-none focus:ring-4 focus:ring-blue-600/5 focus:border-blue-600 transition-all text-sm font-bold text-black shadow-sm"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
               />
             </div>
             
             <div className="flex items-center gap-3">
-              <div className="flex items-center bg-white p-1 rounded-[22px] border border-black shadow-sm">
-                <div className="flex items-center gap-2 px-4 py-3 bg-slate-50 rounded-2xl border border-black">
-                  <Filter className="w-4 h-4 text-slate-500" />
+              {activeTab !== "logs" && (
+              <div className="flex items-center bg-white p-1 rounded-xl border border-black shadow-sm">
+                <div className="flex items-center gap-2 px-3 py-2 bg-slate-50 rounded-lg border border-black">
+                  <Filter className="w-4 h-4 text-slate-600" />
                   <select 
-                    className="text-sm font-black text-slate-900 bg-transparent border-none focus:ring-0 cursor-pointer min-w-[120px]"
+                    className="text-xs font-black text-black bg-transparent border-none focus:ring-0 cursor-pointer min-w-[120px]"
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                   >
@@ -2008,19 +2628,23 @@ export default function AnyTraderAdmin() {
                   </select>
                 </div>
               </div>
+              )}
 
               {activeTab === "users" && filteredGuestUsers.length > 0 && (
                 <button 
+                  type="button"
                   onClick={() => setShowGuestDeleteModal(true)}
                   disabled={isSubmitting}
-                  className="bg-red-50 text-red-600 p-4 rounded-[22px] hover:bg-red-100 transition-all disabled:opacity-50 border border-red-100 active:scale-95"
+                  className="bg-red-50 text-red-700 px-3.5 py-2.5 rounded-xl hover:bg-red-100 transition-all disabled:opacity-50 border border-black active:scale-95 flex items-center gap-1.5 text-xs font-black"
                   title="Purge Guest Accounts"
                 >
-                  {isSubmitting ? <Loader2 className="w-6 h-6 animate-spin" /> : <Trash2 className="w-6 h-6" />}
+                  {isSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                  <span>Purge Guests ({filteredGuestUsers.length})</span>
                 </button>
               )}
             </div>
           </div>
+          )}
 
           {/* Table Surface */}
           <div className="flex-1 relative overflow-x-auto elegant-scrollbar">
@@ -2126,7 +2750,7 @@ export default function AnyTraderAdmin() {
                   <tr key={`desktop-${u.id}`} className={cn(
                     "hover:bg-slate-50/30 transition-colors cursor-pointer",
                     selectedUserIds.includes(u.id) && "bg-blue-50/50"
-                  )} onClick={() => window.open(`/profile/${u.id}`, '_blank')}>
+                  )} onClick={() => navigate(`/profile/${u.id}`)}>
                     <td className="p-4" onClick={(e) => e.stopPropagation()}>
                       {(() => {
                         const isProtected = u.id === user?.uid || 
@@ -2211,12 +2835,24 @@ export default function AnyTraderAdmin() {
                             onChange={async (e) => {
                               const newTier = e.target.value;
                               try {
-                                await updateDoc(doc(db, "users", u.id), { tierId: newTier });
-                                await createAuditLog("update_user_tier", u.id, "user", `Changed tier to ${newTier}`);
+                                const idToken = user ? await user.getIdToken() : "";
+                                if (!idToken) throw new Error("Admin authentication required.");
+                                const res = await fetch(`/api/admin/users/${encodeURIComponent(u.id)}/attributes`, {
+                                  method: "POST",
+                                  headers: {
+                                    "Content-Type": "application/json",
+                                    Authorization: `Bearer ${idToken}`,
+                                  },
+                                  body: JSON.stringify({ tierId: newTier }),
+                                });
+                                const data = await res.json().catch(() => ({}));
+                                if (!res.ok || !data?.success) {
+                                  throw new Error(data?.error || `Failed to update tier (${res.status})`);
+                                }
                                 showToast("Success", `Updated ${u.name}'s tier to ${newTier}`);
-                              } catch (err) {
+                              } catch (err: any) {
                                 console.error(err);
-                                showToast("Error", "Failed to update tier", "error");
+                                showToast("Error", err?.message || "Failed to update tier", "error");
                               }
                             }}
                             className="text-[10px] font-bold text-blue-600 bg-blue-50 border-none rounded-lg focus:ring-0 py-1"
@@ -2239,12 +2875,13 @@ export default function AnyTraderAdmin() {
                       )}
                     </td>
                     <td className="p-4">
-                      {u.role === "tradesperson" && (
+                      {(u.role === "tradesperson" || (u.role === "business" && u.businessLayer !== "properties")) && (
                         <span className={cn(
                           "text-[10px] font-bold uppercase px-2 py-0.5 rounded-full",
                           u.verificationStatus === "auditioned" ? "bg-amber-100 text-amber-700 border border-amber-200" :
                           u.verificationStatus === "vetted" ? "bg-emerald-100 text-emerald-700 border border-emerald-200" :
                           u.verificationStatus === "verified" ? "bg-indigo-50 text-indigo-600 border border-indigo-100" : 
+                          u.verificationStatus === "provisional" ? "bg-blue-50 text-blue-700 border border-blue-200" :
                           u.verificationStatus === "pending" ? "bg-orange-50 text-orange-600 border border-orange-100" : 
                           "bg-slate-50 text-slate-400"
                         )}>
@@ -2260,9 +2897,9 @@ export default function AnyTraderAdmin() {
                     </td>
                         <td className="p-4 text-right">
                           <div className="flex items-center justify-end gap-1.5">
-                            {u.role === "tradesperson" && (
+                            {(u.role === "tradesperson" || (u.role === "business" && u.businessLayer !== "properties")) && (
                               <div className="flex items-center gap-1 border-r border-black pr-2 mr-2">
-                                {u.verificationStatus === "pending" && (
+                                {(u.verificationStatus === "pending" || u.verificationStatus === "provisional") && (
                                   <>
                                     <button onClick={(e) => { e.stopPropagation(); handleVerifyTradesperson(u.id, "verified"); }} className="p-2 text-emerald-600 bg-emerald-50 hover:bg-emerald-100 rounded-xl transition-all shadow-sm" title="Approve Identity">
                                       <UserCheck className="w-4 h-4" />
@@ -2272,12 +2909,12 @@ export default function AnyTraderAdmin() {
                                     </button>
                                   </>
                                 )}
-                                {(u.verificationStatus === "verified" || u.verificationStatus === "pending") && (
+                                {(u.verificationStatus === "verified" || u.verificationStatus === "pending" || u.verificationStatus === "provisional") && (
                                   <button onClick={(e) => { e.stopPropagation(); handleVerifyTradesperson(u.id, "vetted"); }} className="p-2 text-emerald-700 bg-emerald-100 hover:bg-emerald-200 rounded-xl transition-all shadow-sm" title="Mark as Vetted">
                                     <ShieldCheck className="w-4 h-4" />
                                   </button>
                                 )}
-                                {(u.verificationStatus === "vetted" || u.verificationStatus === "verified" || u.verificationStatus === "pending") && (
+                                {(u.verificationStatus === "vetted" || u.verificationStatus === "verified" || u.verificationStatus === "pending" || u.verificationStatus === "provisional") && (
                                   <button onClick={(e) => { e.stopPropagation(); handleVerifyTradesperson(u.id, "auditioned"); }} className="p-2 text-amber-700 bg-amber-100 hover:bg-amber-200 rounded-xl transition-all shadow-sm" title="Mark as Auditioned">
                                     <Medal className="w-4 h-4" />
                                   </button>
@@ -2290,11 +2927,24 @@ export default function AnyTraderAdmin() {
                                 e.stopPropagation(); 
                                 const isCurrentlyFounding = u.isFoundingMember || false;
                                 try {
-                                  await updateDoc(doc(db, "users", u.id), { isFoundingMember: !isCurrentlyFounding });
+                                  const idToken = user ? await user.getIdToken() : "";
+                                  if (!idToken) throw new Error("Admin authentication required.");
+                                  const res = await fetch(`/api/admin/users/${encodeURIComponent(u.id)}/attributes`, {
+                                    method: "POST",
+                                    headers: {
+                                      "Content-Type": "application/json",
+                                      Authorization: `Bearer ${idToken}`,
+                                    },
+                                    body: JSON.stringify({ isFoundingMember: !isCurrentlyFounding }),
+                                  });
+                                  const data = await res.json().catch(() => ({}));
+                                  if (!res.ok || !data?.success) {
+                                    throw new Error(data?.error || `Failed to update Founding status (${res.status})`);
+                                  }
                                   showToast("Success", `${isCurrentlyFounding ? 'Removed' : 'Added'} Founding Member status for ${u.name}`);
-                                } catch (err) {
+                                } catch (err: any) {
                                   console.error(err);
-                                  showToast("Error", "Failed to update Founding status", "error");
+                                  showToast("Error", err?.message || "Failed to update Founding status", "error");
                                 }
                               }} 
                               className={cn(
@@ -2409,6 +3059,7 @@ export default function AnyTraderAdmin() {
                             u.verificationStatus === "auditioned" ? "text-amber-500" :
                             u.verificationStatus === "vetted" ? "text-emerald-500" :
                             u.verificationStatus === "verified" ? "text-indigo-500" : 
+                            u.verificationStatus === "provisional" ? "text-blue-600" :
                             u.verificationStatus === "pending" ? "text-orange-500" : "text-slate-400"
                           )}>
                             {u.verificationStatus || "Pending"}
@@ -2417,23 +3068,23 @@ export default function AnyTraderAdmin() {
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {u.role === "tradesperson" && (
+                        {(u.role === "tradesperson" || (u.role === "business" && u.businessLayer !== "properties")) && (
                           <div className="flex-1 flex gap-2">
-                            {u.verificationStatus === "pending" && (
+                            {(u.verificationStatus === "pending" || u.verificationStatus === "provisional") && (
                               <>
                                 <button onClick={() => handleVerifyTradesperson(u.id, "verified")} className="flex-1 bg-indigo-600 text-white font-black py-4 rounded-2xl shadow-lg shadow-indigo-100 active:scale-95 transition-all text-xs uppercase tracking-widest">Verify</button>
                                 <button onClick={() => handleVerifyTradesperson(u.id, "rejected")} className="px-4 bg-red-50 text-red-600 font-black py-4 rounded-2xl border border-red-100 active:scale-95 transition-all text-xs uppercase tracking-widest">Deny</button>
                               </>
                             )}
-                            {(u.verificationStatus === "verified" || u.verificationStatus === "pending") && (
+                            {(u.verificationStatus === "verified" || u.verificationStatus === "pending" || u.verificationStatus === "provisional") && (
                               <button onClick={() => handleVerifyTradesperson(u.id, "vetted")} className="flex-1 bg-emerald-600 text-white font-black py-4 rounded-2xl shadow-lg shadow-emerald-100 active:scale-95 transition-all text-[10px] uppercase tracking-widest">Vet Pro</button>
                             )}
-                            {(u.verificationStatus === "vetted" || u.verificationStatus === "verified" || u.verificationStatus === "pending") && (
+                            {(u.verificationStatus === "vetted" || u.verificationStatus === "verified" || u.verificationStatus === "pending" || u.verificationStatus === "provisional") && (
                               <button onClick={() => handleVerifyTradesperson(u.id, "auditioned")} className="flex-1 bg-amber-500 text-white font-black py-4 rounded-2xl shadow-lg shadow-amber-100 active:scale-95 transition-all text-[10px] uppercase tracking-widest">Audition</button>
                             )}
                           </div>
                         )}
-                        {u.role !== "tradesperson" && (
+                        {u.role !== "tradesperson" && !(u.role === "business" && u.businessLayer !== "properties") && (
                           <>
                             <button 
                               onClick={() => { exportUserPerformanceReport(u); }}
@@ -2489,7 +3140,7 @@ export default function AnyTraderAdmin() {
               </thead>
                 <tbody className="divide-y divide-slate-100/50">
                   {(isJobsExpanded ? filteredJobs : filteredJobs.slice(0, 3)).map(j => (
-                    <tr key={`desktop-job-${j.id}`} className="hover:bg-slate-50/50 transition-colors group cursor-pointer" onClick={() => window.open(`/job/${j.id}`, '_blank')}>
+                    <tr key={`desktop-job-${j.id}`} className="hover:bg-slate-50/50 transition-colors group cursor-pointer" onClick={() => navigate(`/job/${j.id}`)}>
                       <td className="p-4">
                         <div className="flex items-center gap-2 mb-1">
                           <p className="font-black text-slate-900 text-sm group-hover:text-blue-600 transition-colors">{j.title}</p>
@@ -2558,7 +3209,7 @@ export default function AnyTraderAdmin() {
                 </div>
                 <div className="divide-y divide-slate-100">
                   {(isJobsExpanded ? filteredJobs : filteredJobs.slice(0, 3)).map(j => (
-                  <div key={`mobile-job-${j.id}`} className="p-5 space-y-4 hover:bg-slate-50/50 transition-colors active:bg-slate-100" onClick={() => window.open(`/job/${j.id}`, '_blank')}>
+                  <div key={`mobile-job-${j.id}`} className="p-5 space-y-4 hover:bg-slate-50/50 transition-colors active:bg-slate-100 cursor-pointer" onClick={() => navigate(`/job/${j.id}`)}>
                     <div className="flex items-start justify-between">
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
@@ -2606,46 +3257,90 @@ export default function AnyTraderAdmin() {
           )}
 
             {activeTab === "disputes" && (
-              <div className="p-4 space-y-4">
-                <div className="flex items-center justify-between px-2">
-                  <h3 className="text-sm font-black text-slate-400 uppercase tracking-widest">Active Disputes</h3>
-                  {jobs.filter(j => j.status === "disputed").length > 3 && (
+              <div className="p-5 space-y-4">
+                <div className="flex items-center justify-between px-1">
+                  <div>
+                    <h3 className="text-base font-black text-black flex items-center gap-2">
+                      <Scale className="w-5 h-5 text-red-600" />
+                      Active Disputes ({allDisputedJobs.length})
+                    </h3>
+                    <p className="text-xs text-slate-600">
+                      Live unfiltered dispute queue — resolutions execute atomically via server command and notify both parties.
+                    </p>
+                  </div>
+                  {allDisputedJobs.length > 3 && (
                     <button 
+                      type="button"
                       onClick={() => setIsDisputesExpanded(!isDisputesExpanded)}
-                      className="flex items-center gap-2 text-[10px] font-black uppercase text-blue-600 bg-blue-50 px-3 py-1.5 rounded-xl hover:bg-blue-100 transition-all tracking-widest"
+                      className="flex items-center gap-2 text-[10px] font-black uppercase text-blue-700 bg-blue-50 border border-black px-3 py-1.5 rounded-xl hover:bg-blue-100 transition-all tracking-widest"
                     >
                       {isDisputesExpanded ? (
                         <>HIDE DISPUTES <ChevronUp className="w-3 h-3" /></>
                       ) : (
-                        <>SHOW ALL DISPUTES <ChevronDown className="w-3 h-3" /></>
+                        <>SHOW ALL ({allDisputedJobs.length}) <ChevronDown className="w-3 h-3" /></>
                       )}
                     </button>
                   )}
                 </div>
-                {(isDisputesExpanded ? jobs.filter(j => j.status === "disputed") : jobs.filter(j => j.status === "disputed").slice(0, 3)).map(j => (
-                  <div key={`dispute-${j.id}`} className="bg-slate-50 rounded-2xl p-6 border border-black space-y-4">
-                  <div className="flex items-center justify-between">
+                {(isDisputesExpanded ? allDisputedJobs : allDisputedJobs.slice(0, 3)).map(j => (
+                  <div key={`dispute-${j.id}`} className="bg-slate-50 rounded-2xl p-5 border border-black space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <div className="flex items-center gap-3">
-                      <AlertTriangle className="w-6 h-6 text-red-500" />
+                      <AlertTriangle className="w-6 h-6 text-red-600 shrink-0" />
                       <div>
-                        <h4 className="font-bold text-slate-900">{j.title}</h4>
-                        <p className="text-xs text-slate-500">Raised on {new Date(j.dispute?.createdAt?.seconds * 1000).toLocaleDateString()}</p>
+                        <button
+                          type="button"
+                          onClick={() => navigate(`/job/${j.id}`)}
+                          className="font-bold text-black hover:text-blue-700 hover:underline text-left"
+                        >
+                          {j.title || `Job #${j.id}`}
+                        </button>
+                        <p className="text-xs text-slate-600">
+                          Raised on {formatAdminDate(j.dispute?.createdAt || j.updatedAt || j.createdAt)} • Job ID: {j.jobNo || j.id}
+                        </p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button onClick={() => handleResolveDispute(j.id, "resolved")} className="bg-green-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-green-700 transition-colors">
-                        Mark Resolved
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        disabled={resolvingDisputeId === j.id}
+                        onClick={() => handleResolveDispute(j.id, "resolved")}
+                        className="bg-green-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-green-700 transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                      >
+                        {resolvingDisputeId === j.id && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                        Mark Resolved (Complete)
                       </button>
-                      <button onClick={() => handleResolveDispute(j.id, "mediated")} className="bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-amber-700 transition-colors">
-                        Force Cancel
+                      <button
+                        type="button"
+                        disabled={resolvingDisputeId === j.id}
+                        onClick={() => handleResolveDispute(j.id, "mediated")}
+                        className="bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold hover:bg-amber-700 transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                      >
+                        {resolvingDisputeId === j.id && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                        Force Cancel (Mediated)
                       </button>
                     </div>
                   </div>
                   <div className="bg-white p-4 rounded-xl border border-black">
-                    <p className="text-sm text-slate-700 italic">"{j.dispute?.reason}"</p>
+                    <p className="text-sm text-black italic">"{j.dispute?.reason || "No dispute reason provided."}"</p>
                   </div>
-                  {j.dispute?.photos && (
-                    <div className="flex gap-2">
+
+                  {/* Admin Resolution Notes Input */}
+                  <div>
+                    <label className="text-[10px] font-black uppercase tracking-wider text-black block mb-1">
+                      Resolution Notes (Recorded in Audit Log & Shared with Parties)
+                    </label>
+                    <input
+                      type="text"
+                      value={disputeNotes[j.id] || ""}
+                      onChange={(e) => setDisputeNotes((prev) => ({ ...prev, [j.id]: e.target.value }))}
+                      placeholder="Optional mediation decision summary or refund instruction..."
+                      className="w-full px-3 py-2 rounded-xl bg-white border border-black text-xs text-black font-medium focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                  </div>
+
+                  {j.dispute?.photos && j.dispute.photos.length > 0 && (
+                    <div className="flex gap-2 flex-wrap">
                       {j.dispute.photos.map((url: string, i: number) => (
                         <img key={i} src={url} className="w-20 h-20 rounded-lg object-cover border border-black" referrerPolicy="no-referrer" />
                       ))}
@@ -2656,8 +3351,9 @@ export default function AnyTraderAdmin() {
                   <div className="pt-4 border-t border-black">
                     {!disputeSummaries[j.id] && !isSummarizingDispute[j.id] && (
                       <button 
+                        type="button"
                         onClick={() => handleSummarizeDispute(j)}
-                        className="text-xs font-bold text-indigo-600 bg-indigo-50 px-4 py-2 rounded-xl hover:bg-indigo-100 transition-colors flex items-center gap-2"
+                        className="text-xs font-bold text-indigo-700 bg-indigo-50 border border-black px-4 py-2 rounded-xl hover:bg-indigo-100 transition-colors flex items-center gap-2"
                       >
                         <Zap className="w-4 h-4" />
                         AI Summarize Chat History
@@ -2672,24 +3368,24 @@ export default function AnyTraderAdmin() {
                     )}
 
                     {disputeSummaries[j.id] && (
-                      <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-xl space-y-4">
+                      <div className="bg-indigo-50 border border-black p-4 rounded-xl space-y-4">
                         <div className="flex items-center gap-2 mb-2">
                           <Sparkles className="w-4 h-4 text-indigo-600" />
-                          <h5 className="text-xs font-bold text-indigo-900 uppercase tracking-wider">AI Chat Summary</h5>
+                          <h5 className="text-xs font-bold text-black uppercase tracking-wider">AI Chat Summary</h5>
                         </div>
                         
                         <div className="space-y-3">
                           <div>
-                            <p className="text-xs font-bold text-indigo-800 mb-1">Core Disagreement</p>
-                            <p className="text-sm text-slate-700 bg-white p-3 rounded-lg border border-indigo-50">{disputeSummaries[j.id].summary}</p>
+                            <p className="text-xs font-bold text-black mb-1">Core Disagreement</p>
+                            <p className="text-sm text-black bg-white p-3 rounded-lg border border-black">{disputeSummaries[j.id].summary}</p>
                           </div>
                           
                           <div>
-                            <p className="text-xs font-bold text-indigo-800 mb-1">Timeline of Events</p>
-                            <ul className="space-y-1 bg-white p-3 rounded-lg border border-indigo-50">
+                            <p className="text-xs font-bold text-black mb-1">Timeline of Events</p>
+                            <ul className="space-y-1 bg-white p-3 rounded-lg border border-black">
                               {disputeSummaries[j.id].timeline.map((event, idx) => (
-                                <li key={idx} className="text-xs text-slate-700 flex items-start gap-2">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 mt-1.5 flex-shrink-0" />
+                                <li key={idx} className="text-xs text-black flex items-start gap-2">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 flex-shrink-0" />
                                   {event}
                                 </li>
                               ))}
@@ -2697,8 +3393,8 @@ export default function AnyTraderAdmin() {
                           </div>
 
                           <div>
-                            <p className="text-xs font-bold text-indigo-800 mb-1">Fault Analysis</p>
-                            <p className="text-sm text-slate-700 bg-white p-3 rounded-lg border border-indigo-50 font-medium">{disputeSummaries[j.id].faultAnalysis}</p>
+                            <p className="text-xs font-bold text-black mb-1">Fault Analysis</p>
+                            <p className="text-sm text-black bg-white p-3 rounded-lg border border-black font-medium">{disputeSummaries[j.id].faultAnalysis}</p>
                           </div>
                         </div>
                       </div>
@@ -2706,10 +3402,10 @@ export default function AnyTraderAdmin() {
                   </div>
                 </div>
               ))}
-              {jobs.filter(j => j.status === "disputed").length === 0 && (
+              {allDisputedJobs.length === 0 && (
                 <div className="py-12 text-center space-y-2">
-                  <CheckCircle2 className="w-12 h-12 text-green-500 mx-auto" />
-                  <p className="text-slate-500 font-medium">No active disputes. Everything is running smoothly!</p>
+                  <CheckCircle2 className="w-12 h-12 text-green-600 mx-auto" />
+                  <p className="text-black font-bold">No active disputes. Everything is running smoothly!</p>
                 </div>
               )}
             </div>
@@ -2885,47 +3581,7 @@ export default function AnyTraderAdmin() {
                 </div>
               </div>
 
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                    <Key className="w-5 h-5 text-blue-600" />
-                    Platform API Keys
-                  </h3>
-                  <div className="flex items-center gap-2 bg-blue-50 px-3 py-1 rounded-lg">
-                    <ShieldCheck className="w-4 h-4 text-blue-600" />
-                    <span className="text-[10px] font-bold text-blue-700 uppercase">Encrypted at rest</span>
-                  </div>
-                </div>
-                
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {[
-                    { id: "GEMINI_API_KEY", label: "Gemini AI API Key", description: "Powers all AI features, estimates, and mediation." },
-                    { id: "GOOGLE_MAPS_API_KEY", label: "Google Maps API Key", description: "Used for address lookup and job mapping." },
-                    { id: "STRIPE_SECRET_KEY", label: "Stripe Secret Key", description: "Handles secure payments and payouts." },
-                    { id: "STRIPE_WEBHOOK_SECRET", label: "Stripe Webhook Secret", description: "Verifies payment events from Stripe." },
-                    { id: "SENDGRID_API_KEY", label: "SendGrid API Key", description: "Sends transactional emails and notifications." }
-                  ].map(key => (
-                    <div key={key.id} className="bg-white p-5 rounded-2xl border border-black shadow-sm space-y-4">
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <h4 className="font-bold text-slate-900 text-sm">{key.label}</h4>
-                          <p className="text-[10px] text-slate-500">{key.description}</p>
-                        </div>
-                        <span className="text-[10px] bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-full border border-emerald-200 font-semibold flex items-center gap-1">
-                          <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                          Server-Side (.env)
-                        </span>
-                      </div>
-                      <div className="bg-slate-50 p-3 rounded-xl border border-black flex items-center justify-between">
-                        <code className="text-[10px] font-mono text-slate-500">
-                          Managed securely via Cloud Environment Variables
-                        </code>
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              <AdminSystemToolsTab />
 
               <div className="space-y-4">
                 <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
@@ -3265,38 +3921,168 @@ export default function AnyTraderAdmin() {
           {activeTab === "verifications" && (
             <div className="p-6 space-y-8">
               <div>
-                <h3 className="text-lg font-bold text-slate-900">Verification Queue</h3>
-                <p className="text-sm text-slate-500">Review and approve trade certifications and identity documents.</p>
+                <h3 className="text-lg font-black text-black">Verification, Video KYC & Compliance Queue</h3>
+                <p className="text-sm text-slate-600">Live unfiltered queue across all pending documents, provisional accounts, and Video Credential submissions.</p>
               </div>
 
+              {/* Video Credential Verification Queue */}
+              {videoKycUsers.length > 0 && (
+                <div className="space-y-4">
+                  <h4 className="text-sm font-black text-black uppercase tracking-wider flex items-center gap-2">
+                    <Video className="w-4 h-4 text-blue-600" />
+                    Pending Video Credential Verifications ({videoKycUsers.length})
+                  </h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {videoKycUsers.map((vu) => {
+                      const rawUrl = typeof vu.videoVerificationUrl === "string" ? vu.videoVerificationUrl.trim() : "";
+                      const safeVideoUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
+                      const isBusy = reviewingVideoUid === vu.id;
+                      return (
+                        <div key={`video-${vu.id}`} className="bg-white p-5 rounded-2xl border border-black space-y-4">
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <p className="font-black text-sm text-black">{vu.businessName || vu.name || "Trader"}</p>
+                              <p className="text-xs text-slate-600">{vu.email} • {vu.trades?.join(", ") || vu.role}</p>
+                            </div>
+                            <span className="px-2.5 py-1 rounded-lg text-[10px] font-black uppercase bg-blue-50 text-blue-800 border border-black">
+                              Video Pending
+                            </span>
+                          </div>
+                          {safeVideoUrl ? (
+                            <video
+                              src={safeVideoUrl}
+                              controls
+                              playsInline
+                              className="w-full max-h-56 rounded-xl border border-black bg-black"
+                            />
+                          ) : (
+                            <div className="p-3 rounded-xl bg-amber-50 border border-black text-xs font-bold text-black">
+                              No valid video URL attached to this submission.
+                            </div>
+                          )}
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              disabled={isBusy || !safeVideoUrl}
+                              onClick={() => handleVideoVerification(vu.id, "verified")}
+                              className="flex-1 px-3 py-2 rounded-xl bg-emerald-600 text-white text-xs font-black hover:bg-emerald-700 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                            >
+                              {isBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                              Approve Video Badge
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleVideoVerification(vu.id, "rejected", "Video unclear or does not match trader profile.")}
+                              className="flex-1 px-3 py-2 rounded-xl bg-red-600 text-white text-xs font-black hover:bg-red-700 disabled:opacity-50 flex items-center justify-center gap-1.5"
+                            >
+                              {isBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <XCircle className="w-3.5 h-3.5" />}
+                              Reject Video
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 gap-6">
-                {users.filter(u => u.verificationStatus === "pending" || (u.verificationDocs && u.verificationDocs.some((d: any) => d.status === "pending"))).map(u => (
-                  <div key={u.id} className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-6">
-                    <div className="flex items-center justify-between">
+                {kycQueueUsers.map(u => (
+                  <div key={u.id} className="bg-white p-6 rounded-2xl border border-black shadow-sm space-y-6">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                       <div className="flex items-center gap-4">
-                        <div className="w-12 h-12 rounded-2xl bg-slate-100 flex items-center justify-center text-xl font-bold text-slate-400">
-                          {u.name.charAt(0)}
+                        <div className="w-12 h-12 rounded-2xl bg-slate-100 border border-black flex items-center justify-center text-xl font-bold text-black">
+                          {(u.name || "T").charAt(0)}
                         </div>
                         <div>
-                          <h4 className="font-bold text-slate-900">{u.name}</h4>
-                          <p className="text-xs text-slate-500">{u.email} • {u.trades?.join(", ")}</p>
+                          <h4 className="font-bold text-black">{u.name}</h4>
+                          <p className="text-xs text-slate-600">{u.email} • {u.trades?.join(", ") || u.businessCategory || u.role}</p>
                         </div>
                       </div>
-                      <span className="text-[10px] font-bold bg-amber-50 text-amber-600 px-3 py-1 rounded-full uppercase tracking-wider">
-                        Pending Review
-                      </span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={cn(
+                          "text-[10px] font-bold border border-black px-3 py-1 rounded-lg uppercase tracking-wider",
+                          u.verificationStatus === "provisional"
+                            ? "bg-blue-50 text-blue-800"
+                            : "bg-amber-50 text-amber-800"
+                        )}>
+                          {u.verificationStatus === "provisional" ? "Provisional (Grace)" : "Pending Review"}
+                        </span>
+                        {(u.duplicatePhoneFingerprintDetected || u.duplicatePhoneFlagged) && (
+                          <span className="text-[10px] font-bold bg-red-50 text-red-700 border border-black px-2.5 py-1 rounded-lg uppercase">
+                            Duplicate Phone
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleVerifyTradesperson(u.id, "verified")}
+                          className="px-3 py-1.5 rounded-xl bg-green-600 text-white text-xs font-bold hover:bg-green-700 transition-all flex items-center gap-1.5"
+                          title="Approve entire trader account"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" /> Verify Account
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleVerifyTradesperson(u.id, "rejected")}
+                          className="px-3 py-1.5 rounded-xl bg-red-600 text-white text-xs font-bold hover:bg-red-700 transition-all flex items-center gap-1.5"
+                          title="Reject account verification"
+                        >
+                          <XCircle className="w-3.5 h-3.5" /> Reject Account
+                        </button>
+                        <button
+                          type="button"
+                          disabled={overridingProvisionalUid === u.id}
+                          onClick={() => handleProvisionalOverride(u.id, "extend_grace", 14)}
+                          className="px-3 py-1.5 rounded-xl bg-white text-black border border-black text-xs font-bold hover:bg-slate-100 transition-all disabled:opacity-50 flex items-center gap-1.5"
+                          title="Extend non-regulated document grace period by 14 days"
+                        >
+                          {overridingProvisionalUid === u.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Clock className="w-3.5 h-3.5" />}
+                          +14d Grace
+                        </button>
+                        {(u.duplicatePhoneFingerprintDetected || u.duplicatePhoneFlagged) && (
+                          <button
+                            type="button"
+                            disabled={overridingProvisionalUid === u.id}
+                            onClick={() => handleProvisionalOverride(u.id, "clear_duplicate_phone")}
+                            className="px-3 py-1.5 rounded-xl bg-amber-100 text-black border border-black text-xs font-bold hover:bg-amber-200 transition-all disabled:opacity-50"
+                            title="Clear duplicate-phone provisional restriction"
+                          >
+                            Clear Dup Phone
+                          </button>
+                        )}
+                      </div>
                     </div>
 
+                    {(!u.verificationDocs || u.verificationDocs.length === 0) && (
+                      <div className="p-4 rounded-2xl border border-dashed border-black bg-slate-50 text-xs font-medium text-black">
+                        No certification files uploaded yet. You can still approve or reject the account directly using the buttons above once checked.
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {u.verificationDocs?.map((doc: any, idx: number) => (
-                        <div key={idx} className="p-4 rounded-2xl border border-slate-50 bg-slate-50 space-y-4">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <FileText className="w-4 h-4 text-slate-400" />
-                              <span className="text-xs font-bold text-slate-700">{doc.type}</span>
+                      {u.verificationDocs?.map((doc: any, idx: number) => {
+                        const docKey = `${u.id}_${doc.type}`;
+                        const isReviewingThis = reviewingDocKey === docKey;
+                        const isRejectingThis = rejectingDoc?.userId === u.id && rejectingDoc?.docType === doc.type;
+                        const uploadedTimestamp = doc.uploadedAt || doc.createdAt;
+                        return (
+                        <div key={idx} className="p-4 rounded-2xl border border-black bg-slate-50 space-y-4">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <FileText className="w-4 h-4 text-black shrink-0" />
+                                <span className="text-xs font-bold text-black">{doc.type}</span>
+                              </div>
+                              {(doc.fileName || uploadedTimestamp) && (
+                                <p className="text-[10px] text-slate-600 mt-1 truncate">
+                                  {doc.fileName ? `${doc.fileName}` : "Uploaded document"}
+                                  {uploadedTimestamp ? ` • ${new Date(uploadedTimestamp).toLocaleDateString()}` : ""}
+                                </p>
+                              )}
                             </div>
                             <span className={cn(
-                              "text-[10px] font-bold px-2 py-0.5 rounded-full uppercase",
+                              "text-[10px] font-bold px-2 py-0.5 rounded-full uppercase shrink-0",
                               doc.status === "approved" ? "bg-green-100 text-green-700" :
                               doc.status === "rejected" ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"
                             )}>
@@ -3309,33 +4095,35 @@ export default function AnyTraderAdmin() {
                               href={doc.fileUrl} 
                               target="_blank" 
                               rel="noopener noreferrer"
-                              className="flex-1 flex items-center justify-center gap-2 bg-white border border-black p-2 rounded-xl text-[10px] font-bold text-slate-600 hover:bg-slate-50 transition-all"
+                              className="flex-1 flex items-center justify-center gap-2 bg-white border border-black p-2 rounded-xl text-[10px] font-bold text-black hover:bg-slate-100 transition-all"
                             >
                               <Eye className="w-3 h-3" /> View Document
                             </a>
                             {doc.status === "pending" && (
                               <>
                                 <button 
+                                  type="button"
                                   onClick={() => handleAnalyzeDocument(u.id, doc.type, doc.fileUrl, u.name)}
-                                  disabled={isAnalyzingDoc[`${u.id}_${doc.type}`]}
-                                  className="p-2 bg-indigo-50 text-indigo-600 rounded-xl hover:bg-indigo-100 transition-all disabled:opacity-50"
+                                  disabled={isAnalyzingDoc[docKey] || isReviewingThis}
+                                  className="p-2 bg-indigo-50 text-indigo-700 border border-black rounded-xl hover:bg-indigo-100 transition-all disabled:opacity-50"
                                   title="Run AI Smart KYC"
                                 >
-                                  {isAnalyzingDoc[`${u.id}_${doc.type}`] ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                                  {isAnalyzingDoc[docKey] ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
                                 </button>
                                 <button 
+                                  type="button"
                                   onClick={() => handleApproveDoc(u.id, doc.type)}
-                                  className="p-2 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-all"
+                                  disabled={isReviewingThis}
+                                  className="p-2 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-all disabled:opacity-50"
                                   title="Approve"
                                 >
-                                  <CheckCircle2 className="w-4 h-4" />
+                                  {isReviewingThis ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
                                 </button>
                                 <button 
-                                  onClick={() => {
-                                    const reason = prompt("Enter rejection reason:");
-                                    if (reason) handleRejectDoc(u.id, doc.type, reason);
-                                  }}
-                                  className="p-2 bg-red-600 text-white rounded-xl hover:bg-red-700 transition-all"
+                                  type="button"
+                                  onClick={() => setRejectingDoc({ userId: u.id, docType: doc.type, reason: "" })}
+                                  disabled={isReviewingThis}
+                                  className="p-2 bg-red-600 text-white rounded-xl hover:bg-red-700 transition-all disabled:opacity-50"
                                   title="Reject"
                                 >
                                   <XCircle className="w-4 h-4" />
@@ -3343,8 +4131,42 @@ export default function AnyTraderAdmin() {
                               </>
                             )}
                           </div>
+
+                          {isRejectingThis && (
+                            <div className="p-3 rounded-xl bg-white border border-black space-y-2.5">
+                              <label className="text-[10px] font-black text-black uppercase tracking-wider block">
+                                Rejection Reason (shown to trader)
+                              </label>
+                              <input
+                                type="text"
+                                value={rejectingDoc.reason}
+                                onChange={(e) => setRejectingDoc({ ...rejectingDoc, reason: e.target.value })}
+                                placeholder="e.g. Expired certificate or blurry photo..."
+                                className="w-full px-3 py-2 rounded-lg border border-black text-xs text-black bg-slate-50 focus:bg-white focus:outline-none"
+                              />
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setRejectingDoc(null)}
+                                  className="px-3 py-1.5 rounded-lg border border-black bg-white text-xs font-bold text-black hover:bg-slate-100"
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isReviewingThis || !rejectingDoc.reason.trim()}
+                                  onClick={() => handleRejectDoc(u.id, doc.type, rejectingDoc.reason)}
+                                  className="px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-bold hover:bg-red-700 disabled:opacity-50 flex items-center gap-1"
+                                >
+                                  {isReviewingThis && <Loader2 className="w-3 h-3 animate-spin" />}
+                                  Confirm Reject
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
                           {doc.rejectionReason && (
-                            <p className="text-[10px] text-red-600 font-medium italic">Reason: {doc.rejectionReason}</p>
+                            <p className="text-[10px] text-red-700 font-medium italic">Reason: {doc.rejectionReason}</p>
                           )}
 
                           {/* AI Verification Result */}
@@ -3423,24 +4245,22 @@ export default function AnyTraderAdmin() {
                           )}
 
                           {!doc.autoCheck && doc.status === "pending" && (
-                            <button 
-                              onClick={() => performInitialPublicRecordCheck(u.id, doc.type)}
-                              className="w-full mt-2 py-2 rounded-xl border border-dashed border-black text-[10px] font-bold text-slate-400 hover:bg-white hover:border-blue-400 hover:text-blue-600 transition-all flex items-center justify-center gap-2"
-                            >
-                              <Zap className="w-3 h-3" /> Run Initial Check
-                            </button>
+                            <div className="w-full mt-2 py-2 px-3 rounded-xl border border-dashed border-black bg-amber-50/60 text-[10px] font-bold text-black flex items-center justify-center gap-2">
+                              <Clock className="w-3 h-3 text-amber-700" /> Awaiting Manual Admin Approval
+                            </div>
                           )}
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 ))}
 
-                {users.filter(u => u.verificationStatus === "pending" || (u.verificationDocs && u.verificationDocs.some((d: any) => d.status === "pending"))).length === 0 && (
-                  <div className="text-center py-20 bg-slate-50 rounded-[40px] border border-dashed border-black">
-                    <CheckCircle2 className="w-16 h-16 text-slate-200 mx-auto mb-4" />
-                    <h4 className="text-slate-900 font-bold">Queue is Empty</h4>
-                    <p className="text-slate-500 text-sm">All pending verifications have been processed.</p>
+                {kycQueueUsers.length === 0 && videoKycUsers.length === 0 && (
+                  <div className="text-center py-20 bg-slate-50 rounded-2xl border border-dashed border-black">
+                    <CheckCircle2 className="w-16 h-16 text-slate-300 mx-auto mb-4" />
+                    <h4 className="text-black font-bold">Queue is Empty</h4>
+                    <p className="text-slate-600 text-sm">All pending document and video verifications have been processed.</p>
                   </div>
                 )}
               </div>
@@ -3641,11 +4461,11 @@ export default function AnyTraderAdmin() {
                     {tempConfig.paywallEnabled === false ? <Sparkles className="w-6 h-6" /> : <DollarSign className="w-6 h-6" />}
                   </div>
                   <div>
-                    <p className="text-base font-bold text-slate-900">Platform Monetization Mode</p>
-                    <p className="text-xs text-slate-500">
+                    <p className="text-base font-bold text-black">Platform Monetization Mode</p>
+                    <p className="text-xs text-slate-600">
                       {tempConfig.paywallEnabled === false 
-                        ? "Beta Mode enabled: All tiers are free and paywalls are bypassed." 
-                        : "Monetization enabled: Users must subscribe and pay commission as per their tier."}
+                        ? "Free Beta Mode active: Paid tier paywalls are relaxed while full trade & verification onboarding stays enabled." 
+                        : "Monetization live: Traders start on Free Explorer (5% PAYG) and can upgrade to paid tiers or add-ons via Stripe."}
                     </p>
                   </div>
                 </div>
@@ -3660,6 +4480,33 @@ export default function AnyTraderAdmin() {
                 >
                   {tempConfig.paywallEnabled === false ? "Switch to Monetized Mode" : "Return to Beta Mode"}
                 </button>
+              </div>
+
+              <div className="bg-white p-6 rounded-2xl border border-black shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                <div>
+                  <p className="text-base font-bold text-black">AnyTrader Commission Cap per Job / Milestone (£)</p>
+                  <p className="text-xs text-slate-600">
+                    Maximum platform commission charged on any single AnyTrader quote or milestone (default £250). Set to 0 to disable the cap. Applies instantly to Quotes, Stripe Checkout, and Escrow Releases.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-sm font-black text-black">£</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={10}
+                    value={tempConfig.commissionCapGbp ?? 250}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setTempConfig({
+                        ...tempConfig,
+                        commissionCapGbp: Number.isFinite(val) && val >= 0 ? val : 0,
+                      });
+                      setHasUnsavedChanges(true);
+                    }}
+                    className="w-28 px-3 py-2 rounded-xl border border-black bg-slate-50 text-sm font-bold text-black text-right"
+                  />
+                </div>
               </div>
             </section>
 
@@ -4442,7 +5289,79 @@ export default function AnyTraderAdmin() {
                      </div>
                    </div>
 
-                   {/* 6. COMMISSION & TAX PROTECTION SUMMARY */}
+                   {/* 6. AUTOMATED APPOINTMENTS ADD-ON */}
+                   <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-4 flex flex-col justify-between">
+                     <div className="space-y-3">
+                       <div className="flex items-center justify-between">
+                         <div className="flex items-center gap-2">
+                           <div className="w-8 h-8 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center font-bold text-sm border border-black">
+                             📅
+                           </div>
+                           <div>
+                             <h5 className="font-bold text-sm text-black">Automated Appointments</h5>
+                             <p className="text-[10px] text-slate-600 font-medium">Real-time customer booking slots</p>
+                           </div>
+                         </div>
+                         <label className="relative inline-flex items-center cursor-pointer">
+                           <input
+                             type="checkbox"
+                             className="sr-only peer"
+                             checked={tempConfig.paidAddons?.appointments?.enabled ?? true}
+                             onChange={(e) => {
+                               setTempConfig((prev: any) => ({
+                                 ...prev,
+                                 paidAddons: {
+                                   ...prev?.paidAddons,
+                                   appointments: {
+                                     ...prev?.paidAddons?.appointments,
+                                     enabled: e.target.checked
+                                   }
+                                 }
+                               }));
+                               setHasUnsavedChanges(true);
+                             }}
+                           />
+                           <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+                         </label>
+                       </div>
+
+                       <p className="text-xs text-black">
+                         Allows traders to enable live appointment booking calendars on their public profile (synced directly with Stripe Checkout).
+                       </p>
+
+                       <div className="grid grid-cols-1 gap-3 pt-2">
+                         <div>
+                           <label className="text-[10px] font-black text-black uppercase tracking-widest">Monthly Price (£/mo)</label>
+                           <input
+                             type="number"
+                             step="0.01"
+                             min="0"
+                             className="w-full px-3 py-2 rounded-xl border border-black bg-slate-50 text-sm font-bold text-black mt-1"
+                             value={tempConfig.paidAddons?.appointments?.price ?? 9.99}
+                             onChange={(e) => {
+                               const val = parseFloat(e.target.value);
+                               setTempConfig((prev: any) => ({
+                                 ...prev,
+                                 paidAddons: {
+                                   ...prev?.paidAddons,
+                                   appointments: {
+                                     ...prev?.paidAddons?.appointments,
+                                     price: Number.isFinite(val) && val >= 0 ? val : 0
+                                   }
+                                 }
+                               }));
+                               setHasUnsavedChanges(true);
+                             }}
+                           />
+                         </div>
+                       </div>
+                     </div>
+                     <div className="text-[11px] text-blue-800 bg-blue-50/70 p-2 rounded-xl border border-black">
+                       ✓ Synced live to Billing & Stripe Checkout (price_appointments)
+                     </div>
+                   </div>
+
+                   {/* 7. COMMISSION & TAX PROTECTION SUMMARY */}
                    <div className="bg-slate-900 text-white p-6 rounded-3xl border border-white/20 shadow-sm space-y-4 flex flex-col justify-between">
                      <div className="space-y-3">
                        <div className="flex items-center gap-2">
@@ -5079,13 +5998,19 @@ export default function AnyTraderAdmin() {
           {activeTab === "reconciliation" && (
             <AdminFinancialReconciliationTab
               user={user}
-              disputedJobs={jobs.filter((j) => j.status === "disputed")}
+              disputedJobs={allDisputedJobs}
               onResolveDispute={handleResolveDispute}
               onOpenDisputesTab={() => handleTabChange("disputes")}
             />
           )}
 
           {activeTab === "ops_health" && <AdminOperationalHealthTab />}
+
+          {activeTab === "reviews" && (
+            <AdminReviewsModerationTab reviews={reviews} users={users} />
+          )}
+
+          {activeTab === "gdpr" && <AdminGdprRequestsTab />}
 
           {(activeTab === "users" || activeTab === "jobs" || activeTab === "logs") && (
             <div className="px-6 py-3 bg-slate-50 border-t border-black flex flex-wrap items-center justify-between gap-2 text-xs text-black">
@@ -5188,9 +6113,13 @@ export default function AnyTraderAdmin() {
                   {/* Onboarding Restrictions */}
                   <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-6">
                     <div className="flex items-center justify-between">
-                      <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Onboarding Restrictions</h4>
+                      <h4 className="text-xs font-bold text-black uppercase tracking-wider">Onboarding Restrictions</h4>
                       <button 
-                        onClick={() => setTempConfig({ ...tempConfig, onboardingRestrictionsEnabled: !tempConfig.onboardingRestrictionsEnabled })}
+                        type="button"
+                        onClick={() => {
+                          setTempConfig({ ...tempConfig, onboardingRestrictionsEnabled: !tempConfig.onboardingRestrictionsEnabled });
+                          setHasUnsavedChanges(true);
+                        }}
                         className={cn(
                           "w-12 h-6 rounded-full relative transition-all",
                           tempConfig.onboardingRestrictionsEnabled ? "bg-blue-600" : "bg-slate-200"
@@ -5206,12 +6135,18 @@ export default function AnyTraderAdmin() {
                     {tempConfig.onboardingRestrictionsEnabled && (
                       <div className="space-y-4">
                         <div className="space-y-2">
-                          <label className="text-[10px] font-bold text-slate-400 uppercase">Allowed Postcodes</label>
+                          <label className="text-[10px] font-bold text-black uppercase">Allowed Postcodes</label>
                           <div className="flex flex-wrap gap-2 mb-2">
                             {(tempConfig.allowedPostcodes || []).map((p: string, pIdx: number) => (
-                              <div key={`${p}-${pIdx}`} className="flex items-center gap-1 bg-blue-50 text-blue-700 px-2 py-1 rounded-lg text-xs font-bold">
+                              <div key={`${p}-${pIdx}`} className="flex items-center gap-1 bg-blue-50 text-blue-700 border border-black px-2 py-1 rounded-lg text-xs font-bold">
                                 {p}
-                                <button onClick={() => setTempConfig({ ...tempConfig, allowedPostcodes: tempConfig.allowedPostcodes.filter((pc: string) => pc !== p) })}>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setTempConfig({ ...tempConfig, allowedPostcodes: tempConfig.allowedPostcodes.filter((pc: string) => pc !== p) });
+                                    setHasUnsavedChanges(true);
+                                  }}
+                                >
                                   <X className="w-3 h-3" />
                                 </button>
                               </div>
@@ -5222,14 +6157,17 @@ export default function AnyTraderAdmin() {
                               type="text"
                               value={newPostcode}
                               onChange={(e) => setNewPostcode(e.target.value.toUpperCase())}
-                              className="flex-1 p-3 rounded-xl border border-black bg-slate-50 focus:bg-white transition-all font-mono text-sm text-slate-900"
+                              className="flex-1 p-3 rounded-xl border border-black bg-slate-50 focus:bg-white transition-all font-mono text-sm text-black"
                               placeholder="e.g. SW1A"
                             />
                             <button 
+                              type="button"
                               onClick={() => {
-                                if (newPostcode && !tempConfig.allowedPostcodes?.includes(newPostcode)) {
-                                  setTempConfig({ ...tempConfig, allowedPostcodes: [...(tempConfig.allowedPostcodes || []), newPostcode] });
+                                const cleaned = newPostcode.trim().toUpperCase();
+                                if (cleaned && !tempConfig.allowedPostcodes?.includes(cleaned)) {
+                                  setTempConfig({ ...tempConfig, allowedPostcodes: [...(tempConfig.allowedPostcodes || []), cleaned] });
                                   setNewPostcode("");
+                                  setHasUnsavedChanges(true);
                                 }
                               }}
                               className="bg-blue-600 text-white px-4 rounded-xl font-bold text-sm hover:bg-blue-700"
@@ -5244,6 +6182,265 @@ export default function AnyTraderAdmin() {
                       </div>
                     )}
                   </div>
+
+                  {/* Trader Document Upload Grace Period & Auto-Restrict Controls */}
+                  {(() => {
+                    const activeGraceDays =
+                      tempConfig.documentGracePeriodDays !== undefined && tempConfig.documentGracePeriodDays !== ""
+                        ? Number(tempConfig.documentGracePeriodDays)
+                        : DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS;
+                    const activeProvisionalMaxQuotes =
+                      tempConfig.provisionalMaxQuotes !== undefined && tempConfig.provisionalMaxQuotes !== ""
+                        ? Number(tempConfig.provisionalMaxQuotes)
+                        : DEFAULT_PROVISIONAL_MAX_QUOTES;
+                    const activeEnforceGrace = tempConfig.enforceDocumentGracePeriod !== false;
+                    const providerUsers = users.filter((u) => isServiceProviderProfile(u));
+                    let provisionalNoDocsCount = 0;
+                    let restrictedPastGraceCount = 0;
+                    let regulatedPendingCount = 0;
+
+                    for (const provider of providerUsers) {
+                      const statusObj = evaluateTraderDocumentCompliance(provider, {
+                        gracePeriodDays: Number.isFinite(activeGraceDays) ? activeGraceDays : DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS,
+                        enforceGracePeriod: activeEnforceGrace,
+                        provisionalMaxQuotes: Number.isFinite(activeProvisionalMaxQuotes)
+                          ? activeProvisionalMaxQuotes
+                          : DEFAULT_PROVISIONAL_MAX_QUOTES,
+                      });
+                      if (
+                        statusObj.status === "grace_expired_restricted" ||
+                        statusObj.status === "provisional_quote_cap_reached"
+                      ) {
+                        restrictedPastGraceCount += 1;
+                      } else if (statusObj.status === "regulated_pending_admin") {
+                        regulatedPendingCount += 1;
+                      } else if (statusObj.status === "provisional_grace_active" && !statusObj.hasUploadedAnyDoc) {
+                        provisionalNoDocsCount += 1;
+                      }
+                    }
+
+                    return (
+                      <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-5">
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <h4 className="text-xs font-black text-black uppercase tracking-wider flex items-center gap-2">
+                              <ShieldAlert className="w-4 h-4 text-amber-600" />
+                              Trader Document Grace Period, Quote Cap &amp; Auto-Restrict
+                            </h4>
+                            <p className="text-xs text-black mt-1 leading-relaxed">
+                              Automatically restrict quoting on non-regulated trader profiles that exceed the provisional quote cap or fail to upload Photo ID / Public Liability Insurance within the grace window. Regulated trades and re-registered phone numbers always require Admin approval first.
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTempConfig({
+                                ...tempConfig,
+                                enforceDocumentGracePeriod: !activeEnforceGrace,
+                              });
+                              setHasUnsavedChanges(true);
+                            }}
+                            aria-label="Toggle automatic restriction after document grace period"
+                            className={cn(
+                              "w-12 h-6 rounded-full relative transition-all shrink-0 cursor-pointer border border-black",
+                              activeEnforceGrace ? "bg-emerald-600" : "bg-slate-200"
+                            )}
+                          >
+                            <div
+                              className={cn(
+                                "absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all border border-black/20",
+                                activeEnforceGrace ? "right-1" : "left-1"
+                              )}
+                            />
+                          </button>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+                          <div className="space-y-1.5">
+                            <label className="text-[10px] font-black text-black uppercase tracking-wider">
+                              Grace Period (Days)
+                            </label>
+                            <input
+                              type="number"
+                              min={0}
+                              max={365}
+                              value={Number.isFinite(activeGraceDays) ? activeGraceDays : DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS}
+                              onChange={(e) => {
+                                const parsed = Math.max(0, Math.min(365, parseInt(e.target.value || "0", 10) || 0));
+                                setTempConfig({
+                                  ...tempConfig,
+                                  documentGracePeriodDays: parsed,
+                                });
+                                setHasUnsavedChanges(true);
+                              }}
+                              className="w-full px-3.5 py-2.5 rounded-xl border border-black bg-slate-50 focus:bg-white text-sm font-black text-black"
+                            />
+                            <p className="text-[10px] text-slate-600 font-medium">
+                              Default: {DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS} days.
+                            </p>
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <label className="text-[10px] font-black text-black uppercase tracking-wider">
+                              Provisional Quote Cap (0 Docs)
+                            </label>
+                            <input
+                              type="number"
+                              min={0}
+                              max={100}
+                              value={
+                                Number.isFinite(activeProvisionalMaxQuotes)
+                                  ? activeProvisionalMaxQuotes
+                                  : DEFAULT_PROVISIONAL_MAX_QUOTES
+                              }
+                              onChange={(e) => {
+                                const parsed = Math.max(0, Math.min(100, parseInt(e.target.value || "0", 10) || 0));
+                                setTempConfig({
+                                  ...tempConfig,
+                                  provisionalMaxQuotes: parsed,
+                                });
+                                setHasUnsavedChanges(true);
+                              }}
+                              className="w-full px-3.5 py-2.5 rounded-xl border border-black bg-slate-50 focus:bg-white text-sm font-black text-black"
+                            />
+                            <p className="text-[10px] text-slate-600 font-medium">
+                              Default: {DEFAULT_PROVISIONAL_MAX_QUOTES} quotes (0 = unlimited).
+                            </p>
+                          </div>
+
+                          <div className="flex sm:justify-end">
+                            <button
+                              type="button"
+                              onClick={() => handleTabChange("verifications")}
+                              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white border border-black text-xs font-black cursor-pointer"
+                            >
+                              <ShieldCheck className="w-4 h-4 text-amber-400" />
+                              <span>Open KYC Queue</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-2.5 pt-2 border-t border-slate-200">
+                          <div className="p-3 rounded-2xl border border-black bg-blue-50">
+                            <p className="text-xl font-black text-black">{provisionalNoDocsCount}</p>
+                            <p className="text-[10px] font-bold text-black uppercase tracking-wider mt-0.5">
+                              In Grace (0 Docs)
+                            </p>
+                          </div>
+                          <div className="p-3 rounded-2xl border border-black bg-red-50">
+                            <p className="text-xl font-black text-black">{restrictedPastGraceCount}</p>
+                            <p className="text-[10px] font-bold text-black uppercase tracking-wider mt-0.5">
+                              Auto-Restricted
+                            </p>
+                          </div>
+                          <div className="p-3 rounded-2xl border border-black bg-amber-50">
+                            <p className="text-xl font-black text-black">{regulatedPendingCount}</p>
+                            <p className="text-[10px] font-bold text-black uppercase tracking-wider mt-0.5">
+                              Admin Check Req.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* FlexiPay Repair Financing Launch Control (Off / Coming Soon / Live) */}
+                  {(() => {
+                    const activeFlexiPayMode: "off" | "coming_soon" | "live" =
+                      tempConfig.flexiPayMode === "off" || tempConfig.flexiPayMode === "live" || tempConfig.flexiPayMode === "coming_soon"
+                        ? tempConfig.flexiPayMode
+                        : "coming_soon";
+                    return (
+                      <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-5">
+                        <div className="flex items-start justify-between gap-4 pb-3 border-b border-slate-100">
+                          <div>
+                            <h4 className="text-sm font-black text-black uppercase tracking-wider flex items-center gap-2">
+                              <CreditCard className="w-4 h-4 text-indigo-600" />
+                              FlexiPay Repair Financing Controls
+                            </h4>
+                            <p className="text-xs text-black mt-0.5 leading-relaxed">
+                              Control how FlexiPay (£1,000+ repair financing) appears across quote comparison, home health, search, and trader growth banners. Save settings to publish live.
+                            </p>
+                          </div>
+                          <span
+                            className={cn(
+                              "px-3 py-1 rounded-full text-xs font-black uppercase tracking-wide border border-black shrink-0",
+                              activeFlexiPayMode === "live"
+                                ? "bg-emerald-100 text-black"
+                                : activeFlexiPayMode === "off"
+                                ? "bg-slate-200 text-black"
+                                : "bg-amber-100 text-black"
+                            )}
+                          >
+                            {activeFlexiPayMode === "live"
+                              ? "Live"
+                              : activeFlexiPayMode === "off"
+                              ? "Off (Hidden)"
+                              : "Coming Soon"}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTempConfig({ ...tempConfig, flexiPayMode: "off" });
+                              setHasUnsavedChanges(true);
+                            }}
+                            className={cn(
+                              "p-4 rounded-2xl border text-left transition-all cursor-pointer",
+                              activeFlexiPayMode === "off"
+                                ? "bg-slate-100 border-black shadow-md ring-2 ring-black/20"
+                                : "bg-white border-black/30 hover:border-black"
+                            )}
+                          >
+                            <p className="text-xs font-black text-black uppercase">Off (Hidden)</p>
+                            <p className="text-[11px] text-slate-700 font-medium mt-1">
+                              Completely hides all FlexiPay tabs, banners, search items, and quote financing CTAs.
+                            </p>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTempConfig({ ...tempConfig, flexiPayMode: "coming_soon" });
+                              setHasUnsavedChanges(true);
+                            }}
+                            className={cn(
+                              "p-4 rounded-2xl border text-left transition-all cursor-pointer",
+                              activeFlexiPayMode === "coming_soon"
+                                ? "bg-amber-50 border-black shadow-md ring-2 ring-amber-400/40"
+                                : "bg-white border-black/30 hover:border-black"
+                            )}
+                          >
+                            <p className="text-xs font-black text-black uppercase">Coming Soon (Default)</p>
+                            <p className="text-[11px] text-slate-700 font-medium mt-1">
+                              Shows a transparent &ldquo;Coming Soon&rdquo; badge &amp; info modal without active credit checks.
+                            </p>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTempConfig({ ...tempConfig, flexiPayMode: "live" });
+                              setHasUnsavedChanges(true);
+                            }}
+                            className={cn(
+                              "p-4 rounded-2xl border text-left transition-all cursor-pointer",
+                              activeFlexiPayMode === "live"
+                                ? "bg-emerald-50 border-black shadow-md ring-2 ring-emerald-400/40"
+                                : "bg-white border-black/30 hover:border-black"
+                            )}
+                          >
+                            <p className="text-xs font-black text-black uppercase">Live</p>
+                            <p className="text-[11px] text-slate-700 font-medium mt-1">
+                              Enables the interactive repair financing payment calculator across homeowner &amp; trader flows.
+                            </p>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* Portal & Launch Controls */}
                   <div className="bg-white p-6 rounded-3xl border border-black shadow-sm space-y-6">
@@ -6208,6 +7405,7 @@ export default function AnyTraderAdmin() {
           )}
         </div>
       </div>
+      </div>
     </div>
 
     {/* Bulk Delete Confirmation Modal */}
@@ -6605,28 +7803,28 @@ export default function AnyTraderAdmin() {
               </div>
               
               <div className="text-center space-y-2">
-                <h3 className="text-xl font-bold text-slate-900">
+                <h3 className="text-xl font-bold text-black">
                   {tempConfig.paywallEnabled === false ? "Enable Monetization?" : "Switch to BETA Mode?"}
                 </h3>
-                <p className="text-sm text-slate-500 leading-relaxed">
+                <p className="text-sm text-slate-600 leading-relaxed">
                   {tempConfig.paywallEnabled === false 
-                    ? "Enabling monetization will enforce subscription tiers and job posting limits. Users without active plans will be prompted to upgrade." 
-                    : "Switching to BETA mode will disable ALL payment requirements. Every user will have unlimited free access until you re-enable monetization."}
+                    ? "Enabling monetization activates Free Explorer (5% PAYG), paid subscription tiers, and Stripe Checkout for upgrades & add-ons immediately." 
+                    : "Switching to Free BETA mode relaxes paid tier paywalls while still keeping full trade selection and certification onboarding active."}
                 </p>
                 <div className="mt-4 p-4 bg-slate-50 rounded-2xl border border-black">
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Impact Analysis</p>
-                  <ul className="text-[11px] text-slate-600 text-left space-y-1 list-disc pl-4">
+                  <p className="text-[10px] font-black text-black uppercase tracking-widest mb-1">Impact Analysis</p>
+                  <ul className="text-[11px] text-black text-left space-y-1 list-disc pl-4">
                     {tempConfig.paywallEnabled === false ? (
                       <>
-                        <li>Active subscriptions will be required to post/quote.</li>
-                        <li>Job limits and pricing tiers will be strictly enforced.</li>
-                        <li>Stripe checkout will be activated for all upgrade actions.</li>
+                        <li>Traders start on Free Explorer (5% PAYG) with optional paid tiers.</li>
+                        <li>Tier quote limits, commission rates, and paid add-ons are enforced via Stripe.</li>
+                        <li>Server pricing cache invalidates immediately upon publish.</li>
                       </>
                     ) : (
                       <>
-                        <li>ALL paywalls will be bypassed globally.</li>
-                        <li>Subscription tiers will be visually ignored.</li>
-                        <li>Users can post and quote without any lifetime or monthly limits.</li>
+                        <li>Paid tier paywalls are relaxed globally for beta testing.</li>
+                        <li>New tradespeople still complete full trade category & certification setup.</li>
+                        <li>Server pricing cache invalidates immediately upon publish.</li>
                       </>
                     )}
                   </ul>

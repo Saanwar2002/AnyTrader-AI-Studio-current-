@@ -1,9 +1,10 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { Users, UserPlus, Mail, X, Shield, ShieldCheck, Clock, Trash2, Loader2, CheckCircle2, AlertTriangle, Building2 } from "lucide-react";
-import { db, collection, query, where, onSnapshot, addDoc, deleteDoc, doc, updateDoc, serverTimestamp, handleFirestoreError, OperationType } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { cn } from "@/src/lib/utils";
 import { motion, AnimatePresence } from "motion/react";
+import { toast } from "sonner";
 
 interface TeamMember {
   uid: string;
@@ -19,24 +20,31 @@ interface TeamInvitation {
   email: string;
   role: string;
   status: 'pending' | 'accepted' | 'expired';
+  deliveryStatus?: string;
   createdAt: any;
+  expiresAt?: string;
   businessId: string;
 }
 
 export default function BusinessTeamManagement() {
   const { profile, user } = useAuth();
+  const navigate = useNavigate();
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [invitations, setInvitations] = useState<TeamInvitation[]>([]);
+  const [seatLimit, setSeatLimit] = useState<number>(5);
+  const [isUnlimitedSeats, setIsUnlimitedSeats] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [isSendingInvite, setIsSendingInvite] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pendingRemoveMemberUid, setPendingRemoveMemberUid] = useState<string | null>(null);
 
   // Constants for Tier checking
   const subType = (profile?.subscriptionType || "").toLowerCase();
   const role = (profile?.role || "").toLowerCase();
-  const isEligible = role === 'business' || 
+  const isEligible = role === 'admin' ||
+                    role === 'business' || 
                     role === 'tradesperson' ||
                     subType === 'business' || 
                     subType === 'gold' || 
@@ -45,59 +53,70 @@ export default function BusinessTeamManagement() {
                     subType.includes('business') || 
                     subType.includes('enterprise');
 
-  useEffect(() => {
+  const fetchTeamData = useCallback(async () => {
     if (!user || !isEligible) {
       setLoading(false);
       return;
     }
-
-    // Fetch team members linked to this business
-    // For now, we assume team members have a 'businessId' field matching the business owner's UID
-    const membersQuery = query(collection(db, "users"), where("businessId", "==", user.uid));
-    const unsubMembers = onSnapshot(membersQuery, (snapshot) => {
-      setMembers(snapshot.docs.map(doc => ({ uid: doc.id, ...doc.data() } as TeamMember)));
-    }, (err) => {
-      handleFirestoreError(err, OperationType.LIST, "users");
-    });
-
-    // Fetch pending invitations
-    const invitesQuery = query(collection(db, "invitations"), where("invitedBy", "==", user.uid), where("status", "==", "pending"));
-    const unsubInvites = onSnapshot(invitesQuery, (snapshot) => {
-      setInvitations(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as TeamInvitation)));
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch("/api/business/team", {
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) {
+        throw new Error(data?.error || "Unable to load team details.");
+      }
+      setMembers(Array.isArray(data.members) ? data.members : []);
+      setInvitations(Array.isArray(data.invitations) ? data.invitations : []);
+      if (typeof data.seatLimit === "number") setSeatLimit(data.seatLimit);
+      setIsUnlimitedSeats(Boolean(data.isUnlimitedSeats));
+    } catch (err: any) {
+      console.error("Failed to fetch business team:", err);
+      toast.error(err?.message || "Unable to load team members right now.");
+    } finally {
       setLoading(false);
-    }, (err) => {
-      handleFirestoreError(err, OperationType.LIST, "invitations");
-      setLoading(false);
-    });
-
-    return () => {
-      unsubMembers();
-      unsubInvites();
-    };
+    }
   }, [user, isEligible]);
+
+  useEffect(() => {
+    void fetchTeamData();
+  }, [fetchTeamData]);
 
   const handleSendInvite = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !inviteEmail) return;
+    if (!user || !inviteEmail.trim()) return;
 
     setIsSendingInvite(true);
     setError(null);
 
     try {
-      await addDoc(collection(db, "invitations"), {
-        email: inviteEmail.toLowerCase().trim(),
-        role: "member",
-        permissions: ["post_job", "view_quotes"],
-        status: "pending",
-        invitedBy: user.uid,
-        businessId: user.uid,
-        createdAt: serverTimestamp(),
-        type: "business_team"
+      const idToken = await user.getIdToken();
+      const res = await fetch("/api/business/team/invite", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ email: inviteEmail.toLowerCase().trim() }),
       });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || "Failed to send invitation.");
+      }
 
       setInviteEmail("");
       setShowInviteModal(false);
-      // In a real app, you'd trigger a cloud function to send an email here
+      if (data.deliveryStatus === "delivered") {
+        toast.success(`Invitation email sent to ${data.email}.`);
+      } else if (data.inAppNotified) {
+        toast.success(`Invitation created and sent in-app to ${data.email}.`);
+      } else {
+        toast.success(`Invitation created for ${data.email}.`);
+      }
+      await fetchTeamData();
     } catch (err: any) {
       setError(err.message || "Failed to send invitation");
     } finally {
@@ -106,24 +125,50 @@ export default function BusinessTeamManagement() {
   };
 
   const handleRevokeInvite = async (inviteId: string) => {
+    if (!user) return;
     try {
-      await deleteDoc(doc(db, "invitations", inviteId));
-    } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, "invitations");
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/business/team/invitations/${encodeURIComponent(inviteId)}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to revoke invitation.");
+      }
+      setInvitations((prev) => prev.filter((inv) => inv.id !== inviteId));
+      toast.success("Invitation revoked.");
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to revoke invitation.");
     }
   };
 
-  const handleRemoveMember = async (memberUid: string) => {
-    if (!window.confirm("Are you sure you want to remove this member? They will lose access to team features.")) return;
-    
+  const handleRemoveMember = (memberUid: string) => {
+    setPendingRemoveMemberUid(memberUid);
+  };
+
+  const executeRemoveMember = async () => {
+    if (!pendingRemoveMemberUid || !user) return;
     try {
-      // Don't delete the user, just detach them from the business
-      await updateDoc(doc(db, "users", memberUid), {
-        businessId: null,
-        role: "homeowner" // Revert to basic role
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/business/team/members/${encodeURIComponent(pendingRemoveMemberUid)}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
       });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, "users");
+      const data = await res.json().catch(() => ({} as any));
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to remove team member.");
+      }
+      setMembers((prev) => prev.filter((m) => m.uid !== pendingRemoveMemberUid));
+      toast.success("Team member removed.");
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to remove team member.");
+    } finally {
+      setPendingRemoveMemberUid(null);
     }
   };
 
@@ -138,7 +183,11 @@ export default function BusinessTeamManagement() {
           <p className="text-slate-500 font-medium">Multi-seat team management is exclusive to Business Professional and Enterprise tiers.</p>
         </div>
         <div className="flex flex-col gap-3 w-full">
-           <button className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl shadow-indigo-200 hover:bg-indigo-700 transition-all active:scale-95">
+           <button
+             type="button"
+             onClick={() => navigate("/billing")}
+             className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl shadow-indigo-200 hover:bg-indigo-700 transition-all active:scale-95 cursor-pointer"
+           >
              Upgrade Subscription
            </button>
            <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Starting from £125/month</p>
@@ -162,8 +211,9 @@ export default function BusinessTeamManagement() {
           <p className="text-slate-500 font-medium mt-1">Manage seats, permissions and collaborative job accounts.</p>
         </div>
         <button 
+          type="button"
           onClick={() => setShowInviteModal(true)}
-          className="bg-indigo-600 text-white px-8 py-4 rounded-2xl font-black text-sm flex items-center gap-3 shadow-2xl shadow-indigo-100 hover:bg-indigo-700 transition-all active:scale-95 group"
+          className="bg-indigo-600 text-white px-8 py-4 rounded-2xl font-black text-sm flex items-center gap-3 shadow-2xl shadow-indigo-100 hover:bg-indigo-700 transition-all active:scale-95 group cursor-pointer"
         >
           <UserPlus className="w-5 h-5 transition-transform group-hover:rotate-12" />
           Add Team Member
@@ -177,7 +227,7 @@ export default function BusinessTeamManagement() {
             <div className="p-8 border-b border-slate-50 flex items-center justify-between bg-slate-50/30">
               <h3 className="font-black text-slate-900 uppercase tracking-widest text-xs">Active Team Members</h3>
               <span className="px-3 py-1 bg-white border border-black rounded-xl font-bold text-xs text-slate-500 shadow-sm">
-                {members.length + 1} / {profile?.subscriptionType === 'Enterprise Powerhouse' ? 'Unlimited' : '5'} Seats
+                {members.length + 1} / {isUnlimitedSeats ? 'Unlimited' : seatLimit} Seats
               </span>
             </div>
             <div className="divide-y divide-slate-50">
@@ -376,6 +426,35 @@ export default function BusinessTeamManagement() {
           </div>
         )}
       </AnimatePresence>
+
+      {pendingRemoveMemberUid && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[120] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="text-center space-y-2">
+              <h4 className="text-base font-black text-black">Remove Team Member?</h4>
+              <p className="text-xs text-black leading-relaxed">
+                Are you sure you want to remove this member? They will lose access to your business team features.
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setPendingRemoveMemberUid(null)}
+                className="flex-1 py-2.5 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={executeRemoveMember}
+                className="flex-1 py-2.5 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 cursor-pointer"
+              >
+                Remove Member
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

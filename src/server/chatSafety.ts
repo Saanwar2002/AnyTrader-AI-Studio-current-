@@ -184,24 +184,68 @@ export async function unblockChatParticipantCommand(
   return { unblocked: true, blockId };
 }
 
+export async function areUsersChatBlocked(
+  db: any,
+  uidA: string,
+  uidB: string
+): Promise<{ blocked: boolean; blockedByA: boolean; blockedByB: boolean }> {
+  if (!db || !uidA || !uidB || uidA === uidB) {
+    return { blocked: false, blockedByA: false, blockedByB: false };
+  }
+  try {
+    const col = typeof db.collection === "function" ? db.collection("chat_user_blocks") : null;
+    if (!col || typeof col.doc !== "function") {
+      return { blocked: false, blockedByA: false, blockedByB: false };
+    }
+    const [snapAB, snapBA] = await Promise.all([
+      col.doc(buildChatBlockDocId(uidA, uidB)).get(),
+      col.doc(buildChatBlockDocId(uidB, uidA)).get(),
+    ]);
+    const blockedByA = Boolean(snapAB?.exists && (typeof snapAB.data === "function" ? snapAB.data() : snapAB.data)?.active === true);
+    const blockedByB = Boolean(snapBA?.exists && (typeof snapBA.data === "function" ? snapBA.data() : snapBA.data)?.active === true);
+    return {
+      blocked: blockedByA || blockedByB,
+      blockedByA,
+      blockedByB,
+    };
+  } catch {
+    return { blocked: false, blockedByA: false, blockedByB: false };
+  }
+}
+
 export async function listUserChatBlocksCommand(
   db: any,
   callerUid: string
-): Promise<{ blockedUserIds: string[]; blocks: ChatBlockRecord[] }> {
+): Promise<{ blockedUserIds: string[]; blockedByUserIds: string[]; blocks: ChatBlockRecord[] }> {
   if (!db) {
     throw new ServiceUnavailableError("Database service unavailable.");
   }
-  const snap = await db
-    .collection("chat_user_blocks")
-    .where("blockerUid", "==", callerUid)
-    .where("active", "==", true)
-    .limit(100)
-    .get();
+  const [myBlocksSnap, blockedBySnap] = await Promise.all([
+    db
+      .collection("chat_user_blocks")
+      .where("blockerUid", "==", callerUid)
+      .where("active", "==", true)
+      .limit(100)
+      .get(),
+    db
+      .collection("chat_user_blocks")
+      .where("blockedUid", "==", callerUid)
+      .where("active", "==", true)
+      .limit(100)
+      .get(),
+  ]);
 
-  const blocks: ChatBlockRecord[] = (snap.docs || []).map((d: any) => ({
+  const blocks: ChatBlockRecord[] = (myBlocksSnap.docs || []).map((d: any) => ({
     id: d.id,
     ...(d.data() || {}),
   }));
   const blockedUserIds = Array.from(new Set(blocks.map((b) => b.blockedUid).filter(Boolean)));
-  return { blockedUserIds, blocks };
+  const blockedByUserIds: string[] = Array.from(
+    new Set(
+      (blockedBySnap.docs || [])
+        .map((d: any) => String((d.data() || {}).blockerUid || ""))
+        .filter(Boolean)
+    )
+  );
+  return { blockedUserIds, blockedByUserIds, blocks };
 }

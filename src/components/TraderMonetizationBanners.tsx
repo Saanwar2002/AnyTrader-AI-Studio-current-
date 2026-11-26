@@ -1,8 +1,10 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { CreditCard, ShoppingBag, Video, ArrowRight, ShieldCheck, CheckCircle2 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { toast } from "sonner";
 import BnplFinancingModal from "./BnplFinancingModal";
+import { db, doc, onSnapshot } from "@/src/firebase";
+import { FlexiPayMode, resolveFlexiPayMode } from "@/src/lib/marketplaceContracts";
 
 interface TraderMonetizationBannersProps {
   onOpenVideoVerification?: () => void;
@@ -12,29 +14,57 @@ export function TraderMonetizationBanners({ onOpenVideoVerification }: TraderMon
   const [showBnplModal, setShowBnplModal] = useState(false);
   const [showMaterialsInfo, setShowMaterialsInfo] = useState(false);
   const [showVideoProInfo, setShowVideoProInfo] = useState(false);
+  const [flexiPayMode, setFlexiPayMode] = useState<FlexiPayMode>("coming_soon");
+
+  useEffect(() => {
+    const unsub = onSnapshot(
+      doc(db, "platform_config", "global"),
+      (snap) => {
+        setFlexiPayMode(snap.exists() ? resolveFlexiPayMode(snap.data()) : "coming_soon");
+      },
+      () => setFlexiPayMode("coming_soon")
+    );
+    return () => unsub();
+  }, []);
 
   return (
     <div className="space-y-3 mt-8">
-      {/* 3 Advertising & Growth Offer Containers */}
+      {/* Advertising & Growth Offer Containers */}
       <div className="space-y-3">
-        {/* Section 5.1 BNPL Financing Card */}
-        <div
-          id="bnpl-repair-financing-ad-card"
-          onClick={() => setShowBnplModal(true)}
-          className="p-4 bg-gradient-to-r from-indigo-950 via-slate-900 to-indigo-900 text-white rounded-3xl border border-black shadow-sm flex items-center justify-between cursor-pointer hover:from-slate-900 hover:to-indigo-950 transition group active:scale-[0.99]"
-        >
-          <div>
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] font-extrabold uppercase text-indigo-300">BNPL FlexiPay (£1k+)</span>
-              <span className="bg-amber-400 text-slate-950 font-black text-[9px] px-1.5 py-0.5 rounded border border-black">1.5%–2.5% B2B Fee</span>
+        {/* Section 5.1 BNPL Financing Card (Admin-controlled 3-state switch) */}
+        {flexiPayMode !== "off" && (
+          <div
+            id="bnpl-repair-financing-ad-card"
+            onClick={() => setShowBnplModal(true)}
+            className="p-4 bg-gradient-to-r from-indigo-950 via-slate-900 to-indigo-900 text-white rounded-3xl border border-white/20 shadow-sm flex items-center justify-between cursor-pointer hover:from-slate-900 hover:to-indigo-950 transition group active:scale-[0.99]"
+          >
+            <div>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] font-extrabold uppercase text-indigo-300">FlexiPay (£1k+)</span>
+                {flexiPayMode === "coming_soon" ? (
+                  <span className="bg-amber-400 text-slate-950 font-black text-[9px] px-1.5 py-0.5 rounded border border-black uppercase">
+                    Coming Soon
+                  </span>
+                ) : (
+                  <span className="bg-emerald-400 text-slate-950 font-black text-[9px] px-1.5 py-0.5 rounded border border-black uppercase">
+                    Monthly Plans
+                  </span>
+                )}
+              </div>
+              <p className="text-xl font-black text-amber-300 mt-1">
+                {flexiPayMode === "coming_soon" ? "Repair Financing — Coming Soon" : "0% APR Repair Financing"}
+              </p>
+              <p className="text-[10px] text-indigo-100 font-medium">
+                {flexiPayMode === "coming_soon"
+                  ? "Flexible homeowner monthly payment plans for £1,000+ jobs are launching soon."
+                  : "Help homeowners spread major repair costs (£1,000+) into manageable monthly instalments."}
+              </p>
             </div>
-            <p className="text-xl font-black text-amber-300 mt-1">0% APR Repair Financing</p>
-            <p className="text-[9px] text-indigo-200 font-medium">Financing partner pays 1.5–2.5% origination fee • 100% upfront trader payout</p>
+            <div className="p-3 bg-indigo-800 text-amber-300 rounded-2xl border border-indigo-700 group-hover:scale-105 transition shrink-0 ml-2">
+              <CreditCard className="w-6 h-6" />
+            </div>
           </div>
-          <div className="p-3 bg-indigo-800 text-amber-300 rounded-2xl border border-indigo-700 group-hover:scale-105 transition shrink-0 ml-2">
-            <CreditCard className="w-6 h-6" />
-          </div>
-        </div>
+        )}
 
         {/* Section 5.2 Materials Sourcing Merchant Affiliate Commission Card */}
         <div

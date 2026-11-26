@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { motion } from "motion/react";
+import { useNavigate } from "react-router-dom";
 import { 
   Shield, 
   Truck, 
@@ -12,7 +13,8 @@ import {
   Award
 } from "lucide-react";
 import { cn } from "@/src/lib/utils";
-import { db, collection, query, where, onSnapshot } from "@/src/firebase";
+import { openSafeExternalUrl } from "@/src/lib/safeExternalUrl";
+import { db, collection, query, where, limit as fsLimit, onSnapshot } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { trackClick, generateLead } from "@/src/services/leadService";
 
@@ -26,71 +28,65 @@ interface Perk {
   cta: string;
   link: string;
   badge?: string;
+  isCampaign?: boolean;
+  partnerId?: string;
 }
 
-const PERKS: Perk[] = [
+const DEFAULT_TRADER_PERKS: Perk[] = [
   {
-    id: "insurance-pl",
-    title: "Public Liability Insurance",
-    description: "Essential cover for every tradesperson. Protect yourself against accidental damage or injury claims.",
+    id: "trader-compliance-docs",
+    title: "Verify Insurance & Credentials",
+    description: "Upload your Public Liability Insurance and trade accreditations to earn Verified Pro badges on every quote.",
     icon: Shield,
     color: "blue",
-    category: "Insurance",
-    cta: "Get a Quote",
-    link: "https://example.com/insurance/pl",
+    category: "Verification",
+    cta: "Verify Profile",
+    link: "/profile",
     badge: "Most Popular"
   },
   {
-    id: "insurance-tools",
-    title: "Tool & Equipment Cover",
-    description: "Your tools are your livelihood. Get covered against theft from your van, even overnight.",
-    icon: Wrench,
+    id: "trader-banner-ads",
+    title: "Local Banner & Search Promotions",
+    description: "Feature your business at the top of local homeowner dashboards and directory results.",
+    icon: Zap,
     color: "orange",
-    category: "Insurance",
-    cta: "Protect My Tools",
-    link: "https://example.com/insurance/tools"
+    category: "Growth",
+    cta: "Open Ad Studio",
+    link: "/trader/banner-ads"
   },
   {
-    id: "breakdown-van",
-    title: "Specialist Van Breakdown",
-    description: "Don't get stranded on the way to a job. Includes roadside repair and replacement vehicle.",
-    icon: Truck,
-    color: "red",
-    category: "Vehicle",
-    cta: "View Plans",
-    link: "https://example.com/breakdown"
-  },
-  {
-    id: "business-loan",
-    title: "Business Growth Loans",
-    description: "Need new equipment or a van upgrade? Access flexible loans tailored for sole traders.",
+    id: "trader-tradeos-billing",
+    title: "Zero-Lead-Fee Billing & Invoices",
+    description: "Manage subscription tiers, Stripe Connect payouts, and automated UK sole trader tax reserves.",
     icon: PoundSterling,
     color: "green",
-    category: "Finance",
-    cta: "Check Eligibility",
-    link: "https://example.com/finance"
+    category: "TradeOS",
+    cta: "Open Billing",
+    link: "/billing"
   },
   {
-    id: "income-protection",
-    title: "Income Protection",
-    description: "If you're injured and can't work, we'll help cover your bills and expenses.",
-    icon: HeartPulse,
+    id: "trader-outreach",
+    title: "Availability & Smart Calendar",
+    description: "Keep your working schedule synced so homeowners only send requests on dates you are free.",
+    icon: Wrench,
     color: "rose",
-    category: "Health",
-    cta: "Learn More",
-    link: "https://example.com/health"
+    category: "Scheduling",
+    cta: "Manage Calendar",
+    link: "/trader/calendar"
   }
 ];
 
 export default function PartnerPerks({ limit }: { limit?: number }) {
   const { user, profile } = useAuth();
+  const navigate = useNavigate();
   const [activeCampaigns, setActiveCampaigns] = useState<any[]>([]);
 
   useEffect(() => {
     const q = query(
       collection(db, "campaigns"),
       where("status", "==", "active"),
-      where("targetRole", "in", ["tradesperson", "both"])
+      where("targetRole", "in", ["tradesperson", "both"]),
+      fsLimit(25)
     );
 
     const unsub = onSnapshot(q, (snap) => {
@@ -102,38 +98,47 @@ export default function PartnerPerks({ limit }: { limit?: number }) {
     return () => unsub();
   }, []);
 
-  const handlePerkClick = async (perk: any) => {
-    if (perk.isCampaign && user) {
+  const handlePerkClick = async (perk: Perk, e: React.MouseEvent) => {
+    e.preventDefault();
+    if (perk.isCampaign && user && perk.partnerId) {
       await trackClick(perk.id);
       await generateLead(perk.partnerId, perk.id, user.uid, profile?.role || "tradesperson");
     }
+    if (!perk.link || perk.link === "#") return;
+    if (perk.link.startsWith("/")) {
+      navigate(perk.link);
+    } else {
+      openSafeExternalUrl(perk.link);
+    }
   };
 
-  const mappedCampaigns = activeCampaigns.map(c => ({
-    id: c.id,
-    partnerId: c.partnerId,
-    title: c.title,
-    description: c.content,
-    icon: Shield, // Default icon for now
-    color: "blue",
-    category: "Offer",
-    cta: "Learn More",
-    link: "#", // In a real app, this would be the partner's tracking URL
-    isCampaign: true
-  }));
+  const mappedCampaigns: Perk[] = activeCampaigns
+    .filter((c) => typeof (c.url || c.targetUrl || c.trackingUrl) === "string" && (c.url || c.targetUrl || c.trackingUrl).trim().length > 0)
+    .map(c => ({
+      id: c.id,
+      partnerId: c.partnerId,
+      title: c.title,
+      description: c.content || c.description || "",
+      icon: Shield,
+      color: "blue",
+      category: "Partner Offer",
+      cta: "Learn More",
+      link: String(c.url || c.targetUrl || c.trackingUrl).trim(),
+      isCampaign: true
+    }));
 
-  const combinedPerks = [...mappedCampaigns, ...PERKS];
+  const combinedPerks = [...mappedCampaigns, ...DEFAULT_TRADER_PERKS];
   const displayPerks = limit ? combinedPerks.slice(0, limit) : combinedPerks;
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-1.5 opacity-60 mix-blend-multiply">
-          <Award className="w-4 h-4 text-slate-500" />
-          <h2 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Partner Perks & Offers</h2>
+        <div className="flex items-center gap-1.5 opacity-75">
+          <Award className="w-4 h-4 text-slate-600" />
+          <h2 className="text-xs font-bold text-black uppercase tracking-wider">Partner Perks & Pro Tools</h2>
         </div>
         {!limit && (
-          <p className="text-xs text-slate-400 font-medium">Exclusive deals for AnyTrader Pros</p>
+          <p className="text-xs text-slate-600 font-medium">Exclusive tools & offers for AnyTrader Pros</p>
         )}
       </div>
 
@@ -141,54 +146,65 @@ export default function PartnerPerks({ limit }: { limit?: number }) {
         "grid gap-3",
         limit ? "grid-cols-1" : "grid-cols-1 md:grid-cols-2 lg:grid-cols-3"
       )}>
-        {displayPerks.map((perk, idx) => (
-          <motion.a
-            key={perk.id}
-            href={perk.link}
-            target={perk.link === "#" ? undefined : "_blank"}
-            rel="noopener noreferrer"
-            onClick={() => handlePerkClick(perk)}
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: idx * 0.1 }}
-            className="group block bg-white hover:bg-slate-50 border border-black p-3 rounded-2xl transition-all relative overflow-hidden"
-          >
-             <div className="flex items-center justify-between gap-3">
-               <div className="flex-1 min-w-0">
-                 <div className="flex items-center gap-1.5 mb-1">
-                   <span className="text-[8px] font-bold uppercase tracking-wider text-slate-400 bg-slate-200/50 px-1.5 py-0.5 rounded flex items-center leading-none">
-                     Add
-                   </span>
-                   {(perk as any).badge && (
-                     <span className="text-[9px] font-semibold text-slate-500 truncate leading-none">
-                       • {(perk as any).badge}
-                     </span>
-                   )}
-                 </div>
-                 <h3 className="text-sm font-semibold text-slate-600 truncate">{perk.category}: {perk.title}</h3>
-                 <p className="text-[11px] text-slate-500 line-clamp-1 mt-0.5">{perk.description}</p>
-               </div>
-               <div className="shrink-0 flex items-center">
-                 <ExternalLink className="w-4 h-4 text-slate-300 group-hover:text-slate-500 transition-colors" />
-               </div>
-             </div>
-          </motion.a>
-        ))}
+        {displayPerks.map((perk, idx) => {
+          const isExternal = perk.link.startsWith("http");
+          return (
+            <motion.a
+              key={perk.id}
+              href={perk.link}
+              target={isExternal ? "_blank" : undefined}
+              rel={isExternal ? "noopener noreferrer" : undefined}
+              onClick={(e) => handlePerkClick(perk, e)}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: idx * 0.05 }}
+              className="group block bg-white hover:bg-slate-50 border border-black p-3 rounded-2xl transition-all relative overflow-hidden cursor-pointer"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <span className="text-[8px] font-bold uppercase tracking-wider text-slate-600 bg-slate-200/70 px-1.5 py-0.5 rounded flex items-center leading-none">
+                      {perk.isCampaign ? "Ad" : "Pro Tool"}
+                    </span>
+                    {perk.badge && (
+                      <span className="text-[9px] font-semibold text-slate-600 truncate leading-none">
+                        • {perk.badge}
+                      </span>
+                    )}
+                  </div>
+                  <h3 className="text-sm font-semibold text-black truncate">{perk.category}: {perk.title}</h3>
+                  <p className="text-[11px] text-slate-700 line-clamp-1 mt-0.5">{perk.description}</p>
+                </div>
+                <div className="shrink-0 flex items-center">
+                  {isExternal ? (
+                    <ExternalLink className="w-4 h-4 text-slate-500 group-hover:text-black transition-colors" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-slate-500 group-hover:text-black transition-colors" />
+                  )}
+                </div>
+              </div>
+            </motion.a>
+          );
+        })}
       </div>
 
       {limit && (
-        <div className="bg-primary/5 rounded-[2rem] p-6 border border-primary/10 flex flex-col md:flex-row items-center justify-between gap-4">
+        <div className="bg-primary/5 rounded-[2rem] p-6 border border-black flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-12 h-12 rounded-2xl bg-primary text-white flex items-center justify-center shadow-lg shadow-primary/20">
               <Zap className="w-6 h-6 fill-current" />
             </div>
             <div>
-              <h4 className="font-black text-slate-900">Unlock More Business Perks</h4>
-              <p className="text-sm text-slate-600">Get access to fuel cards, tool discounts, and more by becoming a Verified Pro.</p>
+              <h4 className="font-black text-black">Grow Your Trade Business</h4>
+              <p className="text-sm text-black/80">Promote your profile locally or manage your Verified Pro tools and membership.</p>
             </div>
           </div>
-          <button className="bg-primary text-white px-6 py-3 rounded-2xl font-black text-sm hover:bg-primary-hover transition-all shadow-lg shadow-primary/20 active:scale-95">
-            View All Perks
+          <button
+            type="button"
+            onClick={() => navigate("/trader/banner-ads")}
+            className="bg-primary text-white px-6 py-3 rounded-2xl font-black text-sm hover:bg-primary-hover transition-all shadow-lg shadow-primary/20 active:scale-95 cursor-pointer"
+          >
+            Open Ad Studio
           </button>
         </div>
       )}

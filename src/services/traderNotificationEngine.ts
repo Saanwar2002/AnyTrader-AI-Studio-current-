@@ -1,5 +1,17 @@
-import { db, collection, query, where, getDocs, doc, setDoc, updateDoc, serverTimestamp, handleFirestoreError, OperationType, sendNotification } from "../firebase";
-import { calculateDistanceMiles } from "../lib/utils";
+import { db, collection, query, where, limit, getDocs, doc, updateDoc, sendNotification } from "../firebase";
+import { isOpenJobStatus, isProfileAcceptingNewWork, PUBLIC_OPEN_JOB_STATUSES } from "../lib/marketplaceContracts";
+import {
+  evaluateCategoryAlignment,
+  evaluateCertificationEligibility,
+  evaluateGeographicFit,
+  extractJobPostcode,
+  extractTraderCategories,
+  hasExclusiveLeadAccess,
+  isTraderInQuietHours,
+  isWithinExclusiveWindow,
+} from "../lib/unifiedJobMatching";
+import { getCategoryMetadata } from "../lib/fuzzyMatch";
+import { categoryRegistry } from "./categoryRegistrySync";
 
 export type MatchNotificationSchedule = "every_5_hours" | "morning_8am" | "afternoon_2pm" | "silent_in_app_only";
 
@@ -41,13 +53,11 @@ export function isScheduleWindowActive(
   }
 
   if (schedule === "morning_8am") {
-    // Active if in the morning window (08:00 - 10:00) and hasn't notified in the last 12 hours
     const isMorning = currentHour >= 8 && currentHour < 12;
     return isMorning && hoursSinceLast >= 12;
   }
 
   if (schedule === "afternoon_2pm") {
-    // Active if in afternoon window (14:00 - 18:00) and hasn't notified in the last 12 hours
     const isAfternoon = currentHour >= 14 && currentHour < 18;
     return isAfternoon && hoursSinceLast >= 12;
   }
@@ -56,61 +66,78 @@ export function isScheduleWindowActive(
 }
 
 /**
- * Evaluates whether a job strictly matches a trader's trade, services, and distance radius.
+ * Evaluates whether a job strictly matches a trader's trade, services, certifications,
+ * Priority Offers exclusive window, and true geodesic/postcode-centroid radius.
+ * Works identically on private `/jobs` AND sanitized `/public_job_cards`.
  */
-export function isJobStrictMatch(job: any, traderProfile: any, radiusMiles: number = 25): { isMatch: boolean; distance: number; reason: string } {
+export function isJobStrictMatch(
+  job: any,
+  traderProfile: any,
+  radiusMiles: number = 25
+): { isMatch: boolean; distance: number; reason: string } {
   if (!job || !traderProfile) {
     return { isMatch: false, distance: 0, reason: "Missing job or trader data" };
   }
 
-  // 1. Status Check: Must be posted & open
-  if (job.status !== "posted" && job.status !== "open") {
+  // 1. Status Check: Must be open for quotes
+  if (!isOpenJobStatus(job.status)) {
     return { isMatch: false, distance: 0, reason: "Job is not open" };
   }
 
+  // 1b. Respect Priority Offers exclusive early-access window
+  if (isWithinExclusiveWindow(job) && !hasExclusiveLeadAccess(traderProfile)) {
+    return { isMatch: false, distance: 0, reason: "In Priority Offers exclusive window" };
+  }
+
   // 2. Prevent notifying self
-  if (job.userId && traderProfile.uid && job.userId === traderProfile.uid) {
+  const ownerId = job.homeownerId || job.userId || job.ownerId;
+  if (ownerId && traderProfile.uid && ownerId === traderProfile.uid) {
     return { isMatch: false, distance: 0, reason: "Self-posted job" };
   }
 
-  // 3. Exact Trade Category Matching
-  const traderTrades: string[] = (traderProfile.trades || []).map((t: string) => t.trim().toLowerCase());
-  const traderServices: string[] = (traderProfile.services || []).map((s: string) => s.trim().toLowerCase());
-  const traderTags: string[] = (traderProfile.tags || []).map((tag: string) => tag.trim().toLowerCase());
+  // 3. Strict Trade Category & Subcategory Matching via Unified Engine
+  const meta = getCategoryMetadata(job.category || "");
+  const reg = categoryRegistry.getCategoryByName(job.category || "");
+  const categorySynonyms = Array.from(new Set([...(meta?.synonyms || []), ...(reg?.synonyms || [])]));
 
-  const jobCategory = (job.category || "").trim().toLowerCase();
-  const jobSubcategory = (job.subcategory || "").trim().toLowerCase();
-  const jobTitle = (job.title || "").toLowerCase();
+  const catAlign = evaluateCategoryAlignment(traderProfile, job, {
+    mode: "strict",
+    categorySynonyms,
+  });
 
-  const tradeMatched = 
-    traderTrades.length === 0 || // If trader has not set specific trades, lenient fallback
-    traderTrades.includes(jobCategory) ||
-    (jobSubcategory && traderServices.includes(jobSubcategory)) ||
-    traderTrades.some(t => jobTitle.includes(t)) ||
-    traderTags.some(tag => jobTitle.includes(tag) || jobCategory.includes(tag));
-
-  if (!tradeMatched) {
+  if (!catAlign.matched) {
     return { isMatch: false, distance: 0, reason: "Category mismatch" };
   }
 
-  // 4. Distance Radius Check
-  let distance = 0;
-  if (job.lat && job.lng && traderProfile.lat && traderProfile.lng) {
-    distance = calculateDistanceMiles(traderProfile.lat, traderProfile.lng, job.lat, job.lng);
-    if (distance > radiusMiles) {
-      return { isMatch: false, distance, reason: `Outside ${radiusMiles}mi radius (${distance}mi)` };
-    }
-  } else if (job.postcode && traderProfile.postcode) {
-    // Postcode outward code match
-    const jobPrefix = job.postcode.trim().split(" ")[0].toUpperCase();
-    const traderPrefix = traderProfile.postcode.trim().split(" ")[0].toUpperCase();
-    if (jobPrefix !== traderPrefix && radiusMiles < 15) {
-      // Conservative estimation
-      distance = 8;
-    }
+  // 3b. Regulated Certification Gate
+  const certCheck = evaluateCertificationEligibility(traderProfile, job);
+  if (!certCheck.eligible) {
+    return {
+      isMatch: false,
+      distance: 0,
+      reason: certCheck.reason || "Regulated certification required",
+    };
   }
 
-  return { isMatch: true, distance, reason: "Exact trade and area match" };
+  // 4. Unified Geodesic + UK Postcode-Centroid Distance Radius Check (works on public_job_cards.postcodeArea!)
+  const geo = evaluateGeographicFit(traderProfile, job, {
+    overrideRadiusMiles: radiusMiles,
+  });
+
+  if (!geo.withinRadius) {
+    const distDisplay = geo.distanceMiles !== null ? `${geo.distanceMiles.toFixed(1)}mi` : "unverified";
+    return {
+      isMatch: false,
+      distance: geo.distanceMiles ?? 0,
+      reason: `Outside ${radiusMiles}mi radius (${distDisplay})`,
+    };
+  }
+
+  return {
+    isMatch: true,
+    distance: geo.distanceMiles ?? 0,
+    reason: "Exact trade and area match",
+  };
 }
 
 /**
@@ -126,7 +153,6 @@ export async function triggerDeviceNotification(params: {
 }): Promise<boolean> {
   const { title, body, icon = "/icon.png", tag = "trader-match", data = {}, silent = false } = params;
 
-  // 1. Check Web Notification API
   if (typeof window !== "undefined" && "Notification" in window) {
     if (Notification.permission === "granted") {
       try {
@@ -138,7 +164,7 @@ export async function triggerDeviceNotification(params: {
             badge: "/icon.png",
             tag,
             data: {
-              url: "/trade-jobs",
+              url: "/job-feed",
               openSettings: false,
               ...data,
             },
@@ -148,12 +174,11 @@ export async function triggerDeviceNotification(params: {
           } as any);
           return true;
         } else {
-          // Standard browser Notification constructor fallback
           new Notification(title, {
             body,
             icon,
             tag,
-            data: { url: "/trade-jobs", ...data },
+            data: { url: "/job-feed", ...data },
             silent,
           });
           return true;
@@ -178,6 +203,14 @@ export async function checkAndNotifyTraderMatches(
     return { matchedCount: 0, notified: false, topJobs: [] };
   }
 
+  if (traderProfile.role === "business" && String(traderProfile.businessLayer || "").toLowerCase() === "properties") {
+    return { matchedCount: 0, notified: false, topJobs: [] };
+  }
+
+  if (!isProfileAcceptingNewWork(traderProfile)) {
+    return { matchedCount: 0, notified: false, topJobs: [] };
+  }
+
   const settings: TraderMatchNotificationSettings = {
     ...DEFAULT_NOTIFICATION_SETTINGS,
     ...(traderProfile.matchNotificationSettings || {}),
@@ -188,11 +221,21 @@ export async function checkAndNotifyTraderMatches(
   const force = options?.forceCheck || false;
 
   try {
-    // Query recently posted jobs
-    const q = query(
-      collection(db, "public_job_cards"),
-      where("status", "in", ["posted", "open"])
-    );
+    const traderCats = extractTraderCategories(traderProfile).slice(0, 10);
+
+    // Scoped bounded query (Firestore allows max 1 `in` clause per query: scope by category when available)
+    const q =
+      traderCats.length > 0
+        ? query(
+            collection(db, "public_job_cards"),
+            where("category", "in", traderCats),
+            limit(100)
+          )
+        : query(
+            collection(db, "public_job_cards"),
+            where("status", "in", [...PUBLIC_OPEN_JOB_STATUSES]),
+            limit(100)
+          );
 
     const snapshot = await getDocs(q);
     if (snapshot.empty) {
@@ -217,30 +260,34 @@ export async function checkAndNotifyTraderMatches(
       return { matchedCount: 0, notified: false, topJobs: [] };
     }
 
-    // Sort by emergency first, then date
+    // Sort by emergency first, then closest distance, then newest
     matchedJobs.sort((a, b) => {
       if (a.isEmergency && !b.isEmergency) return -1;
       if (!a.isEmergency && b.isEmergency) return 1;
+      const distA = typeof a.distanceMiles === "number" ? a.distanceMiles : 999;
+      const distB = typeof b.distanceMiles === "number" ? b.distanceMiles : 999;
+      if (distA !== distB) return distA - distB;
       const timeA = a.postedDate?.seconds || (a.postedDate ? new Date(a.postedDate).getTime() : 0);
       const timeB = b.postedDate?.seconds || (b.postedDate ? new Date(b.postedDate).getTime() : 0);
       return timeB - timeA;
     });
 
-    // Check dispatch criteria:
-    // 1. Emergency Bypass: If emergency exists and bypassEmergency is ON, notify immediately
-    const shouldBypass = hasEmergency && settings.bypassEmergency;
-    
-    // 2. Periodic Schedule is due or Forced check
-    const shouldNotify = shouldBypass || isPeriodicDue || force;
+    const inQuietHours = isTraderInQuietHours(traderProfile);
+    const emergencyOptIn = Boolean(
+      traderProfile.isAvailableForEmergency === true || traderProfile.isAvailableForInstantMatch === true
+    );
+    const shouldBypass = hasEmergency && settings.bypassEmergency && (!inQuietHours || emergencyOptIn);
+    const shouldNotify = shouldBypass || (!inQuietHours && isPeriodicDue) || force;
 
     if (shouldNotify && matchedJobs.length > 0) {
       const topJob = matchedJobs[0];
       const jobSample = matchedJobs
         .slice(0, 2)
-        .map(j => `${j.title || "Trade Job"}${j.budget ? ` (£${j.budget})` : ""}`)
+        .map((j) => `${j.title || "Trade Job"}${j.estimateMax ? ` (up to £${j.estimateMax})` : j.budget ? ` (£${j.budget})` : ""}`)
         .join(" • ");
 
-      const locationSummary = topJob.location || topJob.city || topJob.postcode || "your area";
+      const locationSummary =
+        extractJobPostcode(topJob) || topJob.city || topJob.area || "your area";
       const count = matchedJobs.length;
 
       const title = shouldBypass
@@ -251,32 +298,30 @@ export async function checkAndNotifyTraderMatches(
         ? `${topJob.title || "Emergency Repair"} needs immediate assistance in ${locationSummary}. Tap to view.`
         : `${jobSample}${count > 2 ? ` + ${count - 2} more` : ""} in ${locationSummary}. Tap to quote.`;
 
-      const isSilent = settings.schedule === "silent_in_app_only";
+      const isSilent = settings.schedule === "silent_in_app_only" || inQuietHours;
+      const targetLink = count === 1 || shouldBypass ? `/job/${topJob.id}` : "/job-feed";
 
-      // 1. Deliver Device Notification
       await triggerDeviceNotification({
         title,
         body,
         tag: shouldBypass ? `emergency-${topJob.id}` : `match-digest-${Date.now()}`,
         data: {
           jobId: topJob.id,
-          url: "/trade-jobs",
+          url: targetLink,
           count,
         },
         silent: isSilent,
       });
 
-      // 2. Also ensure an in-app Alert document is saved in Firestore so ALERTS badge pulses
       await sendNotification(
         traderProfile.uid,
         title,
         body,
         shouldBypass ? "emergency_alert" : "job_lead",
-        "/trade-jobs",
+        targetLink,
         { jobId: topJob.id }
       );
 
-      // 3. Update Trader Profile lastNotifiedAt timestamp
       if (traderProfile.uid) {
         try {
           await updateDoc(doc(db, "users", traderProfile.uid), {

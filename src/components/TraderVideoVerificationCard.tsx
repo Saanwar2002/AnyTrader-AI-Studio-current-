@@ -23,6 +23,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
   const [isSubscribing, setIsSubscribing] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [facingMode, setFacingMode] = useState<"user" | "environment">("user");
+  const [showRemoveVideoConfirm, setShowRemoveVideoConfirm] = useState(false);
 
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "platform_config", "global"), (snap) => {
@@ -157,6 +158,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
         },
         body: JSON.stringify({
           userId: profile.uid,
+          priceId: "price_video_pro",
           tierName: "Verified Video Pro",
           mode: "subscription",
           price_data: {
@@ -165,7 +167,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
             recurring: { interval: 'month' },
             product_data: {
               name: "Verified Video Pro Add-on",
-              description: "Verified video intro badge, priority placement, and +35 AI match score boost."
+              description: `Verified video intro badge, priority placement, and +${plan.matchScoreBonus} AI match score boost.`
             }
           },
           successUrl: `${window.location.origin}/profile?video_pro=success`,
@@ -178,13 +180,11 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
         })
       });
 
-      const data = await response.json();
-      if (data.url) {
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.url) {
         window.location.href = data.url;
-      } else if (data.error) {
-        toast.error(data.error);
       } else {
-        toast.success(`⚡ Verified Video Pro Active! Granted +${plan.matchScoreBonus} AI Match Score points and Priority Quote Placement (£${plan.monthlyPrice}/mo).`);
+        toast.error(data.error || "Unable to start Stripe Checkout. Your subscription was not activated.");
       }
     } catch (err) {
       console.error("Subscription checkout error:", err);
@@ -363,20 +363,45 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
     }
   };
 
-  const handleRemoveVideo = async () => {
+  const handleRemoveVideo = () => {
     if (!profile?.uid) return;
-    if (!window.confirm("Are you sure you want to remove your Video Credential Verification?")) return;
+    setShowRemoveVideoConfirm(true);
+  };
 
+  const executeRemoveVideo = async () => {
+    if (!profile?.uid) return;
     try {
+      const token = await auth.currentUser?.getIdToken();
+      if (token) {
+        const res = await fetch("/api/account/remove-video-verification", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        const data = await res.json().catch(() => ({} as any));
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.error || "Failed to remove Video Credential.");
+        }
+      } else {
+        await updateDoc(doc(db, "users", profile.uid), {
+          videoVerificationUrl: null,
+          videoVerificationStatus: "none",
+        });
+      }
       const updates = {
         videoVerificationUrl: null,
-        videoVerificationStatus: "none"
+        videoVerificationStatus: "none",
+        videoVerified: false,
+        isVideoVerified: false,
       };
-      await updateDoc(doc(db, "users", profile.uid), updates);
       if (onUpdateProfile) onUpdateProfile(updates);
+      setShowRemoveVideoConfirm(false);
       toast.success("Video Credential removed.");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error removing video verification:", err);
+      toast.error(err?.message || "Failed to remove Video Credential.");
     }
   };
 
@@ -433,12 +458,21 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
             />
           </div>
 
-          <div className="bg-emerald-50 border border-emerald-200 p-3.5 rounded-2xl flex items-center gap-3 text-emerald-900 text-xs font-semibold">
-            <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0" />
-            <span>
-              <strong>Verified Trader Video Intro Active.</strong> Homeowners can watch your 30s video intro on your public profile & quote cards.
-            </span>
-          </div>
+          {isVideoVerified ? (
+            <div className="bg-emerald-50 border border-emerald-200 p-3.5 rounded-2xl flex items-center gap-3 text-emerald-900 text-xs font-semibold">
+              <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0" />
+              <span>
+                <strong>Verified Trader Video Intro Active.</strong> Homeowners can watch your 30s video intro on your public profile & quote cards.
+              </span>
+            </div>
+          ) : (
+            <div className="bg-amber-50 border border-black p-3.5 rounded-2xl flex items-center gap-3 text-black text-xs font-semibold">
+              <AlertCircle className="w-5 h-5 text-amber-700 shrink-0" />
+              <span>
+                <strong>Pending Admin Review.</strong> Your video intro has been uploaded and will appear as Verified on your public profile once approved by our team.
+              </span>
+            </div>
+          )}
         </div>
       )}
 
@@ -564,7 +598,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
                     <div className="flex flex-wrap items-center gap-2">
                       <h4 className="font-extrabold text-white text-xs">Verified Video Pro Badge Subscription</h4>
                       <span className="bg-amber-400 text-slate-950 font-black text-[9px] px-1.5 py-0.5 rounded border border-black">
-                        £15.00 / month
+                        £{plan.monthlyPrice.toFixed(2)} / month
                       </span>
                       {isVideoProCanceling && (
                         <span className="bg-rose-500/80 text-white font-black text-[9px] px-1.5 py-0.5 rounded border border-rose-400/50 flex items-center gap-1">
@@ -579,7 +613,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
                         </span>
                       )}
                     </div>
-                    <p className="text-[10px] text-indigo-200">Unlock priority quote placement, +35 AI match points, and gold trust badges.</p>
+                    <p className="text-[10px] text-indigo-200">Unlock priority quote placement, +{plan.matchScoreBonus} AI match points, and gold trust badges.</p>
                   </div>
                 </div>
 
@@ -611,7 +645,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
                   ) : (
                     <>
                       <Zap className="w-4 h-4 text-amber-300" />
-                      <span>Upgrade for £15/mo</span>
+                      <span>Upgrade for £{plan.monthlyPrice.toFixed(2)}/mo</span>
                     </>
                   )}
                 </button>
@@ -620,7 +654,7 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] pt-1">
                 <div className="p-2 bg-white/10 rounded-xl border border-white/10">
                   <p className="text-[9px] font-extrabold uppercase text-indigo-300">Matching Bonus</p>
-                  <p className="font-extrabold text-amber-300 text-xs mt-0.5">+35 Signal Points</p>
+                  <p className="font-extrabold text-amber-300 text-xs mt-0.5">+{plan.matchScoreBonus} Signal Points</p>
                 </div>
                 <div className="p-2 bg-white/10 rounded-xl border border-white/10">
                   <p className="text-[9px] font-extrabold uppercase text-indigo-300">Quote Positioning</p>
@@ -664,6 +698,35 @@ export function TraderVideoVerificationCard({ profile, onUpdateProfile, isReadOn
               />
             </div>
           )}
+        </div>
+      )}
+
+      {showRemoveVideoConfirm && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[120] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="text-center space-y-2">
+              <h4 className="text-base font-black text-black">Remove Video Credential?</h4>
+              <p className="text-xs text-black leading-relaxed">
+                Are you sure you want to remove your Video Credential Verification? You can record or upload a new one anytime.
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setShowRemoveVideoConfirm(false)}
+                className="flex-1 py-2.5 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={executeRemoveVideo}
+                className="flex-1 py-2.5 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 cursor-pointer"
+              >
+                Remove Video
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

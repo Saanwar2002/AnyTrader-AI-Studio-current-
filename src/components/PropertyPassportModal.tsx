@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from "react";
-import { db, doc, updateDoc, collection, query, where, onSnapshot, addDoc, serverTimestamp, handleFirestoreError, OperationType } from "@/src/firebase";
+import React, { useState, useEffect, useMemo } from "react";
+import { Link } from "react-router-dom";
+import { db, doc, updateDoc, collection, query, where, onSnapshot, handleFirestoreError, OperationType } from "@/src/firebase";
 import { useAuth } from "./AuthProvider";
 import { shareToWhatsApp, copyPrivacyShareLink } from "@/src/utils/shareUtils";
-import { generateJobNumber, getOutwardPostcode, formatJobLocation } from "@/src/lib/utils";
+import { getOutwardPostcode } from "@/src/lib/utils";
 import { lookupPostcode } from "@/src/services/postcodeService";
 import { X, ArrowLeft, Home, ShieldCheck, AlertTriangle, Calendar, FileText, Wrench, CheckCircle2, Share2, Sparkles, Plus, Edit2, TrendingUp, Info, Copy, Check, Users, Zap, ExternalLink, Clock, KeyRound, Printer, QrCode } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
@@ -10,24 +11,29 @@ import { toast } from "sonner";
 import { TransferOwnershipModal } from "./property/TransferOwnershipModal";
 import { BuyerPackModal } from "./property/BuyerPackModal";
 import { EstateAgentQRGeneratorModal } from "./property/EstateAgentQRGeneratorModal";
-import { calculatePropertyHealthScore } from "./property/propertyUtils";
 import { createJobViaCommand } from "../services/jobCommandService";
+import { syncPublicPropertyPassport } from "../services/propertyCommandService";
+import { derivePropertyPredictiveInsights } from "../lib/propertyInsights";
 
 interface PropertyPassportModalProps {
   property: any;
+  initialTab?: "passport" | "certs" | "history" | "predictive" | "tenant";
   onClose: () => void;
   onUpdated?: () => void;
 }
 
-export function PropertyPassportModal({ property, onClose, onUpdated }: PropertyPassportModalProps) {
+export function PropertyPassportModal({ property, initialTab = "passport", onClose, onUpdated }: PropertyPassportModalProps) {
   const { user, profile } = useAuth();
-  const [activeTab, setActiveTab] = useState<"passport" | "certs" | "history" | "predictive" | "tenant">("passport");
+  const [activeTab, setActiveTab] = useState<"passport" | "certs" | "history" | "predictive" | "tenant">(initialTab);
   const [isEditing, setIsEditing] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedTenantLink, setCopiedTenantLink] = useState(false);
   const [completedJobs, setCompletedJobs] = useState<any[]>([]);
   const [tenantIssues, setTenantIssues] = useState<any[]>([]);
   const [dispatchingJobId, setDispatchingJobId] = useState<string | null>(null);
+  const [resolvingIssueId, setResolvingIssueId] = useState<string | null>(null);
+  const [runningServerAssessment, setRunningServerAssessment] = useState(false);
+  const [serverAssessmentTaskId, setServerAssessmentTaskId] = useState<string | null>(null);
 
   // Transfer & Buyer Pack modal state
   const [showTransferModal, setShowTransferModal] = useState(false);
@@ -90,34 +96,94 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
     }
   };
 
-  // Load associated completed jobs for history & valuation impact
+  // Load associated completed jobs for history & valuation impact (owner-scoped to satisfy Firestore rules)
   useEffect(() => {
-    if (!property?.id) return;
-    const q = query(collection(db, "jobs"), where("propertyId", "==", property.id));
+    if (!property?.id || !user?.uid) return;
+    const q = query(collection(db, "jobs"), where("homeownerId", "==", user.uid));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const j = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-      setCompletedJobs(j.filter((job: any) => job.status === "completed"));
+      setCompletedJobs(
+        j.filter(
+          (job: any) =>
+            (job.propertyId === property.id || job.propertyPassportId === property.id || job.linkedPropertyId === property.id) &&
+            job.status === "completed"
+        )
+      );
     }, (err) => {
       console.error("Error loading property jobs history:", err);
     });
     return unsubscribe;
-  }, [property?.id]);
+  }, [property?.id, user?.uid]);
 
-  // Load tenant reported issues for this property
+  // Load tenant reported issues for this property (landlordOwnerId-scoped to satisfy Firestore rules)
   useEffect(() => {
-    if (!property?.id) return;
-    const q = query(collection(db, "tenant_issues"), where("propertyId", "==", property.id));
+    if (!property?.id || !user?.uid) return;
+    const q = query(collection(db, "tenant_issues"), where("landlordOwnerId", "==", user.uid));
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const issues = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      const issues = snapshot.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .filter((issue: any) => issue.propertyId === property.id)
+        .sort((a: any, b: any) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
       setTenantIssues(issues);
     }, (err) => {
       console.error("Error loading tenant issues:", err);
     });
     return unsubscribe;
-  }, [property?.id]);
+  }, [property?.id, user?.uid]);
+
+  const handleMarkIssueResolved = async (issueId: string) => {
+    if (!user || !issueId) return;
+    setResolvingIssueId(issueId);
+    try {
+      const nowIso = new Date().toISOString();
+      await updateDoc(doc(db, "tenant_issues", issueId), {
+        status: "resolved",
+        resolvedAt: nowIso,
+        updatedAt: nowIso,
+      });
+      toast.success("Tenant repair report marked as resolved.");
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `tenant_issues/${issueId}`);
+      toast.error("Could not update tenant issue status.");
+    } finally {
+      setResolvingIssueId(null);
+    }
+  };
+
+  const handleRunServerPredictiveAssessment = async () => {
+    if (!user || !property?.id) return;
+    setRunningServerAssessment(true);
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch(`/api/intelligence/properties/${encodeURIComponent(property.id)}/predictive-maintenance`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          componentType: boilerBrand ? "boiler" : "roof",
+          predictionType: "scheduled_passport_review",
+          forecastStart: new Date().toISOString().slice(0, 10),
+          rationale: `Owner requested predictive maintenance review for ${property.name || "property"}`,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result.error || "Could not enqueue predictive maintenance assessment.");
+      }
+      setServerAssessmentTaskId(String(result.taskId || "queued"));
+      toast.success("Server predictive maintenance assessment queued for this property.");
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to trigger predictive assessment.");
+    } finally {
+      setRunningServerAssessment(false);
+    }
+  };
 
   const handleOneTapDispatch = async (jobDetails: {
     idKey?: string;
+    tenantIssueId?: string;
     title: string;
     category: string;
     subcategory?: string;
@@ -181,13 +247,13 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
       const fullAddr = `${resolvedAddressLine}${property.address?.line2 ? ', ' + property.address.line2 : ''}${resolvedCity ? ', ' + resolvedCity : ''}${resolvedPostcode ? ' ' + resolvedPostcode : ''}`;
 
       if (!user) return;
-      await createJobViaCommand({
+      const createdJob = await createJobViaCommand({
         user,
         payload: {
           title: jobDetails.title,
           category: jobDetails.category,
           subCategory: jobDetails.subcategory || "Property Maintenance",
-          description: `${jobDetails.description}\n\n--- PRE-LOADED PROPERTY PASSPORT SPECS ---\n- Location Area: ${displayLocation !== "Area on Request" ? displayLocation : "Provided on Booking"}\n- Boiler Spec: ${boilerBrand || 'Standard'} ${boilerModel || ''} (${boilerAge || 'N/A'} yrs old)\n- Roof Condition: ${roofCondition || 'Good'}\n- EPC Rating: Grade ${epcRating || 'C'}\n\n(Full property street address & direct contact details will be automatically revealed to the assigned tradesperson once a quote is accepted)`,
+          description: `${jobDetails.description}\n\n--- PRE-LOADED PROPERTY PASSPORT SPECS ---\n- Location Area: ${displayLocation !== "Area on Request" ? displayLocation : "Provided on Booking"}\n- Boiler Spec: ${boilerBrand || 'Not recorded'} ${boilerModel || ''}${boilerAge ? ` (${boilerAge} yrs old)` : ''}\n- Roof Condition: ${roofCondition || 'Not recorded'}\n- EPC Rating: ${epcRating ? `Grade ${epcRating}` : 'Not recorded'}\n\n(Full property street address & direct contact details will be automatically revealed to the assigned tradesperson once a quote is accepted)`,
           budget: jobDetails.budget ? String(jobDetails.budget) : "120",
           urgency: jobDetails.urgency === "emergency" ? "emergency" : "urgent",
           postcode: resolvedPostcode,
@@ -199,10 +265,21 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
           metadata: {
             propertyName: property.name || resolvedAddressLine || "Property",
             passportSpecsAttached: true,
+            tenantIssueId: jobDetails.tenantIssueId || undefined,
             agreedAmount: jobDetails.budget || "120",
           },
         },
       });
+
+      if (jobDetails.tenantIssueId && createdJob?.jobId) {
+        const nowIso = new Date().toISOString();
+        await updateDoc(doc(db, "tenant_issues", jobDetails.tenantIssueId), {
+          status: "dispatched",
+          linkedJobId: createdJob.jobId,
+          dispatchedAt: nowIso,
+          updatedAt: nowIso,
+        }).catch((err) => console.warn("Could not link dispatched job to tenant issue:", err));
+      }
 
       // Backfill property address if it was missing
       if (resolvedPostcode && (!property.address?.postcode || !property.address?.city)) {
@@ -258,6 +335,11 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
         },
         updatedAt: new Date().toISOString()
       });
+      if (publicConsentEnabled && user) {
+        syncPublicPropertyPassport(user, property.id).catch((err) =>
+          console.warn("Non-fatal public passport projection sync:", err)
+        );
+      }
       toast.success("Property Passport & Component Registry updated!");
       setIsEditing(false);
       if (onUpdated) onUpdated();
@@ -276,7 +358,6 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
       title: property.name || property.address?.line1 || "Property Passport",
       postcode: property.address?.postcode
     });
-    toast.success("Opening WhatsApp with secure privacy link!");
   };
 
   const handleCopyLink = async () => {
@@ -296,6 +377,24 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
   const today = new Date().toISOString().split('T')[0];
   const isGasExpiringSoon = gasSafetyExpiry && gasSafetyExpiry <= today;
   const isEicrExpiringSoon = eicrExpiry && eicrExpiry <= today;
+
+  const predictiveInsights = useMemo(
+    () =>
+      derivePropertyPredictiveInsights({
+        ...property,
+        epcRating,
+        gasSafetyExpiry,
+        eicrExpiry,
+        roofCondition,
+        boilerInfo: {
+          brand: boilerBrand,
+          model: boilerModel,
+          age: boilerAge,
+          lastServiced: boilerLastServiced,
+        },
+      }),
+    [property, epcRating, gasSafetyExpiry, eicrExpiry, roofCondition, boilerBrand, boilerModel, boilerAge, boilerLastServiced]
+  );
 
   return (
     <AnimatePresence>
@@ -870,50 +969,92 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {tenantIssues.map((issue) => (
+                    {tenantIssues.map((issue) => {
+                      const status = String(issue.status || "open").toLowerCase();
+                      const isDispatched = status === "dispatched";
+                      const isResolved = status === "resolved";
+                      return (
                       <div key={issue.id} className="p-4 bg-white rounded-2xl border border-black shadow-sm space-y-2">
-                        <div className="flex items-center justify-between">
-                          <span className={`text-[10px] uppercase font-black px-2 py-0.5 rounded-full ${
-                            issue.urgency === 'emergency' ? 'bg-red-100 text-red-800 border border-red-300' :
-                            issue.urgency === 'urgent' ? 'bg-amber-100 text-amber-800 border border-amber-300' :
-                            'bg-blue-100 text-blue-800 border border-blue-300'
-                          }`}>
-                            {issue.urgency?.toUpperCase() || 'ROUTINE'}
-                          </span>
-                          <span className="text-[10px] text-slate-400 font-bold">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className={`text-[10px] uppercase font-black px-2 py-0.5 rounded-full ${
+                              issue.urgency === 'emergency' ? 'bg-red-100 text-red-800 border border-red-300' :
+                              issue.urgency === 'urgent' ? 'bg-amber-100 text-amber-800 border border-amber-300' :
+                              'bg-blue-100 text-blue-800 border border-blue-300'
+                            }`}>
+                              {issue.urgency?.toUpperCase() || 'ROUTINE'}
+                            </span>
+                            <span className={`text-[10px] uppercase font-black px-2 py-0.5 rounded-full border ${
+                              isResolved
+                                ? "bg-emerald-100 text-emerald-800 border-emerald-300"
+                                : isDispatched
+                                  ? "bg-purple-100 text-purple-800 border-purple-300"
+                                  : "bg-slate-100 text-slate-800 border-slate-300"
+                            }`}>
+                              {status}
+                            </span>
+                          </div>
+                          <span className="text-[10px] text-slate-500 font-bold">
                             {issue.createdAt ? new Date(issue.createdAt).toLocaleDateString() : 'Recent'}
                           </span>
                         </div>
 
                         <div>
-                          <p className="font-black text-slate-900 text-sm">{issue.title}</p>
-                          <p className="text-xs text-slate-600 mt-1">{issue.description}</p>
+                          <p className="font-black text-black text-sm">{issue.title}</p>
+                          <p className="text-xs text-slate-700 mt-1">{issue.description}</p>
                         </div>
 
                         <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-200 text-xs text-slate-700 flex flex-wrap gap-x-4 gap-y-1 font-semibold">
-                          <span>Tenant: <strong className="text-slate-900">{issue.tenantName}</strong> {issue.flatUnit ? `(${issue.flatUnit})` : ''}</span>
-                          <span>Tel: <strong className="text-slate-900">{issue.tenantPhone}</strong></span>
+                          <span>Tenant: <strong className="text-black">{issue.tenantName}</strong> {issue.flatUnit ? `(${issue.flatUnit})` : ''}</span>
+                          {issue.tenantPhone && <span>Tel: <strong className="text-black">{issue.tenantPhone}</strong></span>}
                         </div>
 
-                        <div className="flex justify-end pt-1">
-                          <button
-                            onClick={() => handleOneTapDispatch({
-                              idKey: issue.id,
-                              title: `Tenant Repair: ${issue.title}`,
-                              category: issue.category || "General Repair",
-                              description: `TENANT REPORTED REPAIR: ${issue.description}\nTenant Contact: ${issue.tenantName} (${issue.tenantPhone}, ${issue.flatUnit || 'Main'})`,
-                              budget: issue.urgency === 'emergency' ? "180" : "120",
-                              urgency: issue.urgency || "urgent"
-                            })}
-                            disabled={dispatchingJobId === issue.id}
-                            className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white font-black text-xs rounded-xl border border-blue-500 shadow-md transition flex items-center gap-1.5"
-                          >
-                            <Zap className="w-4 h-4 text-amber-300" />
-                            {dispatchingJobId === issue.id ? "Dispatching..." : "⚡ 1-Tap Dispatch Trade for Tenant"}
-                          </button>
+                        <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                          {isDispatched && issue.linkedJobId && (
+                            <Link
+                              to={`/job/${issue.linkedJobId}`}
+                              onClick={onClose}
+                              className="px-3 py-2 bg-slate-900 hover:bg-black text-white font-black text-xs rounded-xl border border-black transition flex items-center gap-1.5"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5 text-blue-400" />
+                              View Dispatched Job
+                            </Link>
+                          )}
+
+                          {!isResolved && (
+                            <button
+                              type="button"
+                              onClick={() => handleMarkIssueResolved(issue.id)}
+                              disabled={resolvingIssueId === issue.id}
+                              className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 font-extrabold text-xs rounded-xl border border-black transition"
+                            >
+                              {resolvingIssueId === issue.id ? "Updating..." : "Mark Resolved"}
+                            </button>
+                          )}
+
+                          {!isDispatched && !isResolved && (
+                            <button
+                              type="button"
+                              onClick={() => handleOneTapDispatch({
+                                idKey: issue.id,
+                                tenantIssueId: issue.id,
+                                title: `Tenant Repair: ${issue.title}`,
+                                category: issue.category || "General Repair",
+                                description: `TENANT REPORTED REPAIR: ${issue.description}\nTenant Contact: ${issue.tenantName} (${issue.tenantPhone || 'See passport'}, ${issue.flatUnit || 'Main'})`,
+                                budget: issue.urgency === 'emergency' ? "180" : "120",
+                                urgency: issue.urgency || "urgent"
+                              })}
+                              disabled={dispatchingJobId === issue.id}
+                              className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white font-black text-xs rounded-xl border border-black shadow-md transition flex items-center gap-1.5"
+                            >
+                              <Zap className="w-4 h-4 text-amber-300" />
+                              {dispatchingJobId === issue.id ? "Dispatching..." : "⚡ 1-Tap Dispatch Trade for Tenant"}
+                            </button>
+                          )}
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -960,76 +1101,72 @@ export function PropertyPassportModal({ property, onClose, onUpdated }: Property
 
             {activeTab === "predictive" && (
               <div className="space-y-4">
-                <div className="p-4 bg-purple-50 border border-purple-200 rounded-2xl flex items-start gap-3">
-                  <Sparkles className="w-5 h-5 text-purple-600 shrink-0 mt-0.5" />
-                  <div>
-                    <h5 className="font-extrabold text-sm text-purple-900">TradeOS AI Predictive Maintenance Engine</h5>
-                    <p className="text-xs text-purple-800">
-                      Automated analysis of appliance ages, certificate renewal schedules, and seasonal weather trends.
-                    </p>
+                <div className="p-4 bg-purple-50 border border-black rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <Sparkles className="w-5 h-5 text-purple-600 shrink-0 mt-0.5" />
+                    <div>
+                      <h5 className="font-extrabold text-sm text-black">TradeOS Predictive Maintenance Engine</h5>
+                      <p className="text-xs text-slate-700">
+                        Derived directly from your recorded compliance dates, boiler specs, roof condition, and EPC grade.
+                      </p>
+                      {serverAssessmentTaskId && (
+                        <p className="text-[11px] font-bold text-emerald-700 mt-1">
+                          ✓ Server intelligence assessment queued (Task: {serverAssessmentTaskId.slice(0, 14)})
+                        </p>
+                      )}
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={handleRunServerPredictiveAssessment}
+                    disabled={runningServerAssessment}
+                    className="px-3 py-2 bg-slate-900 hover:bg-black text-white font-extrabold text-xs rounded-xl border border-black transition shrink-0"
+                  >
+                    {runningServerAssessment ? "Queueing..." : "Run Server Assessment"}
+                  </button>
                 </div>
 
                 <div className="space-y-3">
-                  <div className="p-4 bg-white rounded-2xl border border-black shadow-sm space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-black text-slate-900 flex items-center gap-1.5">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                        Annual Boiler Servicing & Flue Check
-                      </span>
-                      <span className="text-[10px] font-extrabold bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">Recommended</span>
+                  {predictiveInsights.map((insight) => (
+                    <div key={insight.idKey} className="p-4 bg-white rounded-2xl border border-black shadow-sm space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-black text-black flex items-center gap-1.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                          {insight.title}
+                        </span>
+                        <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full shrink-0 ${
+                          insight.badgeTone === "red"
+                            ? "bg-red-100 text-red-800"
+                            : insight.badgeTone === "amber"
+                              ? "bg-amber-100 text-amber-900"
+                              : insight.badgeTone === "purple"
+                                ? "bg-purple-100 text-purple-800"
+                                : "bg-blue-100 text-blue-800"
+                        }`}>
+                          {insight.badge}
+                        </span>
+                      </div>
+                      <p className="text-xs text-black pl-5">{insight.summary}</p>
+                      <div className="flex justify-end pt-1">
+                        <button
+                          type="button"
+                          onClick={() => handleOneTapDispatch({
+                            idKey: insight.idKey,
+                            title: insight.dispatchTitle,
+                            category: insight.category,
+                            description: insight.summary,
+                            budget: insight.budget,
+                            urgency: insight.urgency
+                          })}
+                          disabled={dispatchingJobId === insight.idKey}
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-extrabold text-xs rounded-xl border border-black shadow-sm transition flex items-center gap-1.5"
+                        >
+                          <Zap className="w-3.5 h-3.5 text-amber-300" />
+                          {dispatchingJobId === insight.idKey ? "Dispatching..." : insight.ctaLabel}
+                        </button>
+                      </div>
                     </div>
-                    <p className="text-xs text-slate-600 pl-5">
-                      Boiler ({boilerBrand || "Boiler"}) is {boilerAge} years old. Regular servicing prevents winter breakdown risks.
-                    </p>
-                    <div className="flex justify-end pt-1">
-                      <button
-                        onClick={() => handleOneTapDispatch({
-                          idKey: "pred-boiler",
-                          title: `Annual Boiler Service & Maintenance (${boilerBrand || 'Boiler'})`,
-                          category: "Heating & Gas",
-                          description: `Annual boiler service for ${boilerBrand} ${boilerModel} (${boilerAge} yrs old). Pressure test, safety check & flue test.`,
-                          budget: "95",
-                          urgency: "routine"
-                        })}
-                        disabled={dispatchingJobId === "pred-boiler"}
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-extrabold text-xs rounded-xl border border-blue-500 shadow-sm transition flex items-center gap-1.5"
-                      >
-                        <Zap className="w-3.5 h-3.5 text-amber-300" />
-                        {dispatchingJobId === "pred-boiler" ? "Dispatching..." : "1-Tap Dispatch Boiler Engineer"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="p-4 bg-white rounded-2xl border border-black shadow-sm space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-black text-slate-900 flex items-center gap-1.5">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                        Autumn Gutter & Roof Inspection
-                      </span>
-                      <span className="text-[10px] font-extrabold bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full">Seasonal Alert</span>
-                    </div>
-                    <p className="text-xs text-slate-600 pl-5">
-                      Roof condition is currently flagged as "{roofCondition}". Schedule a quick roof check before winter rain.
-                    </p>
-                    <div className="flex justify-end pt-1">
-                      <button
-                        onClick={() => handleOneTapDispatch({
-                          idKey: "pred-roof",
-                          title: `Roof Tile & Gutter Inspection (${property.name || 'Property'})`,
-                          category: "Roofing",
-                          description: `Roof & gutter inspection. Current condition flagged as '${roofCondition}'. Clear debris & check flashing.`,
-                          budget: "130",
-                          urgency: "routine"
-                        })}
-                        disabled={dispatchingJobId === "pred-roof"}
-                        className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white font-extrabold text-xs rounded-xl border border-purple-500 shadow-sm transition flex items-center gap-1.5"
-                      >
-                        <Zap className="w-3.5 h-3.5 text-amber-300" />
-                        {dispatchingJobId === "pred-roof" ? "Dispatching..." : "1-Tap Dispatch Roofer"}
-                      </button>
-                    </div>
-                  </div>
+                  ))}
                 </div>
               </div>
             )}

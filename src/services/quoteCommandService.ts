@@ -37,7 +37,7 @@ export interface CreateQuoteOptions extends BaseQuoteCommandOptions {
     expiryDate?: string | null;
     isImmediateStart?: boolean;
     isEmergency?: boolean;
-    paymentPreference?: "fixed_price" | "hourly" | "milestone" | "negotiable";
+    paymentPreference?: "fixed_price" | "hourly" | "daily" | "milestone" | "negotiable";
     paymentTrack?: "quick" | "project";
     quoteScope?: "labor_only" | "materials_included" | "custom" | "full_project";
     depositTerm?: string;
@@ -62,7 +62,7 @@ export interface UpdateQuoteOptions extends BaseQuoteCommandOptions {
     startDate?: string | null;
     startDateType?: "immediate" | "flexible" | "specific";
     expiryDate?: string | null;
-    paymentPreference?: "fixed_price" | "hourly" | "milestone" | "negotiable";
+    paymentPreference?: "fixed_price" | "hourly" | "daily" | "milestone" | "negotiable";
     paymentTrack?: "quick" | "project";
     quoteScope?: "labor_only" | "materials_included" | "custom" | "full_project";
     milestones?: Array<{ id?: string; title: string; amount: number; description?: string }>;
@@ -201,6 +201,23 @@ export async function withdrawQuoteViaCommand(options: WithdrawQuoteOptions): Pr
   return dispatchQuoteCommand(
     user,
     "WithdrawQuote",
+    {
+      jobId,
+      quoteId,
+      reason,
+    },
+    idempotencyKey
+  );
+}
+
+/**
+ * 3b. DeleteQuote (Server-Authoritative Permanent Deletion of Non-Accepted Quote)
+ */
+export async function deleteQuoteViaCommand(options: WithdrawQuoteOptions): Promise<QuoteCommandResult> {
+  const { user, jobId, quoteId, reason, idempotencyKey } = options;
+  return dispatchQuoteCommand(
+    user,
+    "DeleteQuote",
     {
       jobId,
       quoteId,

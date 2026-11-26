@@ -1,8 +1,15 @@
 import React, { useState, useEffect } from "react";
-import { db, doc, updateDoc, setDoc, onSnapshot } from "@/src/firebase";
+import { auth, db, doc, setDoc, onSnapshot } from "@/src/firebase";
 import { Loader2, Plus, Trash2, Save, AlertCircle, Edit2, X, Check } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { toast } from "sonner";
 import { cn } from "@/src/lib/utils";
+
+const formatCommissionPercent = (decimalRate: unknown): number => {
+  const num = Number(decimalRate) || 0;
+  const pct = num > 1 ? num : num * 100;
+  return Number(pct.toFixed(2));
+};
 
 interface Tier {
   price: number;
@@ -38,6 +45,9 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [pendingDeleteTier, setPendingDeleteTier] = useState<{ model: string; tierKey: string } | null>(null);
+  const [pendingAddTierModel, setPendingAddTierModel] = useState<string | null>(null);
+  const [newTierKeyInput, setNewTierKeyInput] = useState("");
 
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "platform_config", "global_tiers"), (snapshot) => {
@@ -63,21 +73,37 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
   };
 
   const handleDeleteTier = (model: string, tierKey: string) => {
-    if (!window.confirm(`Are you sure you want to delete the ${tierKey} tier?`)) return;
-    
+    setPendingDeleteTier({ model, tierKey });
+  };
+
+  const confirmDeleteTier = () => {
+    if (!pendingDeleteTier) return;
+    const { model, tierKey } = pendingDeleteTier;
+    setPendingDeleteTier(null);
     setConfig((prev: any) => {
       const newConfig = { ...prev };
       delete newConfig.providerModels[model].tiers[tierKey];
       return newConfig;
     });
-    setHasUnsavedChanges(true); // Mark as unsaved
+    setHasUnsavedChanges(true);
+    toast.success(`Removed ${tierKey} tier (click Deploy Now to publish).`);
   };
 
   const handleAddTier = (model: string) => {
-    const tierKey = prompt("Enter a unique ID for this tier (e.g., 'premium', 'gold'):");
-    if (!tierKey) return;
+    setNewTierKeyInput("");
+    setPendingAddTierModel(model);
+  };
+
+  const confirmAddTier = () => {
+    if (!pendingAddTierModel) return;
+    const model = pendingAddTierModel;
+    const tierKey = newTierKeyInput.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+    if (!tierKey) {
+      toast.error("Please enter a valid tier ID (letters, numbers, hyphen or underscore).");
+      return;
+    }
     if (config.providerModels[model].tiers[tierKey]) {
-      alert("A tier with this ID already exists.");
+      toast.error("A tier with this ID already exists.");
       return;
     }
 
@@ -114,57 +140,97 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
     }));
 
     setEditing({ model, tierKey, data: newTier });
-    setHasUnsavedChanges(true); // Mark as unsaved
+    setHasUnsavedChanges(true);
+    setPendingAddTierModel(null);
   };
 
   const handleSave = async () => {
     setSaving(true);
     try {
-      await setDoc(doc(db, "platform_config", "global_tiers"), config);
-      
-      // Auto-sync Commission down to Rides Command Center
-      const taxiCommission = config?.providerModels?.on_demand_transport?.tiers?.standard?.commission;
-      if (typeof taxiCommission === 'number') {
-        await setDoc(doc(db, "platform_config", "ride_fees"), {
-          fees: { platformCommission: taxiCommission * 100 }
-        }, { merge: true });
+      const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : "";
+      if (!idToken) {
+        throw new Error("Admin authentication required to publish pricing tiers.");
       }
 
-      // Auto-sync Trade Tiers to platform_config/global feeTiers so both admin panels stay in perfect sync!
-      const oneOffTiers = config?.providerModels?.one_off_trades?.tiers;
-      if (oneOffTiers) {
-        const syncedFeeTiers = Object.entries(oneOffTiers).map(([tierKey, data]: [string, any]) => {
-          let name = "Free Explorer";
-          const lower = tierKey.toLowerCase();
-          if (lower === 'pro' || lower.includes('silver')) name = "Silver Professional";
-          else if (lower === 'premium' || lower === 'gold' || lower.includes('elite')) name = "Gold Elite";
-          else if (lower === 'platinum' || lower.includes('enterprise')) name = "Platinum Enterprise";
-          else if (lower === 'payg' || lower.includes('free')) name = "Free Explorer";
-          else name = tierKey.charAt(0).toUpperCase() + tierKey.slice(1);
+      const rawCap =
+        config?.providerModels?.one_off_trades?.commissionCapGbp ??
+        config?.commissionCapGbp;
+      const parsedCap = rawCap === undefined || rawCap === null || rawCap === "" ? 250 : Number(rawCap);
+      const safeCapGbp = Number.isFinite(parsedCap) && parsedCap >= 0 ? parsedCap : 250;
 
-          return {
-            name,
-            price: Number(data.price) || 0,
-            commission: (Number(data.commission) || 0) * 100, // stored as % in feeTiers
-            maxQuotes: Number(data.maxQuotes) || 9999,
-            maxAcceptedQuotes: Number(data.maxAcceptedQuotes) || 9999,
-            leadFee: Number(data.leadFee) || 0,
-            description: data.description || "",
-            features: data.features || [],
-            limitPeriod: "monthly"
+      const providerModelsPatch: Record<string, any> = {};
+      for (const [modelKey, modelVal] of Object.entries<any>(config?.providerModels || {})) {
+        if (modelsToShow && modelsToShow.length > 0 && !modelsToShow.includes(modelKey)) {
+          continue;
+        }
+        if (modelKey === "one_off_trades") {
+          providerModelsPatch[modelKey] = {
+            ...modelVal,
+            commissionCapGbp: safeCapGbp,
           };
-        });
-
-        await setDoc(doc(db, "platform_config", "global"), {
-          feeTiers: syncedFeeTiers
-        }, { merge: true });
+        } else {
+          providerModelsPatch[modelKey] = modelVal;
+        }
       }
 
-      setHasUnsavedChanges(false); // Reset unsaved changes
-      alert("Tiers updated successfully and synced with global platform config!");
-    } catch (error) {
+      const oneOffTiers = providerModelsPatch?.one_off_trades?.tiers;
+      const syncedFeeTiers = oneOffTiers
+        ? Object.entries(oneOffTiers).map(([tierKey, data]: [string, any]) => {
+            let name = "Free Explorer";
+            const lower = tierKey.toLowerCase();
+            if (lower === 'pro' || lower.includes('silver')) name = "Silver Professional";
+            else if (lower === 'premium' || lower === 'gold' || lower.includes('elite')) name = "Gold Elite";
+            else if (lower === 'platinum' || lower.includes('enterprise')) name = "Platinum Enterprise";
+            else if (lower === 'payg' || lower.includes('free')) name = "Free Explorer";
+            else name = tierKey.charAt(0).toUpperCase() + tierKey.slice(1);
+
+            return {
+              name,
+              price: Number(data.price) || 0,
+              commission: formatCommissionPercent(data.commission),
+              maxQuotes: Number(data.maxQuotes) || 9999,
+              maxAcceptedQuotes: Number(data.maxAcceptedQuotes) || 9999,
+              leadFee: Number(data.leadFee) || 0,
+              description: data.description || "",
+              features: data.features || [],
+              limitPeriod: "monthly"
+            };
+          })
+        : undefined;
+
+      const res = await fetch("/api/admin/pricing-config/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          tempConfig: { commissionCapGbp: safeCapGbp },
+          ...(syncedFeeTiers ? { feeTiers: syncedFeeTiers } : {}),
+          commissionCapGbp: safeCapGbp,
+          globalTiersProviderModels: providerModelsPatch,
+        }),
+      });
+      const resData = await res.json().catch(() => ({}));
+      if (!res.ok || !resData?.success) {
+        throw new Error(resData?.error || `Failed to publish tiers (${res.status})`);
+      }
+
+      // Preserve AnyRoller ride_fees sync only when on_demand_transport is explicitly managed
+      if (providerModelsPatch?.on_demand_transport) {
+        const taxiCommission = providerModelsPatch.on_demand_transport?.tiers?.standard?.commission;
+        if (typeof taxiCommission === 'number') {
+          await setDoc(doc(db, "platform_config", "ride_fees"), {
+            fees: { platformCommission: formatCommissionPercent(taxiCommission) }
+          }, { merge: true });
+        }
+      }
+
+      setHasUnsavedChanges(false);
+      toast.success(`Tiers & commission cap (£${safeCapGbp === 0 ? "Uncapped" : safeCapGbp}) atomically published (v${resData.configVersion}).`);
+    } catch (error: any) {
       console.error("Error saving tiers:", error);
-      alert("Failed to save tiers");
+      toast.error(error?.message || "Failed to save tiers. Please try again.");
     } finally {
       setSaving(false);
     }
@@ -183,8 +249,10 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
         <button 
           onClick={async () => {
             const initialConfig = {
+              commissionCapGbp: 250,
               providerModels: {
                 one_off_trades: {
+                  commissionCapGbp: 250,
                   tiers: {
                     payg: {
                       price: 0,
@@ -259,8 +327,43 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
         .filter(([model]) => !modelsToShow || modelsToShow.includes(model))
         .map(([model, modelData]: [string, any]) => (
         <div key={model} className="space-y-4">
-          <div className="flex justify-between items-center">
-            <h3 className="text-sm font-bold uppercase tracking-wider text-slate-500">{model.replace(/_/g, " ")}</h3>
+          <div className="flex flex-wrap justify-between items-center gap-3">
+            <h3 className="text-sm font-bold uppercase tracking-wider text-black">{model.replace(/_/g, " ")}</h3>
+            {model === "one_off_trades" && (
+              <div className="flex items-center gap-3 bg-white px-4 py-2 rounded-xl border border-black">
+                <div>
+                  <p className="text-[10px] font-black uppercase tracking-wider text-black">Max Commission Cap (£)</p>
+                  <p className="text-[10px] text-slate-600">0 = No Cap (default £250)</p>
+                </div>
+                <input
+                  type="number"
+                  min={0}
+                  step={10}
+                  value={
+                    modelData?.commissionCapGbp ??
+                    config?.commissionCapGbp ??
+                    250
+                  }
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    const nextCap = Number.isFinite(val) && val >= 0 ? val : 0;
+                    setConfig((prev: any) => ({
+                      ...prev,
+                      commissionCapGbp: nextCap,
+                      providerModels: {
+                        ...(prev?.providerModels || {}),
+                        one_off_trades: {
+                          ...(prev?.providerModels?.one_off_trades || {}),
+                          commissionCapGbp: nextCap,
+                        },
+                      },
+                    }));
+                    setHasUnsavedChanges(true);
+                  }}
+                  className="w-24 px-2.5 py-1.5 rounded-lg border border-black bg-slate-50 text-sm font-bold text-black text-right"
+                />
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
             {Object.entries(modelData.tiers || {}).map(([tierKey, tier]: [string, any]) => {
@@ -305,10 +408,13 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
                           <input 
                             type="number" 
                             step="0.1"
-                            value={(editing.data.commission ?? 0) * 100} 
+                            min={0}
+                            max={100}
+                            value={formatCommissionPercent(editing.data.commission)} 
                             onChange={(e) => {
                               const val = parseFloat(e.target.value);
-                              setEditing({...editing, data: {...editing.data, commission: isNaN(val) ? 0 : val / 100}});
+                              const decimalVal = isNaN(val) ? 0 : Math.round((Math.max(0, Math.min(100, val)) / 100) * 1000000) / 1000000;
+                              setEditing({...editing, data: {...editing.data, commission: decimalVal}});
                             }}
                             className="w-full text-sm border-b border-black py-1 focus:outline-none focus:border-blue-500"
                           />
@@ -439,7 +545,7 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
                   <div className="space-y-1 mb-6 flex-1">
                     <div className="flex justify-between items-center py-2.5 border-b border-black/50">
                       <span className="text-sm font-medium text-slate-500">Commission</span>
-                      <span className="text-sm font-bold text-slate-900 bg-slate-100 px-2.5 py-0.5 rounded-full">{tier.commission * 100}%</span>
+                      <span className="text-sm font-bold text-slate-900 bg-slate-100 px-2.5 py-0.5 rounded-full">{formatCommissionPercent(tier.commission)}%</span>
                     </div>
 
                     {model === 'one_off_trades' && (
@@ -531,6 +637,64 @@ export default function AdminTierManager({ modelsToShow }: AdminTierManagerProps
           </motion.div>
         )}
       </AnimatePresence>
+
+      {pendingDeleteTier && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">Delete Tier?</h3>
+            <p className="text-sm text-black">
+              Are you sure you want to delete the <span className="font-bold">{pendingDeleteTier.tierKey}</span> tier?
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPendingDeleteTier(null)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteTier}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 rounded-lg hover:bg-red-700"
+              >
+                Delete Tier
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingAddTierModel && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">Add New Tier</h3>
+            <p className="text-sm text-black">
+              Enter a unique ID for this tier (e.g. <span className="font-mono font-bold">premium</span> or <span className="font-mono font-bold">gold</span>):
+            </p>
+            <input
+              type="text"
+              value={newTierKeyInput}
+              onChange={(e) => setNewTierKeyInput(e.target.value)}
+              placeholder="e.g. premium"
+              className="w-full px-3 py-2 text-sm text-black bg-white border border-black rounded-lg outline-none focus:ring-2 focus:ring-blue-600"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPendingAddTierModel(null)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmAddTier}
+                className="px-4 py-2 text-xs font-bold text-white bg-blue-600 rounded-lg hover:bg-blue-700"
+              >
+                Create Tier
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

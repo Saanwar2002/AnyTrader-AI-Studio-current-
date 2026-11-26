@@ -222,6 +222,17 @@ export default function Conversations() {
             const recipientId = conv.participants.find((p: string) => p !== user?.uid);
             const recipient = profiles[recipientId];
             const isSelected = selectedIds.includes(conv.id);
+            const explicitUnread = user?.uid ? Number(conv.unreadCounts?.[user.uid] || 0) : 0;
+            const lastMsgTime = conv.lastMessageAt?.toMillis?.() || conv.updatedAt?.toMillis?.() || 0;
+            const lastReadTime = user?.uid ? (conv.lastReadAt?.[user.uid]?.toMillis?.() || 0) : 0;
+            const inferredUnread =
+              explicitUnread === 0 &&
+              Boolean(conv.lastSenderId && user?.uid && conv.lastSenderId !== user.uid) &&
+              lastMsgTime > lastReadTime
+                ? 1
+                : 0;
+            const unreadCount = Math.max(explicitUnread, inferredUnread);
+            const hasUnread = unreadCount > 0;
             
             return (
               <div key={conv.id} className="relative group">
@@ -239,7 +250,8 @@ export default function Conversations() {
                     }
                   }}
                   className={cn(
-                    "bg-white p-4 rounded-xl border transition-all flex items-center gap-4 cursor-pointer",
+                    "p-4 rounded-xl border transition-all flex items-center gap-4 cursor-pointer",
+                    hasUnread ? "bg-blue-50/40" : "bg-white",
                     isSelectMode ? (isSelected ? "border-blue-600 bg-blue-50/30" : "border-black") : "border-black hover:border-blue-600 shadow-sm"
                   )}
                 >
@@ -252,7 +264,7 @@ export default function Conversations() {
                     </div>
                   )}
                   
-                  <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center overflow-hidden shrink-0">
+                  <div className="relative w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center overflow-hidden shrink-0 border border-black">
                     {recipient?.avatarUrl ? (
                       <img src={recipient.avatarUrl} alt={recipient.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                     ) : (
@@ -261,13 +273,22 @@ export default function Conversations() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-2">
-                      <h4 className="font-bold text-slate-900 truncate">{recipient?.name || "Loading..."}</h4>
-                      <span className="text-[10px] text-slate-400 whitespace-nowrap">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <h4 className={cn("truncate", hasUnread ? "font-black text-black" : "font-bold text-slate-900")}>
+                          {recipient?.name || "Loading..."}
+                        </h4>
+                        {hasUnread && (
+                          <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full bg-blue-600 text-white text-[10px] font-black border border-black shrink-0">
+                            {unreadCount > 99 ? "99+" : unreadCount}
+                          </span>
+                        )}
+                      </div>
+                      <span className={cn("text-[10px] whitespace-nowrap", hasUnread ? "font-bold text-blue-700" : "text-slate-400")}>
                         {conv.updatedAt?.toDate ? conv.updatedAt.toDate().toLocaleDateString() : "Just now"}
                       </span>
                     </div>
                     <p className="text-xs text-blue-600 font-medium mb-1 truncate">{conv.jobTitle}</p>
-                    <p className="text-sm text-slate-500 truncate">
+                    <p className={cn("text-sm truncate", hasUnread ? "font-bold text-black" : "text-slate-500")}>
                       {conv.lastMessage || "Start the conversation..."}
                     </p>
                   </div>

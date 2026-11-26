@@ -5,6 +5,7 @@ export const SUPPORTED_SUBSCRIPTION_PRODUCTS = [
   "landlord",
   "exclusive_leads",
   "video_pro",
+  "appointments",
   "gotham_saas",
   "driver_gold",
 ] as const;
@@ -35,6 +36,9 @@ export function getSubscriptionIdForProduct(userData: Record<string, any>, subsc
       : undefined;
   }
   if (subscriptionType === "landlord") {
+    if (typeof userData.landlordSubscriptionId === "string" && userData.landlordSubscriptionId.trim()) {
+      return userData.landlordSubscriptionId.trim();
+    }
     return userData.subscriptionType === "landlord" && typeof userData.subscriptionId === "string" && userData.subscriptionId.trim()
       ? userData.subscriptionId.trim()
       : undefined;
@@ -47,6 +51,11 @@ export function getSubscriptionIdForProduct(userData: Record<string, any>, subsc
   if (subscriptionType === "video_pro") {
     return typeof userData.videoProSubscriptionId === "string" && userData.videoProSubscriptionId.trim()
       ? userData.videoProSubscriptionId.trim()
+      : undefined;
+  }
+  if (subscriptionType === "appointments") {
+    return typeof userData.appointmentsSubscriptionId === "string" && userData.appointmentsSubscriptionId.trim()
+      ? userData.appointmentsSubscriptionId.trim()
       : undefined;
   }
   if (subscriptionType === "gotham_saas") {
@@ -113,6 +122,9 @@ export function resolveVerifiedSubscriptionTarget(input: {
   } else if (subscriptionType === "video_pro") {
     statusRaw = userData.videoProSubscriptionStatus ?? (userData.hasVerifiedVideoProSubscription ? "active" : undefined);
     cancelAtPeriodEnd = Boolean(userData.videoProCancelAtPeriodEnd);
+  } else if (subscriptionType === "appointments") {
+    statusRaw = userData.appointmentsSubscriptionStatus ?? (userData.hasAppointmentsAddon || userData.appointmentSettings?.enabled ? "active" : undefined);
+    cancelAtPeriodEnd = Boolean(userData.appointmentsCancelAtPeriodEnd);
   } else if (subscriptionType === "gotham_saas") {
     statusRaw = userData.gothamSubscriptionStatus ?? (userData.isGothamSubscriber ? "active" : undefined);
     cancelAtPeriodEnd = Boolean(userData.gothamCancelAtPeriodEnd);

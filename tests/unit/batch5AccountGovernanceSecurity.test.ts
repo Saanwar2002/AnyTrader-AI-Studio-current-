@@ -515,6 +515,31 @@ describe("Batch 5 P1 Remediations — Account Freeze, Trader Revalidation, Atomi
       expect(versionDoc.version).toBe(5);
     });
 
+    it("correctly normalizes promotional <= 1% commission rates (1% -> 0.01, 0.5% -> 0.005) and syncs commissionCapGbp atomically", async () => {
+      const db = new InMemoryCollectionDb();
+      const result = await publishPlatformPricingConfigAtomic({
+        db,
+        adminUid: "admin_promo",
+        tempConfig: { monetizationEnabled: true, commissionCapGbp: 180 },
+        feeTiers: [
+          { name: "Gold Elite", price: 49.99, commission: 1, maxQuotes: 9999 },
+          { name: "Platinum Enterprise", price: 99.99, commission: 0.5, maxQuotes: 9999 },
+        ],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.commissionCapGbp).toBe(180);
+
+      const globalDoc = db.collections.get("platform_config")?.get("global");
+      const globalTiersDoc = db.collections.get("platform_config")?.get("global_tiers");
+
+      expect(globalDoc.commissionCapGbp).toBe(180);
+      expect(globalTiersDoc.commissionCapGbp).toBe(180);
+      expect(globalTiersDoc.providerModels.one_off_trades.commissionCapGbp).toBe(180);
+      expect(globalTiersDoc.providerModels.one_off_trades.tiers.premium.commission).toBe(0.01);
+      expect(globalTiersDoc.providerModels.one_off_trades.tiers.platinum.commission).toBe(0.005);
+    });
+
     it("rejects invalid commission (> 100%) before writing any document", async () => {
       const db = new InMemoryCollectionDb();
       await expect(

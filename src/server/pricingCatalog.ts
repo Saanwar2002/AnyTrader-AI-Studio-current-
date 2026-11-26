@@ -8,13 +8,21 @@
  */
 
 import { BadRequestError, ForbiddenError, NotFoundError } from "./httpErrors.ts";
-import { normalizeTraderTier } from "../services/stripeIntegrationService.ts";
+import { isJobEligibleForMediationStake } from "./slice2MoneyFlowHelpers.ts";
+import {
+  DEFAULT_ANYTRADER_COMMISSIONS,
+  DEFAULT_ANYTRADER_COMMISSION_CAP_GBP,
+  normalizeTraderTier,
+  type NormalizedTraderTier,
+} from "../services/stripeIntegrationService.ts";
 import {
   BANNER_AD_DAILY_RATE_GBP,
   calculateBannerAdCostPence,
   sanitizeAdWalletTopupGbp,
   sanitizeBannerDurationDays,
 } from "../lib/adPricing.ts";
+
+export { DEFAULT_ANYTRADER_COMMISSIONS, DEFAULT_ANYTRADER_COMMISSION_CAP_GBP };
 
 export interface CatalogItem {
   id: string;
@@ -35,11 +43,11 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
     currency: "gbp",
     mode: "subscription",
   },
-  // Tradesperson Subscription Tiers
+  // Tradesperson Subscription Tiers (canonical defaults matching Admin Control Panel)
   price_pro: {
     id: "price_pro",
     name: "Silver Pro Subscription",
-    amountPence: 2900, // £29.00
+    amountPence: 1999, // £19.99
     currency: "gbp",
     mode: "subscription",
     interval: "month",
@@ -48,7 +56,7 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
   price_premium: {
     id: "price_premium",
     name: "Gold Elite Subscription",
-    amountPence: 4900, // £49.00
+    amountPence: 4999, // £49.99
     currency: "gbp",
     mode: "subscription",
     interval: "month",
@@ -57,7 +65,7 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
   price_platinum: {
     id: "price_platinum",
     name: "Platinum Enterprise Powerhouse",
-    amountPence: 9900, // £99.00
+    amountPence: 9999, // £99.99
     currency: "gbp",
     mode: "subscription",
     interval: "month",
@@ -73,7 +81,7 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
     interval: "month",
     description: "Multi-property digital twins, compliance alerts & 1-tap dispatch",
   },
-  // Driver Subscription
+  // Driver Subscription (AnyRoller — preserved at £49.99/mo, 10% commission)
   price_driver_gold: {
     id: "price_driver_gold",
     name: "Gold Driver Subscription",
@@ -84,11 +92,11 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
     description: "Reduced 10% commission rate and 4 destination filters",
   },
 
-  // Add-ons
+  // Add-ons (canonical defaults matching Admin Control Panel)
   price_exclusive_leads: {
     id: "price_exclusive_leads",
     name: "Exclusive Priority Lead Dispatch",
-    amountPence: 1500, // £15.00
+    amountPence: 2900, // £29.00
     currency: "gbp",
     mode: "subscription",
     interval: "month",
@@ -97,7 +105,7 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
   price_video_pro: {
     id: "price_video_pro",
     name: "Verified Video Pro Add-on",
-    amountPence: 1000, // £10.00
+    amountPence: 1500, // £15.00
     currency: "gbp",
     mode: "subscription",
     interval: "month",
@@ -106,18 +114,27 @@ export const SERVER_PRICING_CATALOG: Record<string, CatalogItem> = {
   price_video_pro_annual: {
     id: "price_video_pro_annual",
     name: "Verified Video Pro (Annual)",
-    amountPence: 9600, // £96.00/yr (£8/mo)
+    amountPence: 14400, // £144.00/yr (£12/mo)
     currency: "gbp",
     mode: "subscription",
     interval: "year",
     description: "Annual verified video pro membership with 20% discount",
+  },
+  price_appointments: {
+    id: "price_appointments",
+    name: "Automated Appointments Add-on",
+    amountPence: 999, // £9.99/mo
+    currency: "gbp",
+    mode: "subscription",
+    interval: "month",
+    description: "Real-time customer appointment booking & availability calendar sync",
   },
 
   // One-off Platform Fees
   price_emergency_boost: {
     id: "price_emergency_boost",
     name: "Emergency Dispatch Priority Boost",
-    amountPence: 499, // £4.99
+    amountPence: 500, // £5.00
     currency: "gbp",
     mode: "payment",
     description: "4-hour priority emergency broadcast to nearby active tradespeople",
@@ -249,6 +266,163 @@ export function invalidateDynamicConfigCache(firestoreDb: any): void {
 }
 
 /**
+ * Resolves the Admin-configured AnyTrader commission cap in GBP (0 = no cap).
+ * Defaults to £250 when not explicitly configured in Firestore.
+ */
+export function resolveCommissionCapGbp(globalTiers?: any, globalConfig?: any): number {
+  const rawCap =
+    globalTiers?.providerModels?.one_off_trades?.commissionCapGbp ??
+    globalTiers?.commissionCapGbp ??
+    globalConfig?.commissionCapGbp;
+  if (rawCap === undefined || rawCap === null || rawCap === "") {
+    return DEFAULT_ANYTRADER_COMMISSION_CAP_GBP;
+  }
+  const parsed = Number(rawCap);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_ANYTRADER_COMMISSION_CAP_GBP;
+  }
+  return parsed;
+}
+
+/**
+ * Pure deterministic capped commission calculation in minor units (pence).
+ * A capGbp of 0 disables the cap (uncapped).
+ */
+export function calculateCappedCommissionPence(
+  amountPence: number,
+  commissionRate: number,
+  capGbp: number = DEFAULT_ANYTRADER_COMMISSION_CAP_GBP
+): { platformFeePence: number; netPayoutPence: number; capApplied: boolean } {
+  const safeAmount = Math.max(0, Math.round(Number(amountPence) || 0));
+  const safeRate = Math.max(0, Math.min(1, Number(commissionRate) || 0));
+  const rawFee = Math.round(safeAmount * safeRate);
+  const safeCapGbp = Number.isFinite(capGbp) && capGbp >= 0 ? capGbp : DEFAULT_ANYTRADER_COMMISSION_CAP_GBP;
+  const capPence = safeCapGbp > 0 ? Math.round(safeCapGbp * 100) : null;
+  const uncappedClamped = Math.min(rawFee, safeAmount);
+  const platformFeePence =
+    capPence !== null ? Math.min(uncappedClamped, capPence) : uncappedClamped;
+  const capApplied = capPence !== null && uncappedClamped > capPence;
+  const netPayoutPence = safeAmount - platformFeePence;
+  return { platformFeePence, netPayoutPence, capApplied };
+}
+
+export interface ResolveAnyTraderCommissionInput {
+  amountPence: number;
+  firestoreDb?: any;
+  traderId?: string | null;
+  traderData?: Record<string, any> | null;
+  traderTier?: string | null;
+  globalTiers?: any;
+  globalConfig?: any;
+  explicitCommissionRate?: number;
+  explicitCapGbp?: number;
+}
+
+export interface ResolvedAnyTraderCommission {
+  normalizedTier: NormalizedTraderTier;
+  commissionRate: number;
+  commissionCapGbp: number;
+  platformFeePence: number;
+  netPayoutPence: number;
+  capApplied: boolean;
+}
+
+/**
+ * Single Canonical AnyTrader Commission Resolver.
+ * Used across Stripe Checkout (pricingCatalog), Escrow Funding & Release (paymentLedger),
+ * and Quote Creation/Revision (quoteCommands) so Admin Control Panel changes take effect
+ * everywhere with zero drift.
+ */
+export async function resolveAnyTraderCommission(
+  input: ResolveAnyTraderCommissionInput
+): Promise<ResolvedAnyTraderCommission> {
+  let { globalTiers, globalConfig, traderData } = input;
+
+  if (input.firestoreDb && (globalTiers === undefined || globalConfig === undefined)) {
+    const loaded = await getDynamicFirestoreConfigs(input.firestoreDb);
+    if (globalTiers === undefined) globalTiers = loaded.globalTiers;
+    if (globalConfig === undefined) globalConfig = loaded.globalConfig;
+  }
+
+  if (!traderData && !input.traderTier && input.firestoreDb && input.traderId) {
+    try {
+      const snap = await input.firestoreDb.collection("users").doc(input.traderId).get();
+      if (snap?.exists) {
+        traderData = typeof snap.data === "function" ? snap.data() : snap.data;
+      }
+    } catch {
+      // Fall back gracefully to canonical PAYG tier if user profile lookup is unavailable
+    }
+  }
+
+  const rawTier = input.traderTier || traderData?.tier || traderData?.tierId || "payg";
+  const subscriptionStatus = String(traderData?.subscriptionStatus || "").trim().toLowerCase();
+  const isTerminalInactiveTier =
+    !input.traderTier &&
+    ["canceled", "cancelled", "unpaid", "incomplete_expired", "free"].includes(subscriptionStatus);
+  const normalizedTier = isTerminalInactiveTier ? "payg" : normalizeTraderTier(String(rawTier));
+
+  let commissionRate = DEFAULT_ANYTRADER_COMMISSIONS[normalizedTier];
+
+  if (
+    typeof input.explicitCommissionRate === "number" &&
+    Number.isFinite(input.explicitCommissionRate) &&
+    input.explicitCommissionRate >= 0
+  ) {
+    commissionRate =
+      input.explicitCommissionRate > 1
+        ? input.explicitCommissionRate / 100
+        : input.explicitCommissionRate;
+  } else {
+    const dynamicTierCommission =
+      globalTiers?.providerModels?.one_off_trades?.tiers?.[normalizedTier]?.commission;
+    if (
+      typeof dynamicTierCommission === "number" &&
+      Number.isFinite(dynamicTierCommission) &&
+      dynamicTierCommission >= 0
+    ) {
+      commissionRate =
+        dynamicTierCommission > 1 ? dynamicTierCommission / 100 : dynamicTierCommission;
+    } else if (Array.isArray(globalConfig?.feeTiers)) {
+      const matched = globalConfig.feeTiers.find(
+        (ft: any) => normalizeTraderTier(ft?.name) === normalizedTier
+      );
+      if (
+        matched &&
+        typeof matched.commission === "number" &&
+        Number.isFinite(matched.commission) &&
+        matched.commission >= 0
+      ) {
+        // platform_config/global.feeTiers always stores percentage values (0..100)
+        commissionRate = Math.round((matched.commission / 100) * 1000000) / 1000000;
+      }
+    }
+  }
+
+  const commissionCapGbp =
+    typeof input.explicitCapGbp === "number" &&
+    Number.isFinite(input.explicitCapGbp) &&
+    input.explicitCapGbp >= 0
+      ? input.explicitCapGbp
+      : resolveCommissionCapGbp(globalTiers, globalConfig);
+
+  const { platformFeePence, netPayoutPence, capApplied } = calculateCappedCommissionPence(
+    input.amountPence,
+    commissionRate,
+    commissionCapGbp
+  );
+
+  return {
+    normalizedTier,
+    commissionRate,
+    commissionCapGbp,
+    platformFeePence,
+    netPayoutPence,
+    capApplied,
+  };
+}
+
+/**
  * Resolves the server-authoritative line item and Stripe Connect routing
  * based strictly on validated server state. DISCARDS client-provided prices.
  */
@@ -262,7 +436,9 @@ async function loadAuthorizedCheckoutJob(firestoreDb: any, jobId: string, authUi
   const assignedTraderId = jobData.acceptedTradespersonId || jobData.acceptedTraderId || jobData.assignedTraderId || jobData.tradespersonId || jobData.traderId;
   if (purpose === "mediation_stake") {
     if (authUid !== ownerId && authUid !== assignedTraderId) throw new ForbiddenError("Only a job participant can pay the mediation stake");
-    if (jobData.status !== "disputed") throw new BadRequestError("Mediation stake can only be paid after the job has entered disputed status");
+    if (!isJobEligibleForMediationStake(jobData.status)) {
+      throw new BadRequestError("Mediation stake can only be paid for an accepted, in-progress, completed, or disputed job");
+    }
     if (jobData.mediationStakePaid === true || jobData.dispute?.mediationStakePaid === true) throw new BadRequestError("The mediation stake has already been paid for this job");
   } else {
     if (authUid !== ownerId) throw new ForbiddenError("Only the job owner can purchase a job boost");
@@ -276,10 +452,8 @@ export async function resolveAuthoritativeLineItem(
   firestoreDb: any
 ): Promise<AuthoritativeLineItemResult> {
   const metadata = body.metadata || {};
-  const mode = body.mode || "subscription";
-  const hasExplicitMembershipSelection =
-    ["price_payg", "price_pro", "price_premium", "price_platinum", "price_landlord", "price_driver_gold"].includes(String(body.priceId || "")) ||
-    (typeof body.tierName === "string" && body.tierName.trim().length > 0);
+  const hasExplicitMembershipPriceId =
+    ["price_payg", "price_pro", "price_premium", "price_platinum", "price_landlord", "price_driver_gold"].includes(String(body.priceId || ""));
 
   // Load dynamic admin-managed configs from Firestore (falls back gracefully to SERVER_PRICING_CATALOG if unset)
   const { globalTiers, globalConfig } = await getDynamicFirestoreConfigs(firestoreDb);
@@ -287,7 +461,7 @@ export async function resolveAuthoritativeLineItem(
   // =========================================================================
   // 1. CLIENT MONEY: Tradesperson Milestone Escrow Funding
   // =========================================================================
-  if (metadata.type === "milestone_funding" && !hasExplicitMembershipSelection) {
+  if (metadata.type === "milestone_funding" && !hasExplicitMembershipPriceId) {
     const { jobId, quoteId, milestoneId } = metadata;
     if (!jobId || !quoteId || !milestoneId) {
       throw new BadRequestError("Milestone funding requires jobId, quoteId, and milestoneId in metadata");
@@ -333,8 +507,22 @@ export async function resolveAuthoritativeLineItem(
 
     // Fetch tradesperson's connected Stripe account
     const traderId = quoteData.tradespersonId;
-    if (!traderId) {
+    if (!traderId || typeof traderId !== "string" || !traderId.trim()) {
       throw new BadRequestError("Quote does not have an assigned tradesperson ID");
+    }
+
+    // Defense-in-depth self-payment rejection (payerUid !== payeeUid):
+    // Prevents dual-role homeowner/tradesperson accounts from funding milestone escrow to themselves.
+    const normalizedPayeeUid = traderId.trim();
+    const normalizedPayerUid = String(authUid || "").trim();
+    const jobOwnerUids = [jobData?.homeownerId, jobData?.userId, jobData?.customerId]
+      .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+      .map((value) => value.trim());
+
+    if (normalizedPayerUid === normalizedPayeeUid || jobOwnerUids.includes(normalizedPayeeUid)) {
+      throw new ForbiddenError(
+        "Self-payment is prohibited: you cannot fund a milestone payment to your own tradesperson account."
+      );
     }
 
     const traderDoc = await firestoreDb.collection("users").doc(traderId).get();
@@ -352,26 +540,21 @@ export async function resolveAuthoritativeLineItem(
       );
     }
 
-    // Platform commission calculation (standard 12% or tier rate)
-    // Checks Firestore platform_config/global_tiers or platform_config/global first
-    const traderTier = traderData.tier || traderData.tierId || "payg";
-    const normalizedTier = normalizeTraderTier(traderTier);
-    let commissionRate = 0.12; // Standard default 12%
-
-    const dynamicCommission = globalTiers?.providerModels?.one_off_trades?.tiers?.[normalizedTier]?.commission;
-    if (typeof dynamicCommission === "number" && !isNaN(dynamicCommission) && dynamicCommission >= 0) {
-      commissionRate = dynamicCommission > 1 ? dynamicCommission / 100 : dynamicCommission;
-    } else {
-      if (normalizedTier === "pro") commissionRate = 0.035; // 3.5%
-      else if (normalizedTier === "premium") commissionRate = 0.025; // 2.5%
-      else if (normalizedTier === "platinum") commissionRate = 0.015; // 1.5%
-    }
-
-    const platformFeePence = Math.min(
-      Math.round(milestoneAmountPence * commissionRate),
-      25000 // £250 cap
-    );
-    const netPayoutPence = milestoneAmountPence - platformFeePence;
+    // Platform commission calculation via canonical AnyTrader resolver
+    // Honors Admin-configured rates in platform_config/global_tiers & platform_config/global
+    // (Defaults: PAYG 5%, Pro 3.5%, Gold 2.5%, Platinum 1.5%, capped at £250 or Admin cap)
+    const resolvedCommission = await resolveAnyTraderCommission({
+      amountPence: milestoneAmountPence,
+      traderData,
+      globalTiers,
+      globalConfig,
+    });
+    const {
+      commissionRate,
+      commissionCapGbp,
+      platformFeePence,
+      netPayoutPence,
+    } = resolvedCommission;
 
     return {
       mode: "payment",
@@ -402,6 +585,8 @@ export async function resolveAuthoritativeLineItem(
               type: "milestone_funding",
               platformFeePence: platformFeePence.toString(),
               netPayoutPence: netPayoutPence.toString(),
+              appliedCommissionRate: commissionRate.toString(),
+              commissionCapGbp: commissionCapGbp.toString(),
             },
           }
         : undefined,
@@ -414,6 +599,8 @@ export async function resolveAuthoritativeLineItem(
         milestoneAmountPence: milestoneAmountPence.toString(),
         platformFeePence: platformFeePence.toString(),
         netPayoutPence: netPayoutPence.toString(),
+        appliedCommissionRate: commissionRate.toString(),
+        commissionCapGbp: commissionCapGbp.toString(),
         userId: authUid,
       },
     };
@@ -423,8 +610,13 @@ export async function resolveAuthoritativeLineItem(
   // 2. B2B SaaS METERED BILLING ("Gotham" Housing Portal)
   // =========================================================================
   if (
-    (!hasExplicitMembershipSelection || body.priceId === "price_gotham_saas" || (typeof body.tierName === "string" && body.tierName.toLowerCase().includes("gotham"))) &&
-    (metadata.type === "gotham_saas" || metadata.subscriptionType === "gotham_saas" || (typeof body.tierName === "string" && body.tierName.toLowerCase().includes("gotham")))
+    !hasExplicitMembershipPriceId &&
+    (
+      body.priceId === "price_gotham_saas" ||
+      metadata.type === "gotham_saas" ||
+      metadata.subscriptionType === "gotham_saas" ||
+      (typeof body.tierName === "string" && body.tierName.toLowerCase().includes("gotham"))
+    )
   ) {
     const doors = Number(metadata.gothamDoorsCount || body.doorsCount || 100);
     const cycle = (metadata.gothamBillingCycle || "monthly") as "monthly" | "annual";
@@ -462,7 +654,7 @@ export async function resolveAuthoritativeLineItem(
   // =========================================================================
   // 3. AD WALLET TOPUP & BANNER AD CHECKOUT (£2.00/day canonical rate)
   // =========================================================================
-  if ((metadata.type === "banner_ad" || metadata.type === "banner_promo") && !hasExplicitMembershipSelection) {
+  if ((metadata.type === "banner_ad" || metadata.type === "banner_promo") && !hasExplicitMembershipPriceId) {
     const safeDays = sanitizeBannerDurationDays(metadata.durationDays || body.durationDays);
     const bannerCostPence = calculateBannerAdCostPence(safeDays);
     return {
@@ -490,7 +682,7 @@ export async function resolveAuthoritativeLineItem(
     };
   }
 
-  if (metadata.type === "ad_wallet_topup" && !hasExplicitMembershipSelection) {
+  if ((body.priceId === "price_ad_wallet_topup" || metadata.type === "ad_wallet_topup") && !hasExplicitMembershipPriceId) {
     const sanitizedPounds = Math.round(sanitizeAdWalletTopupGbp(metadata.topupAmount || 25));
     const topupPence = sanitizedPounds * 100;
 
@@ -521,7 +713,7 @@ export async function resolveAuthoritativeLineItem(
   // =========================================================================
   // 4. DISPUTE MEDIATION STAKE (£25.00)
   // =========================================================================
-  if (body.priceId === "price_dispute_stake" || (metadata.type === "mediation_stake" && !hasExplicitMembershipSelection)) {
+  if (body.priceId === "price_dispute_stake" || (metadata.type === "mediation_stake" && !hasExplicitMembershipPriceId)) {
     await loadAuthorizedCheckoutJob(firestoreDb, String(metadata.jobId || ""), authUid, "mediation_stake");
     const catalogItem = SERVER_PRICING_CATALOG.price_dispute_stake;
     const dynamicStake = Number(globalConfig?.paidAddons?.milestoneEscrow?.homeownerMediationStake);
@@ -555,11 +747,17 @@ export async function resolveAuthoritativeLineItem(
   }
 
   // =========================================================================
-  // 5. PRIORITY BOOSTS (Emergency £4.99, Instant Match £2.99)
+  // 5. PRIORITY BOOSTS (Emergency £5.00, Instant Match £2.99)
   // =========================================================================
-  if (["price_emergency_boost", "price_instant_match", "price_mock_boost", "price_mock_instant_match"].includes(String(body.priceId || "")) || (!hasExplicitMembershipSelection && (metadata.type === "boost" || metadata.tier === "emergency_boost" || metadata.tier === "instant_match"))) {
+  if (
+    ["price_emergency_boost", "price_instant_match", "price_mock_boost", "price_mock_instant_match"].includes(String(body.priceId || "")) ||
+    (!hasExplicitMembershipPriceId && (metadata.type === "boost" || metadata.tier === "emergency_boost" || metadata.tier === "instant_match"))
+  ) {
     await loadAuthorizedCheckoutJob(firestoreDb, String(metadata.jobId || ""), authUid, "boost");
-    const isInstantMatch = metadata.tier === "instant_match" || body.priceId === "price_instant_match";
+    const isInstantMatch =
+      metadata.tier === "instant_match" ||
+      body.priceId === "price_instant_match" ||
+      body.priceId === "price_mock_instant_match";
     const catalogItem = isInstantMatch
       ? SERVER_PRICING_CATALOG.price_instant_match
       : SERVER_PRICING_CATALOG.price_emergency_boost;
@@ -597,9 +795,13 @@ export async function resolveAuthoritativeLineItem(
   }
 
   // =========================================================================
-  // 6. ADD-ONS: Exclusive Leads (£15/mo), Verified Video Pro (£10/mo or £96/yr)
+  // 6. ADD-ONS: Exclusive Leads (£29/mo), Verified Video Pro (£15/mo or £144/yr), Appointments (£9.99/mo)
   // =========================================================================
-  if (body.priceId === "price_exclusive_leads" || (!hasExplicitMembershipSelection && (metadata.isExclusiveAddon === "true" || metadata.type === "exclusive_leads"))) {
+  if (
+    body.priceId === "price_exclusive_leads" ||
+    body.priceId === "price_mock_exclusive_addon" ||
+    (!hasExplicitMembershipPriceId && (metadata.isExclusiveAddon === "true" || metadata.type === "exclusive_leads"))
+  ) {
     const catalogItem = SERVER_PRICING_CATALOG.price_exclusive_leads;
     const dynamicPrice = Number(globalConfig?.paidAddons?.exclusiveLeads?.price || globalConfig?.exclusiveLeadsFee);
     const resolvedAmountPence = (!isNaN(dynamicPrice) && dynamicPrice > 0)
@@ -630,8 +832,12 @@ export async function resolveAuthoritativeLineItem(
     };
   }
 
-  if (body.priceId === "price_video_pro" || (!hasExplicitMembershipSelection && (metadata.isVideoPro === "true" || metadata.type === "video_pro_subscription"))) {
-    const isAnnual = metadata.billingCycle === "annual";
+  if (
+    body.priceId === "price_video_pro" ||
+    body.priceId === "price_video_pro_annual" ||
+    (!hasExplicitMembershipPriceId && (metadata.isVideoPro === "true" || metadata.type === "video_pro_subscription"))
+  ) {
+    const isAnnual = metadata.billingCycle === "annual" || body.priceId === "price_video_pro_annual";
     const catalogItem = isAnnual
       ? SERVER_PRICING_CATALOG.price_video_pro_annual
       : SERVER_PRICING_CATALOG.price_video_pro;
@@ -668,22 +874,56 @@ export async function resolveAuthoritativeLineItem(
     };
   }
 
+  if (
+    body.priceId === "price_appointments" ||
+    (!hasExplicitMembershipPriceId && (metadata.type === "appointments" || metadata.subscriptionType === "appointments"))
+  ) {
+    const catalogItem = SERVER_PRICING_CATALOG.price_appointments;
+    const dynamicPrice = Number(globalConfig?.paidAddons?.appointments?.price);
+    const resolvedAmountPence = (!isNaN(dynamicPrice) && dynamicPrice > 0)
+      ? Math.round(dynamicPrice * 100)
+      : catalogItem.amountPence;
+
+    return {
+      mode: "subscription",
+      isClientMoney: false,
+      authoritativeAmountPence: resolvedAmountPence,
+      lineItem: {
+        price_data: {
+          currency: "gbp",
+          unit_amount: resolvedAmountPence,
+          recurring: { interval: "month" },
+          product_data: {
+            name: catalogItem.name,
+            description: catalogItem.description,
+          },
+        },
+        quantity: 1,
+      },
+      metadata: {
+        type: "appointments",
+        subscriptionType: "appointments",
+        userId: authUid,
+      },
+    };
+  }
+
   // =========================================================================
   // 7. MEMBERSHIP TIERS (Landlord Pro, Driver Gold, Trader Pro/Premium/Platinum)
   // =========================================================================
-  const rawTier = (body.priceId || body.tierName || metadata.tierName || metadata.tier || "Pro").toString();
+  const rawTier = (body.priceId || body.tierName || metadata.tierName || metadata.tier || "").toString().trim();
   const lowerTier = rawTier.toLowerCase();
 
-  let matchedCatalogKey = "price_pro";
-  let canonicalTier = "pro";
+  let matchedCatalogKey = "";
+  let canonicalTier = "";
 
   if (
-    lowerTier.includes("landlord") || body.priceId === "price_landlord"
+    lowerTier.includes("landlord") || body.priceId === "price_landlord" || metadata.subscriptionType === "landlord" || metadata.tier === "landlord"
   ) {
     matchedCatalogKey = "price_landlord";
     canonicalTier = "landlord";
   } else if (
-    lowerTier.includes("gold driver") || body.priceId === "price_driver_gold"
+    lowerTier.includes("gold driver") || body.priceId === "price_driver_gold" || metadata.subscriptionType === "driver_gold" || metadata.type === "driver_gold"
   ) {
     matchedCatalogKey = "price_driver_gold";
     canonicalTier = "driver_gold";
@@ -693,7 +933,7 @@ export async function resolveAuthoritativeLineItem(
   } else if (lowerTier.includes("gold") || lowerTier.includes("elite") || lowerTier.includes("premium") || body.priceId === "price_premium") {
     matchedCatalogKey = "price_premium";
     canonicalTier = "premium";
-  } else if (lowerTier.includes("silver") || lowerTier.includes("pro") || lowerTier.includes("professional") || body.priceId === "price_pro") {
+  } else if (lowerTier.includes("silver") || lowerTier.includes("pro") || lowerTier.includes("professional") || lowerTier.includes("founding") || body.priceId === "price_pro") {
     matchedCatalogKey = "price_pro";
     canonicalTier = "pro";
   } else if (lowerTier.includes("payg") || lowerTier.includes("free") || body.priceId === "price_payg") {
@@ -701,9 +941,13 @@ export async function resolveAuthoritativeLineItem(
     canonicalTier = "payg";
   }
 
-  const catalogItem = SERVER_PRICING_CATALOG[matchedCatalogKey];
+  const catalogItem = matchedCatalogKey ? SERVER_PRICING_CATALOG[matchedCatalogKey] : undefined;
   if (!catalogItem) {
-    throw new BadRequestError(`Unrecognized pricing tier or priceId: '${rawTier}'`);
+    throw new BadRequestError(`Unrecognized pricing tier or product identifier: '${rawTier || "empty"}'`);
+  }
+
+  if (canonicalTier === "payg") {
+    throw new BadRequestError("Free Explorer does not require payment checkout. Please use /api/select-free-tier.");
   }
 
   // Check Firestore admin tier pricing overrides
@@ -719,9 +963,29 @@ export async function resolveAuthoritativeLineItem(
     );
   }
 
-  const resolvedAmountPence = (!isNaN(dynamicTierPrice) && dynamicTierPrice >= 0)
+  let resolvedAmountPence = (!isNaN(dynamicTierPrice) && dynamicTierPrice >= 0)
     ? Math.round(dynamicTierPrice * 100)
     : catalogItem.amountPence;
+
+  // Authoritatively apply Founding PRO lifetime rate (£9.99/mo) for verified Founding Members
+  let resolvedDisplayName = catalogItem.name;
+  let isFoundingProApplied = false;
+  if (canonicalTier === "pro" && firestoreDb && authUid) {
+    try {
+      const callerSnap = await firestoreDb.collection("users").doc(authUid).get();
+      const callerData = callerSnap?.exists
+        ? (typeof callerSnap.data === "function" ? callerSnap.data() : callerSnap.data)
+        : null;
+      if (callerData?.isFoundingMember === true) {
+        const foundingProPence = 999; // £9.99/mo lifetime founding discount
+        resolvedAmountPence = Math.min(resolvedAmountPence, foundingProPence);
+        resolvedDisplayName = "Founding PRO";
+        isFoundingProApplied = true;
+      }
+    } catch {
+      // Non-fatal fallback to standard Silver Pro rate
+    }
+  }
 
   return {
     mode: "subscription",
@@ -733,16 +997,19 @@ export async function resolveAuthoritativeLineItem(
         unit_amount: resolvedAmountPence,
         recurring: { interval: "month" },
         product_data: {
-          name: catalogItem.name,
-          description: catalogItem.description || `Platform subscription tier: ${catalogItem.name}`,
+          name: resolvedDisplayName,
+          description: isFoundingProApplied
+            ? "Exclusive Founding Member lifetime rate for Silver Pro membership"
+            : (catalogItem.description || `Platform subscription tier: ${catalogItem.name}`),
         },
       },
       quantity: 1,
     },
     metadata: {
-      tierName: catalogItem.name,
+      tierName: resolvedDisplayName,
       tier: canonicalTier,
       subscriptionType: canonicalTier === "landlord" ? "landlord" : canonicalTier === "driver_gold" ? "driver_gold" : "tier",
+      ...(isFoundingProApplied ? { isFoundingPro: "true" } : {}),
       userId: authUid,
     },
   };

@@ -15,11 +15,15 @@ export function SEO({
   description = "AnyTrader is the UK's leading marketplace for professional trades and community help. Post jobs, get AI estimates, and hire verified experts.",
   canonical,
   ogType = 'website',
-  ogImage = "https://picsum.photos/seed/anytrader-seo/1200/630",
+  ogImage = "https://www.anytrader.co.uk/app-icon.jpg",
   structuredData
 }: SEOProps) {
   const siteName = "AnyTrader";
   const fullTitle = title.includes(siteName) ? title : `${title} | ${siteName}`;
+  const origin =
+    typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : "https://www.anytrader.co.uk";
 
   return (
     <Helmet>
@@ -59,8 +63,8 @@ export function SEO({
             "@context": "https://schema.org",
             "@type": "Organization",
             "name": "AnyTrader",
-            "url": window.location.origin,
-            "logo": `${window.location.origin}/logo.png`,
+            "url": origin,
+            "logo": `${origin}/app-icon.jpg`,
             "description": description,
             "sameAs": [
               "https://twitter.com/anytrader",

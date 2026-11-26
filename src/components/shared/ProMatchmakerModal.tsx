@@ -1,10 +1,18 @@
 import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Sparkles, UserCircle, Star, Calendar, MessageSquare, CheckCircle } from "lucide-react";
-import { db, collection, query, where, getDocs, addDoc, serverTimestamp, sendNotification } from "@/src/firebase";
+import { db, collection, query, limit, getDocs, addDoc, serverTimestamp, sendNotification } from "@/src/firebase";
 import { getProMatches } from "@/src/services/gemini";
 import { useAuth } from "../AuthProvider";
 import { toast } from "sonner";
+import { isProfileAcceptingNewWork } from "@/src/lib/marketplaceContracts";
+import {
+  extractTraderCategories,
+  extractTraderRating,
+  extractTraderReviewCount,
+  isTraderCalendarAvailableForDate,
+  scoreTraderForJob,
+} from "@/src/lib/unifiedJobMatching";
 
 export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, projectId: string, onClose: () => void }) {
   const { user } = useAuth();
@@ -15,33 +23,46 @@ export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, pr
     async function findMatches() {
       try {
         setLoading(true);
-        // Step 1: Fetch candidate professionals from Firebase
-        // Public profiles provide non-PII directory information
-        const profilesRef = collection(db, "public_profiles");
-        const snapshot = await getDocs(profilesRef);
-        
-        let candidatePros = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        })) as any[];
+        // Step 1: Bounded fetch of non-PII candidate professionals from public_profiles
+        const profilesQuery = query(collection(db, "public_profiles"), limit(100));
+        const snapshot = await getDocs(profilesQuery);
 
-        // Filter out those lacking meaningful data to avoid wasting tokens
-        candidatePros = candidatePros.filter(p => p.businessName || p.fullName || p.name);
+        const syntheticRoleJob = {
+          category: role?.category || role?.roleName || "",
+          title: role?.roleName || "",
+          description: role?.description || role?.notes || "",
+          postcode: role?.postcode || role?.postcodeArea || "",
+          city: role?.city || role?.location || "",
+          preferredDate: role?.requiredDate || null,
+        };
 
-        // Schedule Availability Check (scoped to caller's own calendar events to satisfy zero-trust rules)
-        if (role.requiredDate && user) {
-          try {
-            const reqDateStr = role.requiredDate;
-            const eventsSnapshot = await getDocs(
-              query(collection(db, "calendarEvents"), where("consultantId", "==", user.uid))
-            );
-            const events = eventsSnapshot.docs.map(d => d.data());
-            const busyPros = events.filter(e => e.startTime && e.startTime.startsWith(reqDateStr)).map(e => e.consultantId);
-            candidatePros = candidatePros.filter(p => !busyPros.includes(p.id));
-          } catch (calErr) {
-            console.warn("Calendar availability pre-filter skipped:", calErr);
-          }
-        }
+        let candidatePros = snapshot.docs
+          .map((docSnap) => ({
+            id: docSnap.id,
+            ...docSnap.data(),
+          }))
+          .filter((p: any) => {
+            if (!p.businessName && !p.fullName && !p.name) return false;
+            if (p.isSuspended || p.isDisabled) return false;
+            if (p.role === "business" && String(p.businessLayer || "").toLowerCase() === "properties") return false;
+            if (!isProfileAcceptingNewWork(p)) return false;
+            // Check each candidate pro's own schedule/dateOverrides rather than the caller's calendar
+            if (role?.requiredDate && !isTraderCalendarAvailableForDate(p, role.requiredDate)) {
+              return false;
+            }
+            return true;
+          })
+          .map((p: any) => {
+            const unified = scoreTraderForJob(p, syntheticRoleJob, { mode: "relaxed" });
+            return {
+              ...p,
+              unifiedScore: unified.compositeScore,
+              unifiedHighlights: unified.keyHighlights,
+              distanceMiles: unified.distanceMiles,
+            };
+          })
+          .sort((a: any, b: any) => b.unifiedScore - a.unifiedScore)
+          .slice(0, 20);
 
         if (candidatePros.length === 0) {
           setMatches([]);
@@ -49,27 +70,41 @@ export function ProMatchmakerModal({ role, projectId, onClose }: { role: any, pr
           return;
         }
 
-        // Prepare context for Gemini
-        const candidatesContext = candidatePros.map(p => ({
+        // Prepare honest, bounded top-20 context for Gemini (no inflated 4.5 default rating!)
+        const candidatesContext = candidatePros.map((p: any) => ({
           id: p.id,
           name: p.businessName || p.fullName || p.name,
-          category: p.businessCategory || p.category || "General",
-          rating: p.averageRating || p.rating || 4.5,
-          location: p.city || p.location || "Unknown"
+          category: extractTraderCategories(p)[0] || p.businessCategory || p.category || "General",
+          rating: extractTraderRating(p),
+          reviewsCount: extractTraderReviewCount(p),
+          unifiedMatchScore: p.unifiedScore,
+          distanceMiles: p.distanceMiles,
+          location: p.city || p.postcodeArea || p.location || "Local Area",
         }));
 
-        // Step 2: Use Gemini to identify top matches based on the required role
-        const aiMatches = await getProMatches(role, candidatesContext);
-
-        // Merge AI results with candidate data
-        const enrichedMatches = aiMatches.map((m: any) => {
-          const proObj = candidatePros.find(p => p.id === m.id);
-          return {
-            ...proObj,
-            matchScore: m.matchScore,
-            reason: m.reason
-          };
-        }).sort((a: any, b: any) => b.matchScore - a.matchScore);
+        // Step 2: Use Gemini to refine top matches based on the required role, with deterministic fallback
+        let enrichedMatches: any[] = [];
+        try {
+          const aiMatches = await getProMatches(role, candidatesContext);
+          enrichedMatches = (aiMatches || [])
+            .map((m: any) => {
+              const proObj = candidatePros.find((p: any) => p.id === m.id);
+              if (!proObj) return null;
+              return {
+                ...proObj,
+                matchScore: Number.isFinite(Number(m.matchScore)) ? Number(m.matchScore) : proObj.unifiedScore,
+                reason: m.reason || proObj.unifiedHighlights?.join(" • ") || "Matched via unified skills & availability",
+              };
+            })
+            .filter(Boolean)
+            .sort((a: any, b: any) => b.matchScore - a.matchScore);
+        } catch {
+          enrichedMatches = candidatePros.slice(0, 6).map((p: any) => ({
+            ...p,
+            matchScore: p.unifiedScore,
+            reason: p.unifiedHighlights?.join(" • ") || "Matched via unified skills & availability",
+          }));
+        }
 
         setMatches(enrichedMatches);
       } catch (err) {

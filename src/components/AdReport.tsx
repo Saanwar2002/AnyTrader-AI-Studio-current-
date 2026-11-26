@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
-import { ArrowLeft, Loader2, MousePointerClick, Calendar, Zap, FileText, CheckCircle2, PauseCircle } from "lucide-react";
+import { ArrowLeft, Loader2, MousePointerClick, Calendar, Zap, FileText, CheckCircle2, PauseCircle, Lock } from "lucide-react";
 import { cn } from "../lib/utils";
 import PartnerAdvertisement from "./shared/PartnerAdvertisement";
 
@@ -10,17 +10,32 @@ export default function AdReport() {
   const { id } = useParams<{ id: string }>();
   const [ad, setAd] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [accessDenied, setAccessDenied] = useState(false);
 
   useEffect(() => {
-    if (!id) return;
-    const unsub = onSnapshot(doc(db, "advertisements", id), (docSnapshot) => {
-      if (docSnapshot.exists()) {
-        setAd({ id: docSnapshot.id, ...docSnapshot.data() });
-      } else {
-        setAd(null);
-      }
+    if (!id) {
       setIsLoading(false);
-    });
+      return;
+    }
+    setIsLoading(true);
+    setAccessDenied(false);
+    const unsub = onSnapshot(
+      doc(db, "advertisements", id),
+      (docSnapshot) => {
+        if (docSnapshot.exists()) {
+          setAd({ id: docSnapshot.id, ...docSnapshot.data() });
+        } else {
+          setAd(null);
+        }
+        setIsLoading(false);
+      },
+      (err) => {
+        console.warn("AdReport access error:", err);
+        setAccessDenied(err?.code === "permission-denied");
+        setAd(null);
+        setIsLoading(false);
+      }
+    );
     return unsub;
   }, [id]);
 
@@ -32,17 +47,56 @@ export default function AdReport() {
     );
   }
 
-  if (!ad) {
+  if (accessDenied) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-        <div className="text-center bg-white p-8 rounded-3xl border border-black w-full max-w-sm shadow-xl">
-          <FileText className="w-12 h-12 text-slate-300 mx-auto mb-4" />
-          <h2 className="text-xl font-bold text-slate-900 mb-2">Campaign Not Found</h2>
-          <p className="text-slate-500 mb-6">This advertisement campaign does not exist or has been deleted.</p>
+        <div className="text-center bg-white p-8 rounded-3xl border border-black w-full max-w-sm shadow-xl space-y-4">
+          <Lock className="w-12 h-12 text-black mx-auto" />
+          <h2 className="text-xl font-bold text-black">Sign In Required</h2>
+          <p className="text-sm text-black/70">
+            Campaign reports are private to the campaign owner and platform administrators.
+          </p>
+          <div className="flex flex-col gap-2 pt-2">
+            <Link
+              to="/login"
+              className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm rounded-xl border border-black transition"
+            >
+              Sign In
+            </Link>
+            <Link
+              to="/trader/banner-ads"
+              className="w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-black font-bold text-sm rounded-xl border border-black transition flex items-center justify-center gap-1.5"
+            >
+              <ArrowLeft className="w-4 h-4" /> Back to Banner Ad Studio
+            </Link>
+          </div>
         </div>
       </div>
     );
   }
+
+  if (!ad) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="text-center bg-white p-8 rounded-3xl border border-black w-full max-w-sm shadow-xl space-y-4">
+          <FileText className="w-12 h-12 text-slate-300 mx-auto" />
+          <h2 className="text-xl font-bold text-black">Campaign Not Found</h2>
+          <p className="text-sm text-black/70">This advertisement campaign does not exist or has been deleted.</p>
+          <Link
+            to="/trader/banner-ads"
+            className="inline-flex items-center justify-center gap-1.5 py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-black font-bold text-sm rounded-xl border border-black transition"
+          >
+            <ArrowLeft className="w-4 h-4" /> Back to Ad Studio
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const safeBgColor =
+    typeof ad.bgColor === "string" && ad.bgColor.trim().length > 0
+      ? ad.bgColor.trim()
+      : "bg-slate-900";
 
   const startDate = ad.createdAt?.toDate ? ad.createdAt.toDate().toLocaleDateString() : "Starting soon...";
   
@@ -123,7 +177,7 @@ export default function AdReport() {
                   <img src={ad.imageUrl} alt={ad.title} className="w-full h-full object-cover" />
                 </div>
               ) : (
-                <div className={cn("w-full h-20 sm:h-24 rounded-2xl relative overflow-hidden flex flex-col justify-center p-4 sm:p-5 text-white shadow-md block", ad.bgColor)} style={{ background: ad.bgColor.includes("bg-") ? undefined : ad.bgColor }}>
+                <div className={cn("w-full h-20 sm:h-24 rounded-2xl relative overflow-hidden flex flex-col justify-center p-4 sm:p-5 text-white shadow-md block", safeBgColor.includes("bg-") ? safeBgColor : undefined)} style={{ background: safeBgColor.includes("bg-") ? undefined : safeBgColor }}>
                    <div className="flex items-center gap-4">
                      <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center shrink-0">
                        <Zap className="w-6 h-6 text-white" />

@@ -4,16 +4,25 @@
  */
 
 import React, { useState, useEffect, Suspense } from "react";
-import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link } from "react-router-dom";
+import { BrowserRouter, Routes, Route, useNavigate, useLocation, Navigate, Link } from "react-router-dom";
+import { consumePendingLoginRedirect, extractRedirectFromSearch } from "./lib/authRedirect";
 import { CategoryProvider } from "./lib/CategoryProvider";
 import Layout from "./components/Layout";
 import { useAuth } from "./components/AuthProvider";
 import { Toaster, toast } from "sonner";
 import { ReviewReminder } from "./components/ReviewReminder";
 import { PlusCircle, Briefcase, MessageSquare, User as UserIcon, Bell, ChevronRight, PoundSterling, Search, Lock, Loader2 } from "lucide-react";
-import { db, collection, query, where, onSnapshot, collectionGroup, doc } from "@/src/firebase";
+import { db, collection, query, where, onSnapshot, collectionGroup, doc, getDoc, setDoc, serverTimestamp } from "@/src/firebase";
 
 import { PortalProvider, usePortal } from "./lib/PortalContext";
+import {
+  isAdminAccount,
+  isAnyRollerDriverAccount,
+  isConsultancyAccount,
+  isEcosystemManagerAccount,
+  isPropertyBusinessAccount,
+  isTradeProviderAccount,
+} from "./lib/accountRoles";
 import PlatformSwitcher from "./components/shared/PlatformSwitcher";
 import { AppUpdateModal } from "./components/common/AppUpdateModal";
 import { ShareViewModal } from "./components/ShareViewModal";
@@ -87,6 +96,7 @@ const Availability = lazyWithRetry(() => import("./components/Availability"));
 const Portfolio = lazyWithRetry(() => import("./components/Portfolio"));
 const TradesBannerAdStudio = lazyWithRetry(() => import("./components/TradesBannerAdStudio"));
 const BusinessTeamManagement = lazyWithRetry(() => import("./components/BusinessTeamManagement"));
+const InviteAcceptPage = lazyWithRetry(() => import("./components/InviteAcceptPage"));
 const BillingManager = lazyWithRetry(() => import("./components/BillingManager"));
 const SavedJourneys = lazyWithRetry(() => import("./components/SavedJourneys"));
 const AdReport = lazyWithRetry(() => import("./components/AdReport"));
@@ -95,6 +105,7 @@ const TraderOutreachAgent = lazyWithRetry(() => import("./components/TraderOutre
 const TenantReportPortal = lazyWithRetry(() => import("./components/TenantReportPortal").then(m => ({ default: m.TenantReportPortal })));
 const PublicPropertyPassportView = lazyWithRetry(() => import("./components/property/PublicPropertyPassportView"));
 const MoveInLanding = lazyWithRetry(() => import("./components/property/MoveInLanding"));
+const ClaimPassportPage = lazyWithRetry(() => import("./components/property/ClaimPassportPage"));
 
 import SplashScreen from "./components/SplashScreen";
 
@@ -104,8 +115,21 @@ const PageSkeleton = () => (
   </div>
 );
 
+function PostLoginRedirect() {
+  const location = useLocation();
+  const queryTarget = extractRedirectFromSearch(location.search);
+  const pendingTarget = consumePendingLoginRedirect();
+  const destination = queryTarget || pendingTarget || "/";
+  return <Navigate to={destination} replace />;
+}
+
 function IndexRoute() {
   const { activePortal, activeRole } = usePortal();
+  const pendingRedirect = consumePendingLoginRedirect();
+
+  if (pendingRedirect && pendingRedirect !== "/") {
+    return <Navigate to={pendingRedirect} replace />;
+  }
 
   if (activeRole === "admin") {
     return <Navigate to="/admin" replace />;
@@ -132,6 +156,7 @@ function IndexRoute() {
 }
 
 function ShareGlobalContainer() {
+  const { user } = useAuth();
   const navigate = useNavigate();
   const [shared, setShared] = useState<{ type: ShareType; id: string } | null>(null);
 
@@ -153,12 +178,59 @@ function ShareGlobalContainer() {
     window.history.replaceState({}, "", url.pathname + url.search);
   };
 
-  const handleOpenChat = (recipientId?: string, jobTitle?: string) => {
-    if (recipientId) {
-      navigate(`/chat?recipientId=${recipientId}&jobTitle=${encodeURIComponent(jobTitle || 'Shared Trade')}`);
-    } else {
-      navigate('/chat');
+  const handleOpenChat = async (recipientId?: string, jobTitle?: string) => {
+    if (!user) {
+      navigate("/messages");
+      return;
     }
+    if (recipientId && recipientId !== user.uid) {
+      try {
+        const token = await user.getIdToken();
+        const blockRes = await fetch("/api/chat/blocks", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (blockRes.ok) {
+          const blockData = await blockRes.json().catch(() => ({}));
+          const blocked = Array.isArray(blockData.blockedUserIds) ? blockData.blockedUserIds : [];
+          const blockedBy = Array.isArray(blockData.blockedByUserIds) ? blockData.blockedByUserIds : [];
+          if (blocked.includes(recipientId) || blockedBy.includes(recipientId)) {
+            toast.error("Messaging is unavailable because one of the accounts has blocked the other.");
+            handleClose();
+            return;
+          }
+        }
+
+        const sortedIds = [user.uid, recipientId].sort();
+        const convId = `direct_${sortedIds[0]}_${sortedIds[1]}`;
+        const convRef = doc(db, "conversations", convId);
+        const existing = await getDoc(convRef);
+        if (!existing.exists()) {
+          await setDoc(convRef, {
+            participants: sortedIds,
+            participantNames: {
+              [user.uid]: user.displayName || "Member",
+            },
+            unreadCounts: {
+              [user.uid]: 0,
+              [recipientId]: 0,
+            },
+            jobTitle: jobTitle || "Shared Trade",
+            lastMessage: "",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        handleClose();
+        navigate(`/chat/${convId}`, {
+          state: { jobTitle: jobTitle || "Shared Trade" },
+        });
+        return;
+      } catch (err) {
+        console.error("Error opening shared chat:", err);
+      }
+    }
+    handleClose();
+    navigate("/messages");
   };
 
   if (!shared) return null;
@@ -214,40 +286,39 @@ function WebPushRuntimeBridge() {
   return null;
 }
 
-type RoleGroup = "admin" | "ecosystem" | "business" | "driver" | "corporate";
+type RoleGroup = "admin" | "ecosystem" | "trader" | "consultancy" | "business" | "driver" | "corporate";
 
 function hasRoleAccess(profile: any, allowed: RoleGroup): boolean {
   if (!profile) return false;
   const role = String(profile.role || "").toLowerCase();
   const caps: string[] = Array.isArray(profile.capabilities) ? profile.capabilities : [];
-  const isAdminUser = role === "admin" || role === "super_admin";
-  const isEcosystemUser = isAdminUser || role === "ecosystem_manager";
+  const isAdminUser = isAdminAccount(profile);
+  const isEcosystemUser = isAdminUser || isEcosystemManagerAccount(profile);
 
   switch (allowed) {
     case "admin":
       return isAdminUser;
     case "ecosystem":
       return isEcosystemUser;
+    case "trader":
+      return isEcosystemUser || isTradeProviderAccount(profile);
+    case "consultancy":
+      return isEcosystemUser || isConsultancyAccount(profile);
     case "business":
       return (
         isEcosystemUser ||
-        ["tradesperson", "trader", "business", "consultant"].includes(role) ||
+        role === "business" ||
         profile.subscriptionType === "business" ||
-        caps.some((c) => ["tradesperson", "contractor", "consultant"].includes(c))
+        isTradeProviderAccount(profile) ||
+        isConsultancyAccount(profile)
       );
     case "driver":
-      return (
-        isAdminUser ||
-        role === "driver" ||
-        role === "fleet_driver" ||
-        profile.isDriver === true ||
-        caps.includes("fleet_driver")
-      );
+      return isAdminUser || isAnyRollerDriverAccount(profile);
     case "corporate":
       return (
         isEcosystemUser ||
-        ["business", "landlord", "property_manager", "estate_agent"].includes(role) ||
-        profile.businessLayer === "properties" ||
+        isPropertyBusinessAccount(profile) ||
+        ["landlord", "property_manager", "estate_agent"].includes(role) ||
         profile.hasLandlordPro === true ||
         caps.some((c) => ["landlord", "property_manager", "estate_agent"].includes(c))
       );
@@ -357,7 +428,10 @@ export default function App() {
             <Route path="/ad-report/:id" element={<AdReport />} />
             <Route path="/tenant-report" element={<TenantReportPortal />} />
             <Route path="/passport/view/:id" element={<PublicPropertyPassportView />} />
+            <Route path="/claim-passport" element={<ClaimPassportPage />} />
             <Route path="/move-in" element={<MoveInLanding />} />
+            <Route path="/admin-invite" element={<InviteAcceptPage kind="admin" />} />
+            <Route path="/team-invite" element={<InviteAcceptPage kind="business_team" />} />
           {!user ? (
             <>
               <Route path="/profile/:id" element={<PublicProfile />} />
@@ -369,25 +443,31 @@ export default function App() {
             <>
               <Route path="/" element={<Layout />}>
                 <Route index element={<IndexRoute />} />
-                <Route path="dashboard" element={profile.subscriptionType === "business" ? <BusinessDashboard /> : <Dashboard />} />
-                <Route path="trades-dashboard" element={<RoleRoute allowed="business"><TradesDashboard /></RoleRoute>} />
+                <Route path="dashboard" element={
+                  profile.role === "tradesperson"
+                    ? <TradesDashboard />
+                    : (profile.role === "business" || profile.subscriptionType === "business")
+                    ? <BusinessDashboard />
+                    : <Dashboard />
+                } />
+                <Route path="trades-dashboard" element={<RoleRoute allowed="trader"><TradesDashboard /></RoleRoute>} />
                 <Route path="job-feed" element={<JobFeed />} />
                 <Route path="my-jobs" element={<MyJobs />} />
-                <Route path="trade-jobs" element={<RoleRoute allowed="business"><TradeJobs /></RoleRoute>} />
-                <Route path="trader/calendar" element={<RoleRoute allowed="business"><TraderCalendar /></RoleRoute>} />
-                <Route path="consultancy/calendar" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="consultancy/projects" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="consultancy/clients" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="consultancy/billing" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="consultancy/portfolio" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="consultancy/proposals" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="consultancy/new" element={<RoleRoute allowed="business"><BusinessDashboard /></RoleRoute>} />
-                <Route path="trader/outreach" element={<RoleRoute allowed="business"><TraderOutreachAgent /></RoleRoute>} />
+                <Route path="trade-jobs" element={<RoleRoute allowed="trader"><TradeJobs /></RoleRoute>} />
+                <Route path="trader/calendar" element={<RoleRoute allowed="trader"><TraderCalendar /></RoleRoute>} />
+                <Route path="consultancy/calendar" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/projects" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/clients" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/billing" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/portfolio" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/proposals" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="consultancy/new" element={<RoleRoute allowed="consultancy"><BusinessDashboard /></RoleRoute>} />
+                <Route path="trader/outreach" element={<RoleRoute allowed="trader"><TraderOutreachAgent /></RoleRoute>} />
                 <Route path="portfolio" element={<Portfolio />} />
                 <Route path="move-in" element={<MoveInLanding />} />
                 <Route path="passport/view/:id" element={<PublicPropertyPassportView />} />
-                <Route path="trader/banner-ads" element={<RoleRoute allowed="business"><TradesBannerAdStudio /></RoleRoute>} />
-                <Route path="ad-studio" element={<RoleRoute allowed="business"><TraderAdStudio /></RoleRoute>} />
+                <Route path="trader/banner-ads" element={<RoleRoute allowed="trader"><TradesBannerAdStudio /></RoleRoute>} />
+                <Route path="ad-studio" element={<RoleRoute allowed="trader"><TraderAdStudio /></RoleRoute>} />
                 <Route path="post-job" element={<PostJobWizard />} />
                 <Route path="post-emergency-job" element={<EmergencyJobWizard />} />
                 <Route path="my-quotes" element={<MyQuotes />} />
@@ -396,7 +476,7 @@ export default function App() {
                 <Route path="chat/:conversationId" element={<Chat />} />
                 <Route path="profile" element={<Profile />} />
                 <Route path="profile/:id" element={<PublicProfile />} />
-                <Route path="availability" element={<RoleRoute allowed="business"><Availability /></RoleRoute>} />
+                <Route path="availability" element={<RoleRoute allowed="trader"><Availability /></RoleRoute>} />
                 <Route path="analytics" element={<Analytics />} />
                 <Route path="billing" element={(profile?.role === "driver" || profile?.role === "fleet_driver") ? <DriverEarnings /> : <BillingManager />} />
                 <Route path="team" element={<RoleRoute allowed="business"><BusinessTeamManagement /></RoleRoute>} />
@@ -416,6 +496,7 @@ export default function App() {
                 <Route path="saved-journeys" element={<SavedJourneys />} />
                 <Route path="platform-fee-success" element={<PlatformFeeSuccess />} />
 
+                <Route path="login" element={<PostLoginRedirect />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
             </>

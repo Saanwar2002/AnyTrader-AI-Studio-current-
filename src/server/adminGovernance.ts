@@ -84,11 +84,14 @@ function toMillis(val: any): number {
  */
 export function resolveAdminCapabilityTier(
   decodedToken?: Record<string, any> | null,
-  userDocData?: Record<string, any> | null
+  userDocData?: Record<string, any> | null,
+  adminDocData?: Record<string, any> | null
 ): AdminCapabilityTier {
   const explicit =
     decodedToken?.adminTier ||
     decodedToken?.capabilityTier ||
+    adminDocData?.adminTier ||
+    adminDocData?.capabilityTier ||
     userDocData?.adminTier ||
     userDocData?.capabilityTier;
 
@@ -102,33 +105,51 @@ export function resolveAdminCapabilityTier(
 
   if (
     decodedToken?.isSuperAdmin === true ||
+    adminDocData?.isSuperAdmin === true ||
     userDocData?.isSuperAdmin === true ||
     userDocData?.role === "super_admin"
   ) {
     return "super_admin";
   }
 
-  // Staff members explicitly marked read-only via permissions
-  if (
-    Array.isArray(userDocData?.permissions) &&
-    userDocData.permissions.length > 0 &&
-    !userDocData.permissions.includes("manage_team") &&
-    !userDocData.permissions.includes("manage_payouts") &&
-    !userDocData.permissions.includes("manage_users") &&
-    !userDocData.permissions.includes("manage_jobs")
-  ) {
+  // Staff members with an explicit permissions / adminPermissions list are strictly bounded by those permissions
+  const rawPermissions =
+    (Array.isArray(adminDocData?.permissions) && adminDocData.permissions.length > 0
+      ? adminDocData.permissions
+      : null) ||
+    (Array.isArray(userDocData?.permissions) && userDocData.permissions.length > 0
+      ? userDocData.permissions
+      : null) ||
+    (Array.isArray(userDocData?.adminPermissions) && userDocData.adminPermissions.length > 0
+      ? userDocData.adminPermissions
+      : null);
+
+  if (rawPermissions && rawPermissions.length > 0) {
+    const permSet = new Set(
+      rawPermissions.map((p: any) => String(p || "").trim().toLowerCase()).filter(Boolean)
+    );
+    if (
+      permSet.has("manage_team") ||
+      permSet.has("manage_settings") ||
+      permSet.has("super_admin") ||
+      permSet.has("all")
+    ) {
+      return "super_admin";
+    }
+    if (
+      permSet.has("manage_payouts") ||
+      permSet.has("manage_users") ||
+      permSet.has("manage_jobs") ||
+      permSet.has("manage_disputes") ||
+      permSet.has("manage_adverts") ||
+      permSet.has("manage_categories")
+    ) {
+      return "financial_operator";
+    }
     return "support_readonly";
   }
 
-  if (
-    Array.isArray(userDocData?.permissions) &&
-    userDocData.permissions.includes("manage_payouts") &&
-    !userDocData.permissions.includes("manage_team")
-  ) {
-    return "financial_operator";
-  }
-
-  // Verified full platform admins (e.g., bootstrap/primary admin claim) default to super_admin
+  // Verified full platform admins (e.g., bootstrap/primary admin claim with no restricted staff permissions) default to super_admin
   if (
     decodedToken?.admin === true ||
     decodedToken?.isAdmin === true ||
@@ -417,9 +438,11 @@ export interface BroadcastFanOutResult {
   truncated: boolean;
   channelStatuses: {
     inApp: "sent" | "partial_failure" | "skipped";
-    email: "queued" | "skipped_no_provider" | "disabled";
-    sms: "queued" | "skipped_no_provider" | "disabled";
+    email: "queued" | "partial_failure" | "skipped_no_provider" | "skipped_no_recipients" | "disabled";
+    sms: "queued" | "partial_failure" | "skipped_no_provider" | "skipped_no_recipients" | "disabled";
   };
+  emailQueuedCount?: number;
+  smsQueuedCount?: number;
 }
 
 function normalizeSegmentRole(segment: string): string {
@@ -530,18 +553,53 @@ export async function enqueueAdminBroadcastCommand(
     }
   }
 
+  let emailQueuedCount = 0;
+  let emailFailedCount = 0;
+  // Queue real email_queue items ONLY when email channel requested & provider configured
+  if (wantEmail && emailConfigured && matchedUsers.length > 0) {
+    for (const recipient of matchedUsers) {
+      const email = typeof recipient.email === "string" ? recipient.email.trim().toLowerCase() : "";
+      if (email && email.includes("@")) {
+        try {
+          await db.collection("email_queue").add({
+            to: email,
+            userId: recipient.id,
+            subject: title,
+            text: content,
+            status: "pending",
+            broadcastId,
+            initiatedByUid: actor.uid,
+            createdAt: serverTimestampOrIso(),
+          });
+          emailQueuedCount++;
+        } catch {
+          emailFailedCount++;
+        }
+      }
+    }
+  }
+
+  let smsQueuedCount = 0;
+  let smsFailedCount = 0;
   // Queue SMS items ONLY when SMS channel requested & Twilio configured
-  if (wantSms && smsConfigured) {
+  if (wantSms && smsConfigured && matchedUsers.length > 0) {
     for (const recipient of matchedUsers) {
       const phone = recipient.phone || recipient.phoneNumber;
       if (typeof phone === "string" && phone.trim().length >= 7) {
-        await db.collection("sms_queue").add({
-          to: phone.trim(),
-          body: `${title}: ${content.slice(0, 300)}`,
-          status: "pending",
-          broadcastId,
-          createdAt: serverTimestampOrIso(),
-        });
+        try {
+          await db.collection("sms_queue").add({
+            to: phone.trim(),
+            userId: recipient.id,
+            body: `${title}: ${content.slice(0, 300)}`,
+            status: "pending",
+            broadcastId,
+            initiatedByUid: actor.uid,
+            createdAt: serverTimestampOrIso(),
+          });
+          smsQueuedCount++;
+        } catch {
+          smsFailedCount++;
+        }
       }
     }
   }
@@ -554,20 +612,29 @@ export async function enqueueAdminBroadcastCommand(
       : "sent",
     email: !wantEmail
       ? "disabled"
-      : emailConfigured
+      : !emailConfigured
+      ? "skipped_no_provider"
+      : emailFailedCount > 0
+      ? "partial_failure"
+      : emailQueuedCount > 0
       ? "queued"
-      : "skipped_no_provider",
+      : "skipped_no_recipients",
     sms: !wantSms
       ? "disabled"
-      : smsConfigured
+      : !smsConfigured
+      ? "skipped_no_provider"
+      : smsFailedCount > 0
+      ? "partial_failure"
+      : smsQueuedCount > 0
       ? "queued"
-      : "skipped_no_provider",
+      : "skipped_no_recipients",
   };
 
+  const totalFailed = failedCount + emailFailedCount + smsFailedCount;
   const finalStatus: BroadcastFanOutResult["status"] =
     queuedCount === 0
       ? "queued_empty"
-      : failedCount > 0
+      : totalFailed > 0
       ? "partial_failure"
       : "completed";
 
@@ -586,7 +653,9 @@ export async function enqueueAdminBroadcastCommand(
     totalMatched: matchedUsers.length,
     queuedCount,
     sentCount,
-    failedCount,
+    failedCount: totalFailed,
+    emailQueuedCount,
+    smsQueuedCount,
     truncated,
     maxBatchSize: cap,
     status: finalStatus,
@@ -605,7 +674,9 @@ export async function enqueueAdminBroadcastCommand(
     targetId: broadcastId,
     totalMatched: matchedUsers.length,
     sentCount,
-    failedCount,
+    emailQueuedCount,
+    smsQueuedCount,
+    failedCount: totalFailed,
     channelStatuses,
     timestamp: new Date().toISOString(),
   });
@@ -616,7 +687,9 @@ export async function enqueueAdminBroadcastCommand(
     totalMatched: matchedUsers.length,
     queuedCount,
     sentCount,
-    failedCount,
+    failedCount: totalFailed,
+    emailQueuedCount,
+    smsQueuedCount,
     truncated,
     channelStatuses,
   };

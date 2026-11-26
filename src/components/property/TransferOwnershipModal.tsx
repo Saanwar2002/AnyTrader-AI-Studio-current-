@@ -91,7 +91,7 @@ export function TransferOwnershipModal({ property, onClose, onUpdated }: Transfe
     }
   };
 
-  const handleShareWhatsApp = () => {
+  const handleShareWhatsApp = async () => {
     const code = isPending ? property.transferCode : generatedCode;
     const propName = property.name || property.address?.line1 || "Property Passport";
     const msg = `🏡 *AnyTrader Property Passport Handover*\n` +
@@ -99,7 +99,12 @@ export function TransferOwnershipModal({ property, onClose, onUpdated }: Transfe
       `Transfer Claim Code: *${code}*\n\n` +
       `To claim this property's verified digital maintenance twin, appliance specs, warranties, and compliance records upon completion, open this link:\n` +
       `${claimUrl}`;
-    window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, "_blank", "noopener,noreferrer");
+    try {
+      await navigator.clipboard.writeText(msg);
+      toast.success("WhatsApp handover message copied to clipboard — paste in WhatsApp to send.");
+    } catch {
+      toast.info("Copy the direct claim link above to share via WhatsApp.");
+    }
   };
 
   const handlePrintHandover = () => {

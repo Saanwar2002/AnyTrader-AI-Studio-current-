@@ -1,26 +1,30 @@
 {
+  "id": "/",
   "short_name": "AnyTrader",
   "name": "AnyTrader | Local Trades & Services",
   "description": "The UK's All-in-One Local Trade & Service App. Post jobs, get AI estimates, and hire 100% verified UK tradespeople with zero lead fees.",
   "icons": [
     {
-      "src": "/app-icon.jpg",
-      "type": "image/jpeg",
-      "sizes": "512x512",
-      "purpose": "any maskable"
-    },
-    {
       "src": "/pwa-192.jpg",
       "type": "image/jpeg",
-      "sizes": "192x192"
+      "sizes": "192x192",
+      "purpose": "any"
     },
     {
       "src": "/pwa-512.jpg",
       "type": "image/jpeg",
-      "sizes": "512x512"
+      "sizes": "512x512",
+      "purpose": "any"
+    },
+    {
+      "src": "/app-icon.jpg",
+      "type": "image/jpeg",
+      "sizes": "512x512",
+      "purpose": "any"
     }
   ],
   "start_url": "/",
+  "scope": "/",
   "background_color": "#002B5C",
   "theme_color": "#002B5C",
   "display": "standalone",

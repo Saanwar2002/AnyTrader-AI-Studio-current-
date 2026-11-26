@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { 
   ShieldCheck, 
   X, 
@@ -41,6 +41,13 @@ export const TermsModal: React.FC<TermsModalProps> = ({
   const [selectedCategory, setSelectedCategory] = useState<string>(initialTab);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [expandedSectionId, setExpandedSectionId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedCategory(initialTab);
+      setSearchQuery("");
+    }
+  }, [isOpen, initialTab]);
 
   if (!isOpen) return null;
 

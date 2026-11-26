@@ -48,12 +48,55 @@ export default function Notifications() {
     return () => unsubscribe();
   }, [user]);
 
+  const [isMarkingAllRead, setIsMarkingAllRead] = useState(false);
+
   const markAsRead = async (id: string) => {
     try {
-      await updateDoc(doc(db, "notifications", id), { read: true });
+      await updateDoc(doc(db, "notifications", id), { read: true, isRead: true });
     } catch (err) {
       console.error("Error marking notification as read:", err);
     }
+  };
+
+  const markAllAsRead = async () => {
+    const unread = notifications.filter((n) => !n.read);
+    if (unread.length === 0 || isMarkingAllRead) return;
+    setIsMarkingAllRead(true);
+    try {
+      await Promise.all(
+        unread.map((n) => updateDoc(doc(db, "notifications", n.id), { read: true, isRead: true }))
+      );
+    } catch (err) {
+      console.error("Error marking all notifications as read:", err);
+    } finally {
+      setIsMarkingAllRead(false);
+    }
+  };
+
+  const formatNotificationTimestamp = (raw: any): string => {
+    if (!raw) return "Just now";
+    const parsed = typeof raw?.toDate === "function"
+      ? raw.toDate()
+      : typeof raw?.seconds === "number"
+      ? new Date(raw.seconds * 1000)
+      : new Date(raw);
+    if (!(parsed instanceof Date) || Number.isNaN(parsed.getTime())) {
+      return "Just now";
+    }
+    const now = new Date();
+    const isSameDay =
+      parsed.getFullYear() === now.getFullYear() &&
+      parsed.getMonth() === now.getMonth() &&
+      parsed.getDate() === now.getDate();
+    if (isSameDay) {
+      return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    return parsed.toLocaleString("en-GB", {
+      day: "numeric",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   };
 
   const deleteNotification = async (id: string) => {
@@ -65,16 +108,31 @@ export default function Notifications() {
     }
   };
 
+  const normalizeNotificationPath = (rawPath: string): string => {
+    const trimmed = rawPath.trim();
+    if (/^\/jobs\/([^/?#]+)/i.test(trimmed)) {
+      return trimmed.replace(/^\/jobs\//i, "/job/");
+    }
+    if (/^\/messages\?chatId=([^&]+)/i.test(trimmed)) {
+      const match = trimmed.match(/chatId=([^&]+)/i);
+      if (match?.[1]) return `/chat/${encodeURIComponent(match[1])}`;
+    }
+    if (trimmed === "/hiring") return "/my-jobs";
+    if (trimmed === "/financials") return "/billing";
+    return trimmed;
+  };
+
   const resolveNotificationRoute = (notification: any): string => {
     // 1. Direct path properties on notification document
     const directPath = notification.actionPath || notification.link || notification.actionUrl || notification.url || notification.targetUrl || notification.path;
     if (directPath && typeof directPath === "string" && directPath.trim().length > 0) {
-      return directPath.trim();
+      return normalizeNotificationPath(directPath);
     }
 
     // 2. ID based routing
     if (notification.jobId) return `/job/${notification.jobId}`;
-    if (notification.chatId) return `/messages?chatId=${notification.chatId}`;
+    if (notification.conversationId) return `/chat/${notification.conversationId}`;
+    if (notification.chatId) return `/chat/${notification.chatId}`;
     if (notification.bookingId) return `/job/${notification.bookingId}`;
     if (notification.propertyId) return `/profile#property-passport`;
 
@@ -115,7 +173,10 @@ export default function Notifications() {
       message.includes("quote") ||
       message.includes("job")
     ) {
-      return "/hiring";
+      if (type === "lead" || title.includes("lead") || title.includes("match")) {
+        return "/job-feed";
+      }
+      return "/my-jobs";
     }
 
     // Messages / Chat
@@ -137,7 +198,7 @@ export default function Notifications() {
       title.includes("tax") ||
       message.includes("payment")
     ) {
-      return "/financials";
+      return "/billing";
     }
 
     // Property Passport / CP12 / EICR
@@ -169,14 +230,14 @@ export default function Notifications() {
     if (targetRoute.includes("#verification") || title.includes("verification")) {
       return { label: "View Verification", icon: <ShieldCheck className="w-4 h-4 stroke-[2.5]" /> };
     }
-    if (targetRoute.includes("job") || targetRoute.includes("hiring") || type === "quote" || title.includes("quote")) {
+    if (targetRoute.includes("job") || targetRoute.includes("my-jobs") || targetRoute.includes("my-quotes") || type === "quote" || title.includes("quote")) {
       return { label: "View Job & Quotes", icon: <FileText className="w-4 h-4 stroke-[2.5]" /> };
     }
-    if (targetRoute.includes("messages") || type === "message") {
+    if (targetRoute.includes("messages") || targetRoute.includes("/chat/") || type === "message") {
       return { label: "Open Messages", icon: <MessageSquare className="w-4 h-4 stroke-[2.5]" /> };
     }
-    if (targetRoute.includes("financials") || title.includes("invoice") || title.includes("payment")) {
-      return { label: "View Financials", icon: <CreditCard className="w-4 h-4 stroke-[2.5]" /> };
+    if (targetRoute.includes("billing") || targetRoute.includes("financials") || title.includes("invoice") || title.includes("payment")) {
+      return { label: "View Billing & Payments", icon: <CreditCard className="w-4 h-4 stroke-[2.5]" /> };
     }
     if (targetRoute.includes("#property-passport") || title.includes("property")) {
       return { label: "Open Property Passport", icon: <Building className="w-4 h-4 stroke-[2.5]" /> };
@@ -221,8 +282,18 @@ export default function Notifications() {
     <div className="max-w-2xl mx-auto space-y-6 pb-12">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-black text-black">Notifications</h1>
-        <div className="flex items-center gap-3 text-sm font-extrabold text-black">
+        <div className="flex items-center gap-2 sm:gap-3 text-sm font-extrabold text-black flex-wrap justify-end">
           <span className="bg-slate-100 border border-black px-3 py-1 rounded-full">{notifications.filter(n => !n.read).length} Unread</span>
+          {notifications.some((n) => !n.read) && (
+            <button
+              type="button"
+              onClick={markAllAsRead}
+              disabled={isMarkingAllRead}
+              className="px-3 py-1.5 rounded-xl bg-white border border-black hover:bg-slate-100 text-xs font-black text-black transition-all active:scale-95 disabled:opacity-50"
+            >
+              {isMarkingAllRead ? "Marking..." : "Mark all read"}
+            </button>
+          )}
           
           {(profile?.role === "tradesperson" || profile?.role === "business") && (
             <button
@@ -297,7 +368,7 @@ export default function Notifications() {
                       </h3>
                       <span className="text-xs text-black font-extrabold flex items-center gap-1 shrink-0 bg-slate-100 border border-black px-2 py-0.5 rounded-md">
                         <Clock className="w-3.5 h-3.5 text-black stroke-[2.5]" />
-                        {new Date(notification.createdAt?.toDate?.() || notification.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        {formatNotificationTimestamp(notification.createdAt)}
                       </span>
                     </div>
                     <p className="text-sm text-slate-950 font-bold leading-normal">{notification.message}</p>

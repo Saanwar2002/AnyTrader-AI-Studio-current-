@@ -11,7 +11,8 @@ import { ClaimPropertyPassportModal } from "./property/ClaimPropertyPassportModa
 import { EstateAgentQRGeneratorModal } from "./property/EstateAgentQRGeneratorModal";
 import { createJobViaCommand } from "../services/jobCommandService";
 import { toast } from "sonner";
-import { createPropertyViaCommand, deletePropertyViaCommand } from "../services/propertyCommandService";
+import { createPropertyViaCommand, deletePropertyViaCommand, syncPublicPropertyPassport } from "../services/propertyCommandService";
+import { compressPropertyImageFile } from "../utils/propertyPhotoUtils";
 
 export default function Portfolio() {
   const { user, profile } = useAuth();
@@ -24,14 +25,38 @@ export default function Portfolio() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [editingPropertyId, setEditingPropertyId] = useState<string | null>(null);
   const [passportPropertyModal, setPassportPropertyModal] = useState<any | null>(null);
+  const [passportInitialTab, setPassportInitialTab] = useState<"passport" | "certs" | "history" | "predictive" | "tenant">("passport");
   const [showClaimPassportModal, setShowClaimPassportModal] = useState(false);
   const [qrGeneratorProperty, setQrGeneratorProperty] = useState<any | null>(null);
   const [bulkDispatching, setBulkDispatching] = useState(false);
+  const [portfolioTenantIssues, setPortfolioTenantIssues] = useState<any[]>([]);
+  const [resolvingTenantIssueId, setResolvingTenantIssueId] = useState<string | null>(null);
   
   const [selectedProperty, setSelectedProperty] = useState<any | null>(null);
   const [propertyJobs, setPropertyJobs] = useState<any[]>([]);
   const [selectedPropertyIds, setSelectedPropertyIds] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [landlordProPrice, setLandlordProPrice] = useState<number>(19);
+
+  useEffect(() => {
+    const unsubTiers = onSnapshot(doc(db, "platform_config", "global_tiers"), (snap) => {
+      if (snap.exists()) {
+        const p = Number(snap.data()?.providerModels?.homeowners?.tiers?.landlord?.price);
+        if (Number.isFinite(p) && p > 0) setLandlordProPrice(p);
+      }
+    }, () => {});
+    return () => unsubTiers();
+  }, []);
+
+  const homeownerSubStatus = String(profile?.homeownerSubscriptionStatus || "").toLowerCase();
+  const isLandlordProActive = Boolean(
+    (profile?.isLandlord || profile?.homeownerTierId === "landlord" || profile?.tier === "landlord") &&
+    !["canceled", "cancelled", "unpaid", "incomplete_expired", "free"].includes(homeownerSubStatus)
+  );
+  const landlordCancelAtPeriodEnd = Boolean(
+    profile?.homeownerCancelAtPeriodEnd ?? (profile?.subscriptionType === "landlord" && profile?.cancelAtPeriodEnd)
+  );
+  const landlordCurrentPeriodEnd = profile?.homeownerCurrentPeriodEnd || (profile?.subscriptionType === "landlord" ? profile?.currentPeriodEnd : undefined);
 
   // Form State
   const [propertyName, setPropertyName] = useState("");
@@ -42,6 +67,11 @@ export default function Portfolio() {
   const [contactName, setContactName] = useState("");
   const [contactPhone, setContactPhone] = useState("");
   const [accessInstructions, setAccessInstructions] = useState("");
+  const [totalAreaSqFt, setTotalAreaSqFt] = useState("");
+  const [unitCount, setUnitCount] = useState("");
+  const [photos, setPhotos] = useState<string[]>([]);
+  const [locatingAddress, setLocatingAddress] = useState(false);
+  const [savingProperty, setSavingProperty] = useState(false);
 
   const today = new Date().toISOString().split("T")[0];
   const expiringCp12Count = properties.filter(p => !p.gasSafetyExpiry || p.gasSafetyExpiry <= today).length;
@@ -212,18 +242,113 @@ export default function Portfolio() {
     return unsubscribe;
   }, [user]);
 
+  // Subscribe to landlord's tenant repair reports so /portfolio notification links land on a real inbox
   useEffect(() => {
-    if (!selectedProperty) return;
-    const q = query(collection(db, "jobs"), where("linkedPropertyId", "==", selectedProperty.id));
-    const unsub = onSnapshot(q, (snapshot) => {
-      setPropertyJobs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    if (!user?.uid) return;
+    const q = query(collection(db, "tenant_issues"), where("landlordOwnerId", "==", user.uid));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const issues = snapshot.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .sort((a: any, b: any) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+      setPortfolioTenantIssues(issues);
     }, (error) => {
-      // It might fail if index is missing, handle gracefully
+      console.warn("Could not load portfolio tenant issues:", error);
+      setPortfolioTenantIssues([]);
+    });
+    return unsubscribe;
+  }, [user?.uid]);
+
+  useEffect(() => {
+    if (!selectedProperty || !user?.uid) return;
+    // Owner-scoped query satisfies Firestore rules without requiring a custom composite index
+    const q = query(collection(db, "jobs"), where("homeownerId", "==", user.uid));
+    const unsub = onSnapshot(q, (snapshot) => {
+      const matched = snapshot.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((j: any) =>
+          j.propertyId === selectedProperty.id ||
+          j.propertyPassportId === selectedProperty.id ||
+          j.linkedPropertyId === selectedProperty.id
+        );
+      setPropertyJobs(matched);
+    }, (error) => {
       console.warn("Failed to fetch property jobs:", error);
       setPropertyJobs([]);
     });
     return unsub;
-  }, [selectedProperty]);
+  }, [selectedProperty, user?.uid]);
+
+  const handleMarkPortfolioIssueResolved = async (issueId: string) => {
+    if (!user || !issueId) return;
+    setResolvingTenantIssueId(issueId);
+    try {
+      const nowIso = new Date().toISOString();
+      await updateDoc(doc(db, "tenant_issues", issueId), {
+        status: "resolved",
+        resolvedAt: nowIso,
+        updatedAt: nowIso,
+      });
+      toast.success("Tenant repair report marked as resolved.");
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `tenant_issues/${issueId}`);
+      toast.error("Could not mark tenant issue resolved.");
+    } finally {
+      setResolvingTenantIssueId(null);
+    }
+  };
+
+  const handlePhotoFilesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    const remainingSlots = Math.max(0, 8 - photos.length);
+    if (remainingSlots === 0) {
+      toast.error("Maximum of 8 property photos allowed.");
+      e.target.value = "";
+      return;
+    }
+    for (const file of files.slice(0, remainingSlots)) {
+      if (!file.type.startsWith("image/")) {
+        toast.error(`${file.name} is not a supported image file.`);
+        continue;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        toast.error(`${file.name} exceeds the 5 MB photo limit.`);
+        continue;
+      }
+      try {
+        const compressed = await compressPropertyImageFile(file);
+        setPhotos((prev) => (prev.length < 8 ? [...prev, compressed] : prev));
+      } catch (err: any) {
+        toast.error(err?.message || `Could not process ${file.name}.`);
+      }
+    }
+    e.target.value = "";
+  };
+
+  const handleLocateAddress = async () => {
+    const candidate =
+      postcode.trim() ||
+      (addressLine1.match(/\b([A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9][A-Z]{2})\b/i)?.[1] || "");
+    if (!candidate) {
+      toast.info("Enter a UK postcode (or include it in Full Address) to look up location details.");
+      return;
+    }
+    setLocatingAddress(true);
+    try {
+      const lookup = await lookupPostcode(candidate);
+      if (lookup) {
+        setPostcode(lookup.postcode);
+        if (lookup.city) setCity(lookup.city);
+        toast.success(`Location verified: ${lookup.postcode}${lookup.city ? ` • ${lookup.city}` : ""}`);
+      } else {
+        toast.error("Could not verify that postcode. Please check and try again.");
+      }
+    } catch {
+      toast.error("Postcode lookup is temporarily unavailable.");
+    } finally {
+      setLocatingAddress(false);
+    }
+  };
 
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -252,7 +377,20 @@ export default function Portfolio() {
           }
         }
 
+        const parsedArea = totalAreaSqFt.trim() ? Number(totalAreaSqFt) : undefined;
+        const parsedUnits = unitCount.trim() ? Number(unitCount) : undefined;
+        if (parsedArea !== undefined && (!Number.isFinite(parsedArea) || parsedArea <= 0)) {
+          toast.error("Total area must be a positive number.");
+          return;
+        }
+        if (parsedUnits !== undefined && (!Number.isInteger(parsedUnits) || parsedUnits <= 0)) {
+          toast.error("Number of units must be a positive whole number.");
+          return;
+        }
+
+        setSavingProperty(true);
         if (editingPropertyId) {
+          const existingProp = properties.find((p) => p.id === editingPropertyId);
           await updateDoc(doc(db, "properties", editingPropertyId), {
             name: propertyName,
             "address.line1": addressLine1,
@@ -264,8 +402,17 @@ export default function Portfolio() {
             contactName,
             contactPhone,
             accessInstructions,
+            totalAreaSqFt: parsedArea ?? null,
+            unitCount: parsedUnits ?? null,
+            photos,
             updatedAt: new Date().toISOString()
           });
+          if (existingProp?.isPublicPassport === true && existingProp?.publicConsent === true) {
+            syncPublicPropertyPassport(user, editingPropertyId).catch((err) =>
+              console.warn("Non-fatal public passport sync after edit:", err)
+            );
+          }
+          toast.success("Property updated successfully.");
         } else {
           await createPropertyViaCommand(user, {
             name: propertyName,
@@ -275,8 +422,12 @@ export default function Portfolio() {
             propertyType,
             contactName,
             contactPhone,
-            accessInstructions
+            accessInstructions,
+            ...(parsedArea !== undefined ? { totalAreaSqFt: parsedArea } : {}),
+            ...(parsedUnits !== undefined ? { unitCount: parsedUnits } : {}),
+            ...(photos.length > 0 ? { photos } : {})
           });
+          toast.success("Property added to your portfolio.");
         }
         setIsAdding(false);
         setEditingPropertyId(null);
@@ -289,8 +440,13 @@ export default function Portfolio() {
         setContactName("");
         setContactPhone("");
         setAccessInstructions("");
+        setTotalAreaSqFt("");
+        setUnitCount("");
+        setPhotos([]);
       } catch (error) {
         handleFirestoreError(error, editingPropertyId ? OperationType.UPDATE : OperationType.CREATE, "properties");
+      } finally {
+        setSavingProperty(false);
       }
     }
   };
@@ -305,6 +461,9 @@ export default function Portfolio() {
     setContactName("");
     setContactPhone("");
     setAccessInstructions("");
+    setTotalAreaSqFt("");
+    setUnitCount("");
+    setPhotos([]);
     setStep(1);
     setIsAdding(true);
   };
@@ -318,6 +477,9 @@ export default function Portfolio() {
     setContactName(property.contactName || "");
     setContactPhone(property.contactPhone || "");
     setAccessInstructions(property.accessInstructions || "");
+    setTotalAreaSqFt(property.totalAreaSqFt ? String(property.totalAreaSqFt) : "");
+    setUnitCount(property.unitCount ? String(property.unitCount) : "");
+    setPhotos(Array.isArray(property.photos) ? property.photos : []);
     setEditingPropertyId(property.id);
     setIsAdding(true);
     setStep(1);
@@ -360,9 +522,18 @@ export default function Portfolio() {
                   <select 
                     value={selectedProperty.occupancy || 'occupied'} 
                     onChange={async (e) => {
-                       const v = e.target.value;
-                       await updateDoc(doc(db, "properties", selectedProperty.id), { occupancy: v });
-                       setSelectedProperty({ ...selectedProperty, occupancy: v });
+                      const v = e.target.value;
+                      try {
+                        await updateDoc(doc(db, "properties", selectedProperty.id), {
+                          occupancy: v,
+                          updatedAt: new Date().toISOString(),
+                        });
+                        setSelectedProperty({ ...selectedProperty, occupancy: v });
+                        toast.success(`Occupancy updated to ${v === "vacant" ? "Vacant" : "Occupied"}.`);
+                      } catch (err) {
+                        handleFirestoreError(err, OperationType.UPDATE, `properties/${selectedProperty.id}`);
+                        toast.error("Could not update occupancy status.");
+                      }
                     }}
                     className="text-sm font-medium rounded-xl border border-black bg-white px-3 py-2 shadow-sm shrink-0"
                   >
@@ -394,7 +565,7 @@ export default function Portfolio() {
                             <span className="font-bold text-slate-900">{job.title || job.category}</span>
                             <span className="text-sm font-medium text-slate-500 mt-0.5">Status: <span className="text-slate-700 uppercase tracking-widest text-[10px] bg-slate-100 px-1.5 py-0.5 rounded ml-1">{job.status}</span></span>
                           </div>
-                          <Link to={`/admin/job/${job.id}`} className="p-2 hover:bg-slate-100 rounded-lg transition text-slate-400 hover:text-slate-900">
+                          <Link to={`/job/${job.id}`} className="p-2 hover:bg-slate-100 rounded-lg transition text-slate-400 hover:text-slate-900">
                             <ArrowLeft className="w-5 h-5 rotate-180" />
                           </Link>
                         </div>
@@ -468,28 +639,28 @@ export default function Portfolio() {
               <div>
                 <div className="flex items-center gap-2">
                   <h3 className="font-extrabold text-sm tracking-wide text-white">Landlord Pro Membership</h3>
-                  {(profile?.tier === "landlord" || profile?.isLandlord) ? (
+                  {isLandlordProActive ? (
                     <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-black uppercase tracking-wider">
                       Active
                     </span>
                   ) : (
                     <span className="px-2 py-0.5 rounded-full bg-amber-400/20 text-amber-300 border border-amber-400/30 text-[10px] font-black uppercase tracking-wider">
-                      £19.00 / mo
+                      £{landlordProPrice.toFixed(2)} / mo
                     </span>
                   )}
                 </div>
                 <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                  {(profile?.tier === "landlord" || profile?.isLandlord)
-                    ? profile?.cancelAtPeriodEnd 
-                      ? `Your subscription will cancel on ${profile?.currentPeriodEnd ? new Date(profile.currentPeriodEnd).toLocaleDateString('en-GB') : 'end of cycle'}. You retain full Pro access.`
-                      : `Auto-renews on ${profile?.currentPeriodEnd ? new Date(profile.currentPeriodEnd).toLocaleDateString('en-GB') : 'next cycle'}. Multi-property digital twins, CP12 & EICR alerts & bulk trade dispatch enabled.`
+                  {isLandlordProActive
+                    ? landlordCancelAtPeriodEnd
+                      ? `Your subscription will cancel on ${landlordCurrentPeriodEnd ? new Date(landlordCurrentPeriodEnd).toLocaleDateString('en-GB') : 'end of cycle'}. You retain full Pro access.`
+                      : `Auto-renews on ${landlordCurrentPeriodEnd ? new Date(landlordCurrentPeriodEnd).toLocaleDateString('en-GB') : 'next cycle'}. Multi-property digital twins, CP12 & EICR alerts & bulk trade dispatch enabled.`
                     : "Automate CP12 Gas & EICR alerts, receive tenant repair reports directly on WhatsApp, and bulk dispatch 1-tap trades."}
                 </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
-              {(profile?.tier === "landlord" || profile?.isLandlord) ? (
+              {isLandlordProActive ? (
                 <button
                   onClick={() => navigate("/billing")}
                   className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white font-extrabold text-xs rounded-xl border border-white/20 transition flex items-center gap-1.5"
@@ -512,10 +683,11 @@ export default function Portfolio() {
                         },
                         body: JSON.stringify({
                           userId: user.uid,
+                          priceId: "price_landlord",
                           tierName: "Premium Landlord",
                           price_data: {
                             currency: 'gbp',
-                            unit_amount: 1900,
+                            unit_amount: Math.round(landlordProPrice * 100),
                             product_data: {
                               name: 'Landlord Pro Portfolio Membership',
                               description: 'Multi-property passport digital twins, automated CP12/EICR compliance alerts & bulk trade dispatch'
@@ -545,7 +717,7 @@ export default function Portfolio() {
                   }}
                   className="px-4 py-2.5 bg-amber-400 hover:bg-amber-300 text-slate-900 font-black text-xs uppercase tracking-wider rounded-xl shadow-md transition flex items-center gap-1.5"
                 >
-                  Upgrade to Landlord Pro (£19/mo)
+                  Upgrade to Landlord Pro (£{landlordProPrice.toFixed(2)}/mo)
                 </button>
               )}
             </div>
@@ -592,6 +764,80 @@ export default function Portfolio() {
             </div>
           )}
 
+          {/* Open Tenant Repair Reports Inbox (destination for /portfolio tenant issue notifications) */}
+          {portfolioTenantIssues.filter((i) => String(i.status || "open").toLowerCase() !== "resolved").length > 0 && (
+            <div className="bg-white rounded-2xl border border-black p-4 sm:p-5 shadow-sm space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 rounded-xl bg-red-50 border border-black text-red-700">
+                    <Users className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-black text-black">Open Tenant Repair Reports</h3>
+                    <p className="text-xs text-slate-600">
+                      Incoming issues submitted via your Tenant Repair Portal links.
+                    </p>
+                  </div>
+                </div>
+                <span className="px-2.5 py-1 rounded-lg bg-red-600 text-white text-xs font-black">
+                  {portfolioTenantIssues.filter((i) => String(i.status || "open").toLowerCase() !== "resolved").length} Active
+                </span>
+              </div>
+              <div className="space-y-2">
+                {portfolioTenantIssues
+                  .filter((i) => String(i.status || "open").toLowerCase() !== "resolved")
+                  .slice(0, 6)
+                  .map((issue) => {
+                    const matchedProp = properties.find((p) => p.id === issue.propertyId);
+                    const status = String(issue.status || "open").toLowerCase();
+                    return (
+                      <div key={issue.id} className="p-3 bg-slate-50 rounded-xl border border-black flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="min-w-0 space-y-0.5">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-slate-900 text-white">
+                              {issue.urgency || "urgent"}
+                            </span>
+                            <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded border border-black bg-white text-black">
+                              {status}
+                            </span>
+                            <span className="text-xs font-bold text-slate-600 truncate">
+                              {issue.propertyName || matchedProp?.name || "Managed Property"}
+                            </span>
+                          </div>
+                          <p className="text-sm font-black text-black truncate">{issue.title}</p>
+                          <p className="text-xs text-slate-700 line-clamp-1">
+                            Reported by {issue.tenantName}{issue.flatUnit ? ` (${issue.flatUnit})` : ""} — {issue.description}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {matchedProp && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPassportInitialTab("tenant");
+                                setPassportPropertyModal(matchedProp);
+                              }}
+                              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-black rounded-xl border border-black transition"
+                            >
+                              Open in Passport
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            disabled={resolvingTenantIssueId === issue.id}
+                            onClick={() => handleMarkPortfolioIssueResolved(issue.id)}
+                            className="px-3 py-1.5 bg-white hover:bg-slate-100 text-black text-xs font-extrabold rounded-xl border border-black transition"
+                          >
+                            {resolvingTenantIssueId === issue.id ? "Saving..." : "Mark Resolved"}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          )}
+
           <div className="relative flex gap-2 sm:gap-3 items-center">
             <div className="relative flex-1">
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
@@ -622,11 +868,31 @@ export default function Portfolio() {
 
           <div className="pt-2 pb-6">
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-              {properties.length === 0 ? (
-                  <div className="col-span-full text-center py-8 text-slate-500 text-sm bg-white rounded-xl shadow-sm border border-black">
-                    No properties / sites added yet. Click + to add your first property / site.
-                  </div>
-              ) : properties.map(property => {
+              {(() => {
+                const q = searchQuery.trim().toLowerCase();
+                const filteredProperties = q
+                  ? properties.filter((p) =>
+                      [p.name, p.address?.line1, p.address?.postcode, p.postcode, p.city, p.propertyType]
+                        .filter(Boolean)
+                        .some((v) => String(v).toLowerCase().includes(q))
+                    )
+                  : properties;
+
+                if (properties.length === 0) {
+                  return (
+                    <div className="col-span-full text-center py-8 text-slate-500 text-sm bg-white rounded-xl shadow-sm border border-black">
+                      No properties / sites added yet. Click + to add your first property / site.
+                    </div>
+                  );
+                }
+                if (filteredProperties.length === 0) {
+                  return (
+                    <div className="col-span-full text-center py-8 text-slate-500 text-sm bg-white rounded-xl shadow-sm border border-black">
+                      No properties match &ldquo;{searchQuery}&rdquo;.
+                    </div>
+                  );
+                }
+                return filteredProperties.map(property => {
                 const isSelected = selectedPropertyIds.includes(property.id);
                 return (
                 <div key={property.id} className={cn("flex relative flex-col justify-start p-3 rounded-xl border transition cursor-pointer group shadow-sm bg-white", isSelected ? "border-black ring-1 ring-black bg-white" : "border-black hover:bg-slate-50")} onClick={() => toggleProperty(property.id)}>
@@ -671,6 +937,7 @@ export default function Portfolio() {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
+                          setPassportInitialTab("passport");
                           setPassportPropertyModal(property);
                         }}
                         className="px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-[11px] font-black uppercase tracking-wider border border-blue-200 flex items-center gap-1 transition"
@@ -729,7 +996,8 @@ export default function Portfolio() {
                   </div>
                 </div>
                 );
-              })}
+              });
+              })()}
             </div>
 
             <div className="mt-8 flex justify-end sticky bottom-6 z-20">
@@ -804,8 +1072,13 @@ export default function Portfolio() {
                     <div className="space-y-1.5">
                       <div className="flex justify-between items-center">
                         <label className="block text-[15px] font-medium text-slate-900">Full Address</label>
-                        <button type="button" className="text-[13px] font-medium text-slate-500 flex items-center gap-1 hover:text-slate-900 transition">
-                          <MapPin className="w-3.5 h-3.5" /> Locate on Map
+                        <button
+                          type="button"
+                          onClick={handleLocateAddress}
+                          disabled={locatingAddress}
+                          className="text-[13px] font-medium text-blue-600 flex items-center gap-1 hover:text-blue-800 transition"
+                        >
+                          <MapPin className="w-3.5 h-3.5" /> {locatingAddress ? "Verifying..." : "Verify Postcode"}
                         </button>
                       </div>
                       <input 
@@ -886,24 +1159,58 @@ export default function Portfolio() {
                     </div>
 
                     <div className="space-y-3 pt-2">
-                       <h3 className="text-[16px] font-bold text-slate-900">Details</h3>
+                       <h3 className="text-[16px] font-bold text-slate-900">Details (Optional)</h3>
                        <input 
-                         type="text" 
+                         type="number" 
+                         min="1"
+                         value={totalAreaSqFt}
+                         onChange={(e) => setTotalAreaSqFt(e.target.value)}
                          placeholder="Total Area (sq ft)" 
                          className="w-full px-4 py-3 rounded-xl border border-black bg-white shadow-sm placeholder:text-slate-400 text-[15px]" 
                        />
                        <input 
-                         type="text" 
+                         type="number" 
+                         min="1"
+                         step="1"
+                         value={unitCount}
+                         onChange={(e) => setUnitCount(e.target.value)}
                          placeholder="Number of Units" 
                          className="w-full px-4 py-3 rounded-xl border border-black bg-white shadow-sm placeholder:text-slate-400 text-[15px]" 
                        />
                     </div>
                     
-                    <button type="button" className="w-full mt-2 border border-black rounded-xl py-8 flex flex-col items-center justify-center text-slate-500 hover:bg-slate-50 transition bg-white shadow-sm">
-                      <Camera className="w-8 h-8 text-slate-400 mb-2" strokeWidth={1.5} />
-                      <span className="font-semibold text-slate-800">Upload Photos</span>
-                      <p className="text-sm text-slate-500 mt-0.5">(Drag & Drop or Click)</p>
-                    </button>
+                    <div className="space-y-3">
+                      <label className="w-full mt-2 border border-black rounded-xl py-6 px-4 flex flex-col items-center justify-center text-slate-700 hover:bg-slate-50 transition bg-white shadow-sm cursor-pointer">
+                        <input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          onChange={handlePhotoFilesChange}
+                          className="sr-only"
+                        />
+                        <Camera className="w-8 h-8 text-slate-500 mb-2" strokeWidth={1.5} />
+                        <span className="font-semibold text-black">Upload Photos</span>
+                        <p className="text-xs text-slate-600 mt-0.5">Up to 8 photos (auto-compressed)</p>
+                      </label>
+
+                      {photos.length > 0 && (
+                        <div className="grid grid-cols-4 gap-2">
+                          {photos.map((photoUrl, idx) => (
+                            <div key={idx} className="relative rounded-xl overflow-hidden border border-black aspect-square bg-slate-100">
+                              <img src={photoUrl} alt={`Property preview ${idx + 1}`} className="w-full h-full object-cover" />
+                              <button
+                                type="button"
+                                onClick={() => setPhotos((prev) => prev.filter((_, i) => i !== idx))}
+                                aria-label={`Remove photo ${idx + 1}`}
+                                className="absolute top-1 right-1 bg-black/80 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-md hover:bg-red-600"
+                              >
+                                ×
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </>
                 )}
 
@@ -971,9 +1278,10 @@ export default function Portfolio() {
               <button 
                 type="submit" 
                 form="add-property-form"
-                className="flex-1 py-3.5 font-semibold text-white bg-blue-500 hover:bg-blue-600 active:bg-blue-700 rounded-full shadow-sm transition flex justify-center items-center gap-2"
+                disabled={savingProperty}
+                className="flex-1 py-3.5 font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 active:bg-blue-800 rounded-full shadow-sm transition flex justify-center items-center gap-2"
               >
-                {step < 3 ? "Next Step" : "Add Property / Site"}
+                {step < 3 ? "Next Step" : savingProperty ? "Saving..." : (editingPropertyId ? "Save Changes" : "Add Property / Site")}
               </button>
             </div>
 
@@ -984,6 +1292,7 @@ export default function Portfolio() {
       {passportPropertyModal && (
         <PropertyPassportModal
           property={passportPropertyModal}
+          initialTab={passportInitialTab}
           onClose={() => setPassportPropertyModal(null)}
         />
       )}

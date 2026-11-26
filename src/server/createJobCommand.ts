@@ -16,6 +16,7 @@ import { SERVER_OWNED_PROTECTED_KEYS } from "./authorization.ts";
 import { validateJobTransition, JobStatus } from "./stateMachine.ts";
 import { domainEvents } from "./domainEvents.ts";
 import { sanitizeJobToPublicCard, isDirectJob } from "./projectionSync.ts";
+import { normalizeJobUrgency, normalizeQuoteScope } from "../lib/marketplaceContracts.ts";
 
 /**
  * Server-owned & privileged fields that clients are strictly forbidden from supplying.
@@ -45,26 +46,63 @@ export const JOB_CREATE_PROTECTED_KEYS = new Set([
  * Strict Zod schema for CreateJob client payload.
  * Any unrecognized or smuggled attributes are rejected via .strict().
  */
+const ACCEPTED_JOB_URGENCY_SCHEMA = z
+  .enum([
+    "emergency",
+    "urgent",
+    "standard",
+    "flexible",
+    "asap",
+    "this_week",
+    "this_month",
+    "specific_date",
+    "immediate",
+    "routine",
+  ])
+  .transform((val) => normalizeJobUrgency(val));
+
+const ACCEPTED_JOB_QUOTE_SCOPE_SCHEMA = z
+  .enum([
+    "labor_only",
+    "labour_only",
+    "materials_included",
+    "custom",
+    "full_project",
+    "complete_package",
+    "full_package",
+  ])
+  .transform((val) => normalizeQuoteScope(val));
+
 export const JOB_CREATE_INPUT_SCHEMA = z.object({
   title: z.string().min(3, "Title must be at least 3 characters").max(200),
   description: z.string().min(5, "Description must be at least 5 characters").max(10000),
   category: z.string().min(1, "Category is required"),
   subCategory: z.string().optional().nullable(),
+  subcategory: z.string().optional().nullable(),
   subcategories: z.array(z.string()).optional(),
   postcode: z.string().min(2, "Postcode is required").max(12),
   postcodeArea: z.string().optional(),
-  urgency: z.enum(["emergency", "urgent", "standard", "flexible"]).default("standard"),
+  urgency: ACCEPTED_JOB_URGENCY_SCHEMA.default("standard"),
+  urgencyLabel: z.string().max(60).optional().nullable(),
   isEmergency: z.boolean().optional(),
   budget: z.union([z.number(), z.string(), z.record(z.any())]).optional().nullable(),
   estimateMin: z.number().optional().nullable(),
   estimateMax: z.number().optional().nullable(),
   propertyId: z.string().optional().nullable(),
+  linkedPropertyId: z.string().optional().nullable(),
   propertyPassportId: z.string().optional().nullable(),
+  assetId: z.string().optional().nullable(),
+  assetName: z.string().optional().nullable(),
   location: z.record(z.any()).optional().nullable(),
   city: z.string().optional().nullable(),
   area: z.string().optional().nullable(),
   address: z.string().optional().nullable(),
+  fullAddress: z.string().optional().nullable(),
+  houseNumber: z.string().max(60).optional().nullable(),
+  locationInstructions: z.string().max(1000).optional().nullable(),
   photos: z.array(z.string()).optional(),
+  videos: z.array(z.string()).optional(),
+  documents: z.array(z.union([z.string(), z.object({ name: z.string(), url: z.string() })])).optional(),
   photosCount: z.number().optional(),
   videosCount: z.number().optional(),
   documentsCount: z.number().optional(),
@@ -72,16 +110,27 @@ export const JOB_CREATE_INPUT_SCHEMA = z.object({
   notes: z.string().optional().nullable(),
   directTraderId: z.string().optional().nullable(),
   targetTraderId: z.string().optional().nullable(),
+  targetTradespersonId: z.string().optional().nullable(),
+  targetTradespersonName: z.string().max(160).optional().nullable(),
   isDirectQuote: z.boolean().optional(),
+  isDirectJob: z.boolean().optional(),
+  visibility: z.enum(["public", "private", "direct"]).optional(),
+  claimedDeal: z.record(z.any()).optional().nullable(),
+  paymentPreference: z.string().max(60).optional().nullable(),
+  quoteScope: ACCEPTED_JOB_QUOTE_SCOPE_SCHEMA.optional().nullable(),
+  estimatedCompletionTime: z.union([z.string(), z.number()]).optional().nullable(),
+  estimatedCompletionTimeUnit: z.string().max(40).optional().nullable(),
   bomOrderId: z.string().optional().nullable(),
   parentJobId: z.string().optional().nullable(),
   isBOMDeliveryJob: z.boolean().optional(),
   recurringScheduleId: z.string().optional().nullable(),
   isRecurringInstance: z.boolean().optional(),
   preferredDate: z.string().optional().nullable(),
+  jobDate: z.string().optional().nullable(),
   requiredCertifications: z.array(z.string()).optional(),
   tenancyReference: z.string().optional().nullable(),
   contactPhone: z.string().optional().nullable(),
+  mobileNumber: z.string().optional().nullable(),
   contactEmail: z.string().optional().nullable(),
   metadata: z.record(z.any()).optional(),
   isInstantMatch: z.boolean().optional(),
@@ -391,6 +440,18 @@ export async function executeCreateJobCommand(
 
     // E. Assemble Server-Owned Job Record
     const nowIso = new Date().toISOString();
+    const resolvedTargetTraderId =
+      validatedInput.targetTradespersonId ||
+      validatedInput.targetTraderId ||
+      validatedInput.directTraderId ||
+      null;
+    const isDirect = Boolean(
+      resolvedTargetTraderId ||
+      validatedInput.isDirectQuote ||
+      validatedInput.isDirectJob ||
+      validatedInput.visibility === "private" ||
+      validatedInput.visibility === "direct"
+    );
     const jobDocData: Record<string, any> = {
       ...validatedInput,
       id: jobId,
@@ -398,6 +459,24 @@ export async function executeCreateJobCommand(
       homeownerId: targetHomeownerId,
       createdByUid: identity.uid,
       status: initialStatus,
+      urgencyLabel: validatedInput.urgencyLabel || (typeof rawPayload?.urgency === "string" ? rawPayload.urgency : validatedInput.urgency),
+      preferredDate: validatedInput.preferredDate || validatedInput.jobDate || null,
+      jobDate: validatedInput.jobDate || validatedInput.preferredDate || null,
+      ...(resolvedTargetTraderId
+        ? {
+            targetTradespersonId: resolvedTargetTraderId,
+            targetTraderId: resolvedTargetTraderId,
+            directTraderId: resolvedTargetTraderId,
+            isDirectQuote: true,
+            isDirectJob: true,
+            visibility: validatedInput.visibility || "direct",
+          }
+        : isDirect
+        ? { isDirectJob: true, visibility: validatedInput.visibility || "private" }
+        : {}),
+      photosCount: Array.isArray(validatedInput.photos) ? validatedInput.photos.length : (validatedInput.photosCount || 0),
+      videosCount: Array.isArray(validatedInput.videos) ? validatedInput.videos.length : (validatedInput.videosCount || 0),
+      documentsCount: Array.isArray(validatedInput.documents) ? validatedInput.documents.length : (validatedInput.documentsCount || 0),
       quoteCount: 0,
       hasReview: false,
       hasHomeownerReview: false,
@@ -465,11 +544,17 @@ const JOB_UPDATE_ALLOWED_FIELDS = [
   "area",
   "address",
   "fullAddress",
+  "houseNumber",
+  "locationInstructions",
   "urgency",
+  "urgencyLabel",
   "budget",
   "estimateMin",
   "estimateMax",
   "preferredDate",
+  "jobDate",
+  "paymentPreference",
+  "quoteScope",
   "estimatedCompletionTime",
   "estimatedCompletionTimeUnit",
   "propertyId",
@@ -507,6 +592,13 @@ export async function executeUpdateJobCommand(options: {
       safeUpdate[field] = rawPayload[field];
     }
   }
+  if (typeof safeUpdate.urgency === "string") {
+    safeUpdate.urgencyLabel = safeUpdate.urgencyLabel || safeUpdate.urgency;
+    safeUpdate.urgency = normalizeJobUrgency(safeUpdate.urgency);
+  }
+  if (typeof safeUpdate.quoteScope === "string") {
+    safeUpdate.quoteScope = normalizeQuoteScope(safeUpdate.quoteScope);
+  }
   if (typeof safeUpdate.postcode === "string") {
     safeUpdate.postcode = safeUpdate.postcode.trim().toUpperCase();
   }
@@ -515,6 +607,21 @@ export async function executeUpdateJobCommand(options: {
   }
   if (typeof safeUpdate.description === "string" && safeUpdate.description.trim().length < 10) {
     throw new BadRequestError("Job description must be at least 10 characters.");
+  }
+
+  // Slice 3: Safe server-authoritative emergency expiry actions
+  if (rawPayload?.convertToStandard === true) {
+    safeUpdate.urgency = "standard";
+    safeUpdate.urgencyLabel = "Standard";
+    safeUpdate.isEmergency = false;
+    safeUpdate.emergencyBoostExpiresAt = null;
+    safeUpdate.convertedToStandardAt = new Date().toISOString();
+  } else if (rawPayload?.repostAsEmergency === true) {
+    safeUpdate.urgency = "emergency";
+    safeUpdate.urgencyLabel = "Emergency";
+    safeUpdate.isEmergency = true;
+    safeUpdate.emergencyBoostExpiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    safeUpdate.emergencyRepostedAt = new Date().toISOString();
   }
 
   const nowIso = new Date().toISOString();
@@ -541,6 +648,13 @@ export async function executeUpdateJobCommand(options: {
 
     if (["completed", "cancelled", "disputed"].includes(String(currentJob.status || ""))) {
       throw new ConflictError(`Cannot edit a job in '${currentJob.status}' status.`);
+    }
+
+    if (
+      (rawPayload?.convertToStandard === true || rawPayload?.repostAsEmergency === true) &&
+      !["open", "quoted", "posted", "quoting", "in_bidding"].includes(String(currentJob.status || "open"))
+    ) {
+      throw new ConflictError(`Cannot change emergency state while job is in '${currentJob.status}' status.`);
     }
 
     const mergedJob = {
@@ -571,4 +685,110 @@ export async function executeUpdateJobCommand(options: {
   });
 
   return result;
+}
+
+/**
+ * Server-Authoritative Job Delete / Archive Command (Slice 3)
+ * Atomically deletes or soft-archives a job while ALWAYS removing any
+ * public_job_cards projection so deleted/archived jobs never remain as ghosts
+ * on the public Job Feed.
+ */
+export async function executeDeleteJobCommand(options: {
+  db: any;
+  identity: CanonicalIdentity;
+  jobId: string;
+  mode?: "delete" | "archive";
+}): Promise<{ jobId: string; mode: "delete" | "archive"; deleted: boolean; publicCardRemoved: boolean }> {
+  const { db, identity, jobId } = options;
+  const mode: "delete" | "archive" = options.mode === "archive" ? "archive" : "delete";
+
+  if (!db) {
+    throw new InternalServerError("Database service unavailable.");
+  }
+  if (!jobId || typeof jobId !== "string") {
+    throw new BadRequestError("Valid jobId is required.");
+  }
+  if (!identity || !identity.uid) {
+    throw new UnauthorizedError("Authentication required.");
+  }
+
+  const jobRef = db.collection("jobs").doc(jobId);
+  const publicCardRef = db.collection("public_job_cards").doc(jobId);
+  const arrivalPinRef = db.collection("job_arrival_pins").doc(jobId);
+  const nowIso = new Date().toISOString();
+
+  return db.runTransaction(async (transaction: any) => {
+    const [jobSnap, publicCardSnap, arrivalPinSnap] = await Promise.all([
+      transaction.get(jobRef),
+      transaction.get(publicCardRef),
+      transaction.get(arrivalPinRef),
+    ]);
+
+    if (!jobSnap.exists) {
+      throw new NotFoundError(`Job '${jobId}' was not found.`);
+    }
+
+    const currentJob = jobSnap.data() || {};
+    const ownerId = currentJob.homeownerId || currentJob.userId || currentJob.ownerId || currentJob.customerId;
+    const isAdmin =
+      identity.accountType === "admin" ||
+      (identity as any).isAdmin === true ||
+      (identity as any).role === "admin";
+
+    if (identity.uid !== ownerId && !isAdmin) {
+      throw new ForbiddenError("Only the job owner or an administrator can delete or archive this job.");
+    }
+
+    const status = String(currentJob.status || "open").toLowerCase();
+    const paymentStatus = String(currentJob.paymentStatus || "").toLowerCase();
+    const isActiveWork = ["accepted", "in_progress", "disputed"].includes(status);
+    const hasSettledOrFundedFunds = [
+      "funded",
+      "escrow_funded",
+      "partially_released",
+      "paid",
+      "released",
+      "funds_released",
+    ].includes(paymentStatus);
+
+    if (isActiveWork && !isAdmin) {
+      throw new ConflictError(
+        `Cannot ${mode} an active job in '${status}' status. Cancel or complete the job first.`
+      );
+    }
+
+    if (mode === "delete" && hasSettledOrFundedFunds && !isAdmin) {
+      throw new ConflictError(
+        "Jobs with funded or paid escrow cannot be permanently deleted. Archive the job instead."
+      );
+    }
+
+    let publicCardRemoved = false;
+    if (publicCardSnap?.exists) {
+      transaction.delete(publicCardRef);
+      publicCardRemoved = true;
+    }
+
+    if (mode === "delete") {
+      transaction.delete(jobRef);
+      if (arrivalPinSnap?.exists) {
+        transaction.delete(arrivalPinRef);
+      }
+    } else {
+      const isOpenLike = ["open", "quoted", "posted", "quoting", "in_bidding"].includes(status);
+      transaction.update(jobRef, {
+        clientDeleted: true,
+        archivedAt: nowIso,
+        updatedAt: nowIso,
+        ...(isOpenLike ? { status: "cancelled", cancelledAt: nowIso, cancellationReason: "Archived by homeowner" } : {}),
+      });
+    }
+
+    return {
+      jobId,
+      mode,
+      deleted: true,
+      publicCardRemoved,
+    };
+  });
 }

@@ -109,90 +109,115 @@ if (typeof window !== "undefined") {
   }
 }
 
-// Set up resilient Firebase Auth initialization with safe fallbacks
+// Set up resilient Firebase Auth initialization with explicit fallback persistence & popupRedirectResolver.
+// Try initializeAuth first so strict-privacy/iframe storage fallbacks and browserPopupRedirectResolver
+// actually take effect; fall back to getAuth(app) if Auth was already initialized (e.g. HMR or tests).
 let authInstance: any;
 
-try {
-  // First, check if there's an existing instance already initialized for this app (preventing re-initialization crashes during hot-reloads)
-  authInstance = getAuth(app);
-  console.log("Retrieved already-initialized Firebase Auth instance.");
-} catch (e) {
-  console.log("No existing Firebase Auth instance found. Performing safe initialization...");
-  
-  // Build a verified list of persistence engines based on current window access capabilities
+const buildAllowedPersistence = () => {
   const allowedPersistence: any[] = [];
-  
+
   if (typeof window !== "undefined") {
-    // 1. Check indexedDB
     try {
       if (window.indexedDB) {
         allowedPersistence.push(indexedDBLocalPersistence);
       }
     } catch (_) {}
 
-    // 2. Check localStorage
     try {
       if (window.localStorage) {
         allowedPersistence.push(browserLocalPersistence);
       }
     } catch (_) {}
 
-    // 3. Check sessionStorage
     try {
       if (window.sessionStorage) {
         allowedPersistence.push(browserSessionPersistence);
       }
     } catch (_) {}
   }
-  
-  // Memory persistence is always globally safe
-  allowedPersistence.push(inMemoryPersistence);
 
+  allowedPersistence.push(inMemoryPersistence);
+  return allowedPersistence;
+};
+
+try {
+  const allowedPersistence = buildAllowedPersistence();
+  authInstance = initializeAuth(app, {
+    persistence: allowedPersistence,
+    ...(typeof window !== "undefined"
+      ? { popupRedirectResolver: browserPopupRedirectResolver }
+      : {}),
+  });
+  console.log(
+    "Firebase Auth initialized successfully with verified persistence list:",
+    allowedPersistence.map((p) => p.type)
+  );
+} catch (initErr: any) {
   try {
-    authInstance = initializeAuth(app, {
-      persistence: allowedPersistence,
-      popupRedirectResolver: browserPopupRedirectResolver
-    });
-    console.log("Firebase Auth initialized successfully with verified persistence list:", allowedPersistence.map(p => p.type));
-  } catch (initErr: any) {
-    console.warn("initializeAuth crashed, falling back to standard getAuth:", initErr);
-    try {
-      authInstance = getAuth(app);
-    } catch (fallbackErr) {
-      console.error("Critical: Could not initialize or retrieve Firebase Auth instance:", fallbackErr);
-    }
+    authInstance = getAuth(app);
+    console.log("Retrieved already-initialized Firebase Auth instance.");
+  } catch (fallbackErr) {
+    console.error("Critical: Could not initialize or retrieve Firebase Auth instance:", fallbackErr, initErr);
   }
 }
 
 export const auth = authInstance;
 export const storage = getStorage(app);
 export const googleProvider = new GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: 'select_account' });
+googleProvider.addScope("email");
+googleProvider.addScope("profile");
+googleProvider.setCustomParameters({ prompt: "select_account" });
+
+let googleSignInInFlight: Promise<any> | null = null;
+
+const isEmbeddedPreviewFrame = (): boolean => {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+};
 
 // Auth Helpers
 export const signInWithGoogle = async (_options?: { forceWebView?: boolean }) => {
-  return await executeWebViewGoogleSignIn();
+  if (googleSignInInFlight) {
+    return googleSignInInFlight;
+  }
+  googleSignInInFlight = executeWebViewGoogleSignIn().finally(() => {
+    googleSignInInFlight = null;
+  });
+  return googleSignInInFlight;
 };
 
 const executeWebViewGoogleSignIn = async () => {
   try {
-    return await signInWithPopup(auth, googleProvider);
+    return await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
   } catch (popupErr: any) {
-    if (
-      popupErr?.code === 'auth/popup-blocked' || 
-      popupErr?.code === 'auth/cancelled-popup-request' ||
-      popupErr?.message?.includes('popup-blocked')
-    ) {
-      console.warn("[signInWithGoogle] Popup blocked. Falling back to signInWithRedirect...");
-      await signInWithRedirect(auth, googleProvider);
-      return;
+    const errCode = popupErr?.code || "";
+    const isPopupBlocked =
+      errCode === "auth/popup-blocked" ||
+      String(popupErr?.message || "").includes("popup-blocked");
+
+    if (isPopupBlocked) {
+      // Never trigger full-page Google redirect inside an embedded iframe (Google blocks it via X-Frame-Options)
+      if (isEmbeddedPreviewFrame()) {
+        console.warn("[signInWithGoogle] Popup blocked inside embedded frame; skipping redirect fallback.");
+        throw popupErr;
+      }
+      console.warn("[signInWithGoogle] Popup blocked in top-level window. Falling back to signInWithRedirect...");
+      await signInWithRedirect(auth, googleProvider, browserPopupRedirectResolver);
+      return null;
     }
+
+    // Do not hijack page on cancelled-popup-request or popup-closed-by-user; surface cleanly to Login UI
     throw popupErr;
   }
 };
 import { purgeClientSessionOnUidTransition } from "./lib/sessionIsolation";
 import { unregisterCurrentDevicePushToken } from "./lib/pushNotifications";
-export const handleRedirectResult = () => getRedirectResult(auth);
+export const handleRedirectResult = () => getRedirectResult(auth, browserPopupRedirectResolver);
 export const signInAsGuest = () => signInAnonymously(auth);
 export const logout = async () => {
   const activeUser = auth.currentUser;
@@ -211,6 +236,11 @@ export const signUpWithEmail = (email: string, pass: string) => createUserWithEm
 export const signInWithEmail = (email: string, pass: string) => signInWithEmailAndPassword(auth, email, pass);
 export const sendVerificationEmail = (user: FirebaseUser) => sendEmailVerification(user);
 export const resetPassword = (email: string) => sendPasswordResetEmail(auth, email);
+export const reloadCurrentUser = async (): Promise<FirebaseUser | null> => {
+  if (!auth.currentUser) return null;
+  await auth.currentUser.reload();
+  return auth.currentUser;
+};
 
 // Firestore Error Handling
 export enum OperationType {
@@ -269,7 +299,7 @@ export const sendNotification = async (
   message: string,
   type: "quote" | "message" | "status" | "system" | "job_lead" | "promotion" | "profile_optimization" | "general" | "emergency_alert" = "system",
   link?: string,
-  context?: { jobId?: string; conversationId?: string; projectId?: string }
+  context?: { jobId?: string; conversationId?: string; projectId?: string; appointmentId?: string }
 ) => {
   try {
     const currentUser = auth.currentUser;
@@ -292,7 +322,8 @@ export const sendNotification = async (
           link,
           jobId: context?.jobId,
           conversationId: context?.conversationId,
-          projectId: context?.projectId
+          projectId: context?.projectId,
+          appointmentId: context?.appointmentId
         })
       });
 
@@ -316,106 +347,52 @@ export const sendNotification = async (
   }
 };
 
+export function isPubliclyVisibleReview(review: any): boolean {
+  if (!review || typeof review !== "object") return false;
+  if (review.isHidden === true) return false;
+  const status = String(review.status || "published").trim().toLowerCase();
+  return !["cooling_off", "hidden", "rejected"].includes(status);
+}
+
 export const submitReview = async (
-  jobId: string, 
-  reviewerId: string, 
-  revieweeId: string, 
-  rating: number, 
-  comment: string, 
+  jobId: string,
+  reviewerId: string,
+  revieweeId: string,
+  rating: number,
+  comment: string,
   recommended: boolean = true,
   type: "tradesperson_review" | "homeowner_review" = "tradesperson_review"
 ) => {
   const currentUser = auth.currentUser;
   const effectiveReviewerId = currentUser?.uid || reviewerId;
-
-  // 1. Attempt authoritative server submission first
-  try {
-    const token = currentUser ? await currentUser.getIdToken().catch(() => null) : null;
-
-    const response = await fetch("/api/reviews/submit", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { "Authorization": `Bearer ${token}` } : {})
-      },
-      body: JSON.stringify({
-        jobId,
-        reviewerId: effectiveReviewerId,
-        revieweeId,
-        rating,
-        comment,
-        recommended,
-        type
-      })
-    });
-
-    if (response.ok) {
-      const contentType = response.headers.get("content-type") || "";
-      if (contentType.includes("application/json")) {
-        return await response.json().catch(() => ({ success: true }));
-      }
-      return { success: true };
-    }
-
-    const errJson = await response.json().catch(() => ({}));
-    if (errJson?.fallbackToClient !== true) {
-      throw new Error(errJson?.error || response.statusText || `Failed to submit review (${response.status})`);
-    }
-    console.warn("[submitReview] Server requested explicit sandbox client fallback:", errJson.error || response.statusText);
-  } catch (netErr: any) {
-    if (netErr && !(netErr instanceof TypeError)) {
-      throw netErr;
-    }
-    console.warn("[submitReview] Server submission network unreachable. Proceeding with client-side Firestore submission:", netErr);
+  const token = currentUser ? await currentUser.getIdToken().catch(() => null) : null;
+  if (!token) {
+    throw new Error("Please sign in again before submitting a review.");
   }
 
-  // 2. Client-side Firestore direct submission fallback (only when server unreachable or explicit 503 fallbackToClient)
-  try {
-    const numRating = Math.max(1, Math.min(5, Math.round(Number(rating) || 5)));
-    const isLowRating = numRating <= 2 && type === "tradesperson_review";
-    const status = isLowRating ? "cooling_off" : "published";
-    const publishAt = isLowRating
-      ? new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
-      : new Date();
-
-    const reviewRef = doc(collection(db, "reviews"));
-    await originalSetDoc(reviewRef, {
-      id: reviewRef.id,
+  const response = await fetch(getApiUrl("/api/reviews/submit"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "Authorization": `Bearer ${token}`,
+    },
+    body: JSON.stringify({
       jobId,
       reviewerId: effectiveReviewerId,
       revieweeId,
+      rating,
+      comment,
+      recommended,
       type,
-      rating: numRating,
-      comment: String(comment || "").slice(0, 2000),
-      recommended: type === "tradesperson_review" ? Boolean(recommended) : false,
-      status,
-      publishAt,
-      createdAt: serverTimestamp()
-    });
+    }),
+  });
 
-    // Best-effort update of job review status
-    try {
-      if (type === "tradesperson_review") {
-        await originalUpdateDoc(doc(db, "jobs", jobId), {
-          hasReview: true,
-          hasHomeownerReview: true,
-          updatedAt: serverTimestamp()
-        });
-      } else {
-        await originalUpdateDoc(doc(db, "jobs", jobId), {
-          hasTradespersonReview: true,
-          updatedAt: serverTimestamp()
-        });
-      }
-    } catch (_) {
-      // Non-critical if client lacks permission to update job directly
-    }
-
-    return { success: true, directWrite: true };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, "reviews");
-    throw error;
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error || response.statusText || `Failed to submit review (${response.status})`);
   }
+  return data?.success ? data : { success: true, ...data };
 };
 
 export const onSnapshot = (...args: any[]) => {

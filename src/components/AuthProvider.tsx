@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
-import { auth, db, onAuthStateChanged, type FirebaseUser, doc, onSnapshot, handleFirestoreError, OperationType, logout, updateDoc, setDoc, addDoc, collection, serverTimestamp, signInWithGoogle, sendNotification } from "@/src/firebase";
+import { auth, db, onAuthStateChanged, type FirebaseUser, doc, onSnapshot, handleFirestoreError, OperationType, logout, updateDoc, setDoc, addDoc, collection, serverTimestamp, signInWithGoogle, sendNotification, reloadCurrentUser } from "@/src/firebase";
 import { Loader2, ShieldAlert, LogOut } from "lucide-react";
 import { toast } from "sonner";
 
@@ -18,6 +18,8 @@ interface AuthContextType {
   loading: boolean;
   isAuthReady: boolean;
   isAnonymous: boolean;
+  emailVerified: boolean;
+  refreshEmailVerification: () => Promise<boolean>;
   isTradeBotOpen: boolean;
   setIsTradeBotOpen: (isOpen: boolean) => void;
   signInWithGoogle: (options?: { forceWebView?: boolean }) => Promise<any>;
@@ -36,6 +38,8 @@ const AuthContext = createContext<AuthContextType>({
   loading: true,
   isAuthReady: false,
   isAnonymous: false,
+  emailVerified: false,
+  refreshEmailVerification: async () => false,
   isTradeBotOpen: false,
   setIsTradeBotOpen: () => {},
   signInWithGoogle: async () => {},
@@ -55,7 +59,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [loading, setLoading] = useState(true);
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [isAnonymous, setIsAnonymous] = useState(false);
+  const [emailVerified, setEmailVerified] = useState(false);
   const [isTradeBotOpen, setIsTradeBotOpen] = useState(false);
+
+  const refreshEmailVerification = useCallback(async (): Promise<boolean> => {
+    try {
+      const refreshed = await reloadCurrentUser();
+      const verified = Boolean(refreshed?.emailVerified);
+      setEmailVerified(verified);
+      if (refreshed) {
+        setUser(refreshed);
+      }
+      return verified;
+    } catch (err) {
+      console.warn("[AuthProvider] Failed to refresh email verification status:", err);
+      return Boolean(auth.currentUser?.emailVerified);
+    }
+  }, []);
 
   // Session Heartbeat States
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("active");
@@ -255,20 +275,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
-      // Security: Validate admin email
-      let cachedConfig = null;
-      try {
-        const stored = localStorage.getItem("master_admin_auth_config");
-        if (stored) cachedConfig = JSON.parse(stored);
-      } catch {}
-      const isAdminEmail = isAuthorizedAdminEmail(firebaseUser?.email, cachedConfig);
-      
-      if (firebaseUser && !firebaseUser.emailVerified && !firebaseUser.isAnonymous && !isAdminEmail) {
-        console.warn("Unverified email attempted login:", firebaseUser.email);
+      if (firebaseUser && !firebaseUser.emailVerified && !firebaseUser.isAnonymous) {
+        console.warn("Unverified email signed in:", firebaseUser.email);
       }
 
       setUser(firebaseUser);
       setIsAnonymous(firebaseUser?.isAnonymous || false);
+      setEmailVerified(Boolean(firebaseUser?.emailVerified));
       
       if (profileUnsubscribe) {
         profileUnsubscribe();
@@ -276,92 +289,47 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       if (firebaseUser) {
+        let expirySyncTriggeredForSession = false;
         // Listen for profile changes in real-time
         profileUnsubscribe = onSnapshot(doc(db, "users", firebaseUser.uid), async (docSnap) => {
           try {
             if (docSnap.exists()) {
               const data = docSnap.data();
-              
-              if (isAdminEmail && data.role !== "admin") {
-                data.role = "admin";
-                updateDoc(doc(db, "users", firebaseUser.uid), { 
-                  role: "admin",
-                  subscriptionType: null
-                }).catch(e => console.error("Error updating admin role:", e));
-              }
 
               // Set profile and unblock UI immediately
               setProfile(data as UserProfile);
               setLoading(false);
               setIsAuthReady(true);
-              
-              // Run background doc expiration checks asynchronously
-              setTimeout(() => {
-                const now = new Date();
-                const thirtyDaysFromNow = new Date();
-                thirtyDaysFromNow.setDate(now.getDate() + 30);
-                
-                let needsUpdate = false;
-                let newVerificationStatus = data.verificationStatus;
-                
-                const updatedDocs = (data.verificationDocs || []).map((doc: any) => {
-                  if (doc.expiryDate) {
-                    const expiry = new Date(doc.expiryDate);
-                    
-                    if (expiry < now && doc.status !== "expired") {
-                      needsUpdate = true;
-                      newVerificationStatus = "unverified";
-                      
-                      sendNotification(
-                        firebaseUser.uid,
-                        "Verification Expired ⚠️",
-                        `Your ${doc.type} has expired. Please upload a new document to restore your verified status.`,
-                        "status"
-                      ).catch(() => {});
-                      
-                      return { ...doc, status: "expired" };
-                    }
-                    
-                    if (expiry > now && expiry < thirtyDaysFromNow && !doc.expiryWarningSent) {
-                      needsUpdate = true;
-                      
-                      sendNotification(
-                        firebaseUser.uid,
-                        "Verification Expiring Soon ⏳",
-                        `Your ${doc.type} will expire on ${expiry.toLocaleDateString()}. Please prepare your renewal documents.`,
-                        "status"
-                      ).catch(() => {});
-                      
-                      return { ...doc, expiryWarningSent: true };
-                    }
-                  }
-                  return doc;
-                });
 
-                if (needsUpdate) {
-                  updateDoc(doc(db, "users", firebaseUser.uid), {
-                    verificationDocs: updatedDocs,
-                    verificationStatus: newVerificationStatus
-                  }).catch(e => console.error("Error auto-updating expired docs:", e));
+              // Trigger server-authoritative doc expiry/warning sync once per session if any doc is expired or within 30 days
+              if (!expirySyncTriggeredForSession && Array.isArray(data.verificationDocs) && data.verificationDocs.length > 0) {
+                const nowMs = Date.now();
+                const thirtyDaysMs = nowMs + 30 * 24 * 60 * 60 * 1000;
+                const needsServerExpirySync = data.verificationDocs.some((docItem: any) => {
+                  if (!docItem?.expiryDate) return false;
+                  const expMs = Date.parse(docItem.expiryDate);
+                  if (!Number.isFinite(expMs)) return false;
+                  return (expMs < nowMs && docItem.status !== "expired") ||
+                    (expMs >= nowMs && expMs < thirtyDaysMs && !docItem.expiryWarningSent);
+                });
+                if (needsServerExpirySync) {
+                  expirySyncTriggeredForSession = true;
+                  firebaseUser
+                    .getIdToken()
+                    .then((idToken) =>
+                      fetch("/api/account/sync-expired-docs", {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/json",
+                          Authorization: `Bearer ${idToken}`,
+                        },
+                      })
+                    )
+                    .catch((syncErr) => console.warn("Background doc expiry sync skipped:", syncErr));
                 }
-              }, 0);
-            } else {
-              if (isAdminEmail) {
-                const adminData = {
-                  uid: firebaseUser.uid,
-                  email: firebaseUser.email || "",
-                  name: firebaseUser.displayName || "Admin",
-                  role: "admin" as const,
-                  updatedAt: new Date().toISOString()
-                };
-                setProfile(adminData as any);
-                setDoc(doc(db, "users", firebaseUser.uid), {
-                  ...adminData,
-                  createdAt: serverTimestamp()
-                }, { merge: true }).catch(e => console.error("Error auto-initializing admin profile doc:", e));
-              } else {
-                setProfile(null);
               }
+            } else {
+              setProfile(null);
               setLoading(false);
               setIsAuthReady(true);
             }
@@ -407,6 +375,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       loading, 
       isAuthReady, 
       isAnonymous, 
+      emailVerified,
+      refreshEmailVerification,
       isTradeBotOpen, 
       setIsTradeBotOpen, 
       signInWithGoogle,

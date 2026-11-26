@@ -514,6 +514,82 @@ export async function moderateAdCommand({
   };
 }
 
+export interface EditAdCreativeInput {
+  db: any;
+  authUid: string;
+  adId: string;
+  description?: unknown;
+  title?: unknown;
+}
+
+/**
+ * Server-authoritative creative edit for an advertiser's campaign.
+ * Any edit to creative copy on an approved campaign resets approvalStatus to pending_review,
+ * pauses delivery, and retracts its public_ads projection until re-moderated.
+ */
+export async function editAdCreativeCommand({
+  db,
+  authUid,
+  adId,
+  description,
+  title,
+}: EditAdCreativeInput): Promise<{
+  success: true;
+  adId: string;
+  approvalStatus: "pending_review";
+  isActive: false;
+  requiresReModeration: boolean;
+}> {
+  if (!db) throw new BadRequestError("Database service unavailable");
+  if (!authUid) throw new ForbiddenError("Authentication required");
+  if (!adId) throw new BadRequestError("Advertisement ID is required");
+
+  const cleanDescription =
+    typeof description === "string" ? description.trim().slice(0, 240) : undefined;
+  const cleanTitle =
+    typeof title === "string" ? title.trim().slice(0, 120) : undefined;
+
+  if (!cleanDescription && !cleanTitle) {
+    throw new BadRequestError("Updated headline or description is required.");
+  }
+
+  const adRef = db.collection("advertisements").doc(adId);
+  let wasApproved = false;
+
+  await db.runTransaction(async (tx: any) => {
+    const adSnap = await tx.get(adRef);
+    if (!adSnap.exists) {
+      throw new NotFoundError("Advertisement not found");
+    }
+    const adData = adSnap.data() || {};
+    const isOwner = adData.advertiserUid === authUid || adData.advertiserId === authUid;
+    if (!isOwner) {
+      throw new ForbiddenError("Unauthorized: You do not own this advertisement");
+    }
+
+    wasApproved = adData.approvalStatus === "approved";
+    const updatePayload: Record<string, any> = {
+      approvalStatus: "pending_review",
+      status: "pending_review",
+      isActive: false,
+      updatedAt: serverTimestampOrNow(),
+    };
+    if (cleanDescription) updatePayload.description = cleanDescription;
+    if (cleanTitle) updatePayload.title = cleanTitle;
+
+    tx.update(adRef, updatePayload);
+    syncPublicAdInTransaction(tx, db, adId, { ...adData, ...updatePayload });
+  });
+
+  return {
+    success: true,
+    adId,
+    approvalStatus: "pending_review",
+    isActive: false,
+    requiresReModeration: wasApproved,
+  };
+}
+
 export interface TrackSponsoredAdEventInput {
   db: any;
   adId: string;
@@ -608,6 +684,17 @@ export async function trackSponsoredAdEventCommand({
     }
 
     const adData = adDoc.data() || {};
+    const adOwnerUid = String(adData.advertiserUid || adData.advertiserId || "");
+    if (viewerUid && adOwnerUid && viewerUid === adOwnerUid) {
+      result = {
+        ...result,
+        tracked: false,
+        billed: false,
+        chargeAmount: 0,
+        reason: "self_click_ignored",
+      };
+      return;
+    }
     if (adData.approvalStatus !== "approved" || adData.isActive !== true) {
       result = {
         ...result,

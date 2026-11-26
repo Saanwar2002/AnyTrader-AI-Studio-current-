@@ -61,10 +61,10 @@ export default function AdminDemandSurgeTab({ onShowNotice }: AdminDemandSurgeTa
         setBroadcasted(true);
         onShowNotice?.(res.outcomeMessage, "success");
       } else {
-        onShowNotice?.("Failed to activate surge alerts", "error");
+        onShowNotice?.(res.outcomeMessage || "Surge alerts must be dispatched from the authoritative Broadcasts console.", "info");
       }
-    } catch (err) {
-      onShowNotice?.("Error activating surge mode", "error");
+    } catch (err: any) {
+      onShowNotice?.(err?.message || "Surge alerts must be dispatched from the authoritative Broadcasts console.", "info");
     } finally {
       setExecuting(false);
     }

@@ -3,7 +3,7 @@ import { useAuth } from "./AuthProvider";
 import { BiometricService } from "@/src/services/biometricService";
 import { Fingerprint, ScanFace } from "lucide-react";
 import { EmailAuthProvider, reauthenticateWithCredential } from "firebase/auth";
-import { auth, logout, db, doc, updateDoc, setDoc, handleFirestoreError, OperationType, storage, ref, uploadBytes, getDownloadURL, uploadStorageFile, collection, query, where, or, and, orderBy, getDocs, onSnapshot, sendNotification } from "@/src/firebase";
+import { auth, logout, db, doc, updateDoc, setDoc, handleFirestoreError, OperationType, storage, ref, uploadBytes, getDownloadURL, uploadStorageFile, collection, collectionGroup, query, where, or, and, orderBy, getDoc, getDocs, onSnapshot, sendNotification } from "@/src/firebase";
 import { 
   LogOut, User, Mail, MapPin, Calendar, Shield, Edit2, Check, X, Loader2, Download, FileCheck, Upload, Clock, Star, Image as ImageIcon, Trash2, Briefcase, ChevronRight, Plus,
   Bell, Layout, Home, CreditCard, Bot, BarChart3, Search, History, Zap, HelpCircle, FileText, Pencil, Camera, GripVertical, Info, BookOpen, AlertCircle, Users, ChevronDown,
@@ -29,8 +29,17 @@ import { HomeownerIdentityCard } from "./profile/HomeownerIdentityCard";
 import { SafetyEmergencyCard } from "./profile/SafetyEmergencyCard";
 import TraderNotificationPreferencesModal from "./TraderNotificationPreferencesModal";
 import { OfflineAlertsCard } from "./shared/OfflineAlertsCard";
+import SavedPaymentCardsPanel from "./shared/SavedPaymentCardsPanel";
+import BecomeTradespersonModal from "./shared/BecomeTradespersonModal";
+import DocumentComplianceReminderBanner from "./shared/DocumentComplianceReminderBanner";
 import { cn } from "@/src/lib/utils";
 import { sanitizePublicProfilePayload } from "@/src/lib/publicProfileProjection";
+import {
+  resolveProfileRoleView,
+  isTradeProviderAccount,
+} from "@/src/lib/accountRoles";
+import { isProfileAcceptingNewWork } from "@/src/lib/marketplaceContracts";
+import { validateAndNormalizeProfilePhone } from "@/src/lib/profileValidation";
 import { 
   DndContext, 
   closestCenter,
@@ -55,7 +64,12 @@ import { TermsModal } from "./TermsModal";
 import { CURRENT_TERMS_VERSION } from "../constants/termsAndPrivacy";
 import { getTraderBadges, BadgeOverlay } from "@/src/lib/badges";
 import { lookupPostcode } from "@/src/services/postcodeService";
-import { performInitialPublicRecordCheck } from "../services/verificationService";
+import {
+  getStripeOnboardingLink,
+  getStripeAccountStatus,
+  getStripeLoginLink,
+  normalizeTraderTier,
+} from "@/src/services/stripeIntegrationService";
 
 function SortablePortfolioItem({ url, onRemove }: any) {
   const {
@@ -261,7 +275,7 @@ const BiometricSettings: React.FC<{ user: any }> = ({ user }) => {
     if (enabled) {
       BiometricService.disable();
       setEnabled(false);
-      setSuccess("Biometric sign-in successfully disabled.");
+      setSuccess("Saved device email preference disabled.");
     } else {
       setShowEnrollForm(true);
     }
@@ -278,7 +292,7 @@ const BiometricSettings: React.FC<{ user: any }> = ({ user }) => {
       return;
     }
     if (!password.trim()) {
-      setError("Please enter your account password to confirm enrollment.");
+      setError("Please enter your account password to confirm saving your email on this device.");
       return;
     }
 
@@ -289,20 +303,14 @@ const BiometricSettings: React.FC<{ user: any }> = ({ user }) => {
         await reauthenticateWithCredential(auth.currentUser, cred);
       }
 
-      // Prompt biometric authorization gesture
-      const verified = await BiometricService.authenticate("Confirm biometric signature to enable secure biometric login");
-      if (verified) {
-        const enrolled = await BiometricService.enroll(email);
-        if (enrolled) {
-          setEnabled(true);
-          setShowEnrollForm(false);
-          setPassword("");
-          setSuccess("Biometric sign-in configured successfully!");
-        } else {
-          setError("Failed to enroll credentials locally.");
-        }
+      const enrolled = await BiometricService.enroll(email);
+      if (enrolled) {
+        setEnabled(true);
+        setShowEnrollForm(false);
+        setPassword("");
+        setSuccess("Saved email quick-fill enabled for this device!");
       } else {
-        setError("Biometric validation cancelled or failed.");
+        setError("Failed to save email preference on this device.");
       }
     } catch (err: any) {
       if (err?.code === "auth/wrong-password" || err?.code === "auth/invalid-credential") {
@@ -328,11 +336,11 @@ const BiometricSettings: React.FC<{ user: any }> = ({ user }) => {
               )}
             </div>
             <div>
-              <h3 className="font-extrabold text-sm text-slate-900 leading-tight">Biometric Authentication</h3>
-              <p className="text-xs text-slate-500 mt-1 max-w-sm font-bold">
+              <h3 className="font-extrabold text-sm text-black leading-tight">Device Quick-Sign-In Preference</h3>
+              <p className="text-xs text-black/80 mt-1 max-w-sm font-medium">
                 {!available
-                  ? "Biometrics are not supported or configured on this device."
-                  : `Enable rapid ${biometricType === "face" ? "FaceID" : "Fingerprint"} sign-in on your next app launch.`}
+                  ? "Device quick-sign-in is not available in this browser environment."
+                  : "Remember your account email on this device so you can pre-fill the sign-in screen in one tap. Your password is never stored locally."}
               </p>
             </div>
           </div>
@@ -383,8 +391,8 @@ const BiometricSettings: React.FC<{ user: any }> = ({ user }) => {
                 className="w-full px-4 py-3 bg-slate-50 border border-black rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-xs font-medium text-slate-900"
                 required
               />
-              <p className="text-[10px] text-slate-400 mt-2 font-bold">
-                Please enter your account password to secure biometric key setup on this client device.
+              <p className="text-[10px] text-slate-600 mt-2 font-bold">
+                Confirm your password to remember your email on this browser for faster sign-in pre-fill. Your password is never stored locally.
               </p>
             </div>
             
@@ -417,8 +425,15 @@ const BiometricSettings: React.FC<{ user: any }> = ({ user }) => {
 
 export default function Profile() {
   const { user, profile, setProfile, setIsTradeBotOpen } = useAuth();
-  const isBusinessProfile = profile?.role === 'business' || profile?.role === 'tradesperson';
-  const { activePortal, switchPortal } = usePortal();
+  const { activePortal, switchPortal, setActiveRole } = usePortal();
+  const roleView = resolveProfileRoleView(profile, activePortal);
+  const isBusinessProfile = roleView.isServiceProvider;
+  const isPropertyBusiness = roleView.isPropertyOnlyBusiness;
+  const isPayoutEligible = roleView.isPayoutEligible;
+  const canUpgradeToTradesperson =
+    activePortal === "anytrader" &&
+    !isPropertyBusiness &&
+    (profile?.role === "homeowner" || profile?.role === "customer");
   const navigate = useNavigate();
   const location = useLocation();
   const { isInstallable, installApp } = usePWAInstall();
@@ -568,6 +583,17 @@ export default function Profile() {
   const [showProfileTermsModal, setShowProfileTermsModal] = useState(false);
   const [isAchievementsExpanded, setIsAchievementsExpanded] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [showCancelSubConfirm, setShowCancelSubConfirm] = useState(false);
+  const [isCancelingSub, setIsCancelingSub] = useState(false);
+  const [showClearServicesConfirm, setShowClearServicesConfirm] = useState(false);
+  const [isExportingGdpr, setIsExportingGdpr] = useState(false);
+  const [showDeleteAccountModal, setShowDeleteAccountModal] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [deleteReason, setDeleteReason] = useState("");
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const [deleteAccountError, setDeleteAccountError] = useState<string | null>(null);
+  const [phoneValidationError, setPhoneValidationError] = useState<string | null>(null);
+  const [showBecomeTraderModal, setShowBecomeTraderModal] = useState(false);
   const [isVerificationExpanded, setIsVerificationExpanded] = useState(false);
   const [isNotificationsExpanded, setIsNotificationsExpanded] = useState(false);
   const [showMatchTimingModal, setShowMatchTimingModal] = useState(false);
@@ -581,6 +607,7 @@ export default function Profile() {
   const [isAIPolishing, setIsAIPolishing] = useState(false);
   const [editData, setEditData] = useState<any>({
     name: profile?.name || "",
+    phone: profile?.phone || profile?.phoneNumber || "",
     postcode: profile?.postcode || "",
     city: profile?.city || "",
     county: profile?.county || "",
@@ -618,9 +645,26 @@ export default function Profile() {
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
   const [savedCards, setSavedCards] = useState<any[]>([]);
   const [isProcessingSetup, setIsProcessingSetup] = useState(false);
-  const [cardNumber, setCardNumber] = useState("");
-  const [expiryDate, setExpiryDate] = useState("");
-  const [cvc, setCvc] = useState("");
+  const [busyCardId, setBusyCardId] = useState<string | null>(null);
+  const [busyCardAction, setBusyCardAction] = useState<"default" | "delete" | null>(null);
+  const [stripeConnectStatus, setStripeConnectStatus] = useState<{
+    loading: boolean;
+    connected: boolean;
+    stripeAccountId?: string;
+    payoutsEnabled: boolean;
+    chargesEnabled: boolean;
+    detailsSubmitted: boolean;
+    error?: string;
+  }>({
+    loading: false,
+    connected: Boolean(profile?.stripeAccountId),
+    stripeAccountId: profile?.stripeAccountId,
+    payoutsEnabled: Boolean(profile?.payoutsEnabled),
+    chargesEnabled: Boolean(profile?.chargesEnabled),
+    detailsSubmitted: Boolean(profile?.stripeOnboardingComplete),
+  });
+  const [isLaunchingConnect, setIsLaunchingConnect] = useState(false);
+  const [isOpeningStripeDashboard, setIsOpeningStripeDashboard] = useState(false);
   
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -641,7 +685,7 @@ export default function Profile() {
 
   const activeTiers = React.useMemo(() => {
     if (!platformConfig) return [];
-    if ((profile?.role as string) === "homeowner" || (profile?.role as string) === "customer") {
+    if (roleView.tierCatalogBucket === "homeowners") {
       if (globalTiers?.providerModels?.homeowners?.tiers) {
         return Object.entries(globalTiers.providerModels.homeowners.tiers).map(([k, v]: [string, any]) => ({
           name: k,
@@ -656,7 +700,7 @@ export default function Profile() {
         })).sort((a,b) => a.price - b.price);
       }
       return platformConfig.businessTiers || [];
-    } else if (profile?.role === "driver") {
+    } else if (roleView.tierCatalogBucket === "on_demand_transport") {
       if (globalTiers?.providerModels?.on_demand_transport?.tiers) {
         return Object.entries(globalTiers.providerModels.on_demand_transport.tiers).map(([k, v]: [string, any]) => ({
           name: k,
@@ -687,7 +731,7 @@ export default function Profile() {
       }
       return platformConfig.feeTiers || [];
     }
-  }, [profile?.role, platformConfig, globalTiers]);
+  }, [roleView.tierCatalogBucket, platformConfig, globalTiers]);
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
@@ -702,6 +746,13 @@ export default function Profile() {
         await updateDoc(doc(db, "users", user.uid), {
           portfolio: newPortfolio
         });
+        if (roleView.shouldSyncPublicProfile) {
+          await setDoc(
+            doc(db, "public_profiles", user.uid),
+            sanitizePublicProfilePayload({ portfolio: newPortfolio }),
+            { merge: true }
+          ).catch((pubErr) => console.warn("Public profile portfolio reorder sync skipped:", pubErr));
+        }
       } catch (err) {
         console.error("Error reordering portfolio:", err);
       }
@@ -710,8 +761,10 @@ export default function Profile() {
 
   useEffect(() => {
     if ((isEditing || isEditingIM) && profile) {
+      setPhoneValidationError(null);
       setEditData({
         name: profile.name || "",
+        phone: profile.phone || profile.phoneNumber || "",
         postcode: profile.postcode || "",
         city: profile.city || "",
         county: profile.county || "",
@@ -738,7 +791,7 @@ export default function Profile() {
   }, []);
 
   useEffect(() => {
-    if (profile?.role === "tradesperson" && user?.uid) {
+    if (roleView.shouldLoadProviderReviews && user?.uid) {
       setLoadingReviews(true);
       const q = query(
         collection(db, "reviews"),
@@ -748,8 +801,14 @@ export default function Profile() {
 
       const unsubscribe = onSnapshot(q, (snapshot) => {
         const fetchedReviews = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-        // Only show published reviews or reviews without a status (legacy)
-        setReviews(fetchedReviews.filter((r: any) => r.status !== "cooling_off"));
+        // Only show published visible reviews or legacy reviews without a status
+        setReviews(
+          fetchedReviews.filter(
+            (r: any) =>
+              r.isHidden !== true &&
+              !["cooling_off", "hidden", "rejected"].includes(String(r.status || "published").toLowerCase())
+          )
+        );
         setLoadingReviews(false);
       }, (error) => {
         console.error("Error fetching reviews:", error);
@@ -759,13 +818,125 @@ export default function Profile() {
 
       return () => unsubscribe();
     }
-  }, [user?.uid, profile?.role]);
+  }, [user?.uid, roleView.shouldLoadProviderReviews]);
+
+  const fetchStripeConnectStatus = async (showFeedback?: "return" | "refresh") => {
+    if (!user?.uid) return;
+    setStripeConnectStatus(prev => ({ ...prev, loading: true, error: undefined }));
+    try {
+      const status = await getStripeAccountStatus();
+      const resolvedAccountId = status.stripeAccountId || profile?.stripeAccountId;
+      const payoutsEnabled = Boolean(status.payoutsEnabled);
+      const chargesEnabled = Boolean(status.chargesEnabled);
+      const detailsSubmitted = Boolean(status.detailsSubmitted);
+
+      setStripeConnectStatus({
+        loading: false,
+        connected: Boolean(status.connected || resolvedAccountId),
+        stripeAccountId: resolvedAccountId,
+        payoutsEnabled,
+        chargesEnabled,
+        detailsSubmitted,
+        error: status.error,
+      });
+
+      if (resolvedAccountId) {
+        setProfile((prev: any) =>
+          prev
+            ? {
+                ...prev,
+                stripeAccountId: resolvedAccountId,
+                payoutsEnabled,
+                chargesEnabled,
+                stripeOnboardingComplete: detailsSubmitted,
+              }
+            : prev
+        );
+      }
+
+      if (showFeedback === "return") {
+        if (payoutsEnabled && chargesEnabled) {
+          toast.success("Stripe Connect payouts are active and ready to receive funds.");
+        } else if (detailsSubmitted) {
+          toast.info("Your Stripe details were submitted and are under review. Payouts will activate once Stripe confirms verification.");
+        } else {
+          toast.info("Your Stripe Connect setup is not yet complete. Tap Continue Stripe Setup to finish.");
+        }
+      } else if (showFeedback === "refresh") {
+        toast.info("Your Stripe onboarding session expired. Tap Continue Stripe Setup to resume.");
+      }
+    } catch (err: any) {
+      console.error("Failed to fetch Stripe Connect status:", err);
+      setStripeConnectStatus(prev => ({
+        ...prev,
+        loading: false,
+        error: err?.message || "Unable to verify Stripe Connect status right now.",
+      }));
+    }
+  };
+
+  const handleStartStripeConnect = async () => {
+    if (!user?.uid) return;
+    setIsLaunchingConnect(true);
+    try {
+      const onboardingUrl = await getStripeOnboardingLink(user.uid, "profile");
+      window.location.href = onboardingUrl;
+    } catch (err: any) {
+      console.error("Stripe Connect onboarding error:", err);
+      toast.error(err?.message || "Unable to start Stripe Connect onboarding right now.");
+      setIsLaunchingConnect(false);
+    }
+  };
+
+  const handleOpenStripeDashboard = async () => {
+    if (!user?.uid) return;
+    setIsOpeningStripeDashboard(true);
+    try {
+      const dashboardUrl = await getStripeLoginLink();
+      if (!dashboardUrl) {
+        toast.error("Unable to open the Stripe Express Dashboard right now. Ensure your Stripe onboarding is completed.");
+        return;
+      }
+      window.location.href = dashboardUrl;
+    } catch (err: any) {
+      console.error("Stripe Express Dashboard error:", err);
+      toast.error(err?.message || "Failed to open Stripe Express Dashboard.");
+    } finally {
+      setIsOpeningStripeDashboard(false);
+    }
+  };
 
   useEffect(() => {
-    if (user?.uid) {
-      fetchPaymentMethods(user.uid);
+    if (!user?.uid) return;
+    fetchPaymentMethods(user.uid);
+    const params = new URLSearchParams(location.search);
+    const setupParam = params.get("setup");
+    if (setupParam === "success") {
+      setExpandedMenuId("#payments");
+      toast.success("Payment card linked securely via Stripe.");
+      navigate("/profile#payments", { replace: true });
     }
-  }, [user?.uid]);
+    if (isPayoutEligible) {
+      const connectParam = params.get("stripe_connect");
+      if (connectParam === "success" || connectParam === "return") {
+        setExpandedMenuId("#payments");
+        fetchStripeConnectStatus("return");
+        navigate("/profile#payments", { replace: true });
+      } else if (connectParam === "refresh") {
+        setExpandedMenuId("#payments");
+        fetchStripeConnectStatus("refresh");
+        navigate("/profile#payments", { replace: true });
+      } else {
+        fetchStripeConnectStatus();
+      }
+    }
+  }, [user?.uid, profile?.role, profile?.businessLayer, profile?.stripeAccountId, isPayoutEligible, location.search]);
+
+  useEffect(() => {
+    if (expandedMenuId === "#payments" && user?.uid && isPayoutEligible) {
+      fetchStripeConnectStatus();
+    }
+  }, [expandedMenuId, isPayoutEligible]);
 
   const fetchPaymentMethods = async (userId: string) => {
     try {
@@ -832,19 +1003,82 @@ export default function Profile() {
     }
   };
 
-  const handleDeletePaymentMethod = async (paymentMethodId: string) => {
+  const handleSetDefaultPaymentMethod = async (paymentMethodId: string) => {
     if (!user) return;
+    setBusyCardId(paymentMethodId);
+    setBusyCardAction("default");
     try {
       const token = await auth.currentUser?.getIdToken();
-      await fetch(`/api/payment-methods/${user.uid}/${paymentMethodId}`, {
+      if (!token) {
+        toast.error("Please sign in again to update your default card.");
+        return;
+      }
+      const res = await fetch(`/api/payment-methods/${user.uid}/${paymentMethodId}/default`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.error || "Unable to set default payment method right now.");
+        return;
+      }
+      const nextDefaultId = data.defaultPaymentMethodId || paymentMethodId;
+      setSavedCards((cards) =>
+        cards
+          .map((c) => ({ ...c, isDefault: c.id === nextDefaultId }))
+          .sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+      );
+      toast.success("Default payment card updated.");
+    } catch (err) {
+      console.error("Set Default Card Error:", err);
+      toast.error("Failed to update default payment card.");
+    } finally {
+      setBusyCardId(null);
+      setBusyCardAction(null);
+    }
+  };
+
+  const handleDeletePaymentMethod = async (paymentMethodId: string) => {
+    if (!user) return;
+    setBusyCardId(paymentMethodId);
+    setBusyCardAction("delete");
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) {
+        toast.error("Please sign in again to remove a payment card.");
+        return;
+      }
+      const res = await fetch(`/api/payment-methods/${user.uid}/${paymentMethodId}`, {
         method: "DELETE",
         headers: {
-           ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-        }
+          Authorization: `Bearer ${token}`,
+        },
       });
-      setSavedCards(cards => cards.filter(c => c.id !== paymentMethodId));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.error || "Unable to remove payment card right now.");
+        return;
+      }
+      const nextDefaultId = data.defaultPaymentMethodId ?? null;
+      setSavedCards((cards) =>
+        cards
+          .filter((c) => c.id !== paymentMethodId)
+          .map((c) => ({
+            ...c,
+            isDefault: nextDefaultId !== null ? c.id === nextDefaultId : Boolean(c.isDefault),
+          }))
+          .sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+      );
+      toast.success("Payment card removed.");
     } catch (err) {
       console.error("Delete Error:", err);
+      toast.error("Failed to remove payment card.");
+    } finally {
+      setBusyCardId(null);
+      setBusyCardAction(null);
     }
   };
 
@@ -852,8 +1086,61 @@ export default function Profile() {
     if (!user) return;
     setIsProcessingSetup(true);
     try {
-      toast.info("Manage booking subscriptions securely in Billing.");
-      window.location.assign("/billing");
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) {
+        toast.error("Your sign-in session has expired. Please sign in again.");
+        return;
+      }
+      const appointmentsPrice = Number(platformConfig?.paidAddons?.appointments?.price ?? 9.99);
+      const res = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "Idempotency-Key": crypto.randomUUID()
+        },
+        body: JSON.stringify({
+          userId: user.uid,
+          priceId: "price_appointments",
+          tierName: "Appointment System Add-on",
+          mode: "subscription",
+          price_data: {
+            currency: "gbp",
+            unit_amount: Math.round(appointmentsPrice * 100),
+            recurring: { interval: "month" },
+            product_data: {
+              name: "Appointment System Add-on",
+              description: "Allow customers to book real-time appointments directly from your profile."
+            }
+          },
+          successUrl: `${window.location.origin}/profile?appointments=success`,
+          cancelUrl: `${window.location.origin}/profile`,
+          metadata: {
+            type: "appointments",
+            subscriptionType: "appointments",
+            userId: user.uid
+          }
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.url) {
+        window.location.href = data.url;
+        return;
+      }
+      if (res.ok && data.success) {
+        toast.success(`Appointment System activated (£${appointmentsPrice.toFixed(2)}/mo)!`);
+        setProfile((prev: any) => ({
+          ...prev,
+          hasAppointmentsAddon: true,
+          appointmentsSubscriptionStatus: "active",
+          appointmentSettings: { ...(prev?.appointmentSettings || {}), enabled: true }
+        }));
+        return;
+      }
+      toast.error(data.error || "Unable to start Appointment System checkout.");
+    } catch (err) {
+      console.error("Appointments Checkout Error:", err);
+      toast.error("Unable to start Appointment System checkout right now.");
     } finally {
       setIsProcessingSetup(false);
     }
@@ -864,37 +1151,51 @@ export default function Profile() {
     setIsProcessingSetup(true);
     try {
       const token = await auth.currentUser?.getIdToken();
-      const res = await fetch("/api/create-customer-portal-session", {
+      if (!token) {
+        toast.error("Your sign-in session has expired. Please sign in again.");
+        return;
+      }
+      const isCurrentlyCanceling = Boolean(profile?.appointmentsCancelAtPeriodEnd);
+      const endpoint = isCurrentlyCanceling ? "/api/reactivate-subscription" : "/api/cancel-subscription";
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { "Authorization": `Bearer ${token}` } : {})
+          Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify({ returnUrl: `${window.location.origin}/profile` })
+        body: JSON.stringify({ subscriptionType: "appointments" })
       });
       const data = await res.json().catch(() => ({}));
-      if (res.ok && data.url) {
-        window.location.href = data.url;
+      if (res.ok && data.success) {
+        setProfile((prev: any) => ({
+          ...prev,
+          appointmentsCancelAtPeriodEnd: !isCurrentlyCanceling,
+          ...(data.currentPeriodEnd ? { appointmentsCurrentPeriodEnd: data.currentPeriodEnd } : {})
+        }));
+        toast.success(
+          isCurrentlyCanceling
+            ? "Appointment System auto-renewal resumed!"
+            : "Appointment System scheduled to cancel at the end of the current billing period."
+        );
         return;
       }
-      toast.info("Manage or cancel add-ons from your Billing settings.");
-      window.location.assign("/billing");
+      toast.error(data.error || "Unable to update Appointment System subscription right now.");
     } catch (err) {
-      console.error("Billing Portal Error:", err);
-      toast.error("Unable to open subscription portal right now.");
+      console.error("Appointments Subscription Update Error:", err);
+      toast.error("Unable to update Appointment System subscription right now.");
     } finally {
       setIsProcessingSetup(false);
     }
   };
 
   useEffect(() => {
-    if (profile?.role === "tradesperson" && user?.uid && platformConfig) {
+    if (roleView.shouldLoadMonthlyQuoteUsage && user?.uid && platformConfig) {
       setLoadingUsage(true);
-      const tier = platformConfig.feeTiers?.find((t: any) => t.name === (profile.tierId || "Free Trial"));
+      const tier = platformConfig.feeTiers?.find((t: any) => t.name === (profile?.tierId || "Free Explorer"));
       const isLifetime = tier?.limitPeriod === "lifetime";
-      
+
       const q = query(
-        collection(db, "quotes"),
+        collectionGroup(db, "quotes"),
         where("tradespersonId", "==", user.uid)
       );
 
@@ -907,7 +1208,7 @@ export default function Profile() {
         snapshot.docs.forEach(doc => {
           const data = doc.data();
           const createdAt = data.createdAt?.toMillis?.() || 0;
-          
+
           if (isLifetime || createdAt >= startOfMonth) {
             quotesCount++;
             if (data.status === "accepted") {
@@ -925,7 +1226,7 @@ export default function Profile() {
 
       return () => unsubscribe();
     }
-  }, [user?.uid, profile?.role, profile?.tierId, platformConfig]);
+  }, [user?.uid, roleView.shouldLoadMonthlyQuoteUsage, profile?.tierId, platformConfig]);
 
   const [homeownerJobs, setHomeownerJobs] = useState<any[]>([]);
   const [loadingJobs, setLoadingJobs] = useState(false);
@@ -957,8 +1258,9 @@ export default function Profile() {
     }
   }, [user?.uid, profile?.role]);
 
+  // Dual-role support: load jobs posted by ANY authenticated user (Homeowner, Tradesperson, Business, or Driver)
   useEffect(() => {
-    if (((profile?.role as string) === "homeowner" || (profile?.role as string) === "customer") && user?.uid) {
+    if (user?.uid) {
       setLoadingJobs(true);
       const q = query(
         collection(db, "jobs"),
@@ -970,14 +1272,13 @@ export default function Profile() {
         setHomeownerJobs(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
         setLoadingJobs(false);
       }, (error) => {
-        console.error("Error fetching homeowner jobs:", error);
-        handleFirestoreError(error, OperationType.LIST, "jobs");
+        console.error("Error fetching posted jobs:", error);
         setLoadingJobs(false);
       });
 
       return () => unsubscribe();
     }
-  }, [user?.uid, profile?.role]);
+  }, [user?.uid]);
 
   useEffect(() => {
     const unsubConfig = onSnapshot(doc(db, "platform_config", "global"), (doc) => {
@@ -1013,10 +1314,18 @@ export default function Profile() {
       }
       
       await updateDoc(doc(db, "users", user.uid), {
-        photoURL: downloadUrl
+        photoURL: downloadUrl,
+        avatarUrl: downloadUrl,
       });
+      if (roleView.shouldSyncPublicProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload({ photoURL: downloadUrl, avatarUrl: downloadUrl }),
+          { merge: true }
+        ).catch((pubErr) => console.warn("Public profile avatar sync skipped:", pubErr));
+      }
       
-      setProfile((prev: any) => ({ ...prev, photoURL: downloadUrl }));
+      setProfile((prev: any) => ({ ...prev, photoURL: downloadUrl, avatarUrl: downloadUrl }));
     } catch (err) {
       console.error("Error uploading photo:", err);
       setError("Failed to upload photo.");
@@ -1056,6 +1365,13 @@ export default function Profile() {
         portfolio: newPortfolioUpdated,
         portfolioPhotos: newPortfolioUpdated
       });
+      if (roleView.shouldSyncPublicProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload({ portfolio: newPortfolioUpdated }),
+          { merge: true }
+        ).catch((pubErr) => console.warn("Public profile portfolio upload sync skipped:", pubErr));
+      }
       
       setProfile((prev: any) => ({ ...prev, portfolio: newPortfolioUpdated, portfolioPhotos: newPortfolioUpdated }));
     } catch (err) {
@@ -1084,6 +1400,13 @@ export default function Profile() {
         portfolio: newPortfolio,
         portfolioPhotos: newPortfolio
       });
+      if (roleView.shouldSyncPublicProfile) {
+        await setDoc(
+          doc(db, "public_profiles", user.uid),
+          sanitizePublicProfilePayload({ portfolio: newPortfolio }),
+          { merge: true }
+        ).catch((pubErr) => console.warn("Public profile portfolio removal sync skipped:", pubErr));
+      }
       setProfile((prev: any) => ({ ...prev, portfolio: newPortfolio, portfolioPhotos: newPortfolio }));
     } catch (err) {
       console.error("Error removing portfolio image:", err);
@@ -1142,19 +1465,24 @@ export default function Profile() {
         }
       ];
 
-      await updateDoc(doc(db, "users", user.uid), {
+      const currentStatus = String(profile?.verificationStatus || "").trim().toLowerCase();
+      const shouldPreserveStatus = ["provisional", "verified", "vetted", "auditioned"].includes(currentStatus);
+      const userDocUpdate: Record<string, any> = {
         verificationDocs: updatedDocs,
-        verificationStatus: "pending"
-      });
+      };
+      if (!shouldPreserveStatus) {
+        userDocUpdate.verificationStatus = "pending";
+      }
+
+      await updateDoc(doc(db, "users", user.uid), userDocUpdate);
       
       setProfile((prev: any) => ({ 
         ...prev, 
         verificationDocs: updatedDocs,
-        verificationStatus: "pending"
+        ...(shouldPreserveStatus ? {} : { verificationStatus: "pending" }),
       }));
 
-      // Trigger automated public record check
-      performInitialPublicRecordCheck(user.uid, certType);
+      toast.success(`${certType} uploaded and queued for Admin Verification review.`);
     } catch (err) {
       console.error("Error uploading verification doc:", err);
       setError("Failed to upload document. Please try again.");
@@ -1166,11 +1494,14 @@ export default function Profile() {
   useEffect(() => {
     if (location.hash) {
       const id = location.hash.substring(1);
+      if (id === "verification") {
+        setIsVerificationExpanded(true);
+      }
       const element = document.getElementById(id);
       if (element) {
         setTimeout(() => {
           element.scrollIntoView({ behavior: "smooth" });
-        }, 100);
+        }, 120);
       }
     } else {
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1223,14 +1554,25 @@ export default function Profile() {
 
   const handleSave = async () => {
     if (!user) return;
-    setIsSaving(true);
     setError(null);
+    setPhoneValidationError(null);
+
+    const phoneCheck = validateAndNormalizeProfilePhone(editData.phone ?? "");
+    if (!phoneCheck.valid) {
+      setPhoneValidationError(phoneCheck.error || "Please enter a valid phone number.");
+      toast.error(phoneCheck.error || "Please enter a valid phone number.");
+      return;
+    }
+
+    setIsSaving(true);
     try {
       const tradesArray = editData.trades.split(",").map(t => t.trim()).filter(t => t !== "").slice(0, 15);
       const tagsArray = editData.tags.split(",").map(t => t.trim()).filter(t => t !== "").slice(0, 15);
       
       const finalData: any = {
         ...editData,
+        phone: phoneCheck.normalized,
+        phoneNumber: phoneCheck.normalized,
         trades: tradesArray,
         tags: tagsArray,
         services: editData.services,
@@ -1259,8 +1601,8 @@ export default function Profile() {
       
       await updateDoc(doc(db, "users", user.uid), finalData);
 
-      // If user is a trader, sync strictly sanitized non-PII fields to public_profiles
-      if (profile?.role === "tradesperson" || (profile?.role as any) === "trader" || profile?.role === "business") {
+      // Sync strictly sanitized non-PII fields to public_profiles ONLY for trade/consultancy service providers (never Property Businesses)
+      if (roleView.shouldSyncPublicProfile) {
         try {
           const publicFields = sanitizePublicProfilePayload(finalData);
           if (Object.keys(publicFields).length > 0) {
@@ -1272,12 +1614,14 @@ export default function Profile() {
       }
       setProfile((prev: any) => ({ ...prev, ...finalData }));
       setIsEditing(false);
+      toast.success("Profile changes saved.");
     } catch (err) {
       console.error("Error updating profile:", err);
       try {
         handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
       } catch (e: any) {
         setError(e.message);
+        toast.error(e.message || "Failed to save profile changes.");
       }
     } finally {
       setIsSaving(false);
@@ -1290,15 +1634,23 @@ export default function Profile() {
     try {
       await updateDoc(doc(db, "users", user.uid), {
         acceptingNewWork: nextValue,
+        isAcceptingRequests: nextValue,
       });
-      if (isBusinessProfile) {
+      if (isBusinessProfile || isTradeProviderAccount(profile)) {
         await setDoc(
           doc(db, "public_profiles", user.uid),
-          sanitizePublicProfilePayload({ acceptingNewWork: nextValue }),
+          sanitizePublicProfilePayload({
+            acceptingNewWork: nextValue,
+            isAcceptingRequests: nextValue,
+          }),
           { merge: true }
         ).catch((pubSyncErr) => console.warn("Public profile availability sync skipped:", pubSyncErr));
       }
-      setProfile((prev: any) => ({ ...prev, acceptingNewWork: nextValue }));
+      setProfile((prev: any) => ({
+        ...prev,
+        acceptingNewWork: nextValue,
+        isAcceptingRequests: nextValue,
+      }));
       toast.success(
         nextValue
           ? "Your profile is now active and accepting new work in public search."
@@ -1466,7 +1818,12 @@ export default function Profile() {
   const handleUpdateRecurringStatus = async (scheduleId: string, newStatus: string, otherPartyId: string, title: string) => {
     if (!user) return;
     try {
-      await updateDoc(doc(db, "recurring_schedules", scheduleId), {
+      const schedRef = doc(db, "recurring_schedules", scheduleId);
+      const schedSnap = await getDoc(schedRef);
+      const schedData = schedSnap.exists() ? schedSnap.data() : null;
+      const linkedJobId = schedData?.originalJobId || schedData?.jobId || undefined;
+
+      await updateDoc(schedRef, {
         status: newStatus
       });
       
@@ -1481,7 +1838,8 @@ export default function Profile() {
           "Schedule Update",
           notificationMessage,
           "status",
-          "/profile"
+          "/profile",
+          linkedJobId ? { jobId: linkedJobId } : undefined
         );
       }
     } catch (err) {
@@ -1650,16 +2008,17 @@ export default function Profile() {
       title: "Account",
       items: [
         { icon: User, label: "Account Details", path: "#account" },
-        { icon: Fingerprint, label: "Enable Biometric Quick-Login", path: "#biometrics" },
+        { icon: Fingerprint, label: "Device Sign-In Preferences", path: "#biometrics" },
         { icon: Smartphone, label: "Classic / Mobile Friendly", path: "#uimode" },
         { icon: CreditCard, label: "Payment Methods", path: "#payments" },
         { icon: Shield, label: "Privacy & Legal Compliance", path: "#terms" },
+        { icon: Trash2, label: "Data Privacy & Delete Account", path: "#data-privacy" },
       ]
     },
     {
       title: "Properties & Jobs",
       items: [
-        { icon: Home, label: "My Properties", path: "/profile" },
+        { icon: Home, label: "My Properties", path: "/portfolio" },
         { icon: Briefcase, label: "My Jobs History", path: "/my-jobs?history=true" },
       ]
     },
@@ -1669,14 +2028,14 @@ export default function Profile() {
         { icon: BookOpen, label: "📖 Platform User Guide", path: "#userguide" },
         { icon: Bot, label: "AI Price Chatbot", path: "#tradebot" },
         { icon: Search, label: "Find Tradespeople", path: "/find-trades" },
-        { icon: Zap, label: "Emergency Alerts", path: "/profile" },
+        { icon: Zap, label: "Emergency Alerts", path: "#emergency" },
       ]
     },
     {
       title: "Support",
       items: [
         { icon: Bell, label: "Notifications", path: "/notifications" },
-        { icon: HelpCircle, label: "Help & Support", path: "/profile" },
+        { icon: HelpCircle, label: "Help & Support", path: "#help" },
         { icon: FileText, label: "Terms & Conditions", path: "#terms" },
       ]
     }
@@ -1735,12 +2094,13 @@ export default function Profile() {
       title: "Account",
       items: [
         { icon: User, label: "Account Details", path: "#account" },
-        { icon: Fingerprint, label: "Enable Biometric Quick-Login", path: "#biometrics" },
+        { icon: Fingerprint, label: "Device Sign-In Preferences", path: "#biometrics" },
         { icon: Smartphone, label: "Classic / Mobile Friendly", path: "#uimode" },
         { icon: Bell, label: "Notification Preferences", path: "#notifications" },
         { icon: CreditCard, label: "Payment Methods", path: "#payments" },
         { icon: PoundSterling, label: "Billing & Pricing Tiers", path: "/billing" },
         { icon: Shield, label: "Privacy & Legal Compliance", path: "#terms" },
+        { icon: Trash2, label: "Data Privacy & Delete Account", path: "#data-privacy" },
       ]
     },
     {
@@ -1769,25 +2129,83 @@ export default function Profile() {
       title: "Support",
       items: [
         { icon: Bell, label: "Notifications", path: "/notifications" },
-        { icon: HelpCircle, label: "Help & Support", path: "/profile" },
+        { icon: HelpCircle, label: "Help & Support", path: "#help" },
         { icon: FileText, label: "Terms & Conditions", path: "#terms" },
       ]
     }
   ];
 
-  const menuGroups = activePortal === "anyroller" 
-    ? passengerMenuGroups 
-    : (isBusinessProfile ? tradespersonMenuGroups : homeownerMenuGroups);
+  const propertyBusinessMenuGroups = [
+    {
+      title: "Account",
+      items: [
+        { icon: User, label: "Account Details", path: "#account" },
+        { icon: Fingerprint, label: "Device Sign-In Preferences", path: "#biometrics" },
+        { icon: Smartphone, label: "Classic / Mobile Friendly", path: "#uimode" },
+        { icon: Bell, label: "Notification Preferences", path: "#notifications" },
+        { icon: CreditCard, label: "Payment Methods", path: "#payments" },
+        { icon: PoundSterling, label: "Billing & Landlord Plans", path: "/billing" },
+        { icon: Shield, label: "Privacy & Legal Compliance", path: "#terms" },
+        { icon: Trash2, label: "Data Privacy & Delete Account", path: "#data-privacy" },
+      ]
+    },
+    {
+      title: "Property & Portfolio",
+      items: [
+        { icon: Layout, label: "Business HQ", path: "/" },
+        { icon: Building, label: "Property Portfolio", path: "/portfolio" },
+        { icon: Briefcase, label: "My Projects & Repairs", path: "/my-jobs" },
+        { icon: ClipboardList, label: "Corporate & Housing Portal", path: "/corporate" },
+        { icon: BarChart3, label: "Spend Analytics", path: "/analytics" },
+        { icon: Search, label: "Find Verified Trades", path: "/find-trades" },
+      ]
+    },
+    {
+      title: "Tools & Rides",
+      items: [
+        { icon: Repeat, label: "Book a Ride (AnyRoller)", path: "#switch_portal" },
+        { icon: BookOpen, label: "📖 Platform User Guide", path: "#userguide" },
+        { icon: Bot, label: "AI Price Chatbot", path: "#tradebot" },
+      ]
+    },
+    {
+      title: "Support",
+      items: [
+        { icon: Bell, label: "Notifications", path: "/notifications" },
+        { icon: HelpCircle, label: "Help & Support", path: "#help" },
+        { icon: FileText, label: "Terms & Conditions", path: "#terms" },
+      ]
+    }
+  ];
+
+  const menuGroups = activePortal === "anyroller"
+    ? passengerMenuGroups
+    : isBusinessProfile
+    ? tradespersonMenuGroups
+    : isPropertyBusiness
+    ? propertyBusinessMenuGroups
+    : homeownerMenuGroups;
 
   const handleSubscribe = async () => {
     if (!user || !showCheckoutForTier) return;
     setIsProcessingPayment(true);
-    
+
     try {
-      if (showCheckoutForTier.price > 0) {
-        // Redirect to Stripe checkout for paid plans
+      if (Number(showCheckoutForTier.price || 0) > 0) {
+        // Redirect directly to Stripe Checkout for paid plans (server resolves authoritative pricing)
         const token = await user.getIdToken();
         if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+
+        const rawTierLabel = String(showCheckoutForTier.rawKey || showCheckoutForTier.name || "").toLowerCase();
+        let resolvedPriceId: string | undefined;
+        if (rawTierLabel.includes("landlord")) {
+          resolvedPriceId = "price_landlord";
+        } else if (rawTierLabel.includes("driver") && rawTierLabel.includes("gold")) {
+          resolvedPriceId = "price_driver_gold";
+        } else if (!rawTierLabel.includes("rider_plus") && !rawTierLabel.includes("rider plus")) {
+          resolvedPriceId = `price_${normalizeTraderTier(showCheckoutForTier.rawKey || showCheckoutForTier.name)}`;
+        }
+
         const response = await fetch("/api/create-checkout-session", {
           method: "POST",
           headers: {
@@ -1797,33 +2215,38 @@ export default function Profile() {
           },
           body: JSON.stringify({
             userId: user.uid,
+            ...(resolvedPriceId ? { priceId: resolvedPriceId } : {}),
             tierName: showCheckoutForTier.name,
             mode: "subscription",
-            price_data: {
-              currency: 'gbp',
-              unit_amount: Math.round(showCheckoutForTier.price * 100),
-              recurring: { interval: 'month' },
-              product_data: {
-                name: `${showCheckoutForTier.name} Membership`,
-                description: `Monthly subscription to ${showCheckoutForTier.name}`
-              }
-            },
-            priceId: "price_mock_" + showCheckoutForTier.name.toLowerCase().replace(/\s/g, "_"),
             successUrl: `${window.location.origin}/profile?session_id={CHECKOUT_SESSION_ID}`,
             cancelUrl: `${window.location.origin}/profile`,
             metadata: {
               tierName: showCheckoutForTier.name,
-              userId: user.uid
+              userId: user.uid,
+              ...(resolvedPriceId === "price_landlord" ? { tier: "landlord", subscriptionType: "landlord" } : {})
             }
           }),
         });
 
-        const data = await response.json();
-        if (data.url) {
+        const data = await response.json().catch(() => ({}));
+        if (response.ok && data.url) {
           window.location.href = data.url;
-          return; // Do not clear loading state as we are redirecting
+          return; // Keep loading state while redirecting to Stripe Checkout
+        } else if (response.ok && data.upgraded) {
+          setProfile((prev: any) => ({
+            ...prev,
+            tier: data.tier || prev?.tier,
+            tierId: data.tierName || showCheckoutForTier.name,
+            subscriptionStatus: "active",
+            cancelAtPeriodEnd: false,
+            ...(data.currentPeriodEnd ? { currentPeriodEnd: data.currentPeriodEnd } : {})
+          }));
+          toast.success(data.message || `Successfully switched to ${showCheckoutForTier.name}!`);
+          setShowCheckoutForTier(null);
+          setIsProcessingPayment(false);
+          return;
         } else {
-          throw new Error(data.error || "Failed to initiate checkout");
+          throw new Error(data.error || "Failed to initiate secure Stripe Checkout.");
         }
       } else {
         // Free-tier changes go through the server because subscription fields are server-owned.
@@ -1845,27 +2268,33 @@ export default function Profile() {
           ...prev,
           ...result.fields
         }));
-        
+        toast.success(`Switched to the ${showCheckoutForTier.name} plan.`);
         setShowCheckoutForTier(null);
         setIsProcessingPayment(false);
       }
     } catch (err: any) {
       console.error("Error updating tier:", err);
-      alert(err.message || "Payment init failed. Please try again.");
+      toast.error(err?.message || "Could not start checkout. Please try again.");
       setIsProcessingPayment(false);
     }
   };
 
-  const handleCancelSubscription = async () => {
-    if (!user || !confirm("Are you sure you want to cancel your subscription? You will lose access to premium features at the end of your billing cycle.")) return;
-    
-    const isHomeowner = (profile.role as string) === "homeowner" || (profile.role as string) === "customer";
-    const subscriptionType = isHomeowner
-      ? "landlord"
-      : profile.subscriptionType === "driver_gold" ? "driver_gold" : "tier";
-    const cancelField = isHomeowner
-      ? "homeownerCancelAtPeriodEnd"
-      : subscriptionType === "driver_gold" ? "driverCancelAtPeriodEnd" : "cancelAtPeriodEnd";
+  const handleCancelSubscription = () => {
+    if (!user) return;
+    setShowCancelSubConfirm(true);
+  };
+
+  const executeCancelSubscription = async () => {
+    if (!user) return;
+    setIsCancelingSub(true);
+
+    const subscriptionType = roleView.subscriptionRoleScope;
+    const cancelField =
+      subscriptionType === "landlord"
+        ? "homeownerCancelAtPeriodEnd"
+        : subscriptionType === "driver_gold"
+        ? "driverCancelAtPeriodEnd"
+        : "cancelAtPeriodEnd";
 
     try {
       const token = await user.getIdToken();
@@ -1883,18 +2312,114 @@ export default function Profile() {
         throw new Error(result.error || "Subscription cancellation could not be scheduled.");
       }
       setProfile((prev: any) => ({ ...prev, [cancelField]: true }));
+      setShowCancelSubConfirm(false);
+      toast.success("Subscription cancellation scheduled for the end of your current billing period.");
     } catch (err) {
       console.error("Error canceling subscription:", err);
-      alert(err instanceof Error ? err.message : "Subscription cancellation could not be scheduled.");
+      toast.error(err instanceof Error ? err.message : "Subscription cancellation could not be scheduled.");
+    } finally {
+      setIsCancelingSub(false);
     }
   };
 
-  const currentRoleTierId = (profile.role as string) === "homeowner" || (profile.role as string) === "customer" ? (profile.homeownerTierId || "Standard Homeowner") : (profile.tierId || "Free Explorer");
-  const currentRoleSubscriptionStatus = (profile.role as string) === "homeowner" || (profile.role as string) === "customer" ? profile.homeownerSubscriptionStatus : profile.subscriptionStatus;
-  const currentRoleCancelAtPeriodEnd = (profile.role as string) === "homeowner" || (profile.role as string) === "customer" ? profile.homeownerCancelAtPeriodEnd : profile.cancelAtPeriodEnd;
-  const currentRoleCurrentPeriodEnd = (profile.role as string) === "homeowner" || (profile.role as string) === "customer" ? profile.homeownerCurrentPeriodEnd : profile.currentPeriodEnd;
+  const handleDownloadGdprData = async () => {
+    if (!user || isExportingGdpr) return;
+    setIsExportingGdpr(true);
+    try {
+      const token = await user.getIdToken();
+      if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+      const response = await fetch("/api/account/gdpr/export", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Unable to export your account data right now.");
+      }
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      anchor.href = url;
+      anchor.download = `anytrader-my-data-${dateStamp}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      toast.success("Your personal data export has been downloaded.");
+    } catch (err) {
+      console.error("GDPR export failed:", err);
+      toast.error(err instanceof Error ? err.message : "Unable to export your account data.");
+    } finally {
+      setIsExportingGdpr(false);
+    }
+  };
 
-  if (activePortal === "anyroller" && profile.role !== "driver") {
+  const handleConfirmDeleteAccount = async () => {
+    if (!user || isDeletingAccount) return;
+    setDeleteAccountError(null);
+    if (deleteConfirmText.trim().toUpperCase() !== "DELETE") {
+      setDeleteAccountError('Please type "DELETE" in the box below to confirm.');
+      return;
+    }
+
+    setIsDeletingAccount(true);
+    try {
+      const token = await user.getIdToken();
+      if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+      const response = await fetch("/api/account/gdpr/delete-account", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          confirmationText: deleteConfirmText.trim(),
+          reason: deleteReason.trim() || undefined,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || "Unable to delete your account right now.");
+      }
+      setShowDeleteAccountModal(false);
+      toast.success("Your account has been permanently closed and personal details erased.");
+      await logout();
+      navigate("/login");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unable to delete your account right now.";
+      setDeleteAccountError(msg);
+      toast.error(msg);
+    } finally {
+      setIsDeletingAccount(false);
+    }
+  };
+
+  const currentRoleTierId = roleView.isHomeownerOrPropertyBilling
+    ? (profile.homeownerTierId || "Standard Homeowner")
+    : roleView.isDriver && !roleView.isServiceProvider
+    ? (profile.driverTierId || profile.tierId || "Standard Driver")
+    : (profile.tierId || "Free Explorer");
+  const currentRoleSubscriptionStatus = roleView.isHomeownerOrPropertyBilling
+    ? profile.homeownerSubscriptionStatus
+    : roleView.isDriver && !roleView.isServiceProvider
+    ? (profile.driverSubscriptionStatus || profile.subscriptionStatus)
+    : profile.subscriptionStatus;
+  const currentRoleCancelAtPeriodEnd = roleView.isHomeownerOrPropertyBilling
+    ? profile.homeownerCancelAtPeriodEnd
+    : roleView.isDriver && !roleView.isServiceProvider
+    ? (profile.driverCancelAtPeriodEnd ?? profile.cancelAtPeriodEnd)
+    : profile.cancelAtPeriodEnd;
+  const currentRoleCurrentPeriodEnd = roleView.isHomeownerOrPropertyBilling
+    ? profile.homeownerCurrentPeriodEnd
+    : roleView.isDriver && !roleView.isServiceProvider
+    ? (profile.driverCurrentPeriodEnd || profile.currentPeriodEnd)
+    : profile.currentPeriodEnd;
+
+  if (roleView.shouldShowAnyRollerPassengerView) {
     const passengerGroups = [
       {
         title: "Account",
@@ -2267,7 +2792,7 @@ export default function Profile() {
         </div>
       )}
 
-      {(isBusinessProfile || (((profile.role as string) === "homeowner" || (profile.role as string) === "customer") && profile.subscriptionType === "business")) && platformConfig && (
+      {isBusinessProfile && platformConfig && (
         <div className="bg-white rounded-[2rem] border border-black shadow-[0_8px_30px_rgb(0,0,0,0.08)] bg-gradient-to-b from-white to-slate-50/50 overflow-hidden p-5 mb-8">
           {platformConfig.paywallEnabled === false && (
             <div className="mb-6 p-4 bg-amber-50 rounded-2xl border border-amber-200 flex items-center gap-4">
@@ -2324,15 +2849,7 @@ export default function Profile() {
                 key={tier.name}
                 onClick={() => {
                   if (currentRoleTierId === tier.name) return;
-                  if (tier.price > 0) {
-                    setShowCheckoutForTier(tier);
-                  } else {
-                    if (confirm(`Switch to the ${tier.name} plan?`)) {
-                      setShowCheckoutForTier(tier);
-                      // In a real app we'd call handleSubscribe directly here if price is 0
-                      // or show a simplified checkout
-                    }
-                  }
+                  setShowCheckoutForTier(tier);
                 }}
                 className={cn(
                   "w-full p-4 rounded-2xl border text-left transition-all relative group",
@@ -2443,7 +2960,7 @@ export default function Profile() {
             <div>
               <h3 className="text-sm font-black text-black">Accepting New Work</h3>
               <p className="text-xs text-slate-700">
-                {profile?.acceptingNewWork === false
+                {!isProfileAcceptingNewWork(profile)
                   ? "Paused — your profile is currently hidden from public directory search and TradeBot matches."
                   : "Active — homeowners can discover your profile and send direct quote requests."}
               </p>
@@ -2451,25 +2968,67 @@ export default function Profile() {
             <button
               type="button"
               disabled={isSaving}
-              onClick={() => handleToggleAcceptingNewWork(profile?.acceptingNewWork === false)}
+              onClick={() => handleToggleAcceptingNewWork(!isProfileAcceptingNewWork(profile))}
               className={`px-4 py-2 rounded-xl text-xs font-black border border-black transition shrink-0 ${
-                profile?.acceptingNewWork === false
+                !isProfileAcceptingNewWork(profile)
                   ? "bg-slate-100 text-black hover:bg-slate-200"
                   : "bg-emerald-600 text-white hover:bg-emerald-700"
               }`}
             >
-              {profile?.acceptingNewWork === false ? "Paused — Resume Work" : "Accepting Work"}
+              {!isProfileAcceptingNewWork(profile) ? "Paused — Resume Work" : "Accepting Work"}
             </button>
           </div>
         </>
       ) : (
-        <HomeownerIdentityCard
-          profile={profile}
-          onEditClick={() => setIsEditing(true)}
-          onPhotoUpload={handlePhotoUpload}
-          isUploading={isUploading}
-          activePortal={activePortal}
-        />
+        <>
+          <HomeownerIdentityCard
+            profile={profile}
+            onEditClick={() => setIsEditing(true)}
+            onPhotoUpload={handlePhotoUpload}
+            isUploading={isUploading}
+            activePortal={activePortal}
+          />
+          {canUpgradeToTradesperson && (
+            <div className="mb-6 bg-white rounded-2xl border border-black p-4 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-amber-400 text-black border border-black flex items-center justify-center shrink-0">
+                  <Briefcase className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black text-black leading-tight">
+                    Offer Services / Start a Side Hustle
+                  </h3>
+                  <p className="text-xs font-medium text-black mt-0.5 leading-relaxed">
+                    Add a Tradesperson profile to your existing account and switch between Homeowner &amp; Tradesperson modes anytime.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowBecomeTraderModal(true)}
+                className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white border border-black text-xs font-black shrink-0 cursor-pointer"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                <span>Become a Tradesperson</span>
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Document Upload Grace Period / Admin Approval Reminder */}
+      {isBusinessProfile && (
+        <div className="mb-6">
+          <DocumentComplianceReminderBanner
+            profile={profile}
+            onOpenVerification={() => {
+              setIsVerificationExpanded(true);
+              setTimeout(() => {
+                document.getElementById("verification")?.scrollIntoView({ behavior: "smooth" });
+              }, 100);
+            }}
+          />
+        </div>
       )}
 
       {/* Card 2: Trust, Video Verification & AI Coach */}
@@ -2508,7 +3067,7 @@ export default function Profile() {
           setNewServiceInput={setNewService}
           handleAddService={() => {
             if (tempServices.length >= 15) {
-              alert("Maximum 15 skills & services allowed per trader profile.");
+              toast.error("Maximum 15 skills & services allowed per trader profile.");
               return;
             }
             if (newService.trim()) {
@@ -2520,9 +3079,7 @@ export default function Profile() {
             setTempServices(tempServices.filter((_: any, i: number) => i !== index));
           }}
           handleClearAllServices={() => {
-            if (window.confirm("Are you sure you want to clear all services?")) {
-              setTempServices([]);
-            }
+            setShowClearServicesConfirm(true);
           }}
           startEditingServices={startEditingServices}
           saveServices={handleSaveServices}
@@ -2692,172 +3249,219 @@ export default function Profile() {
                                   className="border-t border border-black"
                                 >
                                   {item.path === "#payments" ? (
-                                    isBusinessProfile || profile.role === "business" ? (
+                                    isPayoutEligible ? (
                                       <div className="p-6 md:p-5 bg-slate-50/50 space-y-8">
                                         {/* Receiving Section */}
                                         <div>
-                                          <div className="flex items-center gap-3 mb-4">
-                                            <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center shrink-0">
-                                              <PoundSterling className="w-5 h-5 text-blue-600" />
+                                          <div className="flex items-center justify-between gap-3 mb-3">
+                                            <div className="flex items-center gap-3">
+                                              <div className="w-10 h-10 rounded-xl bg-blue-100 border border-black flex items-center justify-center shrink-0">
+                                                <PoundSterling className="w-5 h-5 text-blue-700" />
+                                              </div>
+                                              <div>
+                                                <h3 className="text-base md:text-lg font-black text-black leading-tight">Payout Account (Receiving Money)</h3>
+                                                <p className="text-xs font-medium text-black">Receive job payouts directly to your bank via Stripe Connect</p>
+                                              </div>
                                             </div>
-                                            <h3 className="text-lg font-bold text-slate-900">AnyTrader Payouts (Receiving)</h3>
+                                            {(stripeConnectStatus.stripeAccountId || profile?.stripeAccountId) && (
+                                              <button
+                                                type="button"
+                                                onClick={() => fetchStripeConnectStatus()}
+                                                disabled={stripeConnectStatus.loading}
+                                                className="inline-flex items-center gap-1.5 text-xs font-bold text-black bg-white border border-black rounded-xl px-3 py-1.5 hover:bg-slate-100 transition-colors disabled:opacity-50 cursor-pointer shrink-0"
+                                                title="Refresh Stripe Payout Status"
+                                              >
+                                                <RefreshCw className={cn("w-3.5 h-3.5", stripeConnectStatus.loading && "animate-spin")} />
+                                                <span>Refresh</span>
+                                              </button>
+                                            )}
                                           </div>
-                                          <p className="text-sm text-slate-500 mb-2">Connect your bank account securely via Stripe to receive payouts for your AnyTrader jobs.</p>
-                                          <div className="bg-amber-50 border border-amber-200 text-amber-800 text-xs p-3 rounded-xl mb-4 font-medium flex items-start gap-2">
-                                            <Info className="w-4 h-4 mt-0.5 shrink-0" />
-                                            <p><strong>Note:</strong> AnyTrader and AnyRoller are independent platforms. If you are also an AnyRoller taxi driver, you must set up a separate Stripe account inside your Driver Terminal to receive taxi fares.</p>
+
+                                          <div className="bg-blue-50 border border-black text-black text-xs p-3.5 rounded-2xl mb-4 font-medium flex items-start gap-2.5">
+                                            <Info className="w-4 h-4 mt-0.5 shrink-0 text-blue-700" />
+                                            <p>
+                                              <strong>One Unified Profile, Two Stripe Methods:</strong> Your <strong>Payout Account</strong> below receives money when you earn as a service provider across your account. Your <strong>Saved Payment Card</strong> underneath is completely separate and is used when you spend money (hiring trades, subscriptions, or booking AnyRoller taxi rides).
+                                            </p>
                                           </div>
-                                          
-                                          {profile?.stripeConnectId ? (
-                                             <div className="bg-white border text-left border-emerald-200 rounded-2xl p-5 flex items-center justify-between shadow-sm relative overflow-hidden">
-                                                <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-50 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
-                                                <div className="flex items-center gap-4 relative z-10">
-                                                  <div className="w-12 h-12 rounded-xl bg-slate-50 flex items-center justify-center shadow-sm border border-black">
-                                                    <Building className="w-6 h-6 text-slate-400" />
+
+                                          {(() => {
+                                            const activeAccountId = stripeConnectStatus.stripeAccountId || profile?.stripeAccountId;
+                                            const isPayoutsReady =
+                                              Boolean(activeAccountId) &&
+                                              (stripeConnectStatus.payoutsEnabled || Boolean(profile?.payoutsEnabled)) &&
+                                              (stripeConnectStatus.chargesEnabled || Boolean(profile?.chargesEnabled));
+                                            const isDetailsSubmitted =
+                                              stripeConnectStatus.detailsSubmitted || Boolean(profile?.stripeOnboardingComplete);
+                                            const accountSuffix = activeAccountId ? activeAccountId.slice(-4) : "";
+
+                                            if (stripeConnectStatus.loading && !activeAccountId) {
+                                              return (
+                                                <div className="bg-white border border-black rounded-2xl p-6 flex items-center justify-center gap-3 text-sm font-bold text-black">
+                                                  <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                                                  <span>Checking Stripe Connect payout status...</span>
+                                                </div>
+                                              );
+                                            }
+
+                                            if (isPayoutsReady) {
+                                              return (
+                                                <div className="bg-white border border-black text-left rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-sm">
+                                                  <div className="flex items-center gap-4">
+                                                    <div className="w-12 h-12 rounded-xl bg-emerald-50 flex items-center justify-center shadow-sm border border-black shrink-0">
+                                                      <Building className="w-6 h-6 text-emerald-700" />
+                                                    </div>
+                                                    <div>
+                                                      <div className="flex flex-wrap items-center gap-2">
+                                                        <h4 className="text-sm font-black text-black">Stripe Connect Payout Account</h4>
+                                                        {accountSuffix && (
+                                                          <span className="text-[11px] font-mono font-bold text-black bg-slate-100 border border-black rounded-lg px-2 py-0.5">
+                                                            acct_•••{accountSuffix}
+                                                          </span>
+                                                        )}
+                                                      </div>
+                                                      <p className="text-xs text-emerald-700 font-bold flex items-center gap-1 mt-1">
+                                                        <Check className="w-3.5 h-3.5" /> Active &amp; Receiving Payouts
+                                                      </p>
+                                                    </div>
                                                   </div>
-                                                  <div>
-                                                    <h4 className="text-sm font-bold text-slate-900">Stripe Connected Account</h4>
-                                                    <p className="text-xs text-emerald-600 font-bold flex items-center gap-1"><Check className="w-3 h-3" /> Active & Receiving Payouts</p>
+                                                  <button
+                                                    type="button"
+                                                    onClick={handleOpenStripeDashboard}
+                                                    disabled={isOpeningStripeDashboard}
+                                                    className="inline-flex items-center justify-center gap-2 text-xs font-black text-black hover:bg-blue-50 px-4 py-2.5 rounded-xl transition-colors border border-black bg-white shadow-sm disabled:opacity-50 cursor-pointer shrink-0"
+                                                  >
+                                                    {isOpeningStripeDashboard ? (
+                                                      <>
+                                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                        <span>Opening...</span>
+                                                      </>
+                                                    ) : (
+                                                      <span>Open Stripe Dashboard</span>
+                                                    )}
+                                                  </button>
+                                                </div>
+                                              );
+                                            }
+
+                                            if (activeAccountId) {
+                                              return (
+                                                <div className="bg-amber-50 border border-black text-left rounded-2xl p-5 space-y-4 shadow-sm">
+                                                  <div className="flex items-start gap-3.5">
+                                                    <div className="w-11 h-11 rounded-xl bg-white flex items-center justify-center border border-black shrink-0">
+                                                      <AlertCircle className="w-5 h-5 text-amber-600" />
+                                                    </div>
+                                                    <div className="min-w-0 flex-1">
+                                                      <div className="flex flex-wrap items-center gap-2">
+                                                        <h4 className="text-sm font-black text-black">
+                                                          {isDetailsSubmitted
+                                                            ? "Stripe Verification Under Review"
+                                                            : "Stripe Payout Setup Incomplete"}
+                                                        </h4>
+                                                        {accountSuffix && (
+                                                          <span className="text-[11px] font-mono font-bold text-black bg-white border border-black rounded-lg px-2 py-0.5">
+                                                            acct_•••{accountSuffix}
+                                                          </span>
+                                                        )}
+                                                      </div>
+                                                      <p className="text-xs text-black font-medium mt-1 leading-relaxed">
+                                                        {isDetailsSubmitted
+                                                          ? "Stripe is reviewing your submitted details or requires additional bank/ID confirmation before payouts are enabled."
+                                                          : "Finish linking your bank account and identity verification with Stripe so clients can fund and release milestone payouts directly to you."}
+                                                      </p>
+                                                      {stripeConnectStatus.error && (
+                                                        <p className="text-xs font-bold text-red-700 mt-1.5">{stripeConnectStatus.error}</p>
+                                                      )}
+                                                    </div>
+                                                  </div>
+                                                  <div className="flex flex-wrap items-center gap-2.5">
+                                                    <button
+                                                      type="button"
+                                                      onClick={handleStartStripeConnect}
+                                                      disabled={isLaunchingConnect}
+                                                      className="inline-flex items-center justify-center gap-2 bg-blue-600 text-white px-5 py-2.5 rounded-xl text-xs font-black border border-black shadow-sm hover:bg-blue-700 active:scale-95 transition-all disabled:opacity-50 cursor-pointer"
+                                                    >
+                                                      {isLaunchingConnect ? (
+                                                        <>
+                                                          <Loader2 className="w-4 h-4 animate-spin" />
+                                                          <span>Redirecting to Stripe...</span>
+                                                        </>
+                                                      ) : (
+                                                        <span>Continue Stripe Verification</span>
+                                                      )}
+                                                    </button>
                                                   </div>
                                                 </div>
-                                                <button onClick={() => window.open("https://connect.stripe.com/express/dashboard", "_blank")} className="relative z-10 text-xs font-bold text-blue-600 hover:bg-blue-50 px-3 py-1.5 rounded-lg transition-colors border border-blue-200 bg-white shadow-sm">
-                                                  Stripe Dashboard
+                                              );
+                                            }
+
+                                            return (
+                                              <div className="bg-white rounded-2xl border border-black p-6 text-center shadow-sm">
+                                                <div className="w-12 h-12 bg-blue-50 rounded-xl flex items-center justify-center mx-auto mb-3 shadow-sm border border-black">
+                                                  <PoundSterling className="w-5 h-5 text-blue-700" />
+                                                </div>
+                                                <h3 className="text-sm font-black text-black mb-1">Set up Stripe Connect Payouts</h3>
+                                                <p className="text-xs text-black font-medium mb-4 max-w-md mx-auto">
+                                                  Connect your bank account securely via Stripe Express so milestone and job payouts go straight to you.
+                                                </p>
+                                                <button
+                                                  type="button"
+                                                  onClick={handleStartStripeConnect}
+                                                  disabled={isLaunchingConnect}
+                                                  className="inline-flex items-center justify-center gap-2 bg-blue-600 text-white px-6 py-2.5 rounded-xl text-sm font-black border border-black shadow-sm hover:bg-blue-700 active:scale-95 transition-all disabled:opacity-50 cursor-pointer"
+                                                >
+                                                  {isLaunchingConnect ? (
+                                                    <>
+                                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                                      <span>Connecting to Stripe...</span>
+                                                    </>
+                                                  ) : (
+                                                    <span>Set up Payouts with Stripe</span>
+                                                  )}
                                                 </button>
-                                             </div>
-                                          ) : (
-                                             <div className="bg-white rounded-2xl border border-black p-6 text-center">
-                                               <div className="w-12 h-12 bg-blue-50 rounded-full flex items-center justify-center mx-auto mb-3 shadow-sm border border-blue-100">
-                                                 <PoundSterling className="w-5 h-5 text-blue-600" />
-                                               </div>
-                                               <h3 className="text-sm font-bold text-slate-900 mb-1">Set up AnyTrader Payouts</h3>
-                                               <p className="text-xs text-slate-500 mb-4">Connect with Stripe to receive secure payouts directly to your bank account.</p>
-                                               <button 
-                                                 onClick={() => {
-                                                   alert("Redirecting to Stripe Connect onboarding...");
-                                                 }}
-                                                 className="bg-blue-600 text-white px-6 py-2.5 rounded-xl text-sm font-bold shadow-md hover:bg-blue-700 active:scale-95 transition-all"
-                                               >
-                                                 Set up Payouts
-                                               </button>
-                                             </div>
-                                          )}
+                                              </div>
+                                            );
+                                          })()}
                                         </div>
 
                                         {/* Paying Out Section */}
                                         <div className="pt-8 border-t border-black">
-                                          <div className="flex items-center gap-3 mb-4">
-                                            <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center shrink-0">
-                                              <CreditCard className="w-5 h-5 text-slate-600" />
-                                            </div>
-                                            <h3 className="text-lg font-bold text-slate-900">My Payment Method (Paying Out)</h3>
-                                          </div>
-                                          <p className="text-sm text-slate-500 mb-4">Add a card to securely pay other tradespeople for projects. This card can also be used to automatically pay for your AnyRoller taxi journeys.</p>
-                                          
-                                          {savedCards.length > 0 ? (
-                                             <div className="space-y-3">
-                                               {savedCards.map((card: any) => (
-                                                 <div key={card.id} className="bg-white border text-left border-blue-200 rounded-2xl p-5 flex items-center justify-between shadow-sm relative overflow-hidden">
-                                                   <div className="absolute top-0 right-0 w-32 h-32 bg-blue-50 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
-                                                   <div className="flex items-center gap-4 relative z-10">
-                                                     <div className="w-12 h-8 rounded bg-slate-800 text-white flex items-center justify-center font-black text-xs tracking-widest shadow-sm uppercase">
-                                                       {card.brand || "CARD"}
-                                                     </div>
-                                                     <div>
-                                                       <h4 className="text-sm font-bold text-slate-900">•••• •••• •••• {card.last4}</h4>
-                                                       <p className="text-xs text-slate-500 flex items-center gap-1.5 mt-0.5">Expires {card.expMonth}/{card.expYear} • <span className="text-indigo-600 font-bold flex items-center gap-0.5"><Lock className="w-3 h-3 inline" /> Stripe Vaulted</span></p>
-                                                     </div>
-                                                   </div>
-                                                   <button 
-                                                     onClick={() => handleDeletePaymentMethod(card.id)}
-                                                     className="relative z-10 text-xs font-bold text-red-600 hover:bg-red-50 px-3 py-1.5 rounded-lg transition-colors"
-                                                   >
-                                                     Remove Card
-                                                   </button>
-                                                 </div>
-                                               ))}
-                                               <button 
-                                                 onClick={handleAddPaymentMethod}
-                                                 disabled={isProcessingSetup}
-                                                 className="w-full py-3 bg-white border border-black rounded-xl text-sm font-bold text-slate-700 hover:bg-slate-50 transition-colors shadow-sm"
-                                               >
-                                                 {isProcessingSetup ? "Processing..." : "Add Another Card"}
-                                               </button>
-                                             </div>
-                                          ) : (
-                                             <div className="bg-white rounded-2xl border border-black p-6 md:p-8 text-center shadow-sm relative overflow-hidden">
-                                               <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-[11px] font-bold text-indigo-700 mb-4">
-                                                 <Lock className="w-3.5 h-3.5 text-indigo-600" />
-                                                 <span>Secured & Processed directly by Stripe</span>
-                                               </div>
-
-                                               <div className="w-14 h-14 bg-indigo-600 text-white rounded-2xl flex items-center justify-center mx-auto mb-3 shadow-md border border-indigo-700">
-                                                 <CreditCard className="w-7 h-7" />
-                                               </div>
-
-                                               <h3 className="text-base font-black text-slate-900 mb-1">Link Payment Card via Stripe</h3>
-                                               <p className="text-xs text-slate-600 max-w-md mx-auto mb-4 font-medium leading-relaxed">
-                                                 You will be redirected securely to <strong>Stripe's PCI-DSS Level 1 Vault</strong> to link your credit or debit card. AnyTrader <strong>never sees, handles, or stores</strong> your payment card numbers.
-                                               </p>
-
-                                               <div className="bg-slate-50 border border-black rounded-xl p-3.5 mb-5 max-w-md mx-auto text-left space-y-2">
-                                                 <div className="flex items-start gap-2 text-xs text-slate-700 font-medium">
-                                                   <Lock className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                                                   <span><strong>Direct Stripe Vaulting:</strong> Card details are encrypted directly inside Stripe's bank-grade vault.</span>
-                                                 </div>
-                                                 <div className="flex items-start gap-2 text-xs text-slate-700 font-medium">
-                                                   <Shield className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
-                                                   <span><strong>Zero Local Storage:</strong> AnyTrader holds £0 card data — only a secure token to charge for pre-approved jobs.</span>
-                                                 </div>
-                                               </div>
-
-                                               <button 
-                                                 onClick={handleAddPaymentMethod}
-                                                 disabled={isProcessingSetup}
-                                                 className="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3 rounded-xl text-sm font-black shadow-md active:scale-95 transition-all disabled:opacity-50 inline-flex items-center justify-center gap-2 border border-black cursor-pointer"
-                                               >
-                                                 {isProcessingSetup ? (
-                                                   <>
-                                                     <Loader2 className="w-4 h-4 animate-spin" />
-                                                     <span>Connecting to Stripe...</span>
-                                                   </>
-                                                 ) : (
-                                                   <>
-                                                     <Lock className="w-4 h-4" />
-                                                     <span>Link Card via Stripe (PCI-1 Secure)</span>
-                                                   </>
-                                                 )}
-                                               </button>
-
-                                               <p className="text-[11px] text-slate-400 font-medium mt-3">
-                                                 Supports Visa, Mastercard, American Express & Apple Pay
-                                               </p>
-                                             </div>
-                                          )}
+                                          <SavedPaymentCardsPanel
+                                            savedCards={savedCards}
+                                            isAddingCard={isProcessingSetup}
+                                            busyCardId={busyCardId}
+                                            busyAction={busyCardAction}
+                                            onAddCard={handleAddPaymentMethod}
+                                            onSetDefault={handleSetDefaultPaymentMethod}
+                                            onDeleteCard={handleDeletePaymentMethod}
+                                            title="My Payment Methods (Paying Out)"
+                                            subtitle="Used when spending on AnyTrader subscriptions, hiring other trades, or AnyRoller rides."
+                                            emptyDescription="Link a card securely in Stripe's PCI-DSS Level 1 Vault to pay for subscriptions, hire tradespeople, or pay for AnyRoller journeys. AnyTrader never sees or stores your card numbers."
+                                          />
                                         </div>
                                       </div>
                                     ) : (
-                                    <div className="p-6 md:p-5 bg-slate-50/50">
+                                    <div className="p-6 md:p-5 bg-slate-50/50 space-y-6">
                                       {/* How it Works Banner */}
-                                      <details className="bg-blue-50/50 border border-blue-100 rounded-2xl mb-8 group [&_summary::-webkit-details-marker]:hidden">
+                                      <details className="bg-blue-50/50 border border-black rounded-2xl group [&_summary::-webkit-details-marker]:hidden">
                                         <summary className="flex items-center justify-between p-4 cursor-pointer list-none select-none">
                                           <div className="flex items-center gap-3">
-                                            <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center shrink-0">
-                                              <ShieldCheck className="w-5 h-5 text-blue-600" />
+                                            <div className="w-10 h-10 rounded-xl bg-blue-100 border border-black flex items-center justify-center shrink-0">
+                                              <ShieldCheck className="w-5 h-5 text-blue-700" />
                                             </div>
-                                            <h4 className="text-sm font-bold text-slate-900">How Automated Payments Work</h4>
+                                            <h4 className="text-sm font-black text-black">How Automated Payments Work</h4>
                                           </div>
-                                          <ChevronDown className="w-5 h-5 text-slate-400 transition-transform group-open:rotate-180" />
+                                          <ChevronDown className="w-5 h-5 text-black transition-transform group-open:rotate-180" />
                                         </summary>
                                         
-                                        <div className="p-4 pt-1 border-t border-blue-100/30">
-                                          <p className="text-xs text-slate-600 leading-relaxed mb-3">
+                                        <div className="p-4 pt-1 border-t border-black/15">
+                                          <p className="text-xs text-black leading-relaxed mb-3">
                                             Add your card securely once to pay tradespeople for home repairs or projects. This card will also be used to automatically process payments for your AnyRoller taxi journeys. 
                                           </p>
-                                          <div className="flex items-center gap-1.5 text-[10px] uppercase font-black tracking-wider text-slate-400 bg-white inline-flex px-2 py-1 rounded-md border border-black shadow-sm">
-                                            <Shield className="w-3 h-3 text-emerald-500" />
+                                          <div className="flex items-center gap-1.5 text-[10px] uppercase font-black tracking-wider text-black bg-white inline-flex px-2 py-1 rounded-md border border-black shadow-sm">
+                                            <Shield className="w-3 h-3 text-emerald-600" />
                                             Zero Data Stored Locally
                                           </div>
-                                          <p className="text-xs text-slate-500 mt-3 pt-3 border-t border-blue-100/50">
+                                          <p className="text-xs text-black mt-3 pt-3 border-t border-black/15">
                                             <strong>Security Note:</strong> We do not store or process your credit card details on our servers. 
                                             Your confidential data is transmitted directly to <strong>Stripe's PCI-compliant vault</strong>. 
                                             We only hold a secure token used exclusively to charge you for completed work or journeys.
@@ -2865,147 +3469,100 @@ export default function Profile() {
                                         </div>
                                       </details>
 
-                                      {/* Saved Cards / Add Card */}
-                                      {savedCards.length > 0 ? (
-                                        <div className="space-y-3">
-                                          {savedCards.map((card: any) => (
-                                            <div key={card.id} className="bg-white border text-left border-emerald-200 rounded-2xl p-5 flex items-center justify-between shadow-sm relative overflow-hidden">
-                                              <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-50 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
-                                              <div className="flex items-center gap-4 relative z-10">
-                                                <div className="w-12 h-8 rounded bg-slate-800 text-white flex items-center justify-center font-black text-xs tracking-widest shadow-sm uppercase">
-                                                  {card.brand || "CARD"}
-                                                </div>
-                                                <div>
-                                                  <h4 className="text-sm font-bold text-slate-900">•••• •••• •••• {card.last4}</h4>
-                                                  <p className="text-xs text-slate-500 flex items-center gap-1.5 mt-0.5">Expires {card.expMonth}/{card.expYear} • <span className="text-indigo-600 font-bold flex items-center gap-0.5"><Lock className="w-3 h-3 inline" /> Stripe Vaulted</span></p>
-                                                </div>
-                                              </div>
-                                              <button 
-                                                onClick={() => handleDeletePaymentMethod(card.id)}
-                                                className="relative z-10 text-xs font-bold text-red-600 hover:bg-red-50 px-3 py-1.5 rounded-lg transition-colors"
-                                              >
-                                                Remove Card
-                                              </button>
-                                            </div>
-                                          ))}
-                                          <button 
-                                            onClick={handleAddPaymentMethod}
-                                            disabled={isProcessingSetup}
-                                            className="w-full py-3 bg-white border border-black rounded-xl text-sm font-bold text-slate-700 hover:bg-slate-50 transition-colors shadow-sm"
-                                          >
-                                            {isProcessingSetup ? "Processing..." : "Add Another Card"}
-                                          </button>
-                                        </div>
-                                      ) : (
-                                        <div className="space-y-4">
-                                          <div className="bg-white rounded-2xl border border-black p-6 md:p-8 text-center shadow-sm relative overflow-hidden">
-                                            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-50 border border-indigo-200 text-[11px] font-bold text-indigo-700 mb-4">
-                                              <Lock className="w-3.5 h-3.5 text-indigo-600" />
-                                              <span>Secured & Processed directly by Stripe</span>
-                                            </div>
-
-                                            <div className="w-14 h-14 bg-indigo-600 text-white rounded-2xl flex items-center justify-center mx-auto mb-3 shadow-md border border-indigo-700">
-                                              <CreditCard className="w-7 h-7" />
-                                            </div>
-
-                                            <h3 className="text-base font-black text-slate-900 mb-1">Link Payment Card via Stripe</h3>
-                                            <p className="text-xs text-slate-600 max-w-md mx-auto mb-4 font-medium leading-relaxed">
-                                              Add a card to quickly and securely pay for home repairs or AnyRoller taxi rides. You will link your card directly inside <strong>Stripe's PCI-DSS Level 1 Vault</strong> — AnyTrader <strong>never sees or stores your card details</strong>.
-                                            </p>
-
-                                            <div className="bg-slate-50 border border-black rounded-xl p-3.5 mb-5 max-w-md mx-auto text-left space-y-2">
-                                              <div className="flex items-start gap-2 text-xs text-slate-700 font-medium">
-                                                <Lock className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                                                <span><strong>Direct Stripe Vaulting:</strong> Card details are transmitted and encrypted directly by Stripe.</span>
-                                              </div>
-                                              <div className="flex items-start gap-2 text-xs text-slate-700 font-medium">
-                                                <Shield className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
-                                                <span><strong>Zero Local Storage:</strong> We store zero card numbers on AnyTrader servers.</span>
-                                              </div>
-                                            </div>
-
-                                            <button 
-                                              onClick={handleAddPaymentMethod}
-                                              disabled={isProcessingSetup}
-                                              className="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white px-7 py-3 rounded-xl text-sm font-black shadow-md active:scale-95 transition-all disabled:opacity-50 inline-flex items-center justify-center gap-2 border border-black cursor-pointer"
-                                            >
-                                              {isProcessingSetup ? (
-                                                <>
-                                                  <Loader2 className="w-4 h-4 animate-spin" />
-                                                  <span>Connecting to Stripe...</span>
-                                                </>
-                                              ) : (
-                                                <>
-                                                  <Lock className="w-4 h-4" />
-                                                  <span>Link Card via Stripe (PCI-1 Secure)</span>
-                                                </>
-                                              )}
-                                            </button>
-
-                                            <p className="text-[11px] text-slate-400 font-medium mt-3">
-                                              Supports Visa, Mastercard, American Express & Apple Pay
-                                            </p>
-                                          </div>
-                                        </div>
-                                      )}
+                                      <SavedPaymentCardsPanel
+                                        savedCards={savedCards}
+                                        isAddingCard={isProcessingSetup}
+                                        busyCardId={busyCardId}
+                                        busyAction={busyCardAction}
+                                        onAddCard={handleAddPaymentMethod}
+                                        onSetDefault={handleSetDefaultPaymentMethod}
+                                        onDeleteCard={handleDeletePaymentMethod}
+                                        title="Saved Payment Cards (Spending)"
+                                        subtitle="Used for hiring tradespeople, Landlord Pro billing, or AnyRoller taxi rides."
+                                        emptyDescription="Add a card securely inside Stripe's PCI-DSS Level 1 Vault to pay for home repairs, property management plans, or AnyRoller rides. AnyTrader never sees or stores your card details."
+                                      />
                                     </div>
                                     )
                                   ) : item.path === "#appointments" ? (
-                                    <div className="p-6 md:p-5 bg-slate-50/50 space-y-6">
-                                      <div className="flex items-center gap-3 mb-2">
-                                        <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center shrink-0">
-                                          <CalendarClock className="w-5 h-5 text-blue-600" />
-                                        </div>
-                                        <div>
-                                          <h3 className="text-lg font-bold text-slate-900">Appointment System (Add-on)</h3>
-                                          <p className="text-sm text-slate-500">Allow customers to book real-time appointments for your services.</p>
-                                        </div>
-                                      </div>
-
-                                      {profile?.appointmentSettings?.enabled ? (
-                                        <div className="space-y-4">
-                                          <div className="bg-white rounded-xl border-2 border-blue-600 shadow-sm p-5 flex items-center justify-between">
-                                            <div>
-                                              <p className="font-bold text-slate-900">Add-on Active</p>
-                                              <p className="text-xs text-slate-500">You are currently subscribed to the Appointment system.</p>
+                                    (() => {
+                                      const appointmentsPrice = Number(platformConfig?.paidAddons?.appointments?.price ?? 9.99);
+                                      const appointmentsSubStatus = String(profile?.appointmentsSubscriptionStatus || "").toLowerCase();
+                                      const isAppointmentsActive = Boolean(
+                                        (profile?.hasAppointmentsAddon || profile?.appointmentSettings?.enabled) &&
+                                        !["canceled", "cancelled", "unpaid", "incomplete_expired"].includes(appointmentsSubStatus)
+                                      );
+                                      const isAppointmentsCanceling = Boolean(profile?.appointmentsCancelAtPeriodEnd);
+                                      return (
+                                        <div className="p-6 md:p-5 bg-slate-50/50 space-y-6">
+                                          <div className="flex items-center gap-3 mb-2">
+                                            <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center shrink-0">
+                                              <CalendarClock className="w-5 h-5 text-blue-600" />
                                             </div>
-                                            <div className="flex items-center gap-2">
-                                              <span className="bg-green-100 text-green-700 font-black text-[10px] uppercase px-2 py-1 rounded">£9.99/mo</span>
-                                              <button 
-                                                onClick={handleCancelAppointments}
-                                                className="text-xs font-bold text-red-600 hover:underline ml-2"
+                                            <div>
+                                              <h3 className="text-lg font-bold text-black">Appointment System (Add-on)</h3>
+                                              <p className="text-sm text-black">Allow customers to book real-time appointments for your services.</p>
+                                            </div>
+                                          </div>
+
+                                          {isAppointmentsActive ? (
+                                            <div className="space-y-4">
+                                              <div className="bg-white rounded-xl border border-black shadow-sm p-5 flex items-center justify-between gap-4">
+                                                <div>
+                                                  <p className="font-bold text-black">
+                                                    {isAppointmentsCanceling ? "Add-on Canceling at Renewal" : "Add-on Active"}
+                                                  </p>
+                                                  <p className="text-xs text-black">
+                                                    {isAppointmentsCanceling
+                                                      ? "Bookings remain active until the end of your current billing period."
+                                                      : "You are currently subscribed to the Appointment system."}
+                                                  </p>
+                                                </div>
+                                                <div className="flex items-center gap-2 shrink-0">
+                                                  <span className="bg-green-100 text-green-800 font-black text-[10px] uppercase px-2 py-1 rounded">
+                                                    £{appointmentsPrice.toFixed(2)}/mo
+                                                  </span>
+                                                  <button
+                                                    onClick={handleCancelAppointments}
+                                                    className={cn(
+                                                      "text-xs font-bold hover:underline ml-2",
+                                                      isAppointmentsCanceling ? "text-emerald-700" : "text-red-600"
+                                                    )}
+                                                    disabled={isProcessingSetup}
+                                                  >
+                                                    {isProcessingSetup ? "Updating..." : isAppointmentsCanceling ? "Resume" : "Cancel"}
+                                                  </button>
+                                                </div>
+                                              </div>
+                                              <div className="bg-white rounded-xl border border-black shadow-sm p-5">
+                                                <h4 className="font-bold text-black mb-2">Services & Working Hours</h4>
+                                                <p className="text-sm text-black mb-4">Go to your Dashboard or Availability Calendar to manage your provided services, prices, and available appointment slots.</p>
+                                                <button
+                                                  onClick={() => navigate('/availability')}
+                                                  className="w-full sm:w-auto px-4 py-2 bg-slate-900 text-white font-bold rounded-lg text-sm hover:bg-slate-800 transition-colors"
+                                                >
+                                                  Manage Availability
+                                                </button>
+                                              </div>
+                                            </div>
+                                          ) : (
+                                            <div className="bg-white rounded-xl border border-black shadow-sm p-6 text-center">
+                                              <Sparkles className="w-8 h-8 text-amber-500 mx-auto mb-3" />
+                                              <h4 className="text-lg font-bold text-black mb-2">Unlock Automated Bookings</h4>
+                                              <p className="text-sm text-black mb-6">
+                                                Reduce back-and-forth messaging. Let customers see your availability and request appointments directly from your profile for £{appointmentsPrice.toFixed(2)}/month.
+                                              </p>
+                                              <button
+                                                onClick={handleSubscribeToAppointments}
                                                 disabled={isProcessingSetup}
+                                                className="bg-black text-white px-6 py-3 rounded-xl font-bold shadow-md hover:bg-slate-800 active:scale-95 transition-all text-sm w-full md:w-auto"
                                               >
-                                                Cancel
+                                                {isProcessingSetup ? <Loader2 className="w-5 h-5 animate-spin mx-auto"/> : `Enable £${appointmentsPrice.toFixed(2)}/mo Add-on`}
                                               </button>
                                             </div>
-                                          </div>
-                                          <div className="bg-white rounded-xl border-2 border-blue-600 shadow-sm p-5">
-                                            <h4 className="font-bold text-slate-900 mb-2">Services & Working Hours</h4>
-                                            <p className="text-sm text-slate-600 mb-4">Go to your Dashboard or Availability Calendar to manage your provided services, prices, and available appointment slots.</p>
-                                            <button 
-                                              onClick={() => navigate('/availability')}
-                                              className="w-full sm:w-auto px-4 py-2 bg-slate-900 text-white font-bold rounded-lg text-sm hover:bg-slate-800 transition-colors"
-                                            >
-                                              Manage Availability
-                                            </button>
-                                          </div>
+                                          )}
                                         </div>
-                                      ) : (
-                                        <div className="bg-white rounded-xl border-2 border-amber-500 shadow-[0_0_20px_rgba(245,158,11,0.2)] p-6 text-center">
-                                          <Sparkles className="w-8 h-8 text-amber-500 mx-auto mb-3" />
-                                          <h4 className="text-lg font-bold text-slate-900 mb-2">Unlock Automated Bookings</h4>
-                                          <p className="text-sm text-slate-600 mb-6">Reduce back-and-forth messaging. Let customers see your availability and request appointments directly from your profile. Only for £9.99/month.</p>
-                                          <button 
-                                            onClick={handleSubscribeToAppointments}
-                                            disabled={isProcessingSetup}
-                                            className="bg-black text-white px-6 py-3 rounded-xl font-bold shadow-md hover:bg-slate-800 active:scale-95 transition-all text-sm w-full md:w-auto"
-                                          >
-                                            {isProcessingSetup ? <Loader2 className="w-5 h-5 animate-spin mx-auto"/> : "Enable £9.99/mo Add-on"}
-                                          </button>
-                                        </div>
-                                      )}
-                                    </div>
+                                      );
+                                    })()
                                   ) : item.path === "#business" ? (
                                      <div className="p-6 md:p-5 bg-slate-50/50">
                                        {profile.corporateAccountId ? (
@@ -3018,7 +3575,7 @@ export default function Profile() {
                                             
                                             <div className="flex flex-col gap-3 max-w-sm mx-auto">
                                               <button 
-                                                onClick={() => window.location.href = '/corporate'}
+                                                onClick={() => navigate('/corporate')}
                                                 className="flex items-center justify-center gap-2 w-full py-3 bg-slate-900 text-white font-bold rounded-xl hover:bg-slate-800 transition-colors"
                                               >
                                                 <span>Go to Corporate Portal</span>
@@ -3057,7 +3614,7 @@ export default function Profile() {
                                             <div className="mt-8 pt-6 border-t border border-black inline-block w-full">
                                               <p className="text-xs text-slate-500 mb-3">Does your company need an AnyRoller Corporate account?</p>
                                               <button 
-                                                onClick={() => window.location.href = '/corporate'}
+                                                onClick={() => navigate('/corporate')}
                                                 className="text-sm font-bold text-blue-600 hover:text-blue-800 transition-colors"
                                               >
                                                 Learn about AnyRoller Corporate &rarr;
@@ -3104,6 +3661,369 @@ export default function Profile() {
                                         </div>
                                       </div>
                                     </div>
+                                  ) : item.path === "#account" ? (
+                                    <div className="p-5 bg-slate-50/70 space-y-4">
+                                      <div className="bg-white rounded-2xl border border-black p-4 space-y-3">
+                                        <div className="flex items-center justify-between gap-2 pb-2 border-b border-black/10">
+                                          <h4 className="text-sm font-black text-black">Personal & Contact Details</h4>
+                                          <button
+                                            type="button"
+                                            onClick={() => setIsEditing(true)}
+                                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white text-xs font-bold rounded-xl border border-black hover:bg-blue-700 transition-colors cursor-pointer"
+                                          >
+                                            <Edit2 className="w-3.5 h-3.5" />
+                                            Edit Profile & Phone
+                                          </button>
+                                        </div>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                                          <div className="p-3 bg-slate-50 rounded-xl border border-black">
+                                            <p className="text-[10px] font-black uppercase tracking-wider text-black/60">Full Name</p>
+                                            <p className="font-bold text-black mt-0.5">{profile.name || "Not set"}</p>
+                                          </div>
+                                          <div className="p-3 bg-slate-50 rounded-xl border border-black">
+                                            <p className="text-[10px] font-black uppercase tracking-wider text-black/60">Email Address</p>
+                                            <p className="font-bold text-black mt-0.5 break-all">{user?.email || profile.email || "Not set"}</p>
+                                          </div>
+                                          <div className="p-3 bg-slate-50 rounded-xl border border-black">
+                                            <p className="text-[10px] font-black uppercase tracking-wider text-black/60">Phone Number (Private)</p>
+                                            <p className="font-bold text-black mt-0.5">
+                                              {profile.phone || profile.phoneNumber || (
+                                                <span className="text-amber-700">Not added yet — tap Edit to add</span>
+                                              )}
+                                            </p>
+                                          </div>
+                                          <div className="p-3 bg-slate-50 rounded-xl border border-black">
+                                            <p className="text-[10px] font-black uppercase tracking-wider text-black/60">Location & Postcode</p>
+                                            <p className="font-bold text-black mt-0.5">
+                                              {[profile.postcode, profile.city].filter(Boolean).join(" · ") || "Not set"}
+                                            </p>
+                                          </div>
+                                        </div>
+                                        <div className="pt-2 flex flex-wrap gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => setExpandedMenuId("#data-privacy")}
+                                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-white text-black text-xs font-bold rounded-xl border border-black hover:bg-slate-100 transition-colors cursor-pointer"
+                                          >
+                                            <Shield className="w-3.5 h-3.5 text-blue-700" />
+                                            Manage UK GDPR Data & Account Deletion
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ) : item.path === "#notifications" ? (
+                                    <div className="p-5 bg-slate-50/70 space-y-4">
+                                      <div className="bg-white rounded-2xl border border-black p-4 space-y-4">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <div>
+                                            <h4 className="text-sm font-black text-black">Alert & Notification Preferences</h4>
+                                            <p className="text-xs text-black font-medium mt-0.5">Choose how and when AnyTrader notifies you about quotes, messages, and jobs.</p>
+                                          </div>
+                                          <button
+                                            type="button"
+                                            onClick={() => navigate("/notifications")}
+                                            className="text-xs font-bold text-blue-700 underline shrink-0 cursor-pointer"
+                                          >
+                                            View Inbox
+                                          </button>
+                                        </div>
+
+                                        <div className="space-y-2.5">
+                                          <label className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-black cursor-pointer">
+                                            <div>
+                                              <p className="text-xs font-black text-black">Push & In-App Alerts</p>
+                                              <p className="text-[11px] text-black">Instant alerts for new leads, quotes, and chat messages</p>
+                                            </div>
+                                            <input
+                                              type="checkbox"
+                                              checked={notificationSettings.pushEnabled !== false}
+                                              onChange={(e) => setNotificationSettings({ ...notificationSettings, pushEnabled: e.target.checked })}
+                                              className="w-4 h-4 accent-blue-600"
+                                            />
+                                          </label>
+
+                                          <label className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-black cursor-pointer">
+                                            <div>
+                                              <p className="text-xs font-black text-black">Email Summaries</p>
+                                              <p className="text-[11px] text-black">Booking confirmations, receipts, and account notices</p>
+                                            </div>
+                                            <input
+                                              type="checkbox"
+                                              checked={notificationSettings.emailEnabled !== false}
+                                              onChange={(e) => setNotificationSettings({ ...notificationSettings, emailEnabled: e.target.checked })}
+                                              className="w-4 h-4 accent-blue-600"
+                                            />
+                                          </label>
+
+                                          <label className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-black cursor-pointer">
+                                            <div>
+                                              <p className="text-xs font-black text-black">Quiet Hours ({notificationSettings.quietHoursStart || "22:00"} – {notificationSettings.quietHoursEnd || "07:00"})</p>
+                                              <p className="text-[11px] text-black">Mute non-urgent job alerts overnight</p>
+                                            </div>
+                                            <input
+                                              type="checkbox"
+                                              checked={Boolean(notificationSettings.quietHoursEnabled)}
+                                              onChange={(e) => setNotificationSettings({ ...notificationSettings, quietHoursEnabled: e.target.checked })}
+                                              className="w-4 h-4 accent-blue-600"
+                                            />
+                                          </label>
+                                        </div>
+
+                                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                                          <button
+                                            type="button"
+                                            onClick={handleSaveNotifications}
+                                            disabled={isSaving}
+                                            className="px-4 py-2 bg-blue-600 text-white text-xs font-black rounded-xl border border-black hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
+                                          >
+                                            {isSaving ? "Saving..." : "Save Notification Settings"}
+                                          </button>
+                                          {isBusinessProfile && (
+                                            <button
+                                              type="button"
+                                              onClick={() => setShowMatchTimingModal(true)}
+                                              className="px-4 py-2 bg-white text-black text-xs font-bold rounded-xl border border-black hover:bg-slate-100 cursor-pointer"
+                                            >
+                                              Lead Match Radius & Timing
+                                            </button>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ) : item.path === "#faqs" ? (
+                                    <div className="p-5 bg-slate-50/70">
+                                      <div className="bg-white rounded-2xl border border-black p-4 space-y-3">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <div>
+                                            <h4 className="text-sm font-black text-black">Customer Profile FAQs</h4>
+                                            <p className="text-xs text-black font-medium mt-0.5">
+                                              You currently have <strong>{faqs.length}</strong> FAQ{faqs.length === 1 ? "" : "s"} published on your public trader profile.
+                                            </p>
+                                          </div>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setIsEditingFaqs(true);
+                                              toast.info("FAQ editor opened in your Rates & FAQs section above.");
+                                            }}
+                                            className="px-3.5 py-2 bg-blue-600 text-white text-xs font-black rounded-xl border border-black hover:bg-blue-700 shrink-0 cursor-pointer"
+                                          >
+                                            Manage FAQs
+                                          </button>
+                                        </div>
+                                        {faqs.length > 0 && (
+                                          <div className="space-y-2 pt-2 border-t border-black/10">
+                                            {faqs.slice(0, 3).map((faq: any, i: number) => (
+                                              <div key={i} className="p-2.5 bg-slate-50 rounded-xl border border-black text-xs">
+                                                <p className="font-bold text-black">{faq.question}</p>
+                                                <p className="text-black mt-0.5 line-clamp-2">{faq.answer}</p>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ) : item.path === "#emergency" ? (
+                                    <div className="p-5 bg-slate-50/70 space-y-4">
+                                      <div className="bg-white rounded-2xl border border-black p-4 space-y-4">
+                                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                                          <div>
+                                            <h4 className="text-sm font-black text-black flex items-center gap-1.5">
+                                              <Zap className="w-4 h-4 text-red-600" />
+                                              Emergency Alerts & Home Safety
+                                            </h4>
+                                            <p className="text-xs text-black font-medium mt-0.5">
+                                              Need an urgent plumber, electrician, or locksmith right now, or want to keep trusted emergency contacts on file?
+                                            </p>
+                                          </div>
+                                          <button
+                                            type="button"
+                                            onClick={() => navigate("/post-emergency-job")}
+                                            className="px-4 py-2.5 bg-red-600 text-white text-xs font-black rounded-xl border border-black hover:bg-red-700 shrink-0 cursor-pointer"
+                                          >
+                                            Post Emergency Job
+                                          </button>
+                                        </div>
+
+                                        <div className="border-t border-black/10 pt-3 space-y-2">
+                                          <p className="text-xs font-black text-black uppercase tracking-wider">Saved Emergency Contacts</p>
+                                          {(profile.emergencyContacts || []).length > 0 ? (
+                                            <div className="space-y-2">
+                                              {(profile.emergencyContacts || []).map((c: any, idx: number) => (
+                                                <div key={idx} className="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-black text-xs">
+                                                  <div>
+                                                    <p className="font-bold text-black">{c.name}</p>
+                                                    <p className="text-black">{c.phone}</p>
+                                                  </div>
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => handleRemoveEmergencyContact(idx)}
+                                                    className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg cursor-pointer"
+                                                    title="Remove contact"
+                                                  >
+                                                    <Trash2 className="w-4 h-4" />
+                                                  </button>
+                                                </div>
+                                              ))}
+                                            </div>
+                                          ) : (
+                                            <p className="text-xs text-black">No emergency contacts added yet.</p>
+                                          )}
+
+                                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2">
+                                            <input
+                                              type="text"
+                                              placeholder="Contact name"
+                                              value={newEmergencyContact.name}
+                                              onChange={(e) => setNewEmergencyContact({ ...newEmergencyContact, name: e.target.value })}
+                                              className="px-3 py-2 text-xs text-black bg-white border border-black rounded-xl"
+                                            />
+                                            <input
+                                              type="tel"
+                                              placeholder="Phone (e.g. 07700 900123)"
+                                              value={newEmergencyContact.phone}
+                                              onChange={(e) => setNewEmergencyContact({ ...newEmergencyContact, phone: e.target.value })}
+                                              className="px-3 py-2 text-xs text-black bg-white border border-black rounded-xl"
+                                            />
+                                            <button
+                                              type="button"
+                                              onClick={handleAddEmergencyContact}
+                                              disabled={isSaving || !newEmergencyContact.name.trim() || !newEmergencyContact.phone.trim()}
+                                              className="px-3 py-2 bg-black text-white text-xs font-black rounded-xl border border-black hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+                                            >
+                                              Add Contact
+                                            </button>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ) : item.path === "#help" ? (
+                                    <div className="p-5 bg-slate-50/70">
+                                      <div className="bg-white rounded-2xl border border-black p-4 space-y-3">
+                                        <div>
+                                          <h4 className="text-sm font-black text-black">AnyTrader Help & Support Centre</h4>
+                                          <p className="text-xs text-black font-medium mt-0.5">Get instant answers, read the platform guide, or reach our UK support team.</p>
+                                        </div>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                          <button
+                                            type="button"
+                                            onClick={() => setShowUserGuide(true)}
+                                            className="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 rounded-xl border border-black text-left transition-colors cursor-pointer"
+                                          >
+                                            <BookOpen className="w-5 h-5 text-blue-700 shrink-0" />
+                                            <div>
+                                              <p className="text-xs font-black text-black">Platform User Guide</p>
+                                              <p className="text-[11px] text-black">Step-by-step walkthroughs</p>
+                                            </div>
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => setIsTradeBotOpen(true)}
+                                            className="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 rounded-xl border border-black text-left transition-colors cursor-pointer"
+                                          >
+                                            <Bot className="w-5 h-5 text-blue-700 shrink-0" />
+                                            <div>
+                                              <p className="text-xs font-black text-black">Ask TradeBot Assistant</p>
+                                              <p className="text-[11px] text-black">Price guides & trade advice</p>
+                                            </div>
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => setShowProfileTermsModal(true)}
+                                            className="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 rounded-xl border border-black text-left transition-colors cursor-pointer"
+                                          >
+                                            <FileText className="w-5 h-5 text-emerald-700 shrink-0" />
+                                            <div>
+                                              <p className="text-xs font-black text-black">Terms & Privacy Policy</p>
+                                              <p className="text-[11px] text-black">Dispute rules & data rights</p>
+                                            </div>
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={async () => {
+                                              try {
+                                                await navigator.clipboard.writeText("support@anytrader.co.uk");
+                                                toast.success("Support email copied: support@anytrader.co.uk");
+                                              } catch {
+                                                toast.info("Contact us at support@anytrader.co.uk");
+                                              }
+                                            }}
+                                            className="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 rounded-xl border border-black text-left transition-colors cursor-pointer"
+                                          >
+                                            <Mail className="w-5 h-5 text-blue-700 shrink-0" />
+                                            <div>
+                                              <p className="text-xs font-black text-black">Email Support</p>
+                                              <p className="text-[11px] text-black">support@anytrader.co.uk (tap to copy)</p>
+                                            </div>
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  ) : item.path === "#data-privacy" ? (
+                                    <div className="p-5 bg-slate-50/70 space-y-4">
+                                      <div className="bg-white rounded-2xl border border-black p-4 space-y-4">
+                                        <div>
+                                          <h4 className="text-sm font-black text-black flex items-center gap-2">
+                                            <ShieldCheck className="w-4 h-4 text-emerald-700" />
+                                            UK GDPR Data Rights & Account Closure
+                                          </h4>
+                                          <p className="text-xs text-black font-medium mt-1 leading-relaxed">
+                                            Under UK GDPR (Articles 15, 17 &amp; 20), you can download a portable copy of your personal data at any time or permanently close and erase your account.
+                                          </p>
+                                        </div>
+
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                          <div className="p-3.5 bg-slate-50 rounded-xl border border-black flex flex-col justify-between gap-3">
+                                            <div>
+                                              <p className="text-xs font-black text-black">Download My Data (JSON)</p>
+                                              <p className="text-[11px] text-black mt-1 leading-relaxed">
+                                                Export your profile details, posted jobs, submitted quotes, properties, and reviews in a machine-readable JSON file.
+                                              </p>
+                                            </div>
+                                            <button
+                                              type="button"
+                                              onClick={handleDownloadGdprData}
+                                              disabled={isExportingGdpr}
+                                              className="w-full py-2.5 px-3 bg-white text-black text-xs font-black rounded-xl border border-black hover:bg-slate-100 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                                            >
+                                              {isExportingGdpr ? (
+                                                <>
+                                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                                  <span>Preparing Export...</span>
+                                                </>
+                                              ) : (
+                                                <>
+                                                  <Download className="w-4 h-4" />
+                                                  <span>Download My Data</span>
+                                                </>
+                                              )}
+                                            </button>
+                                          </div>
+
+                                          <div className="p-3.5 bg-red-50/60 rounded-xl border border-black flex flex-col justify-between gap-3">
+                                            <div>
+                                              <p className="text-xs font-black text-red-900">Delete My Account</p>
+                                              <p className="text-[11px] text-black mt-1 leading-relaxed">
+                                                Permanently close your account, remove your public listing, and erase personal contact details. Active or escrowed jobs must be settled first.
+                                              </p>
+                                            </div>
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setDeleteConfirmText("");
+                                                setDeleteReason("");
+                                                setDeleteAccountError(null);
+                                                setShowDeleteAccountModal(true);
+                                              }}
+                                              className="w-full py-2.5 px-3 bg-red-600 text-white text-xs font-black rounded-xl border border-black hover:bg-red-700 transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                                            >
+                                              <Trash2 className="w-4 h-4" />
+                                              <span>Delete Account</span>
+                                            </button>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
                                   ) : item.path === "#biometrics" || item.path === "#privacy" ? (
                                     <BiometricSettings user={user} />
                                   ) : item.path === "#uimode" || item.path === "#settings" ? (
@@ -3113,7 +4033,7 @@ export default function Profile() {
                                       <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center mx-auto mb-3 shadow-sm border border-black">
                                         <item.icon className="w-5 h-5 text-slate-400" />
                                       </div>
-                                      <p className="text-slate-500 font-medium">Settings for {item.label} coming soon.</p>
+                                      <p className="text-black text-xs font-bold">Manage {item.label} via your account settings or Help &amp; Support.</p>
                                     </div>
                                   )}
                                 </motion.div>
@@ -3247,13 +4167,39 @@ export default function Profile() {
 
               <div className="flex-1 overflow-y-auto p-5 space-y-6">
                 <div>
-                  <label className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 block">Full Name</label>
+                  <label className="text-xs font-bold text-black uppercase tracking-wider mb-1 block">Full Name</label>
                   <input 
                     type="text"
-                    className="w-full p-3 rounded-xl border border-black focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all"
+                    className="w-full p-3 rounded-xl border border-black text-black focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all"
                     value={editData.name}
                     onChange={(e) => setEditData({ ...editData, name: e.target.value })}
                   />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-black uppercase tracking-wider mb-1 block">
+                    Phone Number (UK Mobile or Landline)
+                  </label>
+                  <input
+                    type="tel"
+                    inputMode="tel"
+                    placeholder="e.g. 07700 900123 or +44 7700 900123"
+                    className={cn(
+                      "w-full p-3 rounded-xl border text-black focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all",
+                      phoneValidationError ? "border-red-600 bg-red-50/40" : "border-black"
+                    )}
+                    value={editData.phone || ""}
+                    onChange={(e) => {
+                      setPhoneValidationError(null);
+                      setEditData({ ...editData, phone: e.target.value });
+                    }}
+                  />
+                  {phoneValidationError ? (
+                    <p className="text-xs font-bold text-red-700 mt-1">{phoneValidationError}</p>
+                  ) : (
+                    <p className="text-[11px] text-black/70 font-medium mt-1">
+                      Kept private on your account for booking alerts and support — never shown on public search cards.
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1 block">Postcode</label>
@@ -3835,7 +4781,7 @@ export default function Profile() {
         )}
       </AnimatePresence>
 
-      {/* Mock Checkout Modal */}
+      {/* Plan Confirmation & Stripe Checkout Redirect Modal */}
       <AnimatePresence>
         {showCheckoutForTier && (
           <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
@@ -3843,101 +4789,115 @@ export default function Profile() {
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
-              className="bg-white rounded-[2rem] shadow-2xl w-full max-w-md overflow-hidden border border-black"
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden border border-black"
             >
-              <div className="p-6 border-b border border-black bg-slate-50 flex items-center justify-between">
+              <div className="p-5 border-b border-black bg-slate-50 flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-lg shadow-blue-200">
+                  <div className="w-10 h-10 rounded-xl bg-blue-600 border border-black flex items-center justify-center text-white shadow-sm">
                     <CreditCard className="w-5 h-5" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-black text-slate-900">Secure Checkout</h3>
-                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Powered by Stripe (Mock)</p>
+                    <h3 className="text-base font-black text-black">
+                      {Number(showCheckoutForTier.price || 0) > 0 ? "Confirm Subscription Plan" : "Switch to Free Plan"}
+                    </h3>
+                    <p className="text-[11px] text-black font-bold uppercase tracking-wider">
+                      {Number(showCheckoutForTier.price || 0) > 0 ? "Secured by Stripe Checkout" : "Instant Plan Change"}
+                    </p>
                   </div>
                 </div>
-                <button 
+                <button
+                  type="button"
                   onClick={() => !isProcessingPayment && setShowCheckoutForTier(null)}
-                  className="p-2 hover:bg-slate-200 rounded-full transition-colors"
+                  className="p-2 hover:bg-slate-200 rounded-xl border border-transparent hover:border-black transition-colors cursor-pointer"
                   disabled={isProcessingPayment}
+                  aria-label="Close plan confirmation"
                 >
-                  <X className="w-5 h-5 text-slate-400" />
+                  <X className="w-5 h-5 text-black" />
                 </button>
               </div>
-              
-              <div className="p-5 space-y-6">
-                <div className="bg-slate-50 p-4 rounded-2xl border border-black flex items-center justify-between">
-                  <div>
-                    <p className="text-xs font-bold text-slate-500 uppercase">Selected Plan</p>
-                    <p className="text-lg font-black text-slate-900">{showCheckoutForTier.name}</p>
+
+              <div className="p-5 space-y-5">
+                <div className="bg-slate-50 p-4 rounded-2xl border border-black flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-black text-black uppercase tracking-wider">Selected Plan</p>
+                    <p className="text-lg font-black text-black truncate">{showCheckoutForTier.name}</p>
+                    {showCheckoutForTier.description && (
+                      <p className="text-xs font-medium text-black mt-1 leading-snug">{showCheckoutForTier.description}</p>
+                    )}
                   </div>
-                  <div className="text-right">
-                    <p className="text-xs font-bold text-slate-500 uppercase">Monthly</p>
-                    <p className="text-xl font-black text-blue-600">£{showCheckoutForTier.price}</p>
+                  <div className="text-right shrink-0">
+                    <p className="text-[11px] font-black text-black uppercase tracking-wider">
+                      {Number(showCheckoutForTier.price || 0) > 0 ? "Monthly" : "Cost"}
+                    </p>
+                    <p className="text-xl font-black text-blue-700">
+                      {Number(showCheckoutForTier.price || 0) > 0 ? `£${showCheckoutForTier.price}` : "Free"}
+                    </p>
                   </div>
                 </div>
 
-                <div className="space-y-4">
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Card Information</label>
-                    <div className="relative">
-                      <CreditCard className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
-                      <input 
-                        type="text"
-                        placeholder="4242 4242 4242 4242"
-                        className="w-full pl-12 pr-4 py-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 transition-all font-mono text-sm"
-                        value={cardNumber}
-                        onChange={(e) => setCardNumber(e.target.value.replace(/\D/g, '').replace(/(.{4})/g, '$1 ').trim().slice(0, 19))}
-                      />
+                {Number(showCheckoutForTier.price || 0) > 0 ? (
+                  <div className="bg-blue-50 p-4 rounded-2xl border border-black flex gap-3">
+                    <ShieldCheck className="w-5 h-5 text-blue-700 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <p className="text-xs font-black text-black">PCI-DSS Level 1 Stripe Checkout</p>
+                      <p className="text-xs text-black font-medium leading-relaxed">
+                        You will be redirected securely to Stripe Checkout to complete payment. AnyTrader never collects, sees, or stores your card details.
+                      </p>
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Expiry</label>
-                      <input 
-                        type="text"
-                        placeholder="MM / YY"
-                        className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 transition-all font-mono text-sm"
-                        value={expiryDate}
-                        onChange={(e) => setExpiryDate(e.target.value.replace(/\D/g, '').replace(/(.{2})/g, '$1 / ').trim().slice(0, 7))}
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">CVC</label>
-                      <input 
-                        type="text"
-                        placeholder="123"
-                        className="w-full p-4 rounded-2xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 transition-all font-mono text-sm"
-                        value={cvc}
-                        onChange={(e) => setCvc(e.target.value.replace(/\D/g, '').slice(0, 3))}
-                      />
-                    </div>
+                ) : (
+                  <div className="bg-slate-50 p-4 rounded-2xl border border-black flex gap-3">
+                    <Info className="w-5 h-5 text-blue-700 shrink-0 mt-0.5" />
+                    <p className="text-xs text-black font-medium leading-relaxed">
+                      No payment card is required. Your account will switch immediately to the <strong>{showCheckoutForTier.name}</strong> plan.
+                    </p>
                   </div>
+                )}
+
+                <div className="flex flex-col gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleSubscribe}
+                    disabled={isProcessingPayment}
+                    className="w-full bg-blue-600 text-white py-3.5 px-5 rounded-xl font-black text-sm border border-black hover:bg-blue-700 transition-all shadow-sm flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                  >
+                    {isProcessingPayment ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span>{Number(showCheckoutForTier.price || 0) > 0 ? "Redirecting to Stripe..." : "Updating Plan..."}</span>
+                      </>
+                    ) : Number(showCheckoutForTier.price || 0) > 0 ? (
+                      <>
+                        <Lock className="w-4 h-4" />
+                        <span>Continue to Stripe Checkout (£{showCheckoutForTier.price}/mo)</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check className="w-4 h-4" />
+                        <span>Confirm {showCheckoutForTier.name} Plan</span>
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowCheckoutForTier(null)}
+                    disabled={isProcessingPayment}
+                    className="w-full bg-white text-black py-2.5 px-4 rounded-xl font-bold text-xs border border-black hover:bg-slate-100 transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
                 </div>
 
-                <div className="bg-blue-50 p-4 rounded-2xl flex gap-3">
-                  <ShieldCheck className="w-5 h-5 text-blue-600 shrink-0" />
-                  <p className="text-[10px] text-blue-700 leading-relaxed">
-                    Your payment information is encrypted and processed securely. This is a simulation environment; no real funds will be moved.
-                  </p>
-                </div>
-
-                <button
-                  onClick={handleSubscribe}
-                  disabled={isProcessingPayment || !cardNumber || !expiryDate || !cvc}
-                  className="w-full bg-blue-600 text-white p-5 rounded-2xl font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-200 flex items-center justify-center gap-2 disabled:opacity-50"
-                >
-                  {isProcessingPayment ? (
-                    <>
-                      <Loader2 className="w-6 h-6 animate-spin" /> Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Lock className="w-5 h-5" /> Pay £{showCheckoutForTier.price} & Subscribe
-                    </>
-                  )}
-                </button>
-                <p className="text-center text-[10px] text-slate-400">
-                  By subscribing, you agree to our Terms of Service and Privacy Policy.
+                <p className="text-center text-[11px] font-medium text-black">
+                  By continuing, you agree to our{" "}
+                  <button
+                    type="button"
+                    onClick={() => setShowProfileTermsModal(true)}
+                    className="underline font-bold text-blue-700 hover:text-blue-900 cursor-pointer"
+                  >
+                    Terms of Service and Privacy Policy
+                  </button>
+                  .
                 </p>
               </div>
             </motion.div>
@@ -3963,6 +4923,198 @@ export default function Profile() {
           }));
         }}
       />
+
+      {/* Homeowner -> Tradesperson Self-Service Upgrade Modal */}
+      {canUpgradeToTradesperson && (
+        <BecomeTradespersonModal
+          isOpen={showBecomeTraderModal}
+          onClose={() => setShowBecomeTraderModal(false)}
+          user={user}
+          profile={profile}
+          onUpgraded={(result) => {
+            setShowBecomeTraderModal(false);
+            setProfile((prev: any) => ({
+              ...prev,
+              role: "tradesperson",
+              accountType: "service_provider",
+              capabilities: ["homeowner", "tradesperson"],
+              verificationStatus: result?.verificationStatus || prev?.verificationStatus,
+              requiresAdminVerification: Boolean(result?.requiresAdminVerification),
+              documentGraceDeadlineAt: result?.documentGraceDeadlineAt || null,
+            }));
+            try {
+              localStorage.setItem("anytrader_active_role", "trader");
+            } catch {
+              // Ignore storage quota errors
+            }
+            setActiveRole("trader");
+          }}
+        />
+      )}
+
+      {/* Cancel Subscription Confirmation Modal */}
+      {showCancelSubConfirm && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="flex flex-col items-center text-center space-y-3">
+              <div className="w-14 h-14 bg-amber-50 rounded-2xl flex items-center justify-center border border-black">
+                <AlertCircle className="w-7 h-7 text-amber-700" />
+              </div>
+              <h3 className="text-lg font-black text-black">Cancel Subscription?</h3>
+              <p className="text-xs text-black leading-relaxed">
+                Are you sure you want to cancel your subscription? You will keep access to your plan features until the end of your current billing period.
+              </p>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button
+                type="button"
+                disabled={isCancelingSub}
+                onClick={() => setShowCancelSubConfirm(false)}
+                className="flex-1 p-3 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                Keep Plan
+              </button>
+              <button
+                type="button"
+                disabled={isCancelingSub}
+                onClick={executeCancelSubscription}
+                className="flex-1 p-3 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 transition-colors cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5"
+              >
+                {isCancelingSub && <Loader2 className="w-4 h-4 animate-spin" />}
+                Yes, Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear All Services Confirmation Modal */}
+      {showClearServicesConfirm && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="flex flex-col items-center text-center space-y-3">
+              <div className="w-14 h-14 bg-red-50 rounded-2xl flex items-center justify-center border border-black">
+                <Trash2 className="w-7 h-7 text-red-600" />
+              </div>
+              <h3 className="text-lg font-black text-black">Clear All Services?</h3>
+              <p className="text-xs text-black leading-relaxed">
+                This will remove all items from your draft services list. You can save or cancel afterward.
+              </p>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowClearServicesConfirm(false)}
+                className="flex-1 p-3 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setTempServices([]);
+                  setShowClearServicesConfirm(false);
+                  toast.info("All draft services cleared. Tap Save to apply.");
+                }}
+                className="flex-1 p-3 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 transition-colors cursor-pointer"
+              >
+                Clear All
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* UK GDPR Self-Service Account Deletion Modal */}
+      {showDeleteAccountModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-md w-full shadow-2xl border border-black space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 bg-red-50 rounded-2xl flex items-center justify-center border border-black shrink-0">
+                  <Trash2 className="w-5 h-5 text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-black">Permanently Delete Account</h3>
+                  <p className="text-[11px] font-bold text-red-700">UK GDPR Article 17 Right to Erasure</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isDeletingAccount}
+                onClick={() => setShowDeleteAccountModal(false)}
+                className="p-1.5 rounded-xl border border-black hover:bg-slate-100 cursor-pointer"
+              >
+                <X className="w-4 h-4 text-black" />
+              </button>
+            </div>
+
+            <div className="bg-red-50 border border-black rounded-2xl p-3.5 text-xs text-black space-y-1.5 leading-relaxed">
+              <p className="font-black">Before you continue:</p>
+              <ul className="list-disc pl-4 space-y-1">
+                <li>Your personal details will be permanently erased and your public listing removed immediately.</li>
+                <li>Accounts with active, funded, or disputed jobs cannot be closed until those jobs are completed or resolved.</li>
+                <li>Statutory UK tax/invoice records and non-PII anti-fraud hashes are retained only as permitted by law.</li>
+              </ul>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-black text-black mb-1">Optional reason for leaving</label>
+                <input
+                  type="text"
+                  value={deleteReason}
+                  onChange={(e) => setDeleteReason(e.target.value)}
+                  placeholder="Optional feedback..."
+                  maxLength={200}
+                  className="w-full px-3.5 py-2.5 text-xs text-black bg-slate-50 border border-black rounded-xl"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-black text-black mb-1">
+                  Type <span className="text-red-700 font-mono">DELETE</span> to confirm
+                </label>
+                <input
+                  type="text"
+                  value={deleteConfirmText}
+                  onChange={(e) => {
+                    setDeleteAccountError(null);
+                    setDeleteConfirmText(e.target.value);
+                  }}
+                  placeholder="DELETE"
+                  autoComplete="off"
+                  className="w-full px-3.5 py-2.5 text-xs font-black text-black bg-white border border-black rounded-xl uppercase tracking-wider"
+                />
+              </div>
+              {deleteAccountError && (
+                <div className="p-3 bg-red-50 border border-red-600 rounded-xl text-xs font-bold text-red-800">
+                  {deleteAccountError}
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-3 pt-1">
+              <button
+                type="button"
+                disabled={isDeletingAccount}
+                onClick={() => setShowDeleteAccountModal(false)}
+                className="flex-1 p-3 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingAccount || deleteConfirmText.trim().toUpperCase() !== "DELETE"}
+                onClick={handleConfirmDeleteAccount}
+                className="flex-1 p-3 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 transition-colors cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5"
+              >
+                {isDeletingAccount && <Loader2 className="w-4 h-4 animate-spin" />}
+                Delete Permanently
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Double Confirmation Logout Modal */}
       {showLogoutConfirm && (

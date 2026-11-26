@@ -5,40 +5,44 @@ const active = { id: "sub_test", status: "active", cancel_at_period_end: false, 
 
 describe("Stripe subscription lifecycle patch mapping", () => {
   it.each([
-    ["landlord", { homeownerSubscriptionStatus: "active" }],
+    ["landlord", { isLandlord: true, homeownerTierId: "landlord", homeownerSubscriptionStatus: "active" }],
     ["membership", { isPro: true, isProInvoiceSubscriber: true, subscriptionStatus: "active" }],
     ["gold_driver", { isGoldDriver: true, driverSubscriptionStatus: "active" }],
-    ["exclusive_leads", { hasExclusiveAddon: true, isExclusiveActive: true }],
-    ["video_pro", { hasVerifiedVideoProSubscription: true }],
+    ["exclusive_leads", { hasExclusiveAddon: true, isExclusiveActive: true, exclusiveSubscriptionStatus: "active" }],
+    ["video_pro", { hasVerifiedVideoProSubscription: true, videoProSubscriptionStatus: "active" }],
+    ["appointments", { hasAppointmentsAddon: true, appointmentsSubscriptionStatus: "active" }],
     ["gotham_saas", { isGothamSubscriber: true, gothamSubscriptionStatus: "active" }],
   ] as const)("maps active state to %s only", (product, expected) => {
     const patch = buildSubscriptionLifecyclePatch(product, active);
     for (const [key, value] of Object.entries(expected)) expect(patch[key]).toBe(value);
   });
 
-  it("builds a landlord checkout fulfillment patch without trader membership entitlements", () => {
+  it("builds a landlord checkout fulfillment patch on dedicated landlordSubscriptionId without touching trader membership fields", () => {
     const patch = buildLandlordCheckoutFulfillmentPatch("sub_landlord", active);
     expect(patch).toMatchObject({
-      subscriptionId: "sub_landlord",
-      subscriptionType: "landlord",
+      landlordSubscriptionId: "sub_landlord",
       isLandlord: true,
       homeownerTierId: "landlord",
       homeownerSubscriptionStatus: "active",
       homeownerCancelAtPeriodEnd: false,
       homeownerCurrentPeriodEnd: new Date(1_800_000_000_000).toISOString()
     });
+    expect(patch).not.toHaveProperty("subscriptionId");
+    expect(patch).not.toHaveProperty("subscriptionType");
     expect(patch).not.toHaveProperty("subscriptionStatus");
     expect(patch).not.toHaveProperty("isPro");
     expect(patch).not.toHaveProperty("isProInvoiceSubscriber");
   });
 
-  it("maps landlord cancellation to homeowner-only lifecycle fields", () => {
+  it("maps landlord cancellation to homeowner-only lifecycle fields and revokes isLandlord", () => {
     const patch = buildSubscriptionLifecyclePatch("landlord", {
       ...active,
       status: "canceled",
       cancel_at_period_end: true
     });
     expect(patch).toMatchObject({
+      isLandlord: false,
+      homeownerTierId: "standard",
       homeownerSubscriptionStatus: "canceled",
       homeownerCancelAtPeriodEnd: true,
       homeownerCurrentPeriodEnd: new Date(1_800_000_000_000).toISOString()
@@ -49,11 +53,12 @@ describe("Stripe subscription lifecycle patch mapping", () => {
   });
 
   it.each([
-    ["landlord", { homeownerSubscriptionStatus: "canceled" }],
-    ["membership", { isPro: false, isProInvoiceSubscriber: false }],
+    ["landlord", { isLandlord: false, homeownerTierId: "standard", homeownerSubscriptionStatus: "canceled" }],
+    ["membership", { tier: "payg", tierId: "Free Explorer", isPro: false, isProInvoiceSubscriber: false }],
     ["gold_driver", { isGoldDriver: false }],
-    ["exclusive_leads", { hasExclusiveAddon: false, isExclusiveActive: false }],
-    ["video_pro", { hasVerifiedVideoProSubscription: false }],
+    ["exclusive_leads", { hasExclusiveAddon: false, isExclusiveActive: false, exclusiveSubscriptionStatus: "canceled" }],
+    ["video_pro", { hasVerifiedVideoProSubscription: false, videoProSubscriptionStatus: "canceled" }],
+    ["appointments", { hasAppointmentsAddon: false, appointmentsSubscriptionStatus: "canceled" }],
     ["gotham_saas", { isGothamSubscriber: false }],
   ] as const)("revokes terminal %s state", (product, expected) => {
     const patch = buildSubscriptionLifecyclePatch(product, { ...active, status: "canceled" });
@@ -63,10 +68,11 @@ describe("Stripe subscription lifecycle patch mapping", () => {
   it.each(["past_due", "incomplete", "paused", "unknown"])("preserves entitlement fields for %s", (status) => {
     const fields = {
       landlord: ["isLandlord"],
-      membership: ["isPro", "isProInvoiceSubscriber"],
+      membership: ["isPro", "isProInvoiceSubscriber", "tier", "tierId"],
       gold_driver: ["isGoldDriver"],
       exclusive_leads: ["hasExclusiveAddon", "isExclusiveActive"],
       video_pro: ["hasVerifiedVideoProSubscription"],
+      appointments: ["hasAppointmentsAddon"],
       gotham_saas: ["isGothamSubscriber"],
     } as const;
     for (const product of Object.keys(fields) as (keyof typeof fields)[]) {

@@ -384,23 +384,8 @@ export default function EmergencyJobWizard() {
       // 4 hours if boosted, 2 hours if free
       const expiryHours = isPaidOption ? 4 : 2;
       const boostExpiresAt = new Date(Date.now() + expiryHours * 60 * 60 * 1000).toISOString();
-
-      let jobStatus = "posted";
-      let securityAlert = "";
-
-      // Check for duplicate account/device
-      const userDoc = await getDoc(doc(db, "users", user.uid));
-      const userData = userDoc.data();
-      if (userData?.deviceId) {
-        const usersSnapshot = await getDocs(query(collection(db, "users"), where("deviceId", "==", userData.deviceId)));
-        if (usersSnapshot.size > 1) {
-          console.warn("Potential duplicate account detected for device:", userData.deviceId);
-          jobStatus = "pending_admin_review";
-          securityAlert = "Potential duplicate account detected";
-        }
-      }
-
       const currentBoostTier = isPaidOption ? (isInstantMatch ? "instant_match" : "emergency_boost") : null;
+      const isDirectPrivate = Boolean(targetTradespersonId);
 
       const commandResult = await createJobViaCommand({
         user,
@@ -411,13 +396,22 @@ export default function EmergencyJobWizard() {
           postcode: finalPostcode,
           city: finalCity || undefined,
           area: finalArea || undefined,
+          fullAddress: formData.fullAddress || undefined,
+          mobileNumber: formData.mobileNumber || undefined,
           urgency: "emergency",
           isEmergency: true,
           photos: formData.photos || [],
           isInstantMatch: isInstantMatch,
+          ...(isDirectPrivate
+            ? {
+                isDirectJob: true,
+                visibility: "private" as const,
+                targetTradespersonId,
+                targetTradespersonName: targetTradespersonName || undefined,
+              }
+            : {}),
           metadata: {
             county: finalCounty || null,
-            securityAlert: securityAlert || null,
             paymentPreference: "negotiable",
             quoteScope: "complete_package",
             boostRequested: isPaidOption,
@@ -429,18 +423,18 @@ export default function EmergencyJobWizard() {
 
       const serverJobId = commandResult.jobId;
 
-      // Notify relevant traders via server-authoritative distribution
+      // Notify relevant traders via server-authoritative distribution (respects private 1-to-1 target)
       console.log("Notifying relevant traders for job:", serverJobId);
       await distributeJobNotifications(
         serverJobId,
         formData.category,
-        formData.postcode,
+        finalPostcode,
         "emergency",
         isPaidOption
       );
       
       if (!isPaidOption) {
-        navigate("/my-jobs");
+        navigate(`/job/${serverJobId}`);
       }
       return serverJobId;
     } catch (err) {
@@ -452,16 +446,19 @@ export default function EmergencyJobWizard() {
   const handlePayment = async () => {
     setIsProcessingPayment(true);
     try {
-      // Create job first as non-boosted so we have an ID
-      const jobId = await handleSubmit(false);
+      // Create job first without navigating away so Stripe redirect completes cleanly
+      const jobId = await handleSubmit(true);
       if (!jobId) {
-        setIsProcessingPayment(false); 
+        setIsProcessingPayment(false);
         return;
       }
 
-      // Initiate Stripe Checkout for boost
+      // Initiate Stripe Checkout for the selected tier (Instant Match vs Emergency Boost)
       const token = await user?.getIdToken();
-      if (!token) throw new Error("Please sign in to purchase an emergency boost.");
+      if (!token) throw new Error("Please sign in to complete priority dispatch checkout.");
+
+      const selectedTier = isInstantMatch ? "instant_match" : "emergency_boost";
+      const selectedPriceId = isInstantMatch ? "price_instant_match" : "price_emergency_boost";
       const response = await fetch("/api/create-checkout-session", {
         method: "POST",
         headers: {
@@ -471,34 +468,27 @@ export default function EmergencyJobWizard() {
         },
         body: JSON.stringify({
           userId: user?.uid,
-          price_data: {
-            currency: 'gbp',
-            unit_amount: 499,
-            product_data: {
-              name: 'Emergency Priority Dispatch',
-              description: 'Instant broadcast to local on-call verified tradespeople'
-            }
-          },
-          priceId: "price_mock_boost",
+          priceId: selectedPriceId,
           mode: "payment",
           metadata: {
             type: "boost",
+            tier: selectedTier,
             jobId: jobId
           },
-          successUrl: `${window.location.origin}/job/${jobId}?boost_success=true`,
+          successUrl: `${window.location.origin}/job/${jobId}?boost_success=true&tier=${selectedTier}`,
           cancelUrl: `${window.location.origin}/job/${jobId}`
         }),
       });
 
       const data = await response.json();
-      if (data.url) {
+      if (response.ok && data.url) {
         window.location.href = data.url;
       } else {
         throw new Error(data.error || "Failed to initiate checkout");
       }
     } catch (err: any) {
       console.error("Checkout init failed:", err);
-      alert(err.message || "Failed to start checkout. Your job was still posted.");
+      toast.error(err.message || "Failed to start checkout. Your emergency job was still posted.");
       setIsProcessingPayment(false);
       setShowCheckout(false);
       navigate("/my-jobs");

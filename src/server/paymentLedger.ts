@@ -9,6 +9,7 @@ import { BadRequestError, ConflictError, InternalServerError, ForbiddenError } f
 import { validatePaymentTransition, validateMilestoneTransition } from "./stateMachine.ts";
 import { domainEvents } from "./domainEvents.ts";
 import { BusinessLogicDefense } from "./businessLogicDefense.ts";
+import { getDynamicFirestoreConfigs, resolveAnyTraderCommission } from "./pricingCatalog.ts";
 import crypto from "crypto";
 
 export interface LedgerEntry {
@@ -23,6 +24,8 @@ export interface LedgerEntry {
   amount: number; // in minor units (pence / cents)
   platformFee: number;
   netPayout: number;
+  appliedCommissionRate?: number;
+  commissionCapGbp?: number;
   currency: string;
   type: "ESCROW_DEPOSIT" | "ESCROW_RELEASE" | "PLATFORM_COMMISSION" | "REFUND" | "RIDE_PAYMENT";
   status: "pending" | "completed" | "reversed";
@@ -180,20 +183,65 @@ export class PaymentLedgerEngine {
       currency: string;
       paymentIntentId: string;
       idempotencyKey: string;
+      platformFeePence?: number;
+      appliedCommissionRate?: number;
+      commissionCapGbp?: number;
+      traderTier?: string;
     }
   ): Promise<LedgerEntry> {
-    const { jobId, milestoneId, customerId, traderId, verifiedAmount, currency, paymentIntentId, idempotencyKey } = params;
+    const {
+      jobId,
+      milestoneId,
+      customerId,
+      traderId,
+      verifiedAmount,
+      currency,
+      paymentIntentId,
+      idempotencyKey,
+    } = params;
 
     if (typeof verifiedAmount !== "number" || !Number.isFinite(verifiedAmount) || verifiedAmount <= 0) {
       throw new BadRequestError("Verified amount must be a strictly positive finite number in minor units (pence).");
+    }
+
+    const normalizedCustomerId = typeof customerId === "string" ? customerId.trim() : "";
+    const normalizedTraderId = typeof traderId === "string" ? traderId.trim() : "";
+    if (normalizedCustomerId && normalizedTraderId && normalizedCustomerId === normalizedTraderId) {
+      throw new ForbiddenError("Self-payment is prohibited: payer and payee accounts must be distinct.");
     }
 
     const { result } = await this.executeIdempotentOperation(db, idempotencyKey, "FUND_MILESTONE_ESCROW", {
       version: 1, jobId, milestoneId, customerId, traderId,
       verifiedAmount, currency: currency.toLowerCase(), paymentIntentId,
     }, async () => {
-      const platformFee = Math.round(verifiedAmount * 0.12); // Standard 12% platform fee
-      const netPayout = verifiedAmount - platformFee;
+      const hasAuthoritativeFee =
+        typeof params.platformFeePence === "number" &&
+        Number.isFinite(params.platformFeePence) &&
+        params.platformFeePence >= 0 &&
+        params.platformFeePence <= verifiedAmount;
+
+      let platformFee: number;
+      let netPayout: number;
+      let appliedCommissionRate: number | undefined = params.appliedCommissionRate;
+      let commissionCapGbp: number | undefined = params.commissionCapGbp;
+
+      if (hasAuthoritativeFee) {
+        platformFee = Math.round(params.platformFeePence!);
+        netPayout = verifiedAmount - platformFee;
+      } else {
+        const resolved = await resolveAnyTraderCommission({
+          amountPence: verifiedAmount,
+          firestoreDb: db,
+          traderId,
+          traderTier: params.traderTier,
+          explicitCommissionRate: params.appliedCommissionRate,
+          explicitCapGbp: params.commissionCapGbp,
+        });
+        platformFee = resolved.platformFeePence;
+        netPayout = resolved.netPayoutPence;
+        appliedCommissionRate = resolved.commissionRate;
+        commissionCapGbp = resolved.commissionCapGbp;
+      }
 
       const entryHash = crypto.createHash("sha256").update(`${idempotencyKey}:${paymentIntentId}`).digest("hex").substring(0, 16);
       const entryId = `ledg_fund_${entryHash}`;
@@ -201,11 +249,15 @@ export class PaymentLedgerEngine {
         entryId,
         transactionId: paymentIntentId,
         idempotencyKey,
+        jobId,
+        milestoneId,
         payerId: customerId,
         payeeId: traderId,
         amount: verifiedAmount,
         platformFee,
         netPayout,
+        ...(appliedCommissionRate !== undefined ? { appliedCommissionRate } : {}),
+        ...(commissionCapGbp !== undefined ? { commissionCapGbp } : {}),
         currency: currency.toLowerCase(),
         type: "ESCROW_DEPOSIT",
         status: "completed",
@@ -224,7 +276,11 @@ export class PaymentLedgerEngine {
             escrowEntryId: entryId,
             verifiedAmount,
             platformFee,
+            platformFeePence: platformFee,
             netPayout,
+            netPayoutPence: netPayout,
+            ...(appliedCommissionRate !== undefined ? { appliedCommissionRate } : {}),
+            ...(commissionCapGbp !== undefined ? { commissionCapGbp } : {}),
           });
         }
 
@@ -365,6 +421,26 @@ export class PaymentLedgerEngine {
       throw new ForbiddenError("Unauthorized: current caller is not permitted to release milestone funds");
     }
 
+    const authJobOwnerUids = [
+      authorizationJob?.homeownerId,
+      authorizationJob?.userId,
+      authorizationJob?.customerId,
+    ]
+      .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+      .map((value) => value.trim());
+    const authJobTraderUids = [
+      authorizationJob?.acceptedTradespersonId,
+      authorizationJob?.acceptedTraderId,
+      authorizationJob?.tradespersonId,
+    ]
+      .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+      .map((value) => value.trim());
+    if (authJobOwnerUids.some((ownerUid) => authJobTraderUids.includes(ownerUid))) {
+      throw new ForbiddenError(
+        "Self-payment is prohibited: escrow funds cannot be released when the job owner and tradesperson are the same account."
+      );
+    }
+
     const { result } = await this.executeIdempotentOperation(db, idempotencyKey, "RELEASE_MILESTONE", {
       version: 1, jobId, quoteId, milestoneId: milestoneId || null, authUid,
       authorizationMode: isAdmin ? "admin" : isQrHandshake ? "qr_handshake" : "owner",
@@ -372,6 +448,10 @@ export class PaymentLedgerEngine {
       if (!db) {
         throw new InternalServerError("Database is required for financial escrow release.");
       }
+
+      // Load dynamic Admin pricing/commission configs before entering the Firestore transaction
+      // so commission calculations stay strictly in sync with Admin controls & Stripe Checkout.
+      const { globalTiers, globalConfig } = await getDynamicFirestoreConfigs(db);
 
       // Execute everything inside a single Firestore transaction for atomic safety
       const transactionResult = await db.runTransaction(async (transaction: any) => {
@@ -453,6 +533,23 @@ export class PaymentLedgerEngine {
           throw new BadRequestError("IDOR rejection: Quote tradesperson does not match job accepted tradesperson");
         }
 
+        const txJobOwnerUids = [jobData?.homeownerId, jobData?.userId, jobData?.customerId]
+          .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+          .map((value) => value.trim());
+        const txTraderUids = [
+          jobData?.acceptedTradespersonId,
+          jobData?.acceptedTraderId,
+          jobData?.tradespersonId,
+          quoteData?.tradespersonId,
+        ]
+          .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+          .map((value) => value.trim());
+        if (txJobOwnerUids.some((ownerUid) => txTraderUids.includes(ownerUid))) {
+          throw new ForbiddenError(
+            "Self-payment is prohibited: escrow funds cannot be released when the job owner and tradesperson are the same account."
+          );
+        }
+
         const currentMilestones = quoteData?.milestones || [];
         const targetMilestone = milestoneId
           ? currentMilestones.find((m: any) => m.id === milestoneId)
@@ -462,19 +559,24 @@ export class PaymentLedgerEngine {
           throw new BadRequestError(`Milestone not found: '${milestoneId || "initial"}' does not exist on quote '${quoteId}'`);
         }
 
+        // Read tradesperson profile inside transaction before any writes (needed for tier commission + prod Stripe gate)
+        const traderId = quoteData?.tradespersonId || jobData?.acceptedTradespersonId;
+        let traderData: Record<string, any> | null = null;
+        if (traderId) {
+          const traderRef = db.collection("users").doc(traderId);
+          const traderDoc = await transaction.get(traderRef);
+          traderData = traderDoc?.exists
+            ? (typeof traderDoc.data === "function" ? traderDoc.data() : traderDoc.data) || null
+            : null;
+        }
+
         // Production Pre-Commit Fail-Closed Gate:
         // Prevent committing release to Firestore if tradesperson cannot receive funds via Stripe
         const isProd = process.env.NODE_ENV === "production";
         if (isProd && !targetMilestone.isDestinationCharge) {
-          const traderId = quoteData?.tradespersonId || jobData?.acceptedTradespersonId;
           if (!traderId) {
             throw new BadRequestError("Tradesperson ID missing on quote and job");
           }
-          const traderRef = db.collection("users").doc(traderId);
-          const traderDoc = await transaction.get(traderRef);
-          const traderData = traderDoc?.exists
-            ? (typeof traderDoc.data === "function" ? traderDoc.data() : traderDoc.data)
-            : null;
           const traderStripeAccountId = traderData?.stripeAccountId;
           if (!traderStripeAccountId) {
             throw new BadRequestError("Tradesperson has no connected Stripe payout account");
@@ -484,6 +586,59 @@ export class PaymentLedgerEngine {
           }
         }
 
+        const computeReleaseAmounts = async (amountGbp: number) => {
+          const amountPence = Math.round(amountGbp * 100);
+          // 1. Honor exact persisted fee from milestone funding (zero drift with Stripe destination charge)
+          if (
+            typeof targetMilestone.platformFeePence === "number" &&
+            Number.isFinite(targetMilestone.platformFeePence) &&
+            targetMilestone.platformFeePence >= 0 &&
+            targetMilestone.platformFeePence <= amountPence
+          ) {
+            const platformFeePence = Math.round(targetMilestone.platformFeePence);
+            return {
+              amountPence,
+              platformFeePence,
+              netPayoutPence: amountPence - platformFeePence,
+              appliedCommissionRate:
+                typeof targetMilestone.appliedCommissionRate === "number"
+                  ? targetMilestone.appliedCommissionRate
+                  : undefined,
+              commissionCapGbp:
+                typeof targetMilestone.commissionCapGbp === "number"
+                  ? targetMilestone.commissionCapGbp
+                  : undefined,
+            };
+          }
+
+          // 2. Otherwise resolve dynamically via canonical AnyTrader commission resolver
+          const resolved = await resolveAnyTraderCommission({
+            amountPence,
+            traderData: traderData || {},
+            globalTiers,
+            globalConfig,
+            explicitCommissionRate:
+              typeof targetMilestone.appliedCommissionRate === "number"
+                ? targetMilestone.appliedCommissionRate
+                : typeof quoteData?.appliedCommissionRate === "number"
+                  ? quoteData.appliedCommissionRate
+                  : undefined,
+            explicitCapGbp:
+              typeof targetMilestone.commissionCapGbp === "number"
+                ? targetMilestone.commissionCapGbp
+                : typeof quoteData?.commissionCapGbp === "number"
+                  ? quoteData.commissionCapGbp
+                  : undefined,
+          });
+          return {
+            amountPence,
+            platformFeePence: resolved.platformFeePence,
+            netPayoutPence: resolved.netPayoutPence,
+            appliedCommissionRate: resolved.commissionRate,
+            commissionCapGbp: resolved.commissionCapGbp,
+          };
+        };
+
         // Transactional Claim Validation
         // If it's already released with the SAME idempotency key, authoritative state confirms this release was already committed!
         if (
@@ -491,8 +646,7 @@ export class PaymentLedgerEngine {
           targetMilestone.releaseOperationId === idempotencyKey
         ) {
           const releasedAmount = Number(targetMilestone.amount || targetMilestone.verifiedAmount || 0);
-          const platformFeePence = Math.round(releasedAmount * 100 * 0.12);
-          const netPayoutPence = Math.round(releasedAmount * 100) - platformFeePence;
+          const { platformFeePence, netPayoutPence } = await computeReleaseAmounts(releasedAmount);
           const ledgerEntryId = targetMilestone.escrowReleaseLedgerId || `ledg_rel_${crypto.createHash("sha256").update(idempotencyKey).digest("hex").substring(0, 16)}`;
           return {
             jobData,
@@ -523,8 +677,13 @@ export class PaymentLedgerEngine {
           throw new BadRequestError(`Invalid milestone amount in database: '${releasedAmount}'. Must be a positive finite number.`);
         }
 
-        const platformFeePence = Math.round(releasedAmount * 100 * 0.12);
-        const netPayoutPence = Math.round(releasedAmount * 100) - platformFeePence;
+        const {
+          amountPence,
+          platformFeePence,
+          netPayoutPence,
+          appliedCommissionRate,
+          commissionCapGbp,
+        } = await computeReleaseAmounts(releasedAmount);
         const ledgerHash = crypto.createHash("sha256").update(`${idempotencyKey}:${jobId}:${quoteId}:${targetMilestone.id}`).digest("hex").substring(0, 16);
         const ledgerEntryId = `ledg_rel_${ledgerHash}`;
 
@@ -541,6 +700,10 @@ export class PaymentLedgerEngine {
               releasedAt: new Date().toISOString(), 
               releaseOperationId: idempotencyKey,
               escrowReleaseLedgerId: ledgerEntryId,
+              platformFeePence,
+              netPayoutPence,
+              ...(appliedCommissionRate !== undefined ? { appliedCommissionRate } : {}),
+              ...(commissionCapGbp !== undefined ? { commissionCapGbp } : {}),
             };
           }
           return m;
@@ -571,9 +734,11 @@ export class PaymentLedgerEngine {
           milestoneId: targetMilestone.id,
           payerId: jobData?.homeownerId || authUid,
           payeeId: quoteData?.tradespersonId || "trader",
-          amount: Math.round(releasedAmount * 100),
+          amount: amountPence,
           platformFee: platformFeePence,
           netPayout: netPayoutPence,
+          ...(appliedCommissionRate !== undefined ? { appliedCommissionRate } : {}),
+          ...(commissionCapGbp !== undefined ? { commissionCapGbp } : {}),
           currency: "gbp",
           type: "ESCROW_RELEASE",
           status: "completed",
@@ -1202,5 +1367,143 @@ export class PaymentLedgerEngine {
         ? `QR Handshake complete for "${jobNo}". Escrow released on platform.`
         : `Milestone "${targetMilestoneTitle}" escrow release recorded on platform.`,
     };
+  }
+
+  /**
+   * Canonical Job Payment Status Reconciler (Slice 2 Money Flow Fix):
+   * Executed after a milestone's Stripe transfer succeeds (or is skipped for destination/dev charges).
+   * Inspects all milestones on the accepted quote inside a transaction:
+   * - When ALL milestones are released cleanly, sets jobs/{jobId}.isPaid = true and
+   *   paymentStatus = isQrHandshake ? "handshake_complete" : "paid", and upgrades any existing
+   *   official job invoice (`INV_{jobId}`) to `paid`.
+   * - When SOME milestones are released, sets paymentStatus = "partially_released" without
+   *   marking the job fully paid.
+   */
+  public static async reconcileJobPaymentStatus(
+    db: any,
+    params: { jobId: string; quoteId: string; isQrHandshake?: boolean }
+  ): Promise<{
+    allMilestonesReleased: boolean;
+    anyMilestoneReleased: boolean;
+    paymentStatus: string | null;
+    isPaid: boolean;
+  }> {
+    const { jobId, quoteId, isQrHandshake } = params;
+    if (!db || !jobId || !quoteId) {
+      return { allMilestonesReleased: false, anyMilestoneReleased: false, paymentStatus: null, isPaid: false };
+    }
+
+    const jobRef = db.collection("jobs").doc(jobId);
+    const quoteRef = jobRef.collection("quotes").doc(quoteId);
+    const invoiceRef = db.collection("invoices").doc(`INV_${jobId}`);
+    const nowIso = new Date().toISOString();
+
+    return db.runTransaction(async (tx: any) => {
+      const [jobSnap, quoteSnap, invoiceSnap] = await Promise.all([
+        tx.get(jobRef),
+        tx.get(quoteRef),
+        tx.get(invoiceRef),
+      ]);
+      if (!jobSnap.exists || !quoteSnap.exists) {
+        return { allMilestonesReleased: false, anyMilestoneReleased: false, paymentStatus: null, isPaid: false };
+      }
+      const jobData = (typeof jobSnap.data === "function" ? jobSnap.data() : jobSnap.data) || {};
+      const quoteData = (typeof quoteSnap.data === "function" ? quoteSnap.data() : quoteSnap.data) || {};
+      const milestones = Array.isArray(quoteData.milestones) ? quoteData.milestones : [];
+
+      if (milestones.length === 0) {
+        return {
+          allMilestonesReleased: false,
+          anyMilestoneReleased: false,
+          paymentStatus: jobData.paymentStatus || null,
+          isPaid: Boolean(jobData.isPaid),
+        };
+      }
+
+      const isCleanlyReleased = (m: any) =>
+        ["released", "funds_released"].includes(String(m?.status || "").toLowerCase()) &&
+        m?.releaseStatus !== "reconciliation_required" &&
+        m?.releaseStatus !== "failed";
+
+      const allMilestonesReleased = milestones.every(isCleanlyReleased);
+      const anyMilestoneReleased = milestones.some(isCleanlyReleased);
+
+      if (allMilestonesReleased) {
+        const nextStatus = isQrHandshake ? "handshake_complete" : "paid";
+        tx.update(jobRef, {
+          isPaid: true,
+          paymentStatus: nextStatus,
+          paidAt: jobData.paidAt || nowIso,
+          updatedAt: nowIso,
+        });
+        if (invoiceSnap.exists) {
+          const invData = (typeof invoiceSnap.data === "function" ? invoiceSnap.data() : invoiceSnap.data) || {};
+          if (invData.status !== "paid" || invData.isPaid !== true || invData.paid !== true) {
+            tx.update(invoiceRef, {
+              status: "paid",
+              paid: true,
+              isPaid: true,
+              paidAt: invData.paidAt || nowIso,
+              updatedAt: nowIso,
+            });
+          }
+        }
+        return {
+          allMilestonesReleased: true,
+          anyMilestoneReleased: true,
+          paymentStatus: nextStatus,
+          isPaid: true,
+        };
+      }
+
+      if (anyMilestoneReleased && jobData.isPaid !== true) {
+        tx.update(jobRef, {
+          isPaid: false,
+          paymentStatus: "partially_released",
+          updatedAt: nowIso,
+        });
+        return {
+          allMilestonesReleased: false,
+          anyMilestoneReleased: true,
+          paymentStatus: "partially_released",
+          isPaid: false,
+        };
+      }
+
+      return {
+        allMilestonesReleased: false,
+        anyMilestoneReleased,
+        paymentStatus: jobData.paymentStatus || null,
+        isPaid: Boolean(jobData.isPaid),
+      };
+    });
+  }
+
+  /**
+   * Releases a stale `completed` idempotency lock ONLY when a definite preflight Stripe error
+   * occurred BEFORE any transfer API call was issued and the milestone has been rolled back to `funded`.
+   * Never call this for `reconciliation_required` (ambiguous transfer state).
+   */
+  public static async releaseFailedPreflightIdempotencyLock(
+    db: any,
+    idempotencyKey: string
+  ): Promise<{ released: boolean }> {
+    if (!db || !idempotencyKey || idempotencyKey.includes("/")) {
+      return { released: false };
+    }
+    const idempotencyRef = db.collection("payment_idempotency").doc(idempotencyKey);
+    return db.runTransaction(async (tx: any) => {
+      const snap = await tx.get(idempotencyRef);
+      if (!snap.exists) return { released: false };
+      const data = (typeof snap.data === "function" ? snap.data() : snap.data) || {};
+      if (data.status === "reconciliation_required" || data.releaseStatus === "reconciliation_required") {
+        return { released: false };
+      }
+      if (data.operationName === "ESCROW_RELEASE") {
+        tx.delete(idempotencyRef);
+        return { released: true };
+      }
+      return { released: false };
+    });
   }
 }

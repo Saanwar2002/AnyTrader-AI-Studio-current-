@@ -39,6 +39,7 @@ export default function TradesBannerAdStudio() {
 
   // Live real-time wallet balance from profile or fallback
   const [liveWalletBalance, setLiveWalletBalance] = useState<number>(profile?.adWalletBalance || 0);
+  const [pendingDeleteAdId, setPendingDeleteAdId] = useState<string | null>(null);
 
   // Subscribe to user doc for real-time wallet balance
   useEffect(() => {
@@ -136,6 +137,7 @@ export default function TradesBannerAdStudio() {
         },
         body: JSON.stringify({
           userId: user.uid,
+          priceId: "price_ad_wallet_topup",
           tierName: `Ad Wallet Topup (£${val.toFixed(2)})`,
           mode: "payment",
           price_data: {
@@ -146,8 +148,8 @@ export default function TradesBannerAdStudio() {
               description: "Credits balance for TradeOS Banner Ads & Local Sponsored Slots."
             }
           },
-          successUrl: `${window.location.origin}/banner-ads?topup=success`,
-          cancelUrl: `${window.location.origin}/banner-ads`,
+          successUrl: `${window.location.origin}/trader/banner-ads?topup=success`,
+          cancelUrl: `${window.location.origin}/trader/banner-ads`,
           metadata: {
             type: "ad_wallet_topup",
             topupAmount: val,
@@ -156,18 +158,11 @@ export default function TradesBannerAdStudio() {
         })
       });
 
-      const data = await response.json();
-      if (data.url) {
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.url) {
         window.location.href = data.url;
-      } else if (data.error) {
-        toast.error(data.error);
       } else {
-        const newBalance = (walletBalance || 0) + val;
-        setLiveWalletBalance(newBalance);
-        toast.success(`Successfully added £${val.toFixed(2)} to your Ad Wallet!`, {
-          description: `Your new balance is £${newBalance.toFixed(2)}.`
-        });
-        setShowTopupModal(false);
+        toast.error(data.error || "Unable to start Stripe Checkout. Your wallet was not charged.");
       }
     } catch (err) {
       console.error(err);
@@ -206,7 +201,18 @@ export default function TradesBannerAdStudio() {
         body: JSON.stringify({
           headline: headline.trim(),
           durationDays,
-          targetCategories: [profile?.trade || "all", "all"]
+          targetCategories: (() => {
+            const primaryCats = Array.from(
+              new Set(
+                [
+                  profile?.primaryTrade,
+                  profile?.trade,
+                  ...(Array.isArray(profile?.trades) ? profile.trades : []),
+                ].filter((c): c is string => typeof c === "string" && c.trim().length > 0)
+              )
+            );
+            return primaryCats.length > 0 ? primaryCats.slice(0, 10) : ["all"];
+          })()
         })
       });
 
@@ -271,31 +277,52 @@ export default function TradesBannerAdStudio() {
   };
 
   // Delete Campaign
-  const handleDeleteAd = async (adId: string) => {
-    if (!confirm("Are you sure you want to remove this campaign record?")) return;
+  const handleDeleteAd = (adId: string) => {
+    setPendingDeleteAdId(adId);
+  };
+
+  const executeDeleteAd = async () => {
+    if (!pendingDeleteAdId) return;
     try {
-      await deleteDoc(doc(db, "advertisements", adId));
+      await deleteDoc(doc(db, "advertisements", pendingDeleteAdId));
       toast.success("Campaign record removed.");
     } catch (err) {
       console.error(err);
       toast.error("Failed to delete campaign.");
+    } finally {
+      setPendingDeleteAdId(null);
     }
   };
 
-  // Edit Headline
+  // Edit Headline (server-authoritative — re-submits edited copy for moderation review)
   const handleSaveEdit = async () => {
-    if (!editingAd) return;
+    if (!editingAd || !user) return;
     setIsSaving(true);
     try {
-      await updateDoc(doc(db, "advertisements", editingAd.id), {
-        description: editHeadline.trim() || profile?.trade || "Expert Services",
-        updatedAt: serverTimestamp()
+      const token = await user.getIdToken();
+      const response = await fetch(`/api/ads/${encodeURIComponent(editingAd.id)}/edit`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          description: editHeadline.trim() || traderTrade || "Expert Services",
+        }),
       });
-      toast.success("Campaign updated successfully!");
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to update campaign.");
+      }
+      toast.success(
+        data.requiresReModeration
+          ? "Campaign updated and resubmitted for moderation review."
+          : "Campaign updated successfully!"
+      );
       setEditingAd(null);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      toast.error("Failed to update campaign.");
+      toast.error(err.message || "Failed to update campaign.");
     } finally {
       setIsSaving(false);
     }
@@ -311,9 +338,9 @@ export default function TradesBannerAdStudio() {
   }
 
   const traderName = profile?.businessName || profile?.name || "Your Business Name";
-  const traderRating = (profile?.rating || 5.0).toFixed(1);
-  const traderReviews = profile?.reviewCount || 24;
-  const traderTrade = profile?.trade || "Professional Contractor";
+  const traderReviews = Number(profile?.reviewCount ?? profile?.totalReviews ?? 0);
+  const traderRating = traderReviews > 0 && Number(profile?.rating) > 0 ? Number(profile.rating).toFixed(1) : "New";
+  const traderTrade = profile?.primaryTrade || profile?.trade || profile?.trades?.[0] || "Professional Contractor";
 
   return (
     <div className="max-w-5xl mx-auto px-3 sm:px-6 py-6 sm:py-8 space-y-6 relative">
@@ -703,7 +730,7 @@ export default function TradesBannerAdStudio() {
                           <div className="min-w-0 flex-1">
                             {/* 1. Personal Name */}
                             <h4 className="text-xs sm:text-sm font-black text-white leading-tight truncate">
-                              {profile?.name || profile?.businessName || "Elena Rostova"}
+                              {profile?.name || profile?.businessName || "Your Name / Business"}
                             </h4>
 
                             {/* 2. Business Name */}
@@ -723,7 +750,7 @@ export default function TradesBannerAdStudio() {
 
                               <span className="inline-flex items-center gap-1 bg-gradient-to-r from-sky-500 via-blue-600 to-indigo-600 text-white border border-blue-400/60 px-2 py-0.5 rounded-md text-[9.5px] sm:text-[10px] font-black tracking-wide uppercase shadow-xs shrink-0 max-w-[170px] sm:max-w-[210px] truncate">
                                 <Wrench className="w-2.5 h-2.5 text-sky-200 shrink-0" />
-                                <span className="truncate">{profile?.trade || "Painting & Decorating"}</span>
+                                <span className="truncate">{traderTrade}</span>
                               </span>
                             </div>
                           </div>
@@ -736,8 +763,8 @@ export default function TradesBannerAdStudio() {
                         <Sparkles className="w-3 h-3 fill-amber-300 shrink-0" />
                         <span className="leading-snug line-clamp-1">
                           {profile?.isAvailableForEmergency 
-                            ? "⚡ 24/7 Response Guaranteed" 
-                            : (profile?.accreditations?.[0]?.name ? `✨ ${profile.accreditations[0].name}` : "✨ ✨ City & Guilds Master Approved")}
+                            ? "⚡ 24/7 Emergency Callouts Available" 
+                            : (profile?.accreditations?.[0]?.name ? `✨ ${profile.accreditations[0].name}` : "✨ Direct Homeowner Quotes • Zero Lead Fees")}
                         </span>
                       </div>
                       <p className="text-xs sm:text-[13px] text-slate-200 font-medium leading-snug line-clamp-2">
@@ -989,6 +1016,35 @@ export default function TradesBannerAdStudio() {
           </div>
         )}
       </AnimatePresence>
+
+      {pendingDeleteAdId && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[120] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="text-center space-y-2">
+              <h4 className="text-base font-black text-black">Remove Campaign Record?</h4>
+              <p className="text-xs text-black leading-relaxed">
+                Are you sure you want to remove this banner ad campaign record?
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteAdId(null)}
+                className="flex-1 py-2.5 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={executeDeleteAd}
+                className="flex-1 py-2.5 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 cursor-pointer"
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

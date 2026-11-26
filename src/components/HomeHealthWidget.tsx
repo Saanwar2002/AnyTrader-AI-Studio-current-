@@ -23,6 +23,7 @@ import { PropertyPassportModal } from "./PropertyPassportModal";
 import { syncJobToGoogleCalendar, openGoogleCalendarUrl } from "../services/googleCalendarService";
 import { lookupPostcode } from "../services/postcodeService";
 import { createPropertyViaCommand } from "../services/propertyCommandService";
+import { FlexiPayMode, resolveFlexiPayMode } from "../lib/marketplaceContracts";
 
 interface HomeHealthWidgetProps {
   completedJobs?: any[];
@@ -162,6 +163,22 @@ export default function HomeHealthWidget({ completedJobs = [], userPostcode }: H
   const [plannerSelectedProperty, setPlannerSelectedProperty] = useState("");
   const [isSavingTask, setIsSavingTask] = useState(false);
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [flexiPayMode, setFlexiPayMode] = useState<FlexiPayMode>("coming_soon");
+
+  useEffect(() => {
+    const unsub = onSnapshot(
+      doc(db, "platform_config", "global"),
+      (snap) => {
+        const nextMode = snap.exists() ? resolveFlexiPayMode(snap.data()) : "coming_soon";
+        setFlexiPayMode(nextMode);
+        if (nextMode === "off") {
+          setActiveTab((prev) => (prev === "financing" ? "forecasts" : prev));
+        }
+      },
+      () => setFlexiPayMode("coming_soon")
+    );
+    return () => unsub();
+  }, []);
 
   // 1. Automatically fetch user's Property Passports from Firestore
   useEffect(() => {
@@ -938,7 +955,10 @@ export default function HomeHealthWidget({ completedJobs = [], userPostcode }: H
       {isExpanded && (
         <div className="space-y-4 pt-1">
           {/* Navigation Tab Bar */}
-          <div className="grid grid-cols-4 gap-1 sm:gap-2 bg-slate-950/80 p-1.5 rounded-2xl border border-white">
+          <div className={cn(
+            "grid gap-1 sm:gap-2 bg-slate-950/80 p-1.5 rounded-2xl border border-white",
+            flexiPayMode === "off" ? "grid-cols-3" : "grid-cols-4"
+          )}>
             
             {/* Tab 1: Seasonal Care */}
             <button
@@ -1005,20 +1025,24 @@ export default function HomeHealthWidget({ completedJobs = [], userPostcode }: H
               <span>Insurance</span>
             </button>
 
-            {/* Tab 4: Repair Financing (FlexiPay) */}
-            <button
-              type="button"
-              onClick={() => setActiveTab("financing")}
-              className={cn(
-                "py-2 px-1 rounded-xl text-[9px] sm:text-xs font-black transition-all flex flex-col items-center justify-center cursor-pointer border text-center leading-tight min-h-[48px]",
-                activeTab === "financing"
-                  ? "bg-cyan-500 text-slate-950 border-white shadow-md scale-[1.02]"
-                  : "bg-slate-900/90 text-slate-300 hover:text-white hover:bg-slate-800/80 border-white/30"
-              )}
-            >
-              <span>FlexiPay</span>
-              <span>Repair</span>
-            </button>
+            {/* Tab 4: Repair Financing (FlexiPay — Admin controlled) */}
+            {flexiPayMode !== "off" && (
+              <button
+                type="button"
+                onClick={() => setActiveTab("financing")}
+                className={cn(
+                  "py-2 px-1 rounded-xl text-[9px] sm:text-xs font-black transition-all flex flex-col items-center justify-center cursor-pointer border text-center leading-tight min-h-[48px]",
+                  activeTab === "financing"
+                    ? "bg-cyan-500 text-slate-950 border-white shadow-md scale-[1.02]"
+                    : "bg-slate-900/90 text-slate-300 hover:text-white hover:bg-slate-800/80 border-white/30"
+                )}
+              >
+                <span>FlexiPay</span>
+                <span className="text-[8px] sm:text-[10px]">
+                  {flexiPayMode === "coming_soon" ? "Soon" : "Repair"}
+                </span>
+              </button>
+            )}
           </div>
 
           {/* 4. TAB CONTENTS */}
@@ -1459,47 +1483,69 @@ export default function HomeHealthWidget({ completedJobs = [], userPostcode }: H
           )}
 
           {/* TAB 4: REPAIR FINANCING (FlexiPay) */}
-          {activeTab === "financing" && (
+          {activeTab === "financing" && flexiPayMode !== "off" && (
             <div className="bg-slate-950/80 border border-white rounded-2xl p-4 space-y-4 animate-in fade-in duration-200">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-white/20 pb-3">
-                <div>
-                  <h3 className="text-sm font-black text-indigo-300 flex items-center gap-2">
-                    <CreditCard className="w-4 h-4 text-indigo-400" />
-                    <span>FlexiPay • 0% APR Home Repair Financing</span>
-                  </h3>
-                  <p className="text-xs text-slate-300 mt-0.5">
-                    Spread unexpected boiler replacements, roof repairs, or emergency jobs (£1,000+) across 3 to 12 months.
-                  </p>
+              {flexiPayMode === "coming_soon" ? (
+                <div className="space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-white/20 pb-3">
+                    <div>
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-400 text-slate-950 text-[10px] font-black uppercase tracking-wider mb-1.5">
+                        <Clock className="w-3 h-3" />
+                        <span>Coming Soon</span>
+                      </div>
+                      <h3 className="text-sm font-black text-indigo-200 flex items-center gap-2">
+                        <CreditCard className="w-4 h-4 text-indigo-400" />
+                        <span>FlexiPay Home Repair Financing</span>
+                      </h3>
+                      <p className="text-xs text-slate-300 mt-0.5">
+                        Monthly repayment plans for major repairs (£1,000+) are launching soon. In the meantime, you can stage payments safely via Escrow Milestones.
+                      </p>
+                    </div>
+                  </div>
                 </div>
+              ) : (
+                <>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-white/20 pb-3">
+                    <div>
+                      <h3 className="text-sm font-black text-indigo-300 flex items-center gap-2">
+                        <CreditCard className="w-4 h-4 text-indigo-400" />
+                        <span>FlexiPay • Illustrative Home Repair Financing</span>
+                      </h3>
+                      <p className="text-xs text-slate-300 mt-0.5">
+                        Estimate spreading unexpected boiler replacements, roof repairs, or major jobs (£1,000+) across 3 to 36 months.
+                      </p>
+                    </div>
 
-                <button
-                  type="button"
-                  onClick={() => setShowBnplModal(true)}
-                  className="bg-indigo-600 hover:bg-indigo-500 text-white font-black text-xs px-4 py-2 rounded-xl border border-white transition shadow flex items-center gap-1.5 cursor-pointer shrink-0"
-                >
-                  <span>Open Full Loan Calculator</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowBnplModal(true)}
+                      className="bg-indigo-600 hover:bg-indigo-500 text-white font-black text-xs px-4 py-2 rounded-xl border border-white transition shadow flex items-center gap-1.5 cursor-pointer shrink-0"
+                    >
+                      <span>Open Payment Calculator</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  </div>
 
-              {/* Mini Interactive Preview Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="bg-white/5 border border-white rounded-xl p-3 space-y-1">
-                  <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">3-Month Term</span>
-                  <p className="text-sm font-black text-white">0% APR Interest</p>
-                  <p className="text-xs text-slate-400">Equal monthly split with zero extra fees or charges.</p>
-                </div>
-                <div className="bg-white/5 border border-white rounded-xl p-3 space-y-1">
-                  <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">6-Month Term</span>
-                  <p className="text-sm font-black text-white">0% APR Fixed</p>
-                  <p className="text-xs text-slate-400">Manage major heating and structural repairs smoothly.</p>
-                </div>
-                <div className="bg-white/5 border border-white rounded-xl p-3 space-y-1">
-                  <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">12-Month Term</span>
-                  <p className="text-sm font-black text-white">Low-Rate Flexible</p>
-                  <p className="text-xs text-slate-400">Spread complete renovations or major rewiring over a full year.</p>
-                </div>
-              </div>
+                  {/* Mini Interactive Preview Grid */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="bg-white/5 border border-white rounded-xl p-3 space-y-1">
+                      <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">3-Month Term</span>
+                      <p className="text-sm font-black text-white">0% Representative APR</p>
+                      <p className="text-xs text-slate-400">Illustrative equal monthly split for major repairs.</p>
+                    </div>
+                    <div className="bg-white/5 border border-white rounded-xl p-3 space-y-1">
+                      <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">6-Month Term</span>
+                      <p className="text-sm font-black text-white">0% Representative APR</p>
+                      <p className="text-xs text-slate-400">Manage major heating and structural repairs smoothly.</p>
+                    </div>
+                    <div className="bg-white/5 border border-white rounded-xl p-3 space-y-1">
+                      <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider">12–36 Months</span>
+                      <p className="text-sm font-black text-white">Flexible Monthly Plans</p>
+                      <p className="text-xs text-slate-400">Spread renovations or major rewiring subject to lender status.</p>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           )}
 

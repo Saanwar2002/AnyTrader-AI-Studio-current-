@@ -646,30 +646,51 @@ export async function createBOMOrder(params: {
     updatedAt: new Date().toISOString()
   };
 
-  try {
-    // 1. Save BOM order to Firestore
-    await setDoc(doc(db, "bom_orders", orderId), {
-      ...orderRecord,
-      createdAtServer: serverTimestamp()
-    });
+  if (!auth.currentUser) {
+    throw new Error("Authentication required to place a TradeOS materials order.");
+  }
 
-    // 2. Update Job record with materials details
-    if (params.jobId) {
-      await updateDoc(doc(db, "jobs", params.jobId), {
-        materialsCost: subtotalCost,
-        hasBOMOrder: true,
-        bomOrderId: orderId,
-        bomMerchant: params.selectedMerchant.merchantName,
-        bomStatus: orderRecord.status,
-        bomPickupRef: pickupReferenceCode,
-        updatedAt: serverTimestamp()
-      });
+  try {
+    // 1 & 2. Persist BOM order and link parent Job atomically via server-authoritative API
+    const token = await auth.currentUser.getIdToken();
+    const orderRes = await fetch(getApiUrl("/api/bom/orders"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jobId: params.jobId,
+        jobTitle: params.jobTitle,
+        homeownerId: params.homeownerId,
+        homeownerName: params.homeownerName,
+        propertyId: params.propertyId,
+        items: params.items,
+        selectedMerchant: {
+          brand: params.selectedMerchant.brand,
+          merchantName: params.selectedMerchant.merchantName,
+          branchAddress: params.selectedMerchant.branchAddress,
+          basketTotal: params.selectedMerchant.basketTotal,
+          tradeSavingsAmount: params.selectedMerchant.tradeSavingsAmount,
+          affiliateBreakdown: {
+            affiliateCommissionAmount: params.selectedMerchant.affiliateBreakdown.affiliateCommissionAmount,
+          },
+        },
+        fulfillmentType: params.fulfillmentType,
+        courierDetails: params.courierDetails,
+        paymentSource: params.paymentSource,
+      }),
+    });
+    const orderJson = await orderRes.json().catch(() => ({}));
+    if (!orderRes.ok || !orderJson?.order) {
+      throw new Error(orderJson?.error || `Failed to place BOM order (${orderRes.status})`);
     }
+    const persistedOrder: BOMOrderRecord = orderJson.order;
 
     // 3. Sync to Property Passport if propertyId exists
     if (params.propertyId) {
-      await syncBOMToPropertyPassport(params.propertyId, params.items, orderId);
-      orderRecord.propertyPassportSynced = true;
+      await syncBOMToPropertyPassport(params.propertyId, params.items, persistedOrder.id);
+      persistedOrder.propertyPassportSynced = true;
     }
 
     // 4. If Courier Dispatch selected, create Category 84 dispatch as an AnyTrader Job
@@ -678,13 +699,13 @@ export async function createBOMOrder(params: {
         user: auth.currentUser,
         payload: {
           title: `Express Materials Delivery: ${params.selectedMerchant.merchantName} to Site`,
-          description: `Pick up pre-ordered TradeOS materials basket from ${params.selectedMerchant.merchantName} (${params.courierDetails.pickupAddress}) and deliver to site (${params.courierDetails.deliveryAddress}). Collection Code: ${pickupReferenceCode}. Items: ${params.items.length} parts. Van requirement: ${params.courierDetails.vanTypeLabel}.${params.courierDetails.notes ? ` Special notes: ${params.courierDetails.notes}` : ''}`,
+          description: `Pick up pre-ordered TradeOS materials basket from ${params.selectedMerchant.merchantName} (${params.courierDetails.pickupAddress}) and deliver to site (${params.courierDetails.deliveryAddress}). Collection Code: ${persistedOrder.pickupReferenceCode}. Items: ${params.items.length} parts. Van requirement: ${params.courierDetails.vanTypeLabel}.${params.courierDetails.notes ? ` Special notes: ${params.courierDetails.notes}` : ''}`,
           category: "Courier, Parcel & Express Delivery",
           subCategory: "Bulky Item & Heavy Appliance Transport (Washing Machines, Fridges, Dishwashers)",
           postcode: params.courierDetails.deliveryAddress?.match(/[A-Z]{1,2}[0-9][A-Z0-9]?\s?[0-9][A-Z]{2}/i)?.[0]?.toUpperCase() || "SW1A 1AA",
           urgency: params.courierDetails.deliveryWindow === "asap_90min" ? "emergency" : "standard",
           budget: params.courierDetails.courierFee,
-          bomOrderId: orderId,
+          bomOrderId: persistedOrder.id,
           parentJobId: params.jobId || null,
           isBOMDeliveryJob: true,
           propertyId: params.propertyId || null,
@@ -699,17 +720,18 @@ export async function createBOMOrder(params: {
             fixedPrice: params.courierDetails.courierFee,
             platformFee: params.courierDetails.platformCommission,
             driverPayout: params.courierDetails.driverPayout,
-            pickupReferenceCode,
+            pickupReferenceCode: persistedOrder.pickupReferenceCode,
             merchantName: params.selectedMerchant.merchantName,
           },
         },
       });
     }
-  } catch (err) {
-    console.error("Error creating BOM order in Firestore:", err);
-  }
 
-  return orderRecord;
+    return persistedOrder;
+  } catch (err) {
+    console.error("Failed to place BOM order:", err);
+    throw err;
+  }
 }
 
 /**

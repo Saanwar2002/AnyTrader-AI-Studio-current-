@@ -33,37 +33,46 @@ export async function shareDeal(e: React.MouseEvent | React.TouchEvent, deal: an
   try {
     await navigator.clipboard.writeText(`${text}\n👉 Claim discount: ${dealUrl}`);
     toast.success("Deal link copied to clipboard!");
-  } catch (err) {
-    window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(`${text}\n👉 Claim discount: ${dealUrl}`)}`, '_blank');
+  } catch {
+    toast.error("Unable to copy deal link on this browser. Please copy the profile URL directly.");
   }
 }
 
 export function DealCountdownBadge({ deal, className }: { deal: any; className?: string }) {
-  const [timeLeft, setTimeLeft] = useState("");
+  const [timeLeft, setTimeLeft] = useState<string | null>(null);
+  const [isExpired, setIsExpired] = useState(false);
+
+  const hasValidExpiry = Boolean(deal?.expiresAt);
 
   useEffect(() => {
-    const calculateTime = () => {
-      let targetMs: number;
-      if (deal?.expiresAt) {
-        targetMs = typeof deal.expiresAt === "string" ? new Date(deal.expiresAt).getTime() : Number(deal.expiresAt);
-      } else {
-        let hash = 0;
-        const key = deal?.id || deal?.service || "deal";
-        for (let i = 0; i < key.length; i++) {
-          hash = (hash << 5) - hash + key.charCodeAt(i);
-          hash |= 0;
-        }
-        const baseOffsetMs = (75 + (Math.abs(hash) % 270)) * 60 * 1000;
-        const now = Date.now();
-        const cycleLength = 8 * 3600 * 1000;
-        const cycleStart = Math.floor(now / cycleLength) * cycleLength;
-        targetMs = cycleStart + baseOffsetMs;
-        if (targetMs <= now) {
-          targetMs = now + baseOffsetMs;
-        }
-      }
+    if (!hasValidExpiry) {
+      setTimeLeft(null);
+      setIsExpired(false);
+      return;
+    }
 
-      const diff = Math.max(0, targetMs - Date.now());
+    const rawExpiry = deal.expiresAt;
+    const targetMs =
+      typeof rawExpiry?.toMillis === "function"
+        ? rawExpiry.toMillis()
+        : typeof rawExpiry === "string"
+        ? new Date(rawExpiry).getTime()
+        : Number(rawExpiry);
+
+    if (!Number.isFinite(targetMs)) {
+      setTimeLeft(null);
+      setIsExpired(false);
+      return;
+    }
+
+    const calculateTime = () => {
+      const diff = targetMs - Date.now();
+      if (diff <= 0) {
+        setIsExpired(true);
+        setTimeLeft("Expired");
+        return;
+      }
+      setIsExpired(false);
       const hours = Math.floor(diff / (1000 * 60 * 60));
       const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
 
@@ -78,12 +87,16 @@ export function DealCountdownBadge({ deal, className }: { deal: any; className?:
     calculateTime();
     const interval = setInterval(calculateTime, 1000);
     return () => clearInterval(interval);
-  }, [deal?.id, deal?.expiresAt]);
+  }, [deal?.expiresAt, hasValidExpiry]);
 
   return (
     <span className={cn("inline-flex items-center gap-1 text-[9px] sm:text-[9.5px] bg-amber-50 text-amber-900 border border-amber-300/80 px-2 py-0.5 rounded-md font-extrabold uppercase tracking-tight shrink-0 shadow-2xs", className)}>
-      <Clock className="w-2.5 h-2.5 text-amber-600 shrink-0 animate-pulse" />
-      Ends in {timeLeft || "2h 15m"}
+      <Clock className="w-2.5 h-2.5 text-amber-600 shrink-0" />
+      {!hasValidExpiry || timeLeft === null
+        ? "Limited Offer"
+        : isExpired
+        ? "Offer Ended"
+        : `Ends in ${timeLeft}`}
     </span>
   );
 }

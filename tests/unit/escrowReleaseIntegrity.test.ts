@@ -354,7 +354,7 @@ describe("AnyTrader V8.3 — Escrow Release Integrity & Anti-Forgery Defense", (
             capturedOpts.push(opts);
             return {
               id: "tr_verified_success_888",
-              amount: 44000,
+              amount: 47500,
               currency: "gbp",
               destination: "acct_prod_trader_12345",
               metadata: {

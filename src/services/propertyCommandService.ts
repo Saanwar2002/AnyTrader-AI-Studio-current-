@@ -109,3 +109,47 @@ export async function revokePropertyTransfer(
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.error || "Property transfer could not be revoked.");
 }
+
+export async function syncPublicPropertyPassport(
+  user: { getIdToken: () => Promise<string> },
+  propertyId: string,
+  options?: { isPublicPassport?: boolean; publicConsent?: boolean }
+): Promise<{ published: boolean; isPublicPassport: boolean; publicConsent: boolean }> {
+  const token = await user.getIdToken();
+  if (!token) throw new Error("You must be signed in to sync a public property passport.");
+  const response = await fetch(`/api/properties/${encodeURIComponent(propertyId)}/sync-public-passport`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(options || {}),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "Public passport sync failed.");
+  return {
+    published: Boolean(result.published),
+    isPublicPassport: Boolean(result.isPublicPassport),
+    publicConsent: Boolean(result.publicConsent),
+  };
+}
+
+export interface TenantPropertyContextSummary {
+  id: string;
+  name: string;
+  outwardPostcode: string;
+  city: string;
+  propertyType: string;
+}
+
+export async function fetchTenantPropertyContext(
+  propertyId: string
+): Promise<TenantPropertyContextSummary | null> {
+  const cleanId = String(propertyId || "").trim();
+  if (!cleanId || cleanId === "manual") return null;
+  const response = await fetch(`/api/properties/${encodeURIComponent(cleanId)}/tenant-context`);
+  if (!response.ok) return null;
+  const result = await response.json().catch(() => ({}));
+  return result?.property ? (result.property as TenantPropertyContextSummary) : null;
+}
+

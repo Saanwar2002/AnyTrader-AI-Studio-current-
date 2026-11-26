@@ -14,6 +14,23 @@ service cloud.firestore {
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       ); 
     }
+    function isReadOnlyAdminDoc() {
+      return exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('adminTier', '') == 'support_readonly';
+    }
+    function isMutatingAdmin() {
+      return isAdmin() &&
+        request.auth.token.get('adminTier', '') != 'support_readonly' &&
+        !isReadOnlyAdminDoc();
+    }
+    function isSuperAdmin() {
+      return isAdmin() &&
+        !(request.auth.token.get('adminTier', '') in ['support_readonly', 'financial_operator']) &&
+        !(
+          exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.get('adminTier', '') in ['support_readonly', 'financial_operator']
+        );
+    }
 
     function isJobOwner(jobData) {
       return isSignedIn() && (
@@ -99,7 +116,8 @@ service cloud.firestore {
     }
 
     match /admins/{adminId} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isSuperAdmin();
     }
 
     match /test/{subPath=**} {
@@ -127,21 +145,43 @@ service cloud.firestore {
     }
     match /platform_config/{doc} {
       allow read: if doc != 'secrets';
-      allow write: if isAdmin() && doc != 'secrets';
+      allow write: if isSuperAdmin() && doc != 'secrets';
+    }
+    match /platform_config_versions/{versionId} {
+      allow get, list: if isAdmin();
+      allow create, update, delete: if false; // Immutable config history; server Admin SDK writes only
+    }
+    match /gdpr_requests/{requestId} {
+      allow get, list: if isAdmin() || (isSignedIn() && resource.data.get('userId', '') == request.auth.uid);
+      allow create, update, delete: if false; // Immutable GDPR audit log; server Admin SDK writes only
+    }
+    match /bom_orders/{orderId} {
+      allow get, list: if isAdmin() || (
+        isSignedIn() && (
+          resource.data.get('tradespersonId', '') == request.auth.uid ||
+          resource.data.get('homeownerId', '') == request.auth.uid
+        )
+      );
+      allow create, update, delete: if false; // Server-authoritative BOM orders via /api/bom/orders only
     }
     match /platform_categories/{document=**} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
     match /dynamic_search_synonyms/{synonymId} {
       allow read: if isSignedIn() || isAdmin();
-      allow write: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
     match /unmatched_search_telemetry/{telemetryId} {
       allow read: if isAdmin();
       allow create: if isSignedIn() && request.resource.data.query is string && request.resource.data.query.size() <= 200;
-      allow update: if isAdmin() || (isSignedIn() && request.resource.data.query is string && request.resource.data.query.size() <= 200 && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'suggestedCategory', 'suggestedTrade']));
-      allow delete: if isAdmin();
+      allow update: if isMutatingAdmin() || (
+        isSignedIn() &&
+        request.resource.data.query == resource.data.query &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['count', 'lastSearchedAt', 'postcode', 'updatedAt']) &&
+        request.resource.data.get('count', 1) == resource.data.get('count', 0) + 1
+      );
+      allow delete: if isMutatingAdmin();
     }
 
     // --- Advertisements (Private Billing & Campaign Source of Truth — Owner & Admin Only, AT-ADS-11, AT-ADS-13) ---
@@ -152,13 +192,19 @@ service cloud.firestore {
           resource.data.get('advertiserId', '') == request.auth.uid
         )
       );
-      allow create: if isAdmin();
-      allow update: if isAdmin() || (
+      allow create: if isMutatingAdmin();
+      allow update: if isMutatingAdmin() || (
         isSignedIn() && (
-          // Ad Owner Creative/Metadata Updates ONLY (engagement counters, billing, auto-top-up & state are strictly server-only)
+          // Ad Owner Non-Creative Metadata Updates ONLY while unapproved (creative edits on approved ads must go through /api/ads/:id/edit for re-moderation)
           (resource.data.advertiserUid == request.auth.uid || resource.data.get('advertiserId', '') == request.auth.uid) &&
           request.resource.data.advertiserUid == resource.data.advertiserUid &&
           request.resource.data.get('advertiserId', resource.data.advertiserUid) == resource.data.get('advertiserId', resource.data.advertiserUid) &&
+          (
+            resource.data.get('approvalStatus', '') != 'approved' ||
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+              'title', 'description', 'tagline', 'url', 'imageUrl', 'targetCategories', 'voucherCode'
+            ])
+          ) &&
           !request.resource.data.diff(resource.data).affectedKeys().hasAny([
             'prepaidBalance', 'isActive', 'lastAutoTopUpAt', 'approvalStatus',
             'totalBudget', 'totalCost', 'dailyRate', 'recurringPrice', 'costPerDisplay',
@@ -171,7 +217,7 @@ service cloud.firestore {
           ])
         )
       );
-      allow delete: if isAdmin() || (
+      allow delete: if isMutatingAdmin() || (
         isSignedIn() && (resource.data.advertiserUid == request.auth.uid || resource.data.get('advertiserId', '') == request.auth.uid)
       );
     }
@@ -198,7 +244,7 @@ service cloud.firestore {
             'callOutFee', 'hourlyRate', 'dayRate', 'pricingNotes',
             'experienceYears', 'yearsInBusiness', 'qualifications', 'certifications', 'tradeBodyMemberships',
             'portfolio', 'galleryImages', 'workingHours', 'workingDays', 'availability',
-            'acceptingNewWork', 'isAvailableForEmergency', 'emergencyCallout', 'emergencyAvailable',
+            'acceptingNewWork', 'isAcceptingRequests', 'isAvailableForEmergency', 'isAvailableForInstantMatch', 'emergencyCallout', 'emergencyAvailable',
             'isGasSafeRegistered', 'isNiceicApproved', 'insuranceVerified', 'publicLiabilityVerified',
             'rating', 'trustScore', 'totalReviews', 'verifiedTrader', 'isVerified', 'videoVerified', 'verificationStatus',
             'miniProfileSettings', 'createdAt', 'updatedAt'
@@ -209,11 +255,15 @@ service cloud.firestore {
           request.resource.data.get('verifiedTrader', false) == false &&
           request.resource.data.get('isVerified', false) == false &&
           request.resource.data.get('videoVerified', false) == false &&
-          request.resource.data.get('verificationStatus', 'unverified') == 'unverified'
+          request.resource.data.get('verificationStatus', 'unverified') == 'unverified' &&
+          request.resource.data.get('isGasSafeRegistered', false) == false &&
+          request.resource.data.get('isNiceicApproved', false) == false &&
+          request.resource.data.get('insuranceVerified', false) == false &&
+          request.resource.data.get('publicLiabilityVerified', false) == false
         )
       );
       allow update: if isSignedIn() && (
-        isAdmin() || (
+        isMutatingAdmin() || (
           isOwner(userId) &&
           request.resource.data.keys().hasOnly([
             'uid', 'id', 'name', 'displayName', 'businessName', 'companyName',
@@ -226,23 +276,25 @@ service cloud.firestore {
             'callOutFee', 'hourlyRate', 'dayRate', 'pricingNotes',
             'experienceYears', 'yearsInBusiness', 'qualifications', 'certifications', 'tradeBodyMemberships',
             'portfolio', 'galleryImages', 'workingHours', 'workingDays', 'availability',
-            'acceptingNewWork', 'isAvailableForEmergency', 'emergencyCallout', 'emergencyAvailable',
+            'acceptingNewWork', 'isAcceptingRequests', 'isAvailableForEmergency', 'isAvailableForInstantMatch', 'emergencyCallout', 'emergencyAvailable',
             'isGasSafeRegistered', 'isNiceicApproved', 'insuranceVerified', 'publicLiabilityVerified',
-            'isDisabled', 'rating', 'trustScore', 'totalReviews', 'reviewsCount', 'totalJobsDone', 'totalJobsCompleted',
-            'responseRate', 'verified', 'isVerified', 'verifiedTrader', 'verificationStatus',
+            'isDisabled', 'rating', 'trustScore', 'totalReviews', 'reviewsCount', 'reviewCount', 'totalJobsDone', 'totalJobsCompleted', 'completedJobsCount',
+            'responseRate', 'availabilityStatus', 'fairnessScore', 'verified', 'isVerified', 'verifiedTrader', 'verificationStatus', 'requiresAdminVerification',
             'videoVerified', 'isVideoVerified', 'videoVerificationStatus', 'videoVerificationUrl',
-            'badges', 'tierId', 'recommendedCategories', 'referralBoostUntil',
+            'badges', 'tier', 'tierId', 'hasVerifiedVideoProSubscription', 'recommendedCategories', 'referralBoostUntil',
             'miniProfileSettings', 'createdAt', 'updatedAt'
           ]) &&
           !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-            'rating', 'trustScore', 'totalReviews', 'reviewsCount', 'totalJobsDone', 'totalJobsCompleted',
+            'rating', 'trustScore', 'totalReviews', 'reviewsCount', 'reviewCount', 'totalJobsDone', 'totalJobsCompleted', 'completedJobsCount',
             'verified', 'isVerified', 'verifiedTrader', 'badges', 'videoVerificationStatus', 'videoVerified',
-            'isVideoVerified', 'verificationStatus', 'tierId', 'responseRate', 'recommendedCategories',
+            'isVideoVerified', 'verificationStatus', 'requiresAdminVerification', 'tier', 'tierId', 'hasVerifiedVideoProSubscription',
+            'isGasSafeRegistered', 'isNiceicApproved', 'insuranceVerified', 'publicLiabilityVerified',
+            'responseRate', 'availabilityStatus', 'fairnessScore', 'recommendedCategories',
             'referralBoostUntil', 'isDisabled'
           ])
         )
       );
-      allow delete: if isOwner(userId) || isAdmin();
+      allow delete: if isOwner(userId) || isSuperAdmin();
     }
 
     // --- User Profiles (Private PII & Full Profile) ---
@@ -283,18 +335,18 @@ service cloud.firestore {
         )
       );
       
-      allow delete: if isOwner(userId) || isAdmin();
+      allow delete: if isOwner(userId) || isSuperAdmin();
       
       // Task 35-A + AT-ACCOUNT-02: Explicit allowlist on update — clients can ONLY modify approved non-privileged fields
       // Prevents self-elevation of role, driver, verification, tier, balance, credits, or unexpected fields
       allow update: if isSignedIn() && (
-        isAdmin() || (
+        isMutatingAdmin() || (
           isOwner(userId) &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'id', 'uid', 'name', 'displayName', 'email', 'phone', 'phoneNumber',
             'photoURL', 'avatarUrl', 'profileImage', 'avatar',
             'bio', 'about', 'description',
-            'trade', 'primaryTrade', 'category', 'businessCategory', 'businessLayer',
+            'trade', 'primaryTrade', 'category', 'businessCategory',
             'trades', 'categories', 'services', 'productsAndServices', 'skills', 'subcategories', 'specializations',
             'tags', 'specialisms', 'specialistTags',
             'businessName', 'companyName', 'company',
@@ -308,14 +360,14 @@ service cloud.firestore {
             'instantMatchPricing', 'instantMatchSettings', 'emergencyCallOutFee', 'emergencyHourlyRate', 'emergencyTerms',
             'qualifications', 'certifications', 'insurancePolicyNumber', 'insuranceExpiry',
             'insuranceProvider', 'experienceYears', 'yearsInBusiness', 'tradeBodyMemberships',
-            'availability', 'acceptingNewWork', 'schedule', 'weeklySchedule', 'workingHours', 'workingDays', 'serviceRadius', 'coverageRadiusMiles',
+            'availability', 'acceptingNewWork', 'isAcceptingRequests', 'dateOverrides', 'schedule', 'weeklySchedule', 'workingHours', 'workingDays', 'serviceRadius', 'coverageRadiusMiles',
             'emergencyCallout', 'emergencyAvailable', 'isAvailableForEmergency', 'isAvailableForInstantMatch', 'isExclusiveActive',
             'emergencyContact', 'emergencyContactName', 'emergencyContactPhone', 'emergencyContacts',
             'favoriteAddresses', 'regularJourneys', 'preferredDrivers', 'blockedDrivers',
             'isLastJob', 'defaultNavApp', 'isStackingEnabled', 'muteHeadsUpVolume', 'destinationModeActive', 'muteRideOfferAlerts',
             'zoneEnabled', 'zoneMaxDistance', 'earningsGoals',
             'verificationDocs', 'verificationStatus', 'videoVerificationUrl', 'videoVerificationTimestamp', 'videoVerificationStatus',
-            'preferences', 'notificationPreferences', 'notificationSettings', 'matchNotificationSettings', 'settings', 'theme', 'language',
+            'preferences', 'notificationPreferences', 'notificationSettings', 'matchNotificationSettings', 'activeFilter', 'savedFilters', 'settings', 'theme', 'language',
             'uiMode', 'requirePasscode',
             'soundEnabled', 'hapticsEnabled', 'emailNotifications', 'smsNotifications', 'pushNotifications',
             'fcmToken', 'pushToken', 'notificationToken',
@@ -512,15 +564,18 @@ service cloud.firestore {
 
     // --- Server-Only Queues (Locked down from all direct client writes - H3 Remediated) ---
     match /sms_queue/{queueId} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     match /email_queue/{queueId} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     match /email_alerts_queue/{queueId} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     match /audit_logs/{logId} {
@@ -539,12 +594,13 @@ service cloud.firestore {
     }
 
     match /security_alerts/{alertId} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     match /ai_agent_audit_logs/{logId} {
       allow read: if isAdmin();
-      allow create: if isAdmin();
+      allow create: if isMutatingAdmin();
       allow update, delete: if false; // Append-only AI agent audit log; deny client updates/deletes
     }
 
@@ -563,20 +619,47 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // --- Messaging & Conversations (PL-14 Hardened) ---
+    // --- Messaging & Conversations (PL-14 & Slice 3 Chat Block Hardened) ---
+    function isChatPairBlocked(uidA, uidB) {
+      return (
+        exists(/databases/$(database)/documents/chat_user_blocks/$(uidA + '__' + uidB)) &&
+        get(/databases/$(database)/documents/chat_user_blocks/$(uidA + '__' + uidB)).data.active == true
+      ) || (
+        exists(/databases/$(database)/documents/chat_user_blocks/$(uidB + '__' + uidA)) &&
+        get(/databases/$(database)/documents/chat_user_blocks/$(uidB + '__' + uidA)).data.active == true
+      );
+    }
+
+    function isConversationBlocked(participants) {
+      return participants.size() == 2 && isChatPairBlocked(participants[0], participants[1]);
+    }
+
     match /conversations/{conversationId} {
       allow read, list: if isSignedIn() && (resource == null || request.auth.uid in resource.data.participants || isAdmin());
       allow create: if isRegistered() && (
         isAdmin() || (
           request.auth.uid in request.resource.data.participants &&
           request.resource.data.participants.size() >= 2 &&
-          request.resource.data.participants.size() <= 10
+          request.resource.data.participants.size() <= 10 &&
+          !isConversationBlocked(request.resource.data.participants)
         )
       );
       allow update: if isRegistered() && (
         isAdmin() || (
           request.auth.uid in resource.data.participants &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['participants'])
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['participants']) &&
+          (
+            !isConversationBlocked(resource.data.participants) ||
+            (
+              // When blocked, still allow clearing own unread count or soft-deleting own inbox view,
+              // but strictly block sending messages or resetting deletedBy to resurface threads.
+              !request.resource.data.diff(resource.data).affectedKeys().hasAny(['lastMessage', 'lastMessageAt', 'lastSenderId']) &&
+              (
+                !request.resource.data.diff(resource.data).affectedKeys().hasAny(['deletedBy']) ||
+                request.auth.uid in request.resource.data.get('deletedBy', [])
+              )
+            )
+          )
         )
       );
       
@@ -590,7 +673,8 @@ service cloud.firestore {
           isAdmin() ||
           (request.auth.uid == request.resource.data.senderId &&
            exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
-           request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants)
+           request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants &&
+           !isConversationBlocked(get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants))
         );
       }
     }
@@ -604,9 +688,20 @@ service cloud.firestore {
       );
     }
 
-    // --- Reviews (Server-Authoritative Only, PL-05 & PL-01 Hardened) ---
+    // --- Reviews (Server-Authoritative Only, PL-05, PL-01 & Slice 4 Hardened) ---
     match /reviews/{reviewId} {
-      allow read: if true;
+      allow get: if (
+        resource == null ||
+        (
+          resource.data.get('isHidden', false) != true &&
+          !(resource.data.get('status', 'published') in ['hidden', 'cooling_off', 'rejected'])
+        ) ||
+        (isSignedIn() && (
+          isAdmin() ||
+          resource.data.get('reviewerId', '') == request.auth.uid
+        ))
+      );
+      allow list: if true;
       allow create: if false; // All reviews must be submitted via /api/reviews/submit with authoritative counterparty validation
       allow update: if isAdmin();
       allow delete: if isAdmin();
@@ -669,7 +764,7 @@ service cloud.firestore {
         ))
       );
       allow create: if isRegistered() && (
-        isAdmin() ||
+        isSuperAdmin() ||
         request.resource.data.get('invitedBy', '') == request.auth.uid
       );
       // A verified recipient may perform only the pending -> accepted transition.
@@ -688,21 +783,21 @@ service cloud.firestore {
       ) || (
         isSignedIn() &&
         resource.data.get('invitedBy', '') == request.auth.uid
-      ) || isAdmin();
+      ) || isSuperAdmin();
       allow delete: if isRegistered() && (
-        isAdmin() ||
+        isSuperAdmin() ||
         resource.data.get('invitedBy', '') == request.auth.uid
       );
     }
 
     match /emergency_broadcasts/{broadcastId} {
       allow read: if true;
-      allow write: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     match /broadcasts/{broadcastId} {
       allow read: if isSignedIn() || isAdmin();
-      allow write: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     // AT-FIRESTORE-SEARCH-01: Schema-validated, size-bounded search telemetry (server endpoint also available)
@@ -715,7 +810,7 @@ service cloud.firestore {
         request.resource.data.query.size() <= 120 &&
         (!('category' in request.resource.data) || (request.resource.data.category is string && request.resource.data.category.size() <= 80)) &&
         (!('userId' in request.resource.data) || request.resource.data.userId == request.auth.uid);
-      allow update, delete: if isAdmin();
+      allow update, delete: if isMutatingAdmin();
     }
 
     // AT-OUTREACH-02: Durable server-backed outbound outreach queue (admin read only, server-only write)
@@ -728,7 +823,7 @@ service cloud.firestore {
     match /promo_codes/{promoId} {
       allow get: if isSignedIn();
       allow list: if isAdmin();
-      allow write: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     match /partners/{partnerId} {
@@ -939,7 +1034,7 @@ service cloud.firestore {
       );
     }
 
-    // --- Instant Match and Scores ---
+    // --- Instant Match and Scores (Server-Authoritative Writes Only — Slice 2 Money Flow Hardening) ---
     match /instant_matches/{matchId} {
       allow get: if isSignedIn() && (
         resource.data.get('customerId', '') == request.auth.uid || 
@@ -951,24 +1046,13 @@ service cloud.firestore {
         resource.data.get('matchedTraderId', '') == request.auth.uid || 
         isAdmin()
       );
-      allow create: if isSignedIn() && (
-        request.resource.data.get('customerId', '') == request.auth.uid || 
-        isAdmin()
-      );
-      allow update: if isSignedIn() && (
-        resource.data.get('customerId', '') == request.auth.uid || 
-        resource.data.get('matchedTraderId', '') == request.auth.uid || 
-        isAdmin()
-      );
-      allow delete: if isAdmin();
+      allow create, update, delete: if false; // Server Admin SDK writes only (checkout webhook, dispatcher, refund worker)
     }
 
     match /instant_match_attempts/{attemptId} {
       allow get: if isSignedIn() && (resource.data.get('traderId', '') == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.traderId == request.auth.uid || isAdmin());
-      allow create: if isAdmin() || (isSignedIn() && (request.auth.uid == get(/databases/$(database)/documents/instant_matches/$(request.resource.data.instantMatchId)).data.customerId || request.auth.uid == getAfter(/databases/$(database)/documents/instant_matches/$(request.resource.data.instantMatchId)).data.customerId));
-      allow update: if isSignedIn() && (resource.data.get('traderId', '') == request.auth.uid || isAdmin());
-      allow delete: if isAdmin();
+      allow create, update, delete: if false; // Server Admin SDK writes only (/api/instant-match/respond & dispatcher)
     }
 
     match /users/{userId}/trader_match_scores/{categoryId} {
@@ -1226,6 +1310,7 @@ service cloud.firestore {
       allow get, list: if isSignedIn() && (
         isConsultancyResourceOwner() ||
         resource.data.get('traderId', '') == request.auth.uid ||
+        resource.data.get('tradespersonId', '') == request.auth.uid ||
         resource.data.get('consultantId', '') == request.auth.uid ||
         resource.data.get('userId', '') == request.auth.uid ||
         resource.data.get('businessId', '') == request.auth.uid ||
@@ -1442,8 +1527,21 @@ service cloud.firestore {
       allow update: if isSignedIn() && (
         resource.data.traderId == request.auth.uid || 
         (
+          resource.data.get('status', 'active') == 'active' &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedCount', 'status', 'updatedAt']) &&
-          request.resource.data.claimedCount == resource.data.get('claimedCount', 0) + 1
+          request.resource.data.claimedCount == resource.data.get('claimedCount', 0) + 1 &&
+          (
+            resource.data.get('maxBookings', 0) == 0 ||
+            resource.data.get('claimedCount', 0) < resource.data.get('maxBookings', 0)
+          ) &&
+          (
+            request.resource.data.status == 'active' ||
+            (
+              request.resource.data.status == 'sold_out' &&
+              resource.data.get('maxBookings', 0) > 0 &&
+              request.resource.data.claimedCount >= resource.data.get('maxBookings', 0)
+            )
+          )
         ) ||
         isAdmin()
       );
@@ -1454,14 +1552,15 @@ service cloud.firestore {
     }
 
     match /system_settings/{settingId} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isSuperAdmin();
     }
 
     match /platform_settings/{settingId} {
       // Only explicitly isolated public_flags may be read by non-admin signed-in users.
       // Secret/integration config docs such as ai_agent_ecosystem remain strictly admin-only.
       allow read: if isAdmin() || (isSignedIn() && settingId == 'public_flags');
-      allow write: if isAdmin();
+      allow write: if isSuperAdmin();
     }
 
     // ==========================================
@@ -1873,6 +1972,10 @@ service cloud.firestore {
     match /user_presence/{userId} {
       allow read: if isSignedIn() && (isOwner(userId) || isAdmin());
       allow create, update, delete: if false; // Server Admin SDK presence heartbeat writes only
+    }
+
+    match /trader_phone_fingerprints/{fingerprintHash} {
+      allow read, write: if false; // Server Admin SDK GDPR-hashed anti-cycling registry only
     }
   }
 }

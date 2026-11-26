@@ -24,6 +24,9 @@ import { getMaintenancePredictions } from "@/src/services/gemini";
 import HomeownerPerks from "./HomeownerPerks";
 import PartnerAdvertisement from "./shared/PartnerAdvertisement";
 import HomeHealthWidget from "./HomeHealthWidget";
+import { usePortal } from "@/src/lib/PortalContext";
+import BecomeTradespersonModal from "./shared/BecomeTradespersonModal";
+import { isOpenJobStatus, formatJobUrgencyLabel } from "@/src/lib/marketplaceContracts";
 
 const iconMap: Record<string, any> = {
   Search, BarChart3, Briefcase, Plus, ChevronRight, Clock, ImageIcon, VideoIcon
@@ -31,7 +34,11 @@ const iconMap: Record<string, any> = {
 
 export default function Dashboard() {
   const { user, profile, setIsTradeBotOpen } = useAuth();
+  const { setActiveRole } = usePortal();
   const navigate = useNavigate();
+  const [showBecomeTraderModal, setShowBecomeTraderModal] = useState(false);
+  const canUpgradeToTradesperson =
+    profile?.role === "homeowner" || profile?.role === "customer";
   const [activeJobs, setActiveJobs] = useState<any[]>([]);
   const [allJobs, setAllJobs] = useState<any[]>([]);
   const [totalQuotes, setTotalQuotes] = useState(0);
@@ -192,11 +199,11 @@ export default function Dashboard() {
 
   const displayQuotes = recentQuotes
     .filter((q) => {
-      // Only show accepted quotes
-      if (q.status !== "accepted") return false;
-      // Find the associated job
+      // Surface incoming pending, requoted, and accepted quotes (exclude withdrawn/rejected)
+      if (!["pending", "requoted", "requote_requested", "accepted"].includes(String(q.status || "pending"))) {
+        return false;
+      }
       const job = allJobs.find((j) => j.id === q.jobId);
-      // Hide if job is not found, completed, or cancelled
       if (!job || job.status === "completed" || job.status === "cancelled") return false;
       return true;
     })
@@ -247,6 +254,33 @@ export default function Dashboard() {
           <ChevronRight className="w-4 h-4 text-primary" />
         </div>
       </button>
+
+      {/* Homeowner-only Self-Service Upgrade to Tradesperson (Property Businesses intentionally excluded) */}
+      {canUpgradeToTradesperson && (
+        <div className="bg-white rounded-2xl border border-black p-4 sm:p-5 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-400 text-black border border-black flex items-center justify-center shrink-0">
+              <Briefcase className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-black text-black leading-tight">
+                Offer Your Services on AnyTrader
+              </h3>
+              <p className="text-xs font-medium text-black mt-1 leading-relaxed">
+                Start a side hustle or trade business using your existing account. Keep all your homeowner jobs and switch between Homeowner &amp; Tradesperson views anytime.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowBecomeTraderModal(true)}
+            className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white border border-black text-xs font-black shrink-0 cursor-pointer transition-colors"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+            <span>Become a Tradesperson</span>
+          </button>
+        </div>
+      )}
 
       {/* New Home Move-In Pack & Day-One Concierge Banner */}
       {!isMoveInDismissed && (
@@ -615,18 +649,21 @@ export default function Dashboard() {
                             {(() => {
                               const qCount = quoteCounts[job.id] || job.quoteCount || 0;
                               const isFull = qCount >= 5;
+                              const isOpen = isOpenJobStatus(job.status);
                               return (
                                 <span className={cn(
                                   "px-2.5 py-0.5 rounded-full text-[9px] font-black shadow-2xs uppercase tracking-wider transition-all shrink-0",
-                                  job.status === "posted"
+                                  isOpen
                                     ? isFull
                                       ? "border-2 border-red-500 text-red-700 bg-red-50"
                                       : "border-2 border-emerald-500 text-emerald-800 bg-emerald-50 pulse-green-border"
                                     : job.status === "accepted"
                                     ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
-                                    : "bg-red-100 text-red-800 border border-red-200"
+                                    : job.status === "in_progress"
+                                    ? "bg-blue-100 text-blue-800 border border-blue-200"
+                                    : "bg-amber-100 text-amber-800 border border-amber-200"
                                 )}>
-                                  {job.status === 'posted' ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : job.status.replace("_", " ")}
+                                  {isOpen ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : String(job.status || "").replace(/_/g, " ")}
                                 </span>
                               );
                             })()}
@@ -740,7 +777,7 @@ export default function Dashboard() {
                           </div>
                         ) : (
                           <span className="bg-blue-50 text-blue-600 text-[9px] font-black px-2.5 py-1 rounded-lg uppercase tracking-wider">
-                            {job.urgency === "specific_date" && job.jobDate ? `Date: ${new Date(job.jobDate).toLocaleDateString()}` : job.urgency || "Flexible"}
+                            {formatJobUrgencyLabel(job.urgency, job.urgencyLabel, job.preferredDate || job.jobDate)}
                           </span>
                         )}
                         {job.estimatedCompletionTime && (
@@ -954,6 +991,25 @@ export default function Dashboard() {
         videos={selectedJobMedia?.videos}
         title={selectedJobMedia?.title || "Job Media"}
       />
+
+      {canUpgradeToTradesperson && (
+        <BecomeTradespersonModal
+          isOpen={showBecomeTraderModal}
+          onClose={() => setShowBecomeTraderModal(false)}
+          user={user}
+          profile={profile}
+          onUpgraded={() => {
+            setShowBecomeTraderModal(false);
+            try {
+              localStorage.setItem("anytrader_active_role", "trader");
+            } catch {
+              // Ignore storage quota errors
+            }
+            setActiveRole("trader");
+            navigate("/");
+          }}
+        />
+      )}
     </div>
   );
 }

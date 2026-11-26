@@ -355,7 +355,8 @@ describe("Firebase Storage Security Rules Remediation Test Suite", () => {
       expect(rulesContent).toContain("match /intelligence_raw/{aggregateId}/{allPaths=**}");
       const intRawMatch = rulesContent.match(/match \/intelligence_raw\/\{aggregateId\}\/\{allPaths=\*\*\} \{([\s\S]*?)\}/);
       expect(intRawMatch).toBeTruthy();
-      expect(intRawMatch![1]).toContain("allow read, write: if isAdmin();");
+      expect(intRawMatch![1]).toContain("allow read: if isAdmin();");
+      expect(intRawMatch![1]).toContain("allow write: if isMutatingAdmin();");
 
       const evaluateCanAccessIntelligenceRaw = (req: StorageRequestContext): boolean => {
         if (!req.auth) return false;

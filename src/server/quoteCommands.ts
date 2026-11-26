@@ -22,6 +22,15 @@ import { CanonicalIdentity, hasCapability } from "./identity.ts";
 import { SERVER_OWNED_PROTECTED_KEYS } from "./authorization.ts";
 import { validateQuoteTransition, validateJobTransition, QuoteStatus, JobStatus } from "./stateMachine.ts";
 import { domainEvents } from "./domainEvents.ts";
+import { getDynamicFirestoreConfigs, resolveAnyTraderCommission } from "./pricingCatalog.ts";
+import {
+  DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS,
+  DEFAULT_PROVISIONAL_MAX_QUOTES,
+  evaluateTraderDocumentCompliance,
+} from "../lib/traderCompliance.ts";
+import { normalizeQuoteScope } from "../lib/marketplaceContracts.ts";
+import { dispatchAuthoritativeFcmPush } from "./notificationEngine.ts";
+import { enqueueWhatsAppFallback } from "./whatsappNotificationEngine.ts";
 
 const INHERITED_SERVER_OWNED_KEYS = new Set(SERVER_OWNED_PROTECTED_KEYS);
 INHERITED_SERVER_OWNED_KEYS.delete("amount");
@@ -43,6 +52,8 @@ export const QUOTE_MUTATION_PROTECTED_KEYS = new Set([
   "platformFee",
   "netPayout",
   "stripeFee",
+  "appliedCommissionRate",
+  "commissionCapGbp",
   "paymentRail",
   "status",
   "revisionCount",
@@ -156,6 +167,18 @@ export function reconcileMilestonesToAmount(existingMilestones: any[], targetAmo
   return updated;
 }
 
+const ACCEPTED_QUOTE_SCOPE_SCHEMA = z
+  .enum([
+    "labor_only",
+    "labour_only",
+    "materials_included",
+    "custom",
+    "full_project",
+    "complete_package",
+    "full_package",
+  ])
+  .transform((val) => normalizeQuoteScope(val));
+
 /**
  * 1. CreateQuote Schema
  */
@@ -171,9 +194,9 @@ export const CREATE_QUOTE_SCHEMA = z.object({
   expiryDate: z.string().max(100).optional().nullable(),
   isImmediateStart: z.boolean().optional(),
   isEmergency: z.boolean().optional(),
-  paymentPreference: z.enum(["fixed_price", "hourly", "milestone", "negotiable"]).default("fixed_price"),
+  paymentPreference: z.enum(["fixed_price", "hourly", "daily", "milestone", "negotiable"]).default("fixed_price"),
   paymentTrack: z.enum(["quick", "project"]).default("project"),
-  quoteScope: z.enum(["labor_only", "materials_included", "custom", "full_project"]).default("labor_only"),
+  quoteScope: ACCEPTED_QUOTE_SCOPE_SCHEMA.default("full_project"),
   depositTerm: z.string().optional(),
   guaranteeTerm: z.string().optional(),
   partsWarranty: z.string().optional(),
@@ -198,9 +221,9 @@ export const UPDATE_QUOTE_SCHEMA = z.object({
   startDate: z.string().max(100).optional().nullable(),
   startDateType: z.enum(["immediate", "flexible", "specific"]).optional(),
   expiryDate: z.string().max(100).optional().nullable(),
-  paymentPreference: z.enum(["fixed_price", "hourly", "milestone", "negotiable"]).optional(),
+  paymentPreference: z.enum(["fixed_price", "hourly", "daily", "milestone", "negotiable"]).optional(),
   paymentTrack: z.enum(["quick", "project"]).optional(),
-  quoteScope: z.enum(["labor_only", "materials_included", "custom", "full_project"]).optional(),
+  quoteScope: ACCEPTED_QUOTE_SCOPE_SCHEMA.optional(),
   milestones: z.array(QUOTE_MILESTONE_SCHEMA).optional(),
   materialsIncluded: z.boolean().optional(),
   materialsBreakdown: z.array(z.record(z.any())).optional(),
@@ -212,6 +235,15 @@ export const UPDATE_QUOTE_SCHEMA = z.object({
  * 3. WithdrawQuote Schema
  */
 export const WITHDRAW_QUOTE_SCHEMA = z.object({
+  jobId: z.string().min(1, "Job ID is required"),
+  quoteId: z.string().min(1, "Quote ID is required"),
+  reason: z.string().max(1000).optional(),
+}).strict();
+
+/**
+ * 3b. DeleteQuote Schema (Server-Authoritative Permanent Quote Deletion)
+ */
+export const DELETE_QUOTE_SCHEMA = z.object({
   jobId: z.string().min(1, "Job ID is required"),
   quoteId: z.string().min(1, "Quote ID is required"),
   reason: z.string().max(1000).optional(),
@@ -248,6 +280,7 @@ export const RESPOND_TO_REQUOTE_SCHEMA = z.object({
   estimatedDuration: z.string().max(100).optional(),
   estimatedDays: z.number().int().positive().optional().nullable(),
   startDate: z.string().max(100).optional().nullable(),
+  quoteScope: ACCEPTED_QUOTE_SCOPE_SCHEMA.optional(),
   milestones: z.array(QUOTE_MILESTONE_SCHEMA).optional(),
   materialsIncluded: z.boolean().optional(),
   materialsBreakdown: z.array(z.record(z.any())).optional(),
@@ -258,6 +291,7 @@ export const RESPOND_TO_REQUOTE_SCHEMA = z.object({
 export type CreateQuoteInput = z.infer<typeof CREATE_QUOTE_SCHEMA>;
 export type UpdateQuoteInput = z.infer<typeof UPDATE_QUOTE_SCHEMA>;
 export type WithdrawQuoteInput = z.infer<typeof WITHDRAW_QUOTE_SCHEMA>;
+export type DeleteQuoteInput = z.infer<typeof DELETE_QUOTE_SCHEMA>;
 export type RejectQuoteInput = z.infer<typeof REJECT_QUOTE_SCHEMA>;
 export type RequestRequoteInput = z.infer<typeof REQUEST_REQUOTE_SCHEMA>;
 export type RespondToRequoteInput = z.infer<typeof RESPOND_TO_REQUOTE_SCHEMA>;
@@ -276,6 +310,7 @@ export type QuoteCommandType =
   | "CreateQuote"
   | "UpdateQuote"
   | "WithdrawQuote"
+  | "DeleteQuote"
   | "RejectQuote"
   | "RequestRequote"
   | "RespondToRequote"
@@ -285,6 +320,7 @@ export type QuoteCommandPayload =
   | { type: "CreateQuote"; payload: CreateQuoteInput }
   | { type: "UpdateQuote"; payload: UpdateQuoteInput }
   | { type: "WithdrawQuote"; payload: WithdrawQuoteInput }
+  | { type: "DeleteQuote"; payload: DeleteQuoteInput }
   | { type: "RejectQuote"; payload: RejectQuoteInput }
   | { type: "RequestRequote"; payload: RequestRequoteInput }
   | { type: "RespondToRequote"; payload: RespondToRequoteInput }
@@ -318,6 +354,9 @@ export function validateQuoteCommandPayload(commandType: QuoteCommandType, rawPa
     case "WithdrawQuote":
       result = WITHDRAW_QUOTE_SCHEMA.safeParse(raw);
       break;
+    case "DeleteQuote":
+      result = DELETE_QUOTE_SCHEMA.safeParse(raw);
+      break;
     case "RejectQuote":
       result = REJECT_QUOTE_SCHEMA.safeParse(raw);
       break;
@@ -347,7 +386,9 @@ export interface ExecuteQuoteCommandOptions {
   identity: CanonicalIdentity;
   command: QuoteCommandPayload;
   idempotencyKey?: string;
-  commissionRate?: number; // default 0.12 (12%)
+  commissionRate?: number; // optional explicit override; otherwise resolved dynamically from trader tier + Admin config (default 5% PAYG)
+  commissionCapGbp?: number; // optional explicit override; otherwise resolved dynamically from Admin config (default £250)
+  messagingClient?: any;
 }
 
 export interface ExecuteQuoteCommandResult {
@@ -361,6 +402,8 @@ export interface ExecuteQuoteCommandResult {
   scheduledDate?: string;
   verificationPin?: string;
   isConfirmedByTradesperson?: boolean;
+  jobTitle?: string;
+  rejectedCompetingQuotes?: Array<{ quoteId: string; traderId: string }>;
   wasReplayed: boolean;
 }
 
@@ -371,7 +414,7 @@ export interface ExecuteQuoteCommandResult {
 export async function executeQuoteCommand(
   options: ExecuteQuoteCommandOptions
 ): Promise<ExecuteQuoteCommandResult> {
-  const { db, identity, command, commissionRate = 0.12 } = options;
+  const { db, identity, command, commissionRate: explicitCommissionRate, commissionCapGbp: explicitCapGbp, messagingClient } = options;
 
   if (!db) {
     throw new BadRequestError("Database service is not initialized.");
@@ -394,6 +437,11 @@ export async function executeQuoteCommand(
   const idempotencyRef = db.collection("idempotency_keys").doc(idempotencyDocId);
 
   const jobRef = db.collection("jobs").doc(jobId);
+
+  // Preload dynamic Admin pricing/commission configs before entering the Firestore transaction
+  const { globalTiers, globalConfig } = ["CreateQuote", "UpdateQuote", "RespondToRequote"].includes(commandType)
+    ? await getDynamicFirestoreConfigs(db)
+    : { globalTiers: null, globalConfig: null };
 
   // 2. Execute Real Atomic Firestore Transaction
   const transactionResult = await db.runTransaction(async (transaction: any) => {
@@ -464,10 +512,47 @@ export async function executeQuoteCommand(
           throw new ForbiddenError("Tradesperson account is suspended or disabled and cannot submit quotes.");
         }
 
-        if (
-          ["rejected", "revoked", "suspended", "expired", "unverified"].includes(storedVerifStatus) ||
-          traderData.isVerified === false
-        ) {
+        if (["rejected", "revoked", "suspended", "expired", "unverified"].includes(storedVerifStatus)) {
+          throw new ForbiddenError("Tradesperson account must be verified before submitting quotes.");
+        }
+
+        const isProvisionalOrNonRegPending =
+          storedVerifStatus === "provisional" ||
+          (storedVerifStatus === "pending" && traderData.requiresAdminVerification !== true);
+
+        if (isProvisionalOrNonRegPending) {
+          let gracePeriodDays = DEFAULT_DOCUMENT_GRACE_PERIOD_DAYS;
+          let enforceGracePeriod = true;
+          let provisionalMaxQuotes = DEFAULT_PROVISIONAL_MAX_QUOTES;
+          try {
+            const dynCfg = await getDynamicFirestoreConfigs(db);
+            const rawDays = Number(dynCfg?.globalConfig?.documentGracePeriodDays);
+            if (Number.isFinite(rawDays) && rawDays >= 0) {
+              gracePeriodDays = Math.floor(rawDays);
+            }
+            if (typeof dynCfg?.globalConfig?.enforceDocumentGracePeriod === "boolean") {
+              enforceGracePeriod = dynCfg.globalConfig.enforceDocumentGracePeriod;
+            }
+            const rawMaxQuotes = Number(dynCfg?.globalConfig?.provisionalMaxQuotes);
+            if (Number.isFinite(rawMaxQuotes) && rawMaxQuotes >= 0) {
+              provisionalMaxQuotes = Math.floor(rawMaxQuotes);
+            }
+          } catch {
+            // Fall back to canonical 14-day / 5-quote enforced grace policy
+          }
+
+          const compliance = evaluateTraderDocumentCompliance(traderData, {
+            gracePeriodDays,
+            enforceGracePeriod,
+            provisionalMaxQuotes,
+            targetJobCategory: jobData.category || jobData.trade || null,
+          });
+          if (!compliance.canQuote) {
+            throw new ForbiddenError(
+              compliance.blockReason || "Tradesperson account must be verified before submitting quotes."
+            );
+          }
+        } else if (traderData.isVerified === false) {
           throw new ForbiddenError("Tradesperson account must be verified before submitting quotes.");
         }
 
@@ -494,10 +579,47 @@ export async function executeQuoteCommand(
       existingQuoteData = quoteSnap.data() || {};
     }
 
+    // Resolve quoting trader profile data before any writes so fee calculations reflect the trader's true tier
+    let quotingTraderData: Record<string, any> = {};
+    if (traderProfileSnap?.exists) {
+      quotingTraderData =
+        (typeof traderProfileSnap.data === "function" ? traderProfileSnap.data() : traderProfileSnap.data) || {};
+    } else if (["CreateQuote", "UpdateQuote", "RespondToRequote"].includes(commandType)) {
+      const targetTraderUid =
+        commandType === "CreateQuote"
+          ? identity.uid
+          : existingQuoteData?.tradespersonId || existingQuoteData?.traderId || existingQuoteData?.proId;
+      if (targetTraderUid) {
+        const snap = await transaction.get(db.collection("users").doc(targetTraderUid));
+        if (snap?.exists) {
+          quotingTraderData = (typeof snap.data === "function" ? snap.data() : snap.data) || {};
+        }
+      }
+    }
+
+    const computeQuoteFeeBreakdown = async (amountGbp: number) => {
+      const amountPence = Math.round(amountGbp * 100);
+      const resolved = await resolveAnyTraderCommission({
+        amountPence,
+        traderData: quotingTraderData,
+        globalTiers,
+        globalConfig,
+        explicitCommissionRate,
+        explicitCapGbp,
+      });
+      return {
+        platformFee: Math.round(resolved.platformFeePence) / 100,
+        netPayout: Math.round(resolved.netPayoutPence) / 100,
+        appliedCommissionRate: resolved.commissionRate,
+        commissionCapGbp: resolved.commissionCapGbp,
+      };
+    };
+
     const nowIso = new Date().toISOString();
     let resultingQuoteId = "";
     let resultingStatus: QuoteStatus = "pending";
     let resultingQuoteDoc: Record<string, any> = {};
+    let rejectedCompetingQuotes: Array<{ quoteId: string; traderId: string }> = [];
 
     switch (commandType) {
       case "CreateQuote": {
@@ -528,11 +650,59 @@ export async function executeQuoteCommand(
           throw new ForbiddenError("This job has reached the maximum limit of 5 quotes.");
         }
 
+        // Validation: Priority Offers exclusive window (server-authoritative enforcement + counter update)
+        const rawExclusiveUntil = jobData.exclusiveUntil;
+        const exclusiveUntilDate = rawExclusiveUntil?.toDate
+          ? rawExclusiveUntil.toDate()
+          : rawExclusiveUntil
+          ? new Date(rawExclusiveUntil)
+          : null;
+        const isWithinExclusiveWindow = Boolean(
+          exclusiveUntilDate &&
+            !Number.isNaN(exclusiveUntilDate.getTime()) &&
+            exclusiveUntilDate.getTime() > Date.now() &&
+            !isExplicitlyInvitedTrader &&
+            !identity.accountType?.includes("admin") &&
+            globalConfig?.paywallEnabled !== false
+        );
+        let exclusiveUsedToday = 0;
+        if (isWithinExclusiveWindow) {
+          if (!quotingTraderData?.hasExclusiveAddon) {
+            throw new ForbiddenError("This job is currently exclusive to Priority Offers members. Please wait or upgrade.");
+          }
+          const lastExclRaw = quotingTraderData?.lastExclusiveQuoteDate;
+          const lastExclDate = lastExclRaw?.toDate
+            ? lastExclRaw.toDate()
+            : lastExclRaw
+            ? new Date(lastExclRaw)
+            : new Date(0);
+          const nowDate = new Date();
+          const isSameDay =
+            lastExclDate.getUTCFullYear() === nowDate.getUTCFullYear() &&
+            lastExclDate.getUTCMonth() === nowDate.getUTCMonth() &&
+            lastExclDate.getUTCDate() === nowDate.getUTCDate();
+          exclusiveUsedToday = isSameDay ? Number(quotingTraderData?.exclusiveSlotsUsedToday || 0) : 0;
+          if (exclusiveUsedToday >= 3) {
+            throw new ForbiddenError("You have used your 3 daily exclusive quotes. You can quote once this job enters the public feed.");
+          }
+          const cooldownRaw = quotingTraderData?.exclusiveCooldownUntil;
+          const cooldownDate = cooldownRaw?.toDate
+            ? cooldownRaw.toDate()
+            : cooldownRaw
+            ? new Date(cooldownRaw)
+            : new Date(0);
+          if (cooldownDate.getTime() > Date.now()) {
+            throw new ForbiddenError("Please wait 2 hours between exclusive priority quotes.");
+          }
+        }
+
         // Invariant: Single active quote per trader on the same job
         // 1. Transactional Trader Lock Document Check
         const traderLockDocId = `${jobId}_${identity.uid}`;
         const traderLockRef = db.collection("trader_quote_locks").doc(traderLockDocId);
         const traderLockSnap = await transaction.get(traderLockRef);
+        const publicCardRef = db.collection("public_job_cards").doc(jobId);
+        const publicCardSnap = await transaction.get(publicCardRef);
         if (traderLockSnap.exists) {
           const lockData = traderLockSnap.data();
           const lockStatus = lockData?.status;
@@ -565,8 +735,12 @@ export async function executeQuoteCommand(
         resultingStatus = "pending";
 
         const numAmount = Math.round(Number(validatedInput.amount) * 100) / 100;
-        const platformFee = Math.round(numAmount * commissionRate * 100) / 100;
-        const netPayout = Math.round((numAmount - platformFee) * 100) / 100;
+        const {
+          platformFee,
+          netPayout,
+          appliedCommissionRate,
+          commissionCapGbp,
+        } = await computeQuoteFeeBreakdown(numAmount);
 
         let milestones = validatedInput.milestones;
         if (milestones && milestones.length > 0) {
@@ -608,6 +782,8 @@ export async function executeQuoteCommand(
           platformFee,
           commission: platformFee,
           netPayout,
+          appliedCommissionRate,
+          commissionCapGbp,
           currency: "gbp",
           coverNote: validatedInput.coverNote || validatedInput.message || "",
           message: validatedInput.coverNote || validatedInput.message || "",
@@ -655,15 +831,62 @@ export async function executeQuoteCommand(
           updatedAt: nowIso,
         });
 
+        // Atomic Trader User Updates (Provisional quote counter + Exclusive Lead counter + Real Behavioral Velocity)
+        const traderUserUpdates: Record<string, any> = {};
+        if (String(quotingTraderData?.verificationStatus || "").toLowerCase() === "provisional") {
+          traderUserUpdates.provisionalQuotesUsed =
+            Math.max(0, Math.floor(Number(quotingTraderData?.provisionalQuotesUsed || 0))) + 1;
+        }
+        if (isWithinExclusiveWindow) {
+          traderUserUpdates.exclusiveSlotsUsedToday = exclusiveUsedToday + 1;
+          traderUserUpdates.exclusiveCooldownUntil = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+          traderUserUpdates.lastExclusiveQuoteDate = nowIso;
+        }
+        // Record real behavioral response velocity (EMA of minutes between job post and quote)
+        const prevQuotesSubmitted = Math.max(0, Math.floor(Number(quotingTraderData?.quotesSubmitted || 0)));
+        traderUserUpdates.quotesSubmitted = prevQuotesSubmitted + 1;
+        const jobPostedRaw = jobData.postedDate || jobData.createdAt;
+        const jobPostedMs =
+          typeof jobPostedRaw?.toMillis === "function"
+            ? jobPostedRaw.toMillis()
+            : typeof jobPostedRaw === "string"
+            ? Date.parse(jobPostedRaw)
+            : typeof jobPostedRaw === "number"
+            ? jobPostedRaw
+            : NaN;
+        if (Number.isFinite(jobPostedMs) && jobPostedMs > 0) {
+          const responseMinutes = Math.max(1, Math.min(10080, (Date.now() - jobPostedMs) / 60000));
+          const prevAvg = Number(quotingTraderData?.avgResponseMinutes);
+          const nextAvg =
+            Number.isFinite(prevAvg) && prevAvg > 0
+              ? Math.round((prevAvg * 0.7 + responseMinutes * 0.3) * 10) / 10
+              : Math.round(responseMinutes * 10) / 10;
+          traderUserUpdates.avgResponseMinutes = nextAvg;
+          traderUserUpdates.lastQuotedAt = nowIso;
+        }
+        if (Object.keys(traderUserUpdates).length > 0) {
+          traderUserUpdates.updatedAt = nowIso;
+          transaction.set(db.collection("users").doc(identity.uid), traderUserUpdates, { merge: true });
+        }
+
         // Atomic Job Quote Count Update
+        const nextJobStatus = jobData.status === "open" ? "quoted" : jobData.status;
         transaction.update(jobRef, {
           quoteCount: currentQuoteCount + 1,
           quotesCount: currentQuoteCount + 1,
           hasQuotes: true,
-          status: jobData.status === "open" ? "quoted" : jobData.status,
+          status: nextJobStatus,
           lastQuoteDate: nowIso,
           updatedAt: nowIso,
         });
+
+        if (publicCardSnap?.exists) {
+          transaction.update(publicCardRef, {
+            quoteCount: currentQuoteCount + 1,
+            status: nextJobStatus,
+            updatedAt: nowIso,
+          });
+        }
 
         break;
       }
@@ -695,8 +918,12 @@ export async function executeQuoteCommand(
           validatedInput.amount !== undefined
             ? Math.round(Number(validatedInput.amount) * 100) / 100
             : existingQuoteData?.amount;
-        const platformFee = Math.round(updatedAmount * commissionRate * 100) / 100;
-        const netPayout = Math.round((updatedAmount - platformFee) * 100) / 100;
+        const {
+          platformFee,
+          netPayout,
+          appliedCommissionRate,
+          commissionCapGbp,
+        } = await computeQuoteFeeBreakdown(updatedAmount);
 
         let milestones = validatedInput.milestones || existingQuoteData?.milestones;
         if (validatedInput.milestones) {
@@ -735,6 +962,8 @@ export async function executeQuoteCommand(
           platformFee,
           commission: platformFee,
           netPayout,
+          appliedCommissionRate,
+          commissionCapGbp,
           coverNote: validatedInput.coverNote ?? existingQuoteData?.coverNote,
           message: validatedInput.coverNote ?? validatedInput.message ?? existingQuoteData?.message,
           estimatedDuration: validatedInput.estimatedDuration ?? existingQuoteData?.estimatedDuration,
@@ -813,6 +1042,67 @@ export async function executeQuoteCommand(
           hasQuotes: decrementedCount > 0,
           updatedAt: nowIso,
         });
+
+        break;
+      }
+
+      case "DeleteQuote": {
+        const quotingTrader =
+          existingQuoteData?.tradespersonId ||
+          existingQuoteData?.traderId ||
+          existingQuoteData?.proId;
+
+        if (identity.uid !== quotingTrader && !isAdmin) {
+          throw new ForbiddenError("You can only delete your own quotes.");
+        }
+
+        const existingQuoteStatus = String(existingQuoteData?.status || "pending").toLowerCase();
+        if (
+          existingQuoteStatus === "accepted" ||
+          jobData.acceptedQuoteId === (validatedInput as any).quoteId ||
+          existingQuoteData?.funded === true ||
+          existingQuoteData?.isPaid === true ||
+          existingQuoteData?.payoutTransferred === true
+        ) {
+          throw new ConflictError("Accepted or funded quotes cannot be deleted for audit and escrow integrity.");
+        }
+
+        const quoteIdToDelete = (validatedInput as any).quoteId;
+        resultingQuoteId = quoteIdToDelete;
+        resultingStatus = "withdrawn";
+        resultingQuoteDoc = {
+          ...existingQuoteData,
+          id: quoteIdToDelete,
+          status: "withdrawn",
+          deletedAt: nowIso,
+          deleteReason: validatedInput.reason || "Deleted by tradesperson",
+        };
+
+        // Permanently delete the non-accepted quote document inside the authoritative server transaction
+        transaction.delete(targetQuoteRef);
+
+        // Release trader lock cleanly so audit trail records deletion
+        if (quotingTrader) {
+          const deleteLockRef = db.collection("trader_quote_locks").doc(`${jobId}_${quotingTrader}`);
+          transaction.set(
+            deleteLockRef,
+            { jobId, quoteId: quoteIdToDelete, traderId: quotingTrader, status: "deleted", deletedAt: nowIso, updatedAt: nowIso },
+            { merge: true }
+          );
+        }
+
+        // Decrement parent job quote count only if this quote was still counted as active
+        const wasActiveQuote = ["pending", "submitted", "requoted", "requote_requested"].includes(existingQuoteStatus);
+        if (wasActiveQuote) {
+          const currentQuoteCount = Number(jobData.quoteCount || jobData.quotesCount || 1);
+          const decrementedCount = Math.max(0, currentQuoteCount - 1);
+          transaction.update(jobRef, {
+            quoteCount: decrementedCount,
+            quotesCount: decrementedCount,
+            hasQuotes: decrementedCount > 0,
+            updatedAt: nowIso,
+          });
+        }
 
         break;
       }
@@ -935,8 +1225,12 @@ export async function executeQuoteCommand(
         resultingStatus = "requoted";
 
         const numAmount = Math.round(Number(validatedInput.amount) * 100) / 100;
-        const platformFee = Math.round(numAmount * commissionRate * 100) / 100;
-        const netPayout = Math.round((numAmount - platformFee) * 100) / 100;
+        const {
+          platformFee,
+          netPayout,
+          appliedCommissionRate,
+          commissionCapGbp,
+        } = await computeQuoteFeeBreakdown(numAmount);
 
         const currentRevisions = Number(existingQuoteData?.revisionCount || 1);
         const nextRevisionCount = currentRevisions + 1;
@@ -978,12 +1272,15 @@ export async function executeQuoteCommand(
           platformFee,
           commission: platformFee,
           netPayout,
+          appliedCommissionRate,
+          commissionCapGbp,
           coverNote: validatedInput.coverNote ?? existingQuoteData?.coverNote,
           message: validatedInput.coverNote ?? validatedInput.message ?? existingQuoteData?.message,
           estimatedDuration: validatedInput.estimatedDuration ?? existingQuoteData?.estimatedDuration,
           estimatedTimeline: validatedInput.estimatedDuration ? validatedInput.estimatedDuration.replace(/_/g, " ") : existingQuoteData?.estimatedTimeline,
           estimatedDays: validatedInput.estimatedDays !== undefined ? validatedInput.estimatedDays : existingQuoteData?.estimatedDays,
           startDate: validatedInput.startDate !== undefined ? validatedInput.startDate : existingQuoteData?.startDate,
+          quoteScope: validatedInput.quoteScope ?? existingQuoteData?.quoteScope,
           milestones,
           materialsIncluded: validatedInput.materialsIncluded !== undefined ? !!validatedInput.materialsIncluded : existingQuoteData?.materialsIncluded,
           materialsBreakdown: validatedInput.materialsBreakdown ?? existingQuoteData?.materialsBreakdown,
@@ -1081,7 +1378,7 @@ export async function executeQuoteCommand(
           updatedAt: nowIso,
         });
 
-        // 9. Atomic Write: Reject Competing Pending Quotes
+        // 9. Atomic Write: Reject Competing Pending/Requoted Quotes
         for (const otherDoc of allQuotesSnap.docs) {
           if (otherDoc.id !== quoteId) {
             const otherData = otherDoc.data() || {};
@@ -1092,8 +1389,9 @@ export async function executeQuoteCommand(
                 rejectedAt: nowIso,
                 updatedAt: nowIso,
               });
-              const otherTrader = otherData.tradespersonId || otherData.traderId;
+              const otherTrader = otherData.tradespersonId || otherData.traderId || otherData.proId;
               if (otherTrader) {
+                rejectedCompetingQuotes.push({ quoteId: otherDoc.id, traderId: String(otherTrader) });
                 const otherLockRef = db.collection("trader_quote_locks").doc(`${jobId}_${otherTrader}`);
                 transaction.set(otherLockRef, { jobId, quoteId: otherDoc.id, traderId: otherTrader, status: "rejected", updatedAt: nowIso }, { merge: true });
               }
@@ -1152,6 +1450,8 @@ export async function executeQuoteCommand(
       scheduledDate: resultingQuoteDoc?.scheduledDate || jobData?.scheduledDate || resultingQuoteDoc?.startDate,
       ...(commandType === "AcceptQuote" ? { verificationPin: resultingQuoteDoc?.verificationPin } : {}),
       isConfirmedByTradesperson: resultingQuoteDoc?.isConfirmedByTradesperson ?? jobData?.isConfirmedByTradesperson ?? false,
+      jobTitle: String(jobData?.title || "your job"),
+      ...(commandType === "AcceptQuote" ? { rejectedCompetingQuotes } : {}),
       quote: resultingQuoteDoc,
       wasReplayed: false,
     };
@@ -1178,6 +1478,7 @@ export async function executeQuoteCommand(
       CreateQuote: "QUOTE_CREATED",
       UpdateQuote: "QUOTE_UPDATED",
       WithdrawQuote: "QUOTE_WITHDRAWN",
+      DeleteQuote: "QUOTE_WITHDRAWN",
       RejectQuote: "QUOTE_REJECTED",
       RequestRequote: "REQUOTE_REQUESTED",
       RespondToRequote: "REQUOTE_RESPONDED",
@@ -1202,6 +1503,173 @@ export async function executeQuoteCommand(
       undefined,
       db
     );
+
+    // Server-authoritative notification dispatch (In-App + FCM Push + Delayed WhatsApp Fallback)
+    try {
+      const targetHomeownerUid = transactionResult.quote?.homeownerId;
+      const targetTraderUid =
+        transactionResult.quote?.tradespersonId ||
+        transactionResult.quote?.traderId ||
+        transactionResult.acceptedTradespersonId;
+      const quoteAmt = Number(transactionResult.quote?.amount || 0);
+      const formattedAmt = Number.isFinite(quoteAmt) && quoteAmt > 0 ? ` (£${quoteAmt.toLocaleString("en-GB")})` : "";
+      const jobTitleLabel = transactionResult.jobTitle ? ` for "${transactionResult.jobTitle}"` : " on your job";
+      const notifNow = new Date().toISOString();
+
+      const notificationsToSend: Array<{
+        recipientUid: string;
+        title: string;
+        message: string;
+        type: string;
+        link: string;
+        quoteId: string;
+        enableWhatsApp: boolean;
+      }> = [];
+
+      if (commandType === "CreateQuote" && targetHomeownerUid && targetHomeownerUid !== identity.uid) {
+        notificationsToSend.push({
+          recipientUid: targetHomeownerUid,
+          title: "New Quote Received",
+          message: `A tradesperson submitted a quote${formattedAmt}${jobTitleLabel}.`,
+          type: "quote",
+          link: `/job/${jobId}`,
+          quoteId: transactionResult.quoteId,
+          enableWhatsApp: true,
+        });
+      } else if (commandType === "UpdateQuote" && targetHomeownerUid && targetHomeownerUid !== identity.uid) {
+        notificationsToSend.push({
+          recipientUid: targetHomeownerUid,
+          title: "Quote Updated",
+          message: `A tradesperson updated their quote${formattedAmt}${jobTitleLabel}.`,
+          type: "quote",
+          link: `/job/${jobId}`,
+          quoteId: transactionResult.quoteId,
+          enableWhatsApp: true,
+        });
+      } else if (commandType === "RespondToRequote" && targetHomeownerUid && targetHomeownerUid !== identity.uid) {
+        notificationsToSend.push({
+          recipientUid: targetHomeownerUid,
+          title: "Revised Quote Submitted",
+          message: `A tradesperson responded to your re-quote request${formattedAmt}${jobTitleLabel}.`,
+          type: "quote",
+          link: `/job/${jobId}`,
+          quoteId: transactionResult.quoteId,
+          enableWhatsApp: true,
+        });
+      } else if (commandType === "WithdrawQuote" && targetHomeownerUid && targetHomeownerUid !== identity.uid) {
+        notificationsToSend.push({
+          recipientUid: targetHomeownerUid,
+          title: "Quote Withdrawn",
+          message: `A tradesperson withdrew their quote${jobTitleLabel}.`,
+          type: "quote",
+          link: `/job/${jobId}`,
+          quoteId: transactionResult.quoteId,
+          enableWhatsApp: false,
+        });
+      } else if (commandType === "RequestRequote" && targetTraderUid && targetTraderUid !== identity.uid) {
+        notificationsToSend.push({
+          recipientUid: targetTraderUid,
+          title: "Re-Quote Requested",
+          message: `A homeowner requested a revised quote on your bid${jobTitleLabel}.`,
+          type: "quote",
+          link: `/job/${jobId}`,
+          quoteId: transactionResult.quoteId,
+          enableWhatsApp: true,
+        });
+      } else if (commandType === "RejectQuote" && targetTraderUid && targetTraderUid !== identity.uid) {
+        notificationsToSend.push({
+          recipientUid: targetTraderUid,
+          title: "Quote Declined",
+          message: `A homeowner declined your quote${jobTitleLabel}. Browse the Job Feed for more local jobs.`,
+          type: "quote",
+          link: "/my-quotes",
+          quoteId: transactionResult.quoteId,
+          enableWhatsApp: false,
+        });
+      } else if (commandType === "AcceptQuote") {
+        if (targetTraderUid && targetTraderUid !== identity.uid) {
+          notificationsToSend.push({
+            recipientUid: targetTraderUid,
+            title: "Quote Accepted! 🎉",
+            message: `Your quote${formattedAmt}${jobTitleLabel} was accepted. Please confirm your start date${transactionResult.scheduledDate ? ` (${transactionResult.scheduledDate})` : ""}.`,
+            type: "quote",
+            link: `/job/${jobId}`,
+            quoteId: transactionResult.quoteId,
+            enableWhatsApp: true,
+          });
+        }
+        const competing = Array.isArray(transactionResult.rejectedCompetingQuotes)
+          ? transactionResult.rejectedCompetingQuotes
+          : [];
+        for (const comp of competing) {
+          if (comp.traderId && comp.traderId !== identity.uid && comp.traderId !== targetTraderUid) {
+            notificationsToSend.push({
+              recipientUid: comp.traderId,
+              title: "Job Awarded to Another Trader",
+              message: `The homeowner has accepted another quote${jobTitleLabel}.`,
+              type: "status",
+              link: "/my-quotes",
+              quoteId: comp.quoteId,
+              enableWhatsApp: false,
+            });
+          }
+        }
+      }
+
+      if (notificationsToSend.length > 0 && typeof db?.collection === "function") {
+        const notifCol = db.collection("notifications");
+        if (notifCol && typeof notifCol.doc === "function") {
+          for (const item of notificationsToSend) {
+            const notifRef = notifCol.doc();
+            await notifRef.set({
+              userId: item.recipientUid,
+              senderId: identity.uid,
+              title: item.title,
+              message: item.message,
+              type: item.type,
+              link: item.link,
+              actionPath: item.link,
+              jobId,
+              quoteId: item.quoteId,
+              read: false,
+              isRead: false,
+              createdAt: notifNow,
+            });
+
+            if (messagingClient) {
+              dispatchAuthoritativeFcmPush(db, messagingClient, {
+                recipientId: item.recipientUid,
+                title: item.title,
+                body: item.message,
+                channelId: "job_leads",
+                notificationId: notifRef.id,
+                eventType: item.type,
+                data: {
+                  link: item.link,
+                  jobId,
+                  type: item.type,
+                },
+              }).catch(() => {});
+            }
+
+            if (item.enableWhatsApp) {
+              enqueueWhatsAppFallback(db, {
+                recipientUid: item.recipientUid,
+                senderUid: identity.uid,
+                senderLabel: item.title,
+                contextId: jobId,
+                contextType: "anytrader_quote",
+                contextSummary: item.message,
+                deepLinkPath: item.link,
+                notificationId: notifRef.id,
+              }).catch(() => {});
+            }
+          }
+        }
+      }
+    } catch (notifErr) {
+      console.warn("[QuoteCommands] Non-blocking notification write skipped:", notifErr);
+    }
   }
 
   return transactionResult;
@@ -1214,6 +1682,7 @@ export interface ExecuteAcceptQuoteOptions {
   quoteId: string;
   rawPayload?: Record<string, any>;
   idempotencyKey?: string;
+  messagingClient?: any;
 }
 
 /**
@@ -1224,7 +1693,7 @@ export interface ExecuteAcceptQuoteOptions {
 export async function executeAcceptQuoteCommand(
   options: ExecuteAcceptQuoteOptions
 ): Promise<ExecuteQuoteCommandResult> {
-  const { db, identity, jobId, quoteId, rawPayload = {}, idempotencyKey } = options;
+  const { db, identity, jobId, quoteId, rawPayload = {}, idempotencyKey, messagingClient } = options;
 
   return executeQuoteCommand({
     db,
@@ -1238,5 +1707,6 @@ export async function executeAcceptQuoteCommand(
       },
     },
     idempotencyKey: idempotencyKey || `accept_${jobId}_${quoteId}_${identity.uid}`,
+    messagingClient,
   });
 }

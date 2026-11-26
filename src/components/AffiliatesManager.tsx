@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Link2, Plus, Copy, Check, Trash2, Edit3, TrendingUp, Users, DollarSign, ExternalLink } from "lucide-react";
 import { db, doc, collection, getDocs, setDoc, deleteDoc, query, orderBy } from "@/src/firebase";
+import { toast } from "sonner";
 
 export interface Affiliate {
   id: string;
@@ -19,6 +20,7 @@ export default function AffiliatesManager() {
   const [isLoading, setIsLoading] = useState(true);
   const [isAdding, setIsAdding] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const [formData, setFormData] = useState<Partial<Affiliate>>({
     name: "",
@@ -37,38 +39,7 @@ export default function AffiliatesManager() {
       const q = query(collection(db, "affiliates"), orderBy("createdAt", "desc"));
       const snapshot = await getDocs(q);
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Affiliate));
-      
-      // If none, inject some mocks for demo
-      if (data.length === 0) {
-        const mocks: Affiliate[] = [
-          {
-            id: "mock_ava",
-            name: "Ava (Influencer)",
-            code: "ava",
-            discountPercentage: 15,
-            commissionPercentage: 10,
-            uses: 342,
-            revenueGenerated: 4500,
-            status: "active",
-            createdAt: Date.now() - 30 * 24 * 60 * 60 * 1000
-          },
-          {
-            id: "mock_tom",
-            name: "Tradesman Tom",
-            code: "tombuilds",
-            discountPercentage: 10,
-            commissionPercentage: 5,
-            uses: 89,
-            revenueGenerated: 1200,
-            status: "active",
-            createdAt: Date.now() - 60 * 24 * 60 * 60 * 1000
-          }
-        ];
-        // Don't necessarily save to DB, just set state
-        setAffiliates(mocks);
-      } else {
-        setAffiliates(data);
-      }
+      setAffiliates(data);
     } catch (err) {
       console.error("Error fetching affiliates:", err);
     } finally {
@@ -95,20 +66,25 @@ export default function AffiliatesManager() {
       await setDoc(doc(db, "affiliates", newAffiliate.id), newAffiliate);
       setIsAdding(false);
       setFormData({ name: "", code: "", discountPercentage: 10, commissionPercentage: 5, status: "active" });
+      toast.success("Affiliate saved.");
       fetchAffiliates();
     } catch (err) {
       console.error("Error saving affiliate:", err);
-      alert("Failed to save affiliate.");
+      toast.error("Failed to save affiliate.");
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!window.confirm("Are you sure you want to delete this affiliate?")) return;
+  const confirmDelete = async () => {
+    if (!pendingDeleteId) return;
+    const id = pendingDeleteId;
+    setPendingDeleteId(null);
     try {
       await deleteDoc(doc(db, "affiliates", id));
+      toast.success("Affiliate deleted.");
       fetchAffiliates();
     } catch (err) {
       console.error("Error deleting:", err);
+      toast.error("Failed to delete affiliate.");
     }
   };
 
@@ -315,7 +291,7 @@ export default function AffiliatesManager() {
                         <Edit3 className="w-4 h-4" />
                       </button>
                       <button 
-                        onClick={() => handleDelete(aff.id)}
+                        onClick={() => setPendingDeleteId(aff.id)}
                         className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
                         title="Delete"
                       >
@@ -329,6 +305,29 @@ export default function AffiliatesManager() {
           </table>
         </div>
       </div>
+
+      {pendingDeleteId && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">Delete Affiliate?</h3>
+            <p className="text-sm text-black">Are you sure you want to permanently remove this affiliate partner?</p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPendingDeleteId(null)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 rounded-lg hover:bg-red-700"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1776,6 +1776,23 @@
             }
           }
         },
+        "flexiPayMode": {
+          "type": "string",
+          "enum": ["off", "coming_soon", "live"],
+          "description": "Admin-controlled FlexiPay BNPL launch state (default: coming_soon)."
+        },
+        "documentGracePeriodDays": {
+          "type": "integer",
+          "description": "Number of days new non-regulated traders can operate provisionally before uploading documents (default: 14)."
+        },
+        "provisionalMaxQuotes": {
+          "type": "integer",
+          "description": "Maximum number of quotes a provisional trader can submit before uploading documents (default: 5)."
+        },
+        "enforceDocumentGracePeriod": {
+          "type": "boolean",
+          "description": "Whether provisional traders are auto-restricted once either the grace period or quote cap is reached."
+        },
         "updatedAt": {
           "type": "string",
           "format": "date-time"
@@ -4564,6 +4581,24 @@
         "$ref": "#/entities/User"
       },
       "description": "Server-authoritative active chat presence heartbeats used to self-cancel delayed WhatsApp fallback nudges while a user is actively viewing a chat."
+    },
+    "/platform_config_versions/{versionId}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Immutable admin-readable history of published platform pricing and configuration versions written exclusively by server Admin SDK."
+    },
+    "/gdpr_requests/{requestId}": {
+      "schema": {
+        "$ref": "#/entities/User"
+      },
+      "description": "Immutable UK GDPR Article 15/17/20 audit log of user data exports and account erasures written exclusively by server Admin SDK."
+    },
+    "/bom_orders/{orderId}": {
+      "schema": {
+        "$ref": "#/entities/Job"
+      },
+      "description": "Server-authoritative TradeOS bill-of-materials merchant orders linked to parent jobs, readable only by assigned tradesperson, homeowner, or admin."
     }
   }
 }

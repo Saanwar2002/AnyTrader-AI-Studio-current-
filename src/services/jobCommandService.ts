@@ -296,3 +296,76 @@ export async function reviewMilestoneWorkViaApi(options: {
   }
   return data;
 }
+
+/**
+ * Server-Authoritative Job Delete / Archive Adapter (Slice 3)
+ * Atomically deletes or soft-archives the job and cleans up public_job_cards.
+ */
+export async function deleteJobViaCommand(options: {
+  user: User;
+  jobId: string;
+  mode?: "delete" | "archive";
+}): Promise<{ success: boolean; jobId: string; mode: "delete" | "archive"; deleted: boolean; publicCardRemoved: boolean }> {
+  const { user, jobId, mode = "delete" } = options;
+  if (!user || !user.uid) {
+    throw new Error("Authentication required: you must be signed in to delete or archive a job.");
+  }
+  if (!jobId) {
+    throw new Error("Job ID is required.");
+  }
+  const token = await user.getIdToken();
+  const response = await fetch(getApiUrl(`/api/jobs/${encodeURIComponent(jobId)}/delete`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ mode }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `Failed to ${mode} job with status ${response.status}`);
+  }
+  return data;
+}
+
+/**
+ * Server-Authoritative Job Scheduling / Reschedule Adapter (Slice 3)
+ */
+export async function executeJobScheduleActionViaApi(options: {
+  user: User;
+  jobId: string;
+  action: "propose_reschedule" | "accept_reschedule" | "reject_reschedule" | "confirm_booking";
+  proposedDate?: string;
+  reason?: string;
+}): Promise<{
+  success: boolean;
+  jobId: string;
+  action: string;
+  scheduledDate?: string | null;
+  isConfirmedByTradesperson?: boolean;
+  rescheduleProposal?: Record<string, any> | null;
+  calendarSynced: boolean;
+}> {
+  const { user, jobId, action, proposedDate, reason } = options;
+  if (!user || !user.uid) {
+    throw new Error("Authentication required.");
+  }
+  if (!jobId) {
+    throw new Error("Job ID is required.");
+  }
+  const token = await user.getIdToken();
+  const response = await fetch(getApiUrl(`/api/jobs/${encodeURIComponent(jobId)}/schedule-action`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ action, proposedDate, reason }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `Failed to update job schedule (${response.status})`);
+  }
+  return data;
+}

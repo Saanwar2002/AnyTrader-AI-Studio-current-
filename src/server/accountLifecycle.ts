@@ -694,3 +694,202 @@ export async function verifyTraderAccountWithProjection(options: VerifyTraderAcc
     publicProfileRetracted,
   };
 }
+
+export interface ReviewTraderVerificationDocumentOptions {
+  db: any;
+  adminUid: string;
+  adminEmail?: string;
+  targetUid: string;
+  docType: string;
+  decision: "approved" | "rejected";
+  reason?: string;
+}
+
+/**
+ * Atomically reviews a single verification document for a trader, updates account-level
+ * verificationStatus / isVerified / verifiedTrader, synchronizes /public_profiles/{uid},
+ * notifies the trader, and writes an immutable admin audit log.
+ */
+export async function reviewTraderVerificationDocument(options: ReviewTraderVerificationDocumentOptions): Promise<{
+  success: true;
+  targetUid: string;
+  docType: string;
+  decision: "approved" | "rejected";
+  verificationStatus: string;
+  isVerified: boolean;
+  allApproved: boolean;
+  publicProfileSynced: boolean;
+  verificationDocs: Record<string, any>[];
+}> {
+  const { db, adminUid, adminEmail, targetUid, docType, decision, reason } = options;
+  if (!db) throw new BadRequestError("Database service unavailable");
+  if (!adminUid) throw new ForbiddenError("Admin authentication required");
+  if (!targetUid) throw new BadRequestError("Target user ID is required");
+  const cleanDocType = String(docType || "").trim();
+  if (!cleanDocType) throw new BadRequestError("Document type is required");
+  if (decision !== "approved" && decision !== "rejected") {
+    throw new BadRequestError("Decision must be 'approved' or 'rejected'.");
+  }
+  const cleanReason = typeof reason === "string" ? reason.trim().slice(0, 300) : "";
+  if (decision === "rejected" && !cleanReason) {
+    throw new BadRequestError("A rejection reason is required when rejecting a document.");
+  }
+
+  const userRef = db.collection("users").doc(targetUid);
+  const publicRef = db.collection("public_profiles").doc(targetUid);
+  const nowIso = new Date().toISOString();
+
+  let finalVerificationStatus = "pending";
+  let finalIsVerified = false;
+  let allApproved = false;
+  let publicProfileSynced = false;
+  let updatedDocs: Record<string, any>[] = [];
+  let traderName = "Tradesperson";
+
+  await db.runTransaction(async (tx: any) => {
+    const [userSnap, publicSnap] = await Promise.all([tx.get(userRef), tx.get(publicRef)]);
+    const userExists = typeof userSnap?.exists === "function" ? userSnap.exists() : Boolean(userSnap?.exists);
+    if (!userExists) {
+      throw new NotFoundError(`User account '${targetUid}' was not found.`);
+    }
+    const userData = (typeof userSnap.data === "function" ? userSnap.data() : userSnap.data) || {};
+    traderName = String(userData.name || userData.displayName || "Tradesperson");
+    const existingDocs: Record<string, any>[] = Array.isArray(userData.verificationDocs) ? userData.verificationDocs : [];
+    const matched = existingDocs.some((d) => String(d?.type || "") === cleanDocType);
+    if (!matched) {
+      throw new NotFoundError(`Verification document '${cleanDocType}' not found for user '${targetUid}'.`);
+    }
+
+    updatedDocs = existingDocs.map((d) => {
+      if (String(d?.type || "") !== cleanDocType) return d;
+      const nextDoc: Record<string, any> = {
+        ...d,
+        status: decision,
+        reviewedAt: nowIso,
+        reviewedBy: adminUid,
+      };
+      if (decision === "rejected") {
+        nextDoc.rejectionReason = cleanReason;
+      } else {
+        delete nextDoc.rejectionReason;
+      }
+      return nextDoc;
+    });
+
+    allApproved = updatedDocs.length > 0 && updatedDocs.every((d) => d.status === "approved");
+    const hasRejected = updatedDocs.some((d) => d.status === "rejected");
+    const prevStatus = String(userData.verificationStatus || "").toLowerCase();
+    const wasHigherTierApproved = prevStatus === "vetted" || prevStatus === "auditioned";
+
+    if (decision === "rejected" || hasRejected) {
+      finalVerificationStatus = "rejected";
+      finalIsVerified = false;
+    } else if (allApproved) {
+      finalVerificationStatus = wasHigherTierApproved ? prevStatus : "verified";
+      finalIsVerified = true;
+    } else {
+      finalVerificationStatus = "pending";
+      finalIsVerified = false;
+    }
+
+    const userUpdate: Record<string, any> = {
+      verificationDocs: updatedDocs,
+      verificationStatus: finalVerificationStatus,
+      isVerified: finalIsVerified,
+      verifiedTrader: finalIsVerified,
+      verified: finalIsVerified,
+      updatedAt: nowIso,
+    };
+    if (finalIsVerified) {
+      userUpdate.verifiedByAdminUid = adminUid;
+      userUpdate.verifiedAt = userData.verifiedAt || nowIso;
+      userUpdate.verificationRevokedAt = null;
+    } else if (decision === "rejected") {
+      userUpdate.verificationRevokedAt = nowIso;
+    }
+
+    tx.update(userRef, userUpdate);
+
+    const isDisabledAccount = userData.isSuspended === true || userData.isDisabled === true || userData.disabled === true;
+    const publicExists = typeof publicSnap?.exists === "function" ? publicSnap.exists() : Boolean(publicSnap?.exists);
+
+    if (finalIsVerified && !isDisabledAccount) {
+      const projection = buildSanitizedPublicProfileProjection(targetUid, {
+        ...userData,
+        ...userUpdate,
+      });
+      if (projection) {
+        tx.set(publicRef, projection, { merge: true });
+        publicProfileSynced = true;
+      }
+    } else if (publicExists) {
+      tx.set(
+        publicRef,
+        {
+          verificationStatus: finalVerificationStatus,
+          isVerified: false,
+          verifiedTrader: false,
+          verified: false,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      publicProfileSynced = true;
+    }
+  });
+
+  // Notify trader of document decision (non-blocking after atomic commit)
+  try {
+    const title =
+      decision === "approved"
+        ? allApproved
+          ? "Account Verified!"
+          : `Document Approved: ${cleanDocType}`
+        : `Verification Document Rejected: ${cleanDocType}`;
+    const message =
+      decision === "approved"
+        ? allApproved
+          ? `Your ${cleanDocType} certificate has been approved and your tradesperson account is now fully verified on AnyTrader.`
+          : `Your ${cleanDocType} certificate was approved. Your remaining submitted documents are still under review.`
+        : `Your ${cleanDocType} certificate could not be approved (${cleanReason}). Please upload an updated document from your Profile.`;
+
+    await db.collection("notifications").add({
+      userId: targetUid,
+      title,
+      message,
+      type: "verification_update",
+      link: "/profile",
+      read: false,
+      createdAt: nowIso,
+    });
+  } catch {
+    // Non-fatal
+  }
+
+  try {
+    await db.collection("admin_audit_logs").add({
+      action: decision === "approved" ? "approve_document" : "reject_document",
+      targetId: targetUid,
+      targetType: "user",
+      details: `${decision === "approved" ? "Approved" : "Rejected"} ${cleanDocType} for ${traderName}. Account status=${finalVerificationStatus} (isVerified=${finalIsVerified}, publicProfileSynced=${publicProfileSynced}).${cleanReason ? ` Reason: ${cleanReason}` : ""}`,
+      adminId: adminUid,
+      adminEmail: adminEmail || null,
+      timestamp: nowIso,
+    });
+  } catch {
+    // Non-fatal
+  }
+
+  return {
+    success: true,
+    targetUid,
+    docType: cleanDocType,
+    decision,
+    verificationStatus: finalVerificationStatus,
+    isVerified: finalIsVerified,
+    allApproved,
+    publicProfileSynced,
+    verificationDocs: updatedDocs,
+  };
+}
+

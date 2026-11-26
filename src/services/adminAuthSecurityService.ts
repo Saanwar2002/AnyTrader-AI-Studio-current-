@@ -1,4 +1,4 @@
-import { auth, db, doc, getDoc, setDoc, onSnapshot, collection, serverTimestamp, query, orderBy, limit, sendNotification } from "@/src/firebase";
+import { auth } from "@/src/firebase";
 
 export interface MasterAdminAuthConfig {
   primaryAdminEmail: string;
@@ -96,7 +96,7 @@ export async function dispatchAdminLoginAlert(params: {
             Admin Access Granted
           </h2>
           <p style="margin: 0 0 18px 0; color: #475569; font-size: 14px; line-height: 1.6;">
-            A Master Administrator session was unlocked using administrative credentials and 2FA Master PIN verification.
+            A Master Administrator session was unlocked using administrative credentials and cryptographic Firebase session re-authentication.
           </p>
 
           <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; margin-bottom: 22px;">
@@ -125,14 +125,14 @@ export async function dispatchAdminLoginAlert(params: {
                 <td style="padding: 6px 0; font-size: 12px; color: #334155; word-break: break-word;">${userAgent}</td>
               </tr>
               <tr>
-                <td style="padding: 6px 0; color: #64748b; font-weight: 600;">2FA PIN Verified:</td>
-                <td style="padding: 6px 0; font-weight: 700; color: #059669;">${pinVerified ? "Yes (Verified 6-Digit PIN)" : "Pending"}</td>
+                <td style="padding: 6px 0; color: #64748b; font-weight: 600;">Session Re-Auth:</td>
+                <td style="padding: 6px 0; font-weight: 700; color: #059669;">${pinVerified ? "Yes (Verified Firebase Session)" : "Pending"}</td>
               </tr>
             </table>
           </div>
 
           <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 14px; margin-bottom: 22px; font-size: 12px; color: #92400e;">
-            <strong>Security Advisory:</strong> If you did not initiate this administrator login session, immediately open the Admin Console and change your Master Admin PIN or lock the terminal.
+            <strong>Security Advisory:</strong> If you did not initiate this administrator login session, immediately open the Admin Console, revoke active sessions, and reset your account password.
           </div>
 
           <div style="text-align: center;">
@@ -199,18 +199,6 @@ export async function dispatchAdminLoginAlert(params: {
       }
     } catch (err) {
       console.debug("Could not record admin login audit via server:", err);
-    }
-
-    // 3. Create an in-app security notification
-    try {
-      await sendNotification(
-        "admin_broadcast",
-        "🛡️ Admin Session Unlocked",
-        `Admin login confirmed for ${adminEmail} from IP ${clientIp}`,
-        "system"
-      );
-    } catch (err) {
-      console.debug("Could not record notification:", err);
     }
 
     return { success: true, clientIp, timestamp: nowIso };

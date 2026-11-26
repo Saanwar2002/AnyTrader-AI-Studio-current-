@@ -3,6 +3,7 @@ import { Search, Filter, Star, MapPin, CheckCircle, ChevronRight, X, SlidersHori
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindowF, CircleF } from "@react-google-maps/api";
 import { getGoogleMapsApiKey, triggerHaptic } from "@/src/lib/capacitor";
 import { db, auth, collection, query, where, orderBy, onSnapshot, setDoc, updateDoc, doc, handleFirestoreError, OperationType, increment } from "@/src/firebase";
+import { limit } from "firebase/firestore";
 import { DidYouMeanSuggestion } from "./common/DidYouMeanSuggestion";
 import { findFuzzySuggestion, buildCandidateDictionary, matchTraderWithSearchQuery, textContainsTokenMatch, categoryMatchesSearch, CATEGORY_SYNONYMS, FuzzyMatchResult, CandidateItem } from "@/src/lib/fuzzyMatch";
 import { initSearchOptimizationService, recordUnmatchedSearch, onDynamicSynonymsUpdate } from "@/src/services/searchOptimizationService";
@@ -18,7 +19,7 @@ import { getTraderUnifiedTrustBadges } from "@/src/lib/trustBadges";
 import { TraderDocumentViewerModal } from "./TraderDocumentViewerModal";
 import { SlowTrustBadgesCarousel } from "./SlowTrustBadgesCarousel";
 import { SEO } from "./SEO";
-import { seedMockTraders, INITIAL_MOCK_TRADERS, INITIAL_MOCK_FLASH_DEALS, generateTraderSeedReviews } from "@/src/services/seedService";
+
 import { isDealSoldOut, isDealPaused, getRemainingSlots, getDealCapacityInfo, formatDealBadgeText, formatDealScheduleText } from "@/src/lib/flashDeals";
 import { shareDeal, DealCountdownBadge } from "@/src/lib/dealUtils";
 import { getCategoryHotSearches } from "@/src/utils/tradePresets";
@@ -58,21 +59,17 @@ const premiumMapOptions: google.maps.MapOptions = {
   ]
 };
 
-const getTraderCoordinates = (tp: Tradesperson): { lat: number; lng: number } => {
-  if (tp.lat && tp.lng) {
+const getTraderCoordinates = (tp: Tradesperson): { lat: number; lng: number } | null => {
+  if (
+    typeof tp.lat === "number" &&
+    typeof tp.lng === "number" &&
+    Number.isFinite(tp.lat) &&
+    Number.isFinite(tp.lng) &&
+    !(tp.lat === 0 && tp.lng === 0)
+  ) {
     return { lat: tp.lat, lng: tp.lng };
   }
-  let hash = 0;
-  for (let i = 0; i < tp.uid.length; i++) {
-    hash = (hash << 5) - hash + tp.uid.charCodeAt(i);
-    hash |= 0;
-  }
-  const latOffset = (((Math.abs(hash) % 120) - 60) * 0.003);
-  const lngOffset = (((Math.abs(hash >> 2) % 120) - 60) * 0.004);
-  return {
-    lat: 51.5074 + latOffset,
-    lng: -0.1278 + lngOffset
-  };
+  return null;
 };
 
 interface Tradesperson {
@@ -183,9 +180,9 @@ export default function FindTrades() {
   const location = useLocation();
   const { categories } = useCategories();
   const { user, profile } = useAuth();
-  const [tradespeople, setTradespeople] = useState<Tradesperson[]>(INITIAL_MOCK_TRADERS as any[]);
+  const [tradespeople, setTradespeople] = useState<Tradesperson[]>([]);
   const [platformConfig, setPlatformConfig] = useState<any>(null);
-  const [allDeals, setAllDeals] = useState<any[]>(INITIAL_MOCK_FLASH_DEALS);
+  const [allDeals, setAllDeals] = useState<any[]>([]);
   const dealsContainerRef = React.useRef<HTMLDivElement>(null);
   const [isDealsPlaying, setIsDealsPlaying] = useState(true);
   const [isDealsHovered, setIsDealsHovered] = useState(false);
@@ -450,35 +447,26 @@ export default function FindTrades() {
 
     setLoadingPreviewReviews(true);
 
-    const isMockTrader = INITIAL_MOCK_TRADERS.some(
-      (t: any) => t.uid === traderId || t.id === traderId
-    );
-
     // 1. Fetch real reviews from Firestore
     const reviewsQ = query(
       collection(db, "reviews"),
       where("revieweeId", "==", traderId),
-      orderBy("createdAt", "desc")
+      orderBy("createdAt", "desc"),
+      limit(50)
     );
 
     const unsubReviews = onSnapshot(reviewsQ, (snapshot) => {
       const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const active = fetched.filter((r: any) => r.status !== "cooling_off");
-      if (active.length > 0) {
-        setPreviewReviews(active);
-      } else if (isMockTrader) {
-        setPreviewReviews(generateTraderSeedReviews(selectedTraderPreview.name));
-      } else {
-        setPreviewReviews([]);
-      }
+      const active = fetched.filter(
+        (r: any) =>
+          r.isHidden !== true &&
+          !["cooling_off", "hidden", "rejected"].includes(String(r.status || "published").toLowerCase())
+      );
+      setPreviewReviews(active);
       setLoadingPreviewReviews(false);
     }, (error) => {
       console.warn("Error fetching preview reviews:", error);
-      if (isMockTrader) {
-        setPreviewReviews(generateTraderSeedReviews(selectedTraderPreview.name));
-      } else {
-        setPreviewReviews([]);
-      }
+      setPreviewReviews([]);
       setLoadingPreviewReviews(false);
     });
 
@@ -486,7 +474,8 @@ export default function FindTrades() {
     const portfolioQ = query(
       collection(db, "portfolioItems"),
       where("consultantId", "==", traderId),
-      orderBy("createdAt", "desc")
+      orderBy("createdAt", "desc"),
+      limit(30)
     );
 
     const unsubPortfolio = onSnapshot(portfolioQ, (snapshot) => {
@@ -559,21 +548,24 @@ export default function FindTrades() {
   const [documentViewerInitialBadge, setDocumentViewerInitialBadge] = useState<string>("liability_insurance");
 
   // Rebuild dictionary when tradespeople change, categories load, or dynamic synonyms are registered
+  const dictionaryDepsRef = React.useRef({ tradespeople, categories });
   useEffect(() => {
+    dictionaryDepsRef.current = { tradespeople, categories };
     setCandidateDictionary(buildCandidateDictionary(tradespeople, categories));
   }, [tradespeople, categories]);
 
-  // Synchronize dynamic synonyms from Firestore and re-index dictionary on updates
+  // Synchronize dynamic synonyms from Firestore once on mount and re-index dictionary on updates
   useEffect(() => {
     const unsubInit = initSearchOptimizationService();
     const unsubUpdate = onDynamicSynonymsUpdate(() => {
-      setCandidateDictionary(buildCandidateDictionary(tradespeople, categories));
+      const latest = dictionaryDepsRef.current;
+      setCandidateDictionary(buildCandidateDictionary(latest.tradespeople, latest.categories));
     });
     return () => {
       if (typeof unsubInit === "function") unsubInit();
       if (typeof unsubUpdate === "function") unsubUpdate();
     };
-  }, [tradespeople, categories]);
+  }, []);
 
   // --- Live Auto-Complete Dropdown State ---
   const [isSearchFocused, setIsSearchFocused] = useState(false);
@@ -798,7 +790,7 @@ export default function FindTrades() {
     });
 
     // Subscribe to sanitized public_ads projection for search-feed promoted campaigns
-    const adsQuery = query(collection(db, "public_ads"), where("isActive", "==", true));
+    const adsQuery = query(collection(db, "public_ads"), where("isActive", "==", true), limit(50));
     const unsubAds = onSnapshot(adsQuery, (snapshot) => {
       const ads = snapshot.docs
         .map(d => ({ id: d.id, ...d.data() }))
@@ -808,13 +800,10 @@ export default function FindTrades() {
       console.error("Error fetching active public search ads:", err);
     });
 
-    const q = query(collection(db, "public_profiles"));
+    const q = query(collection(db, "public_profiles"), limit(250));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const dbTraders = snapshot.docs.map(doc => ({ uid: doc.id, ...doc.data() } as Tradesperson));
-      const seedPool = INITIAL_MOCK_TRADERS as Tradesperson[];
-      const dbUids = new Set(dbTraders.map(t => t.uid));
-      const merged = [...dbTraders, ...seedPool.filter(s => !dbUids.has(s.uid))];
-      setTradespeople(merged);
+      setTradespeople(dbTraders);
       setLoading(false);
     }, (error) => {
       console.error("Error fetching tradespeople from public_profiles:", error);
@@ -834,20 +823,13 @@ export default function FindTrades() {
     }
 
     // Subscribe to active off-peak flash deals
-    const dealsQuery = query(collection(db, "flash_deals"), where("status", "==", "active"));
+    const dealsQuery = query(collection(db, "flash_deals"), where("status", "==", "active"), limit(40));
     const unsubDeals = onSnapshot(dealsQuery, (snapshot) => {
       const dbDeals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      if (dbDeals.length > 0) {
-        // Combine DB deals with initial mock deals ensuring no duplicate ids
-        const existingIds = new Set(dbDeals.map(d => d.id));
-        const merged = [...dbDeals, ...INITIAL_MOCK_FLASH_DEALS.filter(m => !existingIds.has(m.id))];
-        setAllDeals(merged);
-      } else {
-        setAllDeals(INITIAL_MOCK_FLASH_DEALS);
-      }
+      setAllDeals(dbDeals);
     }, (err) => {
       console.error("Error fetching active flash deals:", err);
-      setAllDeals(INITIAL_MOCK_FLASH_DEALS);
+      setAllDeals([]);
     });
 
     return () => {
@@ -1191,13 +1173,13 @@ export default function FindTrades() {
 
   // Infinite scroll listener to reveal 10 more on scroll near bottom
   useEffect(() => {
-    if (displayLimit >= filteredTradespeople.length) return;
+    if (displayLimit >= finalDisplayList.length) return;
 
     const handleInfiniteScroll = () => {
       if (!loadMoreSentinelRef.current) return;
       const rect = loadMoreSentinelRef.current.getBoundingClientRect();
       if (rect.top <= window.innerHeight + 500) {
-        setDisplayLimit(prev => Math.min(prev + 10, filteredTradespeople.length));
+        setDisplayLimit(prev => Math.min(prev + 10, finalDisplayList.length));
       }
     };
 
@@ -1205,7 +1187,7 @@ export default function FindTrades() {
     handleInfiniteScroll();
 
     return () => window.removeEventListener("scroll", handleInfiniteScroll);
-  }, [displayLimit, filteredTradespeople.length]);
+  }, [displayLimit, finalDisplayList.length]);
 
   useEffect(() => {
     if (!loading && filteredTradespeople.length === 0 && (searchQuery || selectedCategory !== "All" || minRating !== null || verifiedOnly || postcodeFilterEnabled)) {
@@ -1415,14 +1397,6 @@ export default function FindTrades() {
 
   return (
     <div className="max-w-5xl mx-auto -mt-6 relative">
-      {(platformConfig?.isDemo || true) && (
-        <button
-          onClick={seedMockTraders}
-          className="absolute top-0 right-4 z-50 bg-indigo-600 text-white text-xs px-3 py-1 rounded shadow-md hover:bg-indigo-700"
-        >
-          Seed Mock Traders
-        </button>
-      )}
       <SEO 
         title="Find Trades & Helpers" 
         description="Search for verified tradespeople and community helpers on AnyTrader. View profiles, reviews, and hire the best talent for your project."
@@ -2449,24 +2423,23 @@ export default function FindTrades() {
 
               {/* Google Map Container */}
               <div className="w-full h-[520px] sm:h-[620px] rounded-2xl overflow-hidden border border-slate-700 relative">
-                {isMapScriptLoaded ? (
+                {isMapScriptLoaded ? (() => {
+                  const defaultUkCenter = { lat: 51.5074, lng: -0.1278 };
+                  const firstValidCoords =
+                    filteredTradespeople
+                      .map((tp) => getTraderCoordinates(tp))
+                      .find((c): c is { lat: number; lng: number } => c !== null) || defaultUkCenter;
+                  const selectedCoords = selectedMapTrader ? getTraderCoordinates(selectedMapTrader) : null;
+                  return (
                   <GoogleMap
                     mapContainerStyle={{ width: "100%", height: "100%" }}
-                    center={
-                      filteredTradespeople.length > 0
-                        ? getTraderCoordinates(filteredTradespeople[0])
-                        : { lat: 51.5074, lng: -0.1278 }
-                    }
+                    center={firstValidCoords}
                     zoom={12}
                     options={premiumMapOptions}
                   >
                     {/* Distance Radius Circle */}
                     <CircleF
-                      center={
-                        filteredTradespeople.length > 0
-                          ? getTraderCoordinates(filteredTradespeople[0])
-                          : { lat: 51.5074, lng: -0.1278 }
-                      }
+                      center={firstValidCoords}
                       radius={mapRadiusKm * 1000}
                       options={{
                         fillColor: "#2563eb",
@@ -2477,9 +2450,10 @@ export default function FindTrades() {
                       }}
                     />
 
-                    {/* Pinned Tradespeople Markers */}
+                    {/* Pinned Tradespeople Markers (only render traders with real coordinates) */}
                     {filteredTradespeople.map((tp) => {
                       const coords = getTraderCoordinates(tp);
+                      if (!coords) return null;
                       const isSelected = selectedMapTrader?.uid === tp.uid;
                       return (
                         <MarkerF
@@ -2500,9 +2474,9 @@ export default function FindTrades() {
                     })}
 
                     {/* InfoWindow for Selected Tradesperson */}
-                    {selectedMapTrader && (
+                    {selectedMapTrader && selectedCoords && (
                       <InfoWindowF
-                        position={getTraderCoordinates(selectedMapTrader)}
+                        position={selectedCoords}
                         onCloseClick={() => setSelectedMapTrader(null)}
                       >
                         <div className="p-1 max-w-[220px] text-slate-900">
@@ -2546,7 +2520,8 @@ export default function FindTrades() {
                       </InfoWindowF>
                     )}
                   </GoogleMap>
-                ) : (
+                  );
+                })() : (
                   <div className="w-full h-full bg-slate-950 flex flex-col items-center justify-center p-6 text-center text-slate-400">
                     <Map className="w-10 h-10 text-blue-500 animate-pulse mb-3" />
                     <p className="text-sm font-bold text-white">Loading Interactive Trade Map...</p>

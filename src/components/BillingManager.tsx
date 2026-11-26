@@ -9,8 +9,19 @@ import {
   Calendar, AlertTriangle, RefreshCw, ExternalLink, Car
 } from "lucide-react";
 import { cn } from "@/src/lib/utils";
-import { useNavigate } from "react-router-dom";
-import { normalizeTraderTier } from "@/src/services/stripeIntegrationService";
+import { useNavigate, useLocation } from "react-router-dom";
+import {
+  normalizeTraderTier,
+  getStripeOnboardingLink,
+  getStripeAccountStatus,
+  getStripeLoginLink,
+} from "@/src/services/stripeIntegrationService";
+import {
+  isPropertyOnlyBusinessAccount,
+  isAnyRollerDriverAccount,
+  isPayoutEligibleAccount,
+} from "@/src/lib/accountRoles";
+import SavedPaymentCardsPanel from "./shared/SavedPaymentCardsPanel";
 import { toast } from "sonner";
 
 interface SubscriptionTier {
@@ -27,12 +38,104 @@ interface SubscriptionTier {
 export default function BillingManager() {
   const { user, profile } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [loading, setLoading] = useState(true);
   const [platformConfig, setPlatformConfig] = useState<any>(null);
   const [globalTiers, setGlobalTiers] = useState<any>(null);
   const [selectedTier, setSelectedTier] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isAddingCard, setIsAddingCard] = useState(false);
   const [savedCards, setSavedCards] = useState<any[]>([]);
+  const [busyCardId, setBusyCardId] = useState<string | null>(null);
+  const [busyCardAction, setBusyCardAction] = useState<"default" | "delete" | null>(null);
+  const [stripeConnectStatus, setStripeConnectStatus] = useState<{
+    loading: boolean;
+    connected: boolean;
+    stripeAccountId?: string;
+    payoutsEnabled: boolean;
+    chargesEnabled: boolean;
+    detailsSubmitted: boolean;
+    error?: string;
+  }>({
+    loading: false,
+    connected: Boolean(profile?.stripeAccountId),
+    stripeAccountId: profile?.stripeAccountId,
+    payoutsEnabled: Boolean(profile?.payoutsEnabled),
+    chargesEnabled: Boolean(profile?.chargesEnabled),
+    detailsSubmitted: Boolean(profile?.stripeOnboardingComplete),
+  });
+  const [isLaunchingConnect, setIsLaunchingConnect] = useState(false);
+  const [isOpeningStripeDashboard, setIsOpeningStripeDashboard] = useState(false);
+
+  const isDriverAccount = isAnyRollerDriverAccount(profile);
+  const isPayoutEligible = isPayoutEligibleAccount(profile) || Boolean(profile?.stripeAccountId);
+
+  const fetchStripeConnectStatus = async (showFeedback?: "return" | "refresh") => {
+    if (!user?.uid || !isPayoutEligible) return;
+    setStripeConnectStatus((prev) => ({ ...prev, loading: true, error: undefined }));
+    try {
+      const status = await getStripeAccountStatus();
+      setStripeConnectStatus({
+        loading: false,
+        connected: Boolean(status.connected || profile?.stripeAccountId),
+        stripeAccountId: status.stripeAccountId || profile?.stripeAccountId,
+        payoutsEnabled: Boolean(status.payoutsEnabled),
+        chargesEnabled: Boolean(status.chargesEnabled),
+        detailsSubmitted: Boolean(status.detailsSubmitted),
+        error: status.error,
+      });
+
+      if (showFeedback === "return") {
+        if (status.payoutsEnabled) {
+          toast.success("Stripe Connect payouts are active and ready.");
+        } else if (status.detailsSubmitted) {
+          toast.info("Stripe has received your details and is verifying your payout account.");
+        } else {
+          toast.info("Your Stripe Connect setup is not yet complete. Tap Continue Verification to finish.");
+        }
+      } else if (showFeedback === "refresh") {
+        toast.info("Your Stripe onboarding link expired. Tap Continue Verification to resume.");
+      }
+    } catch (err: any) {
+      console.error("Failed to fetch Stripe Connect status:", err);
+      setStripeConnectStatus((prev) => ({
+        ...prev,
+        loading: false,
+        error: err?.message || "Unable to verify Stripe Connect status right now.",
+      }));
+    }
+  };
+
+  const handleStartStripeConnect = async () => {
+    if (!user?.uid) return;
+    setIsLaunchingConnect(true);
+    try {
+      const onboardingUrl = await getStripeOnboardingLink(user.uid, "billing");
+      window.location.href = onboardingUrl;
+    } catch (err: any) {
+      console.error("Stripe Connect onboarding error:", err);
+      toast.error(err?.message || "Unable to start Stripe Connect onboarding right now.");
+      setIsLaunchingConnect(false);
+    }
+  };
+
+  const handleOpenStripeDashboard = async () => {
+    if (!user?.uid) return;
+    setIsOpeningStripeDashboard(true);
+    try {
+      const dashboardUrl = await getStripeLoginLink();
+      if (!dashboardUrl) {
+        toast.error("Unable to open the Stripe Express Dashboard right now. Ensure Stripe onboarding is completed.");
+        return;
+      }
+      window.location.href = dashboardUrl;
+    } catch (err: any) {
+      console.error("Stripe Express Dashboard error:", err);
+      toast.error(err?.message || "Failed to open Stripe Express Dashboard.");
+    } finally {
+      setIsOpeningStripeDashboard(false);
+    }
+  };
 
   useEffect(() => {
     const unsubGlobal = onSnapshot(doc(db, "platform_config", "global"), (doc) => {
@@ -47,15 +150,34 @@ export default function BillingManager() {
       setLoading(false);
     });
 
-    if (user?.uid) {
-      fetchPaymentMethods(user.uid);
-    }
-
     return () => {
       unsubGlobal();
       unsubTiers();
     };
-  }, [user]);
+  }, []);
+
+  useEffect(() => {
+    if (!user?.uid) return;
+    fetchPaymentMethods(user.uid);
+    const params = new URLSearchParams(location.search);
+    const setupParam = params.get("setup");
+    if (setupParam === "success") {
+      toast.success("Payment card saved securely via Stripe.");
+      navigate("/billing", { replace: true });
+    }
+    if (isPayoutEligible) {
+      const connectParam = params.get("stripe_connect");
+      if (connectParam === "success" || connectParam === "return") {
+        fetchStripeConnectStatus("return");
+        navigate("/billing", { replace: true });
+      } else if (connectParam === "refresh") {
+        fetchStripeConnectStatus("refresh");
+        navigate("/billing", { replace: true });
+      } else {
+        fetchStripeConnectStatus();
+      }
+    }
+  }, [user?.uid, profile?.role, profile?.businessLayer, profile?.stripeAccountId, isPayoutEligible, location.search]);
 
   const fetchPaymentMethods = async (userId: string) => {
     try {
@@ -76,10 +198,13 @@ export default function BillingManager() {
       }
       const data = await res.json();
       if (data && Array.isArray(data.paymentMethods)) {
-        setSavedCards(data.paymentMethods.map((pm: any, index: number) => ({
-          ...pm,
-          isDefault: index === 0 // Making the first one default for display purposes
-        })));
+        const defaultId = typeof data.defaultPaymentMethodId === "string" ? data.defaultPaymentMethodId : null;
+        setSavedCards(
+          data.paymentMethods.map((pm: any) => ({
+            ...pm,
+            isDefault: Boolean(pm.isDefault || (defaultId && pm.id === defaultId)),
+          }))
+        );
       }
     } catch (err) {
       console.error("Error fetching payment methods:", err);
@@ -89,14 +214,40 @@ export default function BillingManager() {
   const handleSelectPlan = async (tier: SubscriptionTier) => {
     if (!user) return;
     setIsProcessing(true);
-    
+
     try {
       const token = await auth.currentUser?.getIdToken();
+      if (!token) {
+        toast.error("Please sign in again to manage your subscription.");
+        return;
+      }
+
+      const canonicalTier = normalizeTraderTier(tier.rawKey || tier.name);
+      const isFreeTier = Number(tier.price || 0) <= 0 || canonicalTier === "payg" || tier.id === "price_payg";
+
+      if (isFreeTier) {
+        const response = await fetch("/api/select-free-tier", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ tierName: canonicalTier || "payg" })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.success) {
+          toast.error(data.error || "Unable to switch to the free plan right now.");
+          return;
+        }
+        toast.success(`Switched to ${tier.name}!`);
+        return;
+      }
+
       const response = await fetch("/api/create-checkout-session", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+          Authorization: `Bearer ${token}`,
           "Idempotency-Key": crypto.randomUUID()
         },
         body: JSON.stringify({
@@ -112,7 +263,7 @@ export default function BillingManager() {
               description: tier.description || `Platform tier ${tier.name}`
             }
           },
-          priceId: tier.id,
+          priceId: `price_${canonicalTier}`,
           successUrl: `${window.location.origin}/dashboard?subscription=success`,
           cancelUrl: `${window.location.origin}/billing`,
           metadata: {
@@ -122,14 +273,16 @@ export default function BillingManager() {
         })
       });
 
-      const data = await response.json();
-      if (data.url) {
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data.url) {
         window.location.href = data.url;
-      } else if (data.error) {
-        toast.error(data.error);
-      } else {
+      } else if (response.ok && data.upgraded) {
+        toast.success(data.message || `Successfully switched to ${tier.name}!`);
+      } else if (response.ok && data.mock) {
         toast.success(`Successfully activated ${tier.name}!`);
         navigate("/dashboard");
+      } else {
+        toast.error(data.error || "Unable to start Stripe Checkout. Your plan was not changed.");
       }
     } catch (err) {
       console.error("Billing Error:", err);
@@ -141,7 +294,7 @@ export default function BillingManager() {
 
   const handleAddPaymentMethod = async () => {
     if (!user) return;
-    setIsProcessing(true);
+    setIsAddingCard(true);
     try {
       const token = await auth.currentUser?.getIdToken();
       if (!token) {
@@ -156,7 +309,7 @@ export default function BillingManager() {
         },
         body: JSON.stringify({
           userId: user.uid,
-          successUrl: `${window.location.origin}/billing`,
+          successUrl: `${window.location.origin}/billing?setup=success`,
           cancelUrl: `${window.location.origin}/billing`
         })
       });
@@ -174,24 +327,86 @@ export default function BillingManager() {
       console.error("Setup Error:", err);
       toast.error("Failed to start payment method setup.");
     } finally {
-      setIsProcessing(false);
+      setIsAddingCard(false);
+    }
+  };
+
+  const handleSetDefaultPaymentMethod = async (paymentMethodId: string) => {
+    if (!user) return;
+    setBusyCardId(paymentMethodId);
+    setBusyCardAction("default");
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) {
+        toast.error("Please sign in again to update your default card.");
+        return;
+      }
+      const res = await fetch(`/api/payment-methods/${user.uid}/${paymentMethodId}/default`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.error || "Unable to set default payment card right now.");
+        return;
+      }
+      const nextDefaultId = data.defaultPaymentMethodId || paymentMethodId;
+      setSavedCards((cards) =>
+        cards
+          .map((c) => ({ ...c, isDefault: c.id === nextDefaultId }))
+          .sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+      );
+      toast.success("Default payment card updated.");
+    } catch (err) {
+      console.error("Set Default Card Error:", err);
+      toast.error("Failed to update default payment card.");
+    } finally {
+      setBusyCardId(null);
+      setBusyCardAction(null);
     }
   };
 
   const handleDeletePaymentMethod = async (paymentMethodId: string) => {
     if (!user) return;
+    setBusyCardId(paymentMethodId);
+    setBusyCardAction("delete");
     try {
       const token = await auth.currentUser?.getIdToken();
-      await fetch(`/api/payment-methods/${user.uid}/${paymentMethodId}`, {
+      if (!token) {
+        toast.error("Please sign in again to remove a payment card.");
+        return;
+      }
+      const res = await fetch(`/api/payment-methods/${user.uid}/${paymentMethodId}`, {
         method: "DELETE",
         headers: {
-           ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-        }
+          Authorization: `Bearer ${token}`,
+        },
       });
-      // Removing locally
-      setSavedCards(cards => cards.filter(c => c.id !== paymentMethodId));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast.error(data.error || "Unable to remove payment card right now.");
+        return;
+      }
+      const nextDefaultId = data.defaultPaymentMethodId ?? null;
+      setSavedCards((cards) =>
+        cards
+          .filter((c) => c.id !== paymentMethodId)
+          .map((c) => ({
+            ...c,
+            isDefault: nextDefaultId !== null ? c.id === nextDefaultId : Boolean(c.isDefault),
+          }))
+          .sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+      );
+      toast.success("Payment card removed.");
     } catch (err) {
       console.error("Delete Error:", err);
+      toast.error("Failed to remove payment card.");
+    } finally {
+      setBusyCardId(null);
+      setBusyCardAction(null);
     }
   };
 
@@ -221,7 +436,11 @@ export default function BillingManager() {
           returnUrl: `${window.location.origin}/billing`
         })
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        toast.error(data.error || "Failed to open billing portal.");
+        return;
+      }
       if (data.url) {
         window.location.href = data.url;
       } else if (data.error) {
@@ -235,7 +454,7 @@ export default function BillingManager() {
     }
   };
 
-  const handleCancelSubscription = async (subscriptionType: 'tier' | 'exclusive_leads' | 'video_pro' | 'driver_gold' | 'landlord' | string) => {
+  const handleCancelSubscription = async (subscriptionType: 'tier' | 'exclusive_leads' | 'video_pro' | 'driver_gold' | 'landlord' | 'appointments' | string) => {
     if (!user) return;
     setIsProcessing(true);
     try {
@@ -265,7 +484,7 @@ export default function BillingManager() {
     }
   };
 
-  const handleReactivateSubscription = async (subscriptionType: 'tier' | 'exclusive_leads' | 'video_pro' | 'driver_gold' | 'landlord' | string) => {
+  const handleReactivateSubscription = async (subscriptionType: 'tier' | 'exclusive_leads' | 'video_pro' | 'driver_gold' | 'landlord' | 'appointments' | string) => {
     if (!user) return;
     setIsProcessing(true);
     try {
@@ -301,12 +520,22 @@ export default function BillingManager() {
   );
 
   // -------------------------------------------------------------
-  // CUSTOMER / LANDLORD BILLING UI
+  // CUSTOMER / LANDLORD / PROPERTY BUSINESS BILLING UI
   // -------------------------------------------------------------
-  if ((profile?.role as string) === "homeowner" || (profile?.role as string) === "customer") {
-    const isLandlordPro = profile?.tier === "landlord" || profile?.isLandlord;
-    const isCanceling = Boolean(profile?.cancelAtPeriodEnd);
-    const renewalDate = profile?.currentPeriodEnd ? new Date(profile.currentPeriodEnd).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : 'Next billing cycle';
+  if (
+    (profile?.role as string) === "homeowner" ||
+    (profile?.role as string) === "customer" ||
+    isPropertyOnlyBusinessAccount(profile)
+  ) {
+    const landlordPrice = Number(globalTiers?.providerModels?.homeowners?.tiers?.landlord?.price ?? platformConfig?.landlordProPrice ?? 19);
+    const homeownerSubStatus = String(profile?.homeownerSubscriptionStatus || "").toLowerCase();
+    const isLandlordTerminal = ["canceled", "cancelled", "unpaid", "incomplete_expired", "free"].includes(homeownerSubStatus);
+    const isLandlordPro = Boolean(
+      (profile?.isLandlord || profile?.homeownerTierId === "landlord" || profile?.tier === "landlord") &&
+      !isLandlordTerminal
+    );
+    const isCanceling = Boolean(profile?.homeownerCancelAtPeriodEnd ?? (profile?.subscriptionType === "landlord" && profile?.cancelAtPeriodEnd));
+    const renewalDate = formatPeriodDate(profile?.homeownerCurrentPeriodEnd || (profile?.subscriptionType === "landlord" ? profile?.currentPeriodEnd : undefined));
 
     return (
       <div className="min-h-screen bg-slate-50 pb-20">
@@ -334,7 +563,7 @@ export default function BillingManager() {
               </div>
 
               <div className="text-right shrink-0">
-                <span className="text-3xl font-black text-white">£19.00</span>
+                <span className="text-3xl font-black text-white">£{landlordPrice.toFixed(2)}</span>
                 <span className="text-xs text-slate-400 font-bold"> / month</span>
               </div>
             </div>
@@ -357,14 +586,14 @@ export default function BillingManager() {
                     <p className="text-xs text-slate-300 font-semibold mt-2">
                       {isCanceling 
                         ? `Your subscription will remain fully active until ${renewalDate}. You won't be charged again.`
-                        : `Your subscription auto-renews on ${renewalDate} for £19.00/mo.`}
+                        : `Your subscription auto-renews on ${renewalDate} for £${landlordPrice.toFixed(2)}/mo.`}
                     </p>
                   </div>
 
                   <div className="flex items-center gap-2">
                     {isCanceling ? (
                       <button
-                        onClick={() => handleReactivateSubscription('tier')}
+                        onClick={() => handleReactivateSubscription('landlord')}
                         disabled={isProcessing}
                         className="px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white font-black text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 transition shadow-sm"
                       >
@@ -373,7 +602,7 @@ export default function BillingManager() {
                       </button>
                     ) : (
                       <button
-                        onClick={() => handleCancelSubscription('tier')}
+                        onClick={() => handleCancelSubscription('landlord')}
                         disabled={isProcessing}
                         className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-rose-500/30 text-rose-200 border border-rose-300/30 font-black text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 transition"
                       >
@@ -425,14 +654,15 @@ export default function BillingManager() {
                           headers: {
                             "Content-Type": "application/json",
                             ...(token ? { "Authorization": `Bearer ${token}` } : {}),
-          "Idempotency-Key": crypto.randomUUID()
+                            "Idempotency-Key": crypto.randomUUID()
                           },
                           body: JSON.stringify({
                             userId: user.uid,
+                            priceId: "price_landlord",
                             tierName: "Premium Landlord",
                             price_data: {
                               currency: 'gbp',
-                              unit_amount: 1900,
+                              unit_amount: Math.round(landlordPrice * 100),
                               product_data: {
                                 name: 'Landlord Pro Portfolio Membership',
                                 description: 'Multi-property passport digital twins, automated CP12/EICR compliance alerts & bulk trade dispatch'
@@ -466,81 +696,46 @@ export default function BillingManager() {
                     className="px-6 py-3 rounded-2xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black text-xs uppercase tracking-wider flex items-center gap-2 shadow-lg transition"
                   >
                     {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4 text-amber-300" />}
-                    Upgrade to Landlord Pro (£19/mo)
+                    Upgrade to Landlord Pro (£{landlordPrice.toFixed(2)}/mo)
                   </button>
                 </div>
               </div>
             )}
           </div>
 
-          <div className="bg-white rounded-[2rem] border border-black shadow-xl shadow-slate-200/50 p-6 mb-6">
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-                <Wallet className="w-5 h-5 text-blue-600" /> Saved Cards
-              </h2>
-              <button 
-                onClick={handleAddPaymentMethod}
-                className="flex items-center gap-2 text-sm font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded-full hover:bg-blue-100 transition-colors"
-              >
-                <Plus className="w-4 h-4" /> Add New
-              </button>
-            </div>
-
-            <div className="space-y-4">
-              {savedCards.map((card) => (
-                <div key={card.id} className="flex items-center justify-between p-4 rounded-2xl border border-black hover:border-blue-200 transition-colors bg-slate-50/50">
-                  <div className="flex items-center gap-4">
-                    <div className="w-12 h-8 bg-slate-900 rounded-md flex items-center justify-center">
-                      <CreditCard className="w-5 h-5 text-white" />
-                    </div>
-                    <div>
-                      <p className="font-bold text-slate-900">•••• •••• •••• {card.last4}</p>
-                      <p className="text-xs text-slate-500 font-medium tracking-wide border-t border-transparent">
-                        Expires {card.expMonth.toString().padStart(2, '0')}/{card.expYear}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-4">
-                    {card.isDefault && (
-                      <span className="text-[10px] font-black uppercase tracking-widest text-emerald-600 bg-emerald-50 px-2 py-1 rounded-md">Default</span>
-                    )}
-                    <button onClick={() => handleDeletePaymentMethod(card.id)} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors">
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-              {savedCards.length === 0 && !isProcessing && (
-                <div className="text-center p-6 text-slate-500 text-sm border-2 border-dashed border-black rounded-2xl">
-                  No payment methods saved yet. Add a card to continue.
-                </div>
-              )}
-            </div>
-            
-            <div className="mt-6 flex items-start gap-3 bg-blue-50/50 p-4 rounded-2xl">
-               <ShieldCheck className="w-5 h-5 text-blue-500 shrink-0 mt-0.5" />
-               <div>
-                 <p className="text-sm font-bold text-blue-900">Payments are secure and encrypted.</p>
-                 <p className="text-xs text-blue-700/70 mt-1 leading-relaxed">
-                    We do not store your full card details. All transactions are securely processed via Stripe's encrypted banking infrastructure.
-                 </p>
-               </div>
-            </div>
-          </div>
+          <SavedPaymentCardsPanel
+            savedCards={savedCards}
+            isAddingCard={isAddingCard}
+            busyCardId={busyCardId}
+            busyAction={busyCardAction}
+            onAddCard={handleAddPaymentMethod}
+            onSetDefault={handleSetDefaultPaymentMethod}
+            onDeleteCard={handleDeletePaymentMethod}
+            title="Saved Payment Cards (Spending)"
+            subtitle="Used for hiring tradespeople, Landlord Pro plans, and AnyRoller rides."
+            emptyDescription="No payment methods saved yet. Link a card inside Stripe's PCI-DSS Level 1 Vault to pay for home repairs, property management subscriptions, or rides."
+          />
         </div>
       </div>
     );
   }
 
+  const terminalSubStatuses = ["canceled", "cancelled", "unpaid", "incomplete_expired", "free"];
+  const isTraderSubTerminal = terminalSubStatuses.includes(String(profile?.subscriptionStatus || "").toLowerCase());
+  const effectiveTraderTierCanonical = isTraderSubTerminal ? "payg" : normalizeTraderTier(profile?.tierId || profile?.tier);
+
   const isCurrentPlan = (tier: SubscriptionTier) => {
-    const currentCanonical = normalizeTraderTier(profile?.tierId || profile?.tier);
     const tierCanonical = normalizeTraderTier(tier.rawKey || tier.name);
-    return currentCanonical === tierCanonical;
+    return effectiveTraderTierCanonical === tierCanonical;
   };
 
   const handleToggleExclusiveLeads = async () => {
     if (!user || !profile) return;
-    const isCurrentlyActive = Boolean(profile?.hasExclusiveAddon && profile?.isExclusiveActive !== false);
+    const isCurrentlyActive = Boolean(
+      profile?.hasExclusiveAddon &&
+      profile?.isExclusiveActive !== false &&
+      !terminalSubStatuses.includes(String(profile?.exclusiveSubscriptionStatus || "").toLowerCase())
+    );
     const isCanceling = Boolean(profile?.exclusiveCancelAtPeriodEnd);
 
     if (isCurrentlyActive && isCanceling) {
@@ -565,6 +760,7 @@ export default function BillingManager() {
         },
         body: JSON.stringify({
           userId: user.uid,
+          priceId: "price_exclusive_leads",
           tierName: "Exclusive Leads Add-on",
           mode: "subscription",
           price_data: {
@@ -604,7 +800,10 @@ export default function BillingManager() {
 
   const handleToggleVideoPro = async () => {
     if (!user || !profile) return;
-    const isCurrentlyActive = Boolean(profile?.hasVerifiedVideoProSubscription);
+    const isCurrentlyActive = Boolean(
+      profile?.hasVerifiedVideoProSubscription &&
+      !terminalSubStatuses.includes(String(profile?.videoProSubscriptionStatus || "").toLowerCase())
+    );
     const isCanceling = Boolean(profile?.videoProCancelAtPeriodEnd);
 
     if (isCurrentlyActive && isCanceling) {
@@ -629,6 +828,7 @@ export default function BillingManager() {
         },
         body: JSON.stringify({
           userId: user.uid,
+          priceId: "price_video_pro",
           tierName: "Verified Video Pro",
           mode: "subscription",
           price_data: {
@@ -666,10 +866,83 @@ export default function BillingManager() {
     }
   };
 
+  const handleToggleAppointments = async () => {
+    if (!user || !profile) return;
+    const isCurrentlyActive = Boolean(
+      (profile?.hasAppointmentsAddon || profile?.appointmentSettings?.enabled) &&
+      !terminalSubStatuses.includes(String(profile?.appointmentsSubscriptionStatus || "").toLowerCase())
+    );
+    const isCanceling = Boolean(profile?.appointmentsCancelAtPeriodEnd);
+
+    if (isCurrentlyActive && isCanceling) {
+      await handleReactivateSubscription('appointments');
+      return;
+    }
+
+    if (isCurrentlyActive) {
+      await handleCancelSubscription('appointments');
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      const response = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+          "Idempotency-Key": crypto.randomUUID()
+        },
+        body: JSON.stringify({
+          userId: user.uid,
+          priceId: "price_appointments",
+          tierName: "Appointment System Add-on",
+          mode: "subscription",
+          price_data: {
+            currency: 'gbp',
+            unit_amount: Math.round(appointmentsPrice * 100),
+            recurring: { interval: 'month' },
+            product_data: {
+              name: "Appointment System Add-on",
+              description: "Allow customers to book real-time appointments directly from your profile."
+            }
+          },
+          successUrl: `${window.location.origin}/billing?appointments=success`,
+          cancelUrl: `${window.location.origin}/billing`,
+          metadata: {
+            type: "appointments",
+            subscriptionType: "appointments",
+            userId: user.uid
+          }
+        })
+      });
+
+      const data = await response.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else if (data.error) {
+        toast.error(data.error);
+      } else {
+        toast.success(`Appointment System Active! (£${appointmentsPrice.toFixed(2)}/mo)`);
+      }
+    } catch (e) {
+      console.error(e);
+      toast.error("Failed to start checkout for Appointment System add-on");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const handleToggleGoldDriver = async () => {
     if (!user || !profile) return;
     const isCurrentlyActive = Boolean(profile?.isGoldDriver || profile?.driverTier === "gold");
     const isCanceling = Boolean(profile?.driverCancelAtPeriodEnd);
+
+    if (!isDriverAccount && !isCurrentlyActive) {
+      toast.error("Gold Driver Tier is only available for registered driver accounts.");
+      return;
+    }
 
     if (isCurrentlyActive && isCanceling) {
       await handleReactivateSubscription('driver_gold');
@@ -693,6 +966,7 @@ export default function BillingManager() {
         },
         body: JSON.stringify({
           userId: user.uid,
+          priceId: "price_driver_gold",
           tierName: "Gold Driver Subscription",
           mode: "subscription",
           price_data: {
@@ -750,12 +1024,14 @@ export default function BillingManager() {
       else if (lower === 'platinum' || lower.includes('enterprise')) displayName = "Platinum Enterprise";
       else displayName = tierKey.charAt(0).toUpperCase() + tierKey.slice(1);
 
+      const rawComm = Number(tier.commission) || 0;
+      const pctComm = Number((rawComm > 1 ? rawComm : rawComm * 100).toFixed(2));
       return {
         id: `price_${tierKey.toLowerCase()}`,
         name: displayName,
         rawKey: tierKey,
         price: Number(tier.price) || 0,
-        commission: (Number(tier.commission) || 0) * 100, // DB stores as 0.05, UI expects 5
+        commission: pctComm, // DB stores as 0.05, UI displays clean 5
         description: tier.description || "",
         features: Array.isArray(tier.features) ? tier.features : [],
         isPopular: lower === "pro" || lower.includes("silver")
@@ -767,7 +1043,7 @@ export default function BillingManager() {
       name: ft.name,
       rawKey: normalizeTraderTier(ft.name),
       price: Number(ft.price) || 0,
-      commission: Number(ft.commission) || 5,
+      commission: Number((Number(ft.commission) || 0).toFixed(2)),
       description: ft.description || "",
       features: Array.isArray(ft.features) ? ft.features : (ft.description ? [ft.description] : []),
       isPopular: normalizeTraderTier(ft.name) === "pro"
@@ -838,6 +1114,13 @@ export default function BillingManager() {
     ];
   }
 
+  const rawCapVal =
+    globalTiers?.providerModels?.one_off_trades?.commissionCapGbp ??
+    globalTiers?.commissionCapGbp ??
+    platformConfig?.commissionCapGbp;
+  const parsedCapVal = rawCapVal === undefined || rawCapVal === null || rawCapVal === "" ? 250 : Number(rawCapVal);
+  const activeCommissionCapGbp = Number.isFinite(parsedCapVal) && parsedCapVal >= 0 ? parsedCapVal : 250;
+
   // Modified Tiers for Founding Members
   const foundingTiers = standardTiers.map(t => {
     if (t.rawKey === "pro" || t.name.includes("Professional") || t.name === "PRO Trader") {
@@ -854,11 +1137,24 @@ export default function BillingManager() {
 
   const activeTiers = isFounding ? foundingTiers : standardTiers;
 
-  const exclusivePrice = platformConfig?.paidAddons?.exclusiveLeads?.price ?? 29.00;
-  const videoProMonthly = platformConfig?.paidAddons?.verifiedVideoPro?.monthlyPrice ?? 15.00;
-  const isExclusiveActive = Boolean(profile?.hasExclusiveAddon && profile?.isExclusiveActive !== false);
-  const isVideoProActive = Boolean(profile?.hasVerifiedVideoProSubscription);
+  const exclusivePrice = Number(platformConfig?.paidAddons?.exclusiveLeads?.price ?? 29.00);
+  const videoProMonthly = Number(platformConfig?.paidAddons?.verifiedVideoPro?.monthlyPrice ?? 15.00);
+  const appointmentsPrice = Number(platformConfig?.paidAddons?.appointments?.price ?? 9.99);
+  const isExclusiveActive = Boolean(
+    profile?.hasExclusiveAddon &&
+    profile?.isExclusiveActive !== false &&
+    !terminalSubStatuses.includes(String(profile?.exclusiveSubscriptionStatus || "").toLowerCase())
+  );
+  const isVideoProActive = Boolean(
+    profile?.hasVerifiedVideoProSubscription &&
+    !terminalSubStatuses.includes(String(profile?.videoProSubscriptionStatus || "").toLowerCase())
+  );
+  const isAppointmentsActive = Boolean(
+    (profile?.hasAppointmentsAddon || profile?.appointmentSettings?.enabled) &&
+    !terminalSubStatuses.includes(String(profile?.appointmentsSubscriptionStatus || "").toLowerCase())
+  );
   const isGoldDriverActive = Boolean(profile?.isGoldDriver || profile?.driverTier === "gold");
+  const showGoldDriverCard = isDriverAccount || isGoldDriverActive;
 
   return (
     <div className="min-h-screen bg-slate-50 pb-20">
@@ -912,19 +1208,19 @@ export default function BillingManager() {
             </div>
             <div>
               <p className="text-[10px] font-black text-blue-200 uppercase tracking-widest">Your Current Plan</p>
-              <h2 className="text-3xl font-black">{profile?.tierId || "Free Trial"}</h2>
+              <h2 className="text-3xl font-black">{isTraderSubTerminal ? "Free Explorer" : (profile?.tierId || "Free Explorer")}</h2>
               <div className="flex flex-wrap items-center gap-3 mt-1.5">
                 <span className="flex items-center gap-1.5 text-xs font-bold text-emerald-400">
                   <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                  {profile?.subscriptionStatus === "active" ? "Active Subscription" : "Trial Period"}
+                  {profile?.subscriptionStatus === "active" && effectiveTraderTierCanonical !== "payg" ? "Active Subscription" : "Pay-As-You-Go"}
                 </span>
 
-                {profile?.cancelAtPeriodEnd ? (
+                {profile?.cancelAtPeriodEnd && !isTraderSubTerminal ? (
                   <span className="flex items-center gap-1 text-xs font-bold text-amber-300 bg-amber-500/20 px-2.5 py-0.5 rounded-full border border-amber-400/30">
                     <AlertTriangle className="w-3 h-3 text-amber-300" />
                     Cancels on {formatPeriodDate(profile?.currentPeriodEnd)} (Benefits Active)
                   </span>
-                ) : profile?.currentPeriodEnd ? (
+                ) : profile?.currentPeriodEnd && profile?.subscriptionStatus === "active" && effectiveTraderTierCanonical !== "payg" ? (
                   <span className="flex items-center gap-1 text-xs text-blue-200 font-medium">
                     <Calendar className="w-3 h-3 text-blue-300" />
                     Renews on {formatPeriodDate(profile?.currentPeriodEnd)}
@@ -935,7 +1231,7 @@ export default function BillingManager() {
           </div>
 
           <div className="relative z-10 flex flex-col sm:flex-row items-stretch sm:items-center gap-3 w-full md:w-auto">
-            {profile?.subscriptionStatus === "active" && (
+            {profile?.subscriptionStatus === "active" && effectiveTraderTierCanonical !== "payg" && (
               <>
                 {profile?.cancelAtPeriodEnd ? (
                   <button
@@ -1011,12 +1307,17 @@ export default function BillingManager() {
 
                   <div className="bg-slate-50 p-3 rounded-xl border border-black/10">
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Platform Fee</span>
+                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Platform Fee</span>
                       <span className="text-sm font-black text-blue-600">{tier.commission}%</span>
                     </div>
                     <div className="w-full h-1.5 bg-slate-200 rounded-full mt-2 overflow-hidden">
                       <div className="h-full bg-blue-600 rounded-full" style={{ width: `${Math.max(5, 100 - (tier.commission * 5))}%` }} />
                     </div>
+                    <p className="text-[10px] font-bold text-black mt-1.5">
+                      {activeCommissionCapGbp > 0
+                        ? `Capped at £${activeCommissionCapGbp.toFixed(0)} max per job`
+                        : "No maximum commission cap"}
+                    </p>
                   </div>
 
                   <div className="space-y-3 pt-3 border-t border-slate-100">
@@ -1249,7 +1550,8 @@ export default function BillingManager() {
               </button>
             </div>
 
-            {/* Gold Driver Subscription Tier */}
+            {/* Gold Driver Subscription Tier (Driver Accounts Only) */}
+            {showGoldDriverCard && (
             <div className="bg-white p-6 rounded-2xl border border-black shadow-sm flex flex-col justify-between">
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
@@ -1335,6 +1637,94 @@ export default function BillingManager() {
                 )}
               </button>
             </div>
+            )}
+
+            {/* Automated Appointments Add-on */}
+            <div className="bg-white p-6 rounded-2xl border border-black shadow-sm flex flex-col justify-between">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="w-10 h-10 rounded-xl bg-blue-50 border border-black/15 flex items-center justify-center">
+                    <Calendar className="w-5 h-5 text-blue-600" />
+                  </div>
+                  <span className={cn(
+                    "text-[10px] font-black uppercase tracking-wider px-2.5 py-1 rounded-full",
+                    profile?.appointmentsCancelAtPeriodEnd
+                      ? "bg-amber-100 text-black border border-amber-300"
+                      : isAppointmentsActive
+                      ? "bg-emerald-100 text-emerald-800"
+                      : "bg-slate-100 text-black"
+                  )}>
+                    {profile?.appointmentsCancelAtPeriodEnd
+                      ? "Canceling"
+                      : isAppointmentsActive
+                      ? "Active"
+                      : "Optional Add-On"}
+                  </span>
+                </div>
+                <div>
+                  <h4 className="text-base font-black text-black">Automated Appointments</h4>
+                  <div className="flex items-baseline gap-1 mt-1">
+                    <span className="text-2xl font-black text-black">£{appointmentsPrice.toFixed(2)}</span>
+                    <span className="text-xs text-slate-500 font-bold">/mo</span>
+                  </div>
+                  {isAppointmentsActive && (
+                    <div className="mt-1">
+                      {profile?.appointmentsCancelAtPeriodEnd ? (
+                        <p className="text-[11px] text-amber-800 font-bold flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3 text-amber-600 shrink-0" />
+                          Cancels on {formatPeriodDate(profile?.appointmentsCurrentPeriodEnd)} (Active until then)
+                        </p>
+                      ) : profile?.appointmentsCurrentPeriodEnd ? (
+                        <p className="text-[11px] text-black font-medium flex items-center gap-1">
+                          <Calendar className="w-3 h-3 text-slate-500 shrink-0" />
+                          Renews on {formatPeriodDate(profile?.appointmentsCurrentPeriodEnd)}
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-black leading-relaxed">
+                  Let customers view your live availability and request booked appointment slots directly from your public trader profile.
+                </p>
+                <div className="text-[11px] font-bold text-black space-y-1 pt-2">
+                  <div className="flex items-center gap-1.5 text-emerald-700">
+                    <Check className="w-3.5 h-3.5" /> Live Availability Calendar Booking
+                  </div>
+                  <div className="flex items-center gap-1.5 text-emerald-700">
+                    <Check className="w-3.5 h-3.5" /> Automated Slot Confirmations
+                  </div>
+                </div>
+              </div>
+
+              <button
+                onClick={handleToggleAppointments}
+                disabled={isProcessing}
+                className={cn(
+                  "w-full mt-6 py-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all duration-200 flex items-center justify-center gap-2",
+                  profile?.appointmentsCancelAtPeriodEnd
+                    ? "bg-emerald-600 text-white hover:bg-emerald-700"
+                    : isAppointmentsActive
+                    ? "bg-blue-50 text-black border border-black hover:bg-rose-50 hover:text-rose-900"
+                    : "bg-slate-900 text-white hover:bg-slate-800"
+                )}
+              >
+                {isProcessing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : profile?.appointmentsCancelAtPeriodEnd ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Resume Auto-Renewal
+                  </>
+                ) : isAppointmentsActive ? (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                    Cancel at Renewal
+                  </>
+                ) : (
+                  `Subscribe (£${appointmentsPrice.toFixed(2)}/mo)`
+                )}
+              </button>
+            </div>
 
             {/* Instant Match & Emergency Dispatch SLA */}
             <div className="bg-white p-6 rounded-2xl border border-black shadow-sm flex flex-col justify-between">
@@ -1371,6 +1761,150 @@ export default function BillingManager() {
                 <p className="text-[11px] font-semibold text-slate-600">Auto-enabled for all verified responders</p>
               </div>
             </div>
+          </div>
+        </div>
+
+        {/* Dual-Role Payment Methods: Receiving Payouts (Stripe Connect) + Saved Cards (Spending) */}
+        <div className="mt-16 max-w-7xl mx-auto space-y-6">
+          <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pb-4 border-b border-black">
+            <div>
+              <div className="flex items-center gap-2 mb-1">
+                <Wallet className="w-5 h-5 text-blue-700" />
+                <h3 className="text-xl font-black text-black tracking-tight">Payment Methods & Payouts</h3>
+              </div>
+              <p className="text-xs text-black font-medium">
+                Manage both how you receive job payouts (Stripe Connect) and how you pay for subscriptions, hired trades, or rides (Saved Cards).
+              </p>
+            </div>
+          </div>
+
+          <div className={cn("grid grid-cols-1 gap-6", isPayoutEligible ? "lg:grid-cols-2" : "lg:grid-cols-1")}>
+            {isPayoutEligible && (
+              <div className="bg-white rounded-2xl border border-black p-5 sm:p-6 shadow-sm flex flex-col justify-between space-y-5">
+                <div className="space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-emerald-50 border border-black flex items-center justify-center shrink-0">
+                        <PoundSterling className="w-5 h-5 text-emerald-700" />
+                      </div>
+                      <div>
+                        <h4 className="text-base font-black text-black leading-tight">Receiving Payouts (Stripe Connect)</h4>
+                        <p className="text-xs font-medium text-black mt-0.5">
+                          Single payout account for completed AnyTrader milestones and AnyRoller earnings.
+                        </p>
+                      </div>
+                    </div>
+                    {stripeConnectStatus.loading ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-black uppercase px-2.5 py-1 rounded-lg bg-slate-100 border border-black text-black shrink-0">
+                        <Loader2 className="w-3 h-3 animate-spin" /> Checking
+                      </span>
+                    ) : stripeConnectStatus.payoutsEnabled ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-black uppercase px-2.5 py-1 rounded-lg bg-emerald-100 border border-black text-emerald-900 shrink-0">
+                        <Check className="w-3 h-3" /> Active
+                      </span>
+                    ) : stripeConnectStatus.connected ? (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-black uppercase px-2.5 py-1 rounded-lg bg-amber-100 border border-black text-black shrink-0">
+                        Verification Needed
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-black uppercase px-2.5 py-1 rounded-lg bg-slate-100 border border-black text-black shrink-0">
+                        Not Connected
+                      </span>
+                    )}
+                  </div>
+
+                  {stripeConnectStatus.error && (
+                    <div className="p-3 rounded-xl bg-amber-50 border border-black text-xs font-medium text-black">
+                      {stripeConnectStatus.error}
+                    </div>
+                  )}
+
+                  {stripeConnectStatus.payoutsEnabled ? (
+                    <div className="p-4 rounded-xl bg-emerald-50 border border-black space-y-1.5">
+                      <p className="text-xs font-black text-black">Your bank account is verified and ready for payouts.</p>
+                      <p className="text-xs text-black font-medium leading-relaxed">
+                        Open your Stripe Express Dashboard to review bank details, transfer history, and tax documents.
+                      </p>
+                    </div>
+                  ) : stripeConnectStatus.connected ? (
+                    <div className="p-4 rounded-xl bg-amber-50 border border-black space-y-1.5">
+                      <p className="text-xs font-black text-black">
+                        {stripeConnectStatus.detailsSubmitted
+                          ? "Stripe is reviewing your verification details."
+                          : "Finish Stripe verification to enable bank payouts."}
+                      </p>
+                      <p className="text-xs text-black font-medium leading-relaxed">
+                        Continue onboarding with Stripe to submit any remaining ID or bank account checks.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="p-4 rounded-xl bg-slate-50 border border-black space-y-1.5">
+                      <p className="text-xs font-black text-black">Connect your bank account via Stripe Express</p>
+                      <p className="text-xs text-black font-medium leading-relaxed">
+                        Required to receive direct payouts from escrow-protected jobs and completed work without holding funds on-platform.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5 pt-2">
+                  {stripeConnectStatus.payoutsEnabled ? (
+                    <button
+                      type="button"
+                      onClick={handleOpenStripeDashboard}
+                      disabled={isOpeningStripeDashboard}
+                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-black border border-black transition-colors disabled:opacity-50 cursor-pointer"
+                    >
+                      {isOpeningStripeDashboard ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      )}
+                      <span>Open Stripe Express Dashboard</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleStartStripeConnect}
+                      disabled={isLaunchingConnect}
+                      className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-black border border-black transition-colors disabled:opacity-50 cursor-pointer"
+                    >
+                      {isLaunchingConnect ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <PoundSterling className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {stripeConnectStatus.connected ? "Continue Stripe Verification" : "Set Up Payouts with Stripe"}
+                      </span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => fetchStripeConnectStatus()}
+                    disabled={stripeConnectStatus.loading}
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-white hover:bg-slate-50 text-black text-xs font-bold border border-black transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    <RefreshCw className={cn("w-3.5 h-3.5", stripeConnectStatus.loading && "animate-spin")} />
+                    <span>Refresh Status</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <SavedPaymentCardsPanel
+              savedCards={savedCards}
+              isAddingCard={isAddingCard}
+              busyCardId={busyCardId}
+              busyAction={busyCardAction}
+              onAddCard={handleAddPaymentMethod}
+              onSetDefault={handleSetDefaultPaymentMethod}
+              onDeleteCard={handleDeletePaymentMethod}
+              title="Saved Payment Cards (Spending)"
+              subtitle="Used for platform subscriptions, add-ons, hiring other tradespeople, or AnyRoller rides."
+              emptyDescription="Link a card inside Stripe's PCI-DSS Level 1 Vault to pay for subscriptions, hire other tradespeople, or pay for AnyRoller journeys."
+            />
           </div>
         </div>
 

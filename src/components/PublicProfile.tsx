@@ -4,14 +4,16 @@ import {
   db, doc, getDoc, collection, query, where, orderBy, onSnapshot, 
   handleFirestoreError, OperationType, addDoc, updateDoc, serverTimestamp, sendNotification, getDocs 
 } from "@/src/firebase";
-import { arrayUnion } from "firebase/firestore";
+import { arrayUnion, limit } from "firebase/firestore";
 import { useAuth } from "./AuthProvider";
 import { 
   Star, MapPin, Calendar, Shield, Check, Briefcase, Clock, Zap, MessageSquare, ChevronLeft, Loader2, Image as ImageIcon, Users, ChevronDown,
   ShieldCheck, CheckCircle, Heart, FileText, AlertTriangle, X, Send, ChevronRight, Award, Share2, UserPlus, HelpCircle, Medal, CalendarClock, Pencil
 } from "lucide-react";
 import { cn, getOutwardPostcode, getDealPricing } from "@/src/lib/utils";
+import { getApiUrl } from "@/src/lib/apiUrl";
 import { motion, AnimatePresence } from "motion/react";
+import { toast } from "sonner";
 import { PROFESSIONAL_BADGES } from "@/src/constants";
 import { getTraderBadges } from "@/src/lib/badges";
 import { getTraderUnifiedTrustBadges } from "@/src/lib/trustBadges";
@@ -21,10 +23,10 @@ import { format } from "date-fns";
 import { SEO } from "./SEO";
 import { Logo } from "./Logo";
 import { TraderVideoVerificationCard } from "./TraderVideoVerificationCard";
-import { INITIAL_MOCK_FLASH_DEALS, INITIAL_MOCK_TRADERS, generateTraderSeedReviews } from "@/src/services/seedService";
 import { DealCountdownBadge, shareDeal } from "@/src/lib/dealUtils";
 import { isDealSoldOut, getRemainingSlots, getDealCapacityInfo, formatDealBadgeText, formatDealScheduleText } from "@/src/lib/flashDeals";
 import { findCategoryForTrader, getCategoryHotSearches, isJobMatchingTrader, CategoryHotSearchPreset } from "@/src/utils/tradePresets";
+import { isProfileAcceptingNewWork } from "@/src/lib/marketplaceContracts";
 
 export default function PublicProfile() {
   const { id } = useParams();
@@ -33,19 +35,15 @@ export default function PublicProfile() {
   const { isB2B, linkedPropertyId, linkedPropertyName } = location.state || {};
   const { profile: currentUserProfile, user: currentUser } = useAuth();
 
-  // Instant seed trader matching & pre-hydration
-  const initialSeedTrader = id ? INITIAL_MOCK_TRADERS.find((t: any) => t.uid === id || t.id === id) : null;
-  const initialProfileData = location.state?.initialProfile || initialSeedTrader || null;
-  
-  const initialSeedReviews = initialSeedTrader ? generateTraderSeedReviews(initialSeedTrader.name) : [];
+  const initialProfileData = location.state?.initialProfile || null;
 
   const [profile, setProfile] = useState<any>(() => initialProfileData);
   const [platformConfig, setPlatformConfig] = useState<any>(null);
-  const [reviews, setReviews] = useState<any[]>(() => initialSeedReviews);
+  const [reviews, setReviews] = useState<any[]>([]);
   const [visibleReviewsCount, setVisibleReviewsCount] = useState<number>(5);
   const [portfolioItems, setPortfolioItems] = useState<any[]>([]);
   const [loading, setLoading] = useState(() => !initialProfileData);
-  const [loadingReviews, setLoadingReviews] = useState(() => !initialSeedTrader);
+  const [loadingReviews, setLoadingReviews] = useState(true);
   const [isAchievementsExpanded, setIsAchievementsExpanded] = useState(false);
   const [isServicesExpanded, setIsServicesExpanded] = useState(false);
   const [openFaqIds, setOpenFaqIds] = useState<string[]>([]);
@@ -67,13 +65,10 @@ export default function PublicProfile() {
     );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const dbDeals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const mockMatches = INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === id);
-      const existingIds = new Set(dbDeals.map(d => d.id));
-      const merged = [...dbDeals, ...mockMatches.filter(m => !existingIds.has(m.id))];
-      setActiveDeals(merged);
+      setActiveDeals(dbDeals);
     }, (error) => {
       console.error("Error fetching trader flash deals:", error);
-      setActiveDeals(INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === id));
+      setActiveDeals([]);
     });
     return () => unsubscribe();
   }, [id]);
@@ -157,7 +152,7 @@ export default function PublicProfile() {
     }
     setIsProcessing(true);
     try {
-      await addDoc(collection(db, "appointments"), {
+      const apptRef = await addDoc(collection(db, "appointments"), {
         customerId: currentUser.uid,
         traderId: id,
         serviceId: selectedService?.id || "general",
@@ -172,13 +167,14 @@ export default function PublicProfile() {
         updatedAt: serverTimestamp()
       });
 
-      // Send notification to trader
+      // Send notification to trader with authoritative appointmentId relationship context
       await sendNotification(
         id!,
         "New Appointment Request",
         `You have a new appointment request from ${currentUserProfile?.name || 'a customer'} for ${bookingDate} at ${bookingTime}.`,
         "system",
-        "#appointments"
+        "/profile#appointments",
+        { appointmentId: apptRef.id }
       );
 
       setIsBookingModalOpen(false);
@@ -186,10 +182,10 @@ export default function PublicProfile() {
       setBookingTime("");
       setBookingNotes("");
       setSelectedService(null);
-      alert("Appointment request sent successfully! You will be notified when it is confirmed.");
+      toast.success("Appointment request sent! You will be notified when it is confirmed.");
     } catch(err) {
       handleFirestoreError(err, OperationType.CREATE, "appointments");
-      alert("Failed to send appointment request.");
+      toast.error("Failed to send appointment request.");
     } finally {
       setIsProcessing(false);
     }
@@ -231,22 +227,11 @@ export default function PublicProfile() {
             console.error("Error updating recently viewed:", e);
           }
         } else {
-          // Fallback to seed/mock traders
-          const mockMatch = INITIAL_MOCK_TRADERS.find((t: any) => t.uid === id || t.id === id);
-          if (mockMatch) {
-            setProfile(mockMatch);
-          } else {
-            console.error("No such profile!");
-          }
+          console.error("No such profile!");
         }
       } catch (error) {
         console.error("Error fetching profile:", error);
-        const mockMatch = INITIAL_MOCK_TRADERS.find((t: any) => t.uid === id || t.id === id);
-        if (mockMatch) {
-          setProfile(mockMatch);
-        } else {
-          handleFirestoreError(error, OperationType.GET, `public_profiles/${id}`);
-        }
+        handleFirestoreError(error, OperationType.GET, `public_profiles/${id}`);
       } finally {
         setLoading(false);
       }
@@ -276,37 +261,30 @@ export default function PublicProfile() {
     const q = query(
       collection(db, "reviews"),
       where("revieweeId", "==", id),
-      orderBy("createdAt", "desc")
+      orderBy("createdAt", "desc"),
+      limit(50)
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const fetchedReviews = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const activeReviews = fetchedReviews.filter((r: any) => r.status !== "cooling_off");
-      if (activeReviews.length === 0) {
-        const mockTrader = INITIAL_MOCK_TRADERS.find((t: any) => t.uid === id || t.id === id);
-        if (mockTrader) {
-          setReviews(generateTraderSeedReviews(mockTrader.name));
-          setLoadingReviews(false);
-          return;
-        }
-      }
+      const activeReviews = fetchedReviews.filter(
+        (r: any) =>
+          r.isHidden !== true &&
+          !["cooling_off", "hidden", "rejected"].includes(String(r.status || "published").toLowerCase())
+      );
       setReviews(activeReviews);
       setLoadingReviews(false);
     }, (error) => {
       console.error("Error fetching reviews:", error);
-      const mockTrader = INITIAL_MOCK_TRADERS.find((t: any) => t.uid === id || t.id === id);
-      if (mockTrader) {
-        setReviews(generateTraderSeedReviews(mockTrader.name));
-      } else {
-        handleFirestoreError(error, OperationType.LIST, "reviews");
-      }
+      handleFirestoreError(error, OperationType.LIST, "reviews");
       setLoadingReviews(false);
     });
 
     const portfolioQ = query(
       collection(db, "portfolioItems"),
       where("consultantId", "==", id),
-      orderBy("createdAt", "desc")
+      orderBy("createdAt", "desc"),
+      limit(30)
     );
     const unsubPortfolio = onSnapshot(portfolioQ, (snapshot) => {
       setPortfolioItems(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
@@ -320,6 +298,23 @@ export default function PublicProfile() {
     };
   }, [id]);
 
+  const checkBidirectionalChatBlock = async (targetUid: string): Promise<boolean> => {
+    if (!currentUser || !targetUid || targetUid === currentUser.uid) return false;
+    try {
+      const token = await currentUser.getIdToken();
+      const res = await fetch(getApiUrl("/api/chat/blocks"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => ({}));
+      const blocked = Array.isArray(data.blockedUserIds) ? data.blockedUserIds : [];
+      const blockedBy = Array.isArray(data.blockedByUserIds) ? data.blockedByUserIds : [];
+      return blocked.includes(targetUid) || blockedBy.includes(targetUid);
+    } catch {
+      return false;
+    }
+  };
+
   const handleMessage = async () => {
     if (!currentUser) {
       navigate("/login");
@@ -329,6 +324,11 @@ export default function PublicProfile() {
 
     setIsProcessing(true);
     try {
+      if (await checkBidirectionalChatBlock(id)) {
+        toast.error("Messaging is unavailable because one of the accounts has blocked the other.");
+        return;
+      }
+
       // Check if conversation already exists
       const q = query(
         collection(db, "conversations"),
@@ -347,6 +347,14 @@ export default function PublicProfile() {
         // Create new conversation
         const convRef = await addDoc(collection(db, "conversations"), {
           participants: [currentUser.uid, id],
+          participantNames: {
+            [currentUser.uid]: currentUserProfile?.name || currentUser.displayName || "Member",
+            [id]: profile.name || "Tradesperson",
+          },
+          unreadCounts: {
+            [currentUser.uid]: 0,
+            [id]: 0,
+          },
           jobId: "general",
           jobTitle: "General Discussion",
           lastMessage: "Conversation started",
@@ -409,6 +417,11 @@ export default function PublicProfile() {
     setIsProcessing(true);
     setError(null);
     try {
+      if (await checkBidirectionalChatBlock(id)) {
+        toast.error("Cannot invite or message this user because one of the accounts has blocked the other.");
+        return;
+      }
+
       // 1. Check for existing conversation for this job
       const q = query(
         collection(db, "conversations"),
@@ -439,6 +452,14 @@ export default function PublicProfile() {
         // Create new conversation
         const convRef = await addDoc(collection(db, "conversations"), {
           participants: [currentUser.uid, id],
+          participantNames: {
+            [currentUser.uid]: currentUserProfile?.name || currentUser.displayName || "Member",
+            [id]: profile.name || "Tradesperson",
+          },
+          unreadCounts: {
+            [currentUser.uid]: 0,
+            [id]: 0,
+          },
           jobId: job.id,
           jobTitle: job.title,
           lastMessage: `Invitation to quote for: ${job.title}${selectedDealForQuote ? ` (${selectedDealForQuote.discountPercentage}% OFF Deal)` : ''}`,
@@ -456,25 +477,33 @@ export default function PublicProfile() {
         });
       }
 
-      // Update job document with invited trader ID
+      // Update job document with invited trader ID via server-authoritative command
       try {
-        await updateDoc(doc(db, "jobs", job.id), {
-          invitedTraderIds: arrayUnion(id),
-          targetTradespersonId: job.targetTradespersonId || id,
-          targetTradespersonName: job.targetTradespersonName || profile.name,
-          updatedAt: serverTimestamp()
+        const idToken = await currentUser.getIdToken();
+        const inviteRes = await fetch(getApiUrl(`/api/jobs/${encodeURIComponent(job.id)}/invite-trader`), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ traderId: id }),
         });
+        if (!inviteRes.ok) {
+          const errBody = await inviteRes.json().catch(() => ({}));
+          console.warn("Could not record job trader invite:", errBody?.error || inviteRes.status);
+        }
       } catch (jobErr) {
         console.warn("Could not update job invitedTraderIds:", jobErr);
       }
 
-      // 2. Send notification
+      // 2. Send notification with authoritative jobId context
       await sendNotification(
         id,
         "New Quote Request! 📝",
         `${currentUserProfile?.name || 'A homeowner'} invited you to quote for "${job.title}"${selectedDealForQuote ? ` (${selectedDealForQuote.discountPercentage}% OFF Flash Deal)` : ''}`,
         "quote",
-        `/job/${job.id}`
+        `/job/${job.id}`,
+        { jobId: job.id }
       );
 
       setIsQuoteModalOpen(false);
@@ -558,11 +587,15 @@ export default function PublicProfile() {
           "name": profile.name,
           "description": profile.bio,
           "image": profile.photoURL,
-          "aggregateRating": {
-            "@type": "AggregateRating",
-            "ratingValue": profile.rating || 5,
-            "reviewCount": profile.totalReviews || 0
-          }
+          ...(Number(profile.totalReviews || 0) > 0 && Number(profile.rating || 0) > 0
+            ? {
+                aggregateRating: {
+                  "@type": "AggregateRating",
+                  ratingValue: Number(profile.rating),
+                  reviewCount: Number(profile.totalReviews),
+                },
+              }
+            : {}),
         }}
       />
       {!currentUser && (
@@ -612,7 +645,7 @@ export default function PublicProfile() {
                   });
                 } else {
                   await navigator.clipboard.writeText(window.location.href);
-                  alert('Profile link copied to clipboard!');
+                  toast.success("Profile link copied to clipboard!");
                 }
               } catch (err: any) {
                 if (err.name === 'AbortError') {
@@ -691,13 +724,13 @@ export default function PublicProfile() {
                 <>
                   <div className="flex flex-wrap items-center justify-center gap-1.5 mb-1 w-full">
                     <h2 className="text-xl sm:text-2xl font-bold text-slate-900">{mainHeading}</h2>
-                    {profile.isAcceptingRequests === false && (
+                    {!isProfileAcceptingNewWork(profile) && (
                       <span className="bg-red-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider border border-red-700 flex items-center gap-1 shadow-sm shrink-0">
                         <AlertTriangle className="w-3 h-3" />
                         Currently Unavailable
                       </span>
                     )}
-                    {isBusyToday() && profile.isAcceptingRequests !== false && (
+                    {isBusyToday() && isProfileAcceptingNewWork(profile) && (
                       <div className="flex flex-wrap items-center justify-center gap-1.5">
                         <span className="bg-orange-100 text-orange-600 text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider border border-orange-200 flex items-center gap-1 shrink-0">
                           <Clock className="w-3 h-3" />
@@ -754,7 +787,11 @@ export default function PublicProfile() {
                 <div className="flex-1 flex items-center justify-center gap-2 px-2.5 sm:px-3 py-2.5 sm:py-3 bg-slate-900 rounded-xl sm:rounded-2xl shadow-md">
                   <Star className="w-4 h-4 sm:w-5 sm:h-5 text-yellow-400 fill-yellow-400 shrink-0" />
                   <div className="flex flex-col items-start min-w-0">
-                    <span className="font-black text-white text-base sm:text-lg leading-none">{profile.rating?.toFixed(1) || "5.0"}</span>
+                    <span className="font-black text-white text-base sm:text-lg leading-none">
+                      {Number(profile.totalReviews || 0) > 0 && Number(profile.rating || 0) > 0
+                        ? Number(profile.rating).toFixed(1)
+                        : "New"}
+                    </span>
                     <span className="text-slate-400 text-[8px] sm:text-[9px] font-black uppercase tracking-tighter mt-0.5 truncate">{profile.totalReviews || 0} reviews</span>
                   </div>
                 </div>
@@ -778,7 +815,7 @@ export default function PublicProfile() {
               </span>
               <span className="inline-flex items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-full border border-black/10 text-xs font-semibold text-slate-700 shadow-2xs">
                 <MapPin className="w-3.5 h-3.5 text-red-500 shrink-0" />
-                <span>{profile.postcode || profile.location || "Location not set"}</span>
+                <span>{profile.postcode ? getOutwardPostcode(profile.postcode) : (profile.location || "Location not set")}</span>
               </span>
               <span className="inline-flex items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-full border border-black/10 text-xs font-semibold text-slate-700 shadow-2xs">
                 <Calendar className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
@@ -1397,7 +1434,7 @@ export default function PublicProfile() {
               Sign In to Contact {profile.name}
             </button>
           </div>
-        ) : profile.isAcceptingRequests === false ? (
+        ) : !isProfileAcceptingNewWork(profile) ? (
           <div className="max-w-2xl mx-auto">
             <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-center gap-3">
               <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0">

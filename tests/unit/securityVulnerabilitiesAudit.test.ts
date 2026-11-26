@@ -19,19 +19,20 @@ describe("Security Vulnerabilities Remediation Audit", () => {
     expect(rulesCode).toMatch(/match \/unmatched_search_telemetry\/\{telemetryId\}[\s\S]*?allow create: if isSignedIn\(\)/);
   });
 
-  // Vulnerability 3: dynamic_search_synonyms restricted to admins only
-  it("Vulnerability 3: verifies dynamic_search_synonyms write is restricted to admins only in firestore.rules", () => {
+  // Vulnerability 3: dynamic_search_synonyms restricted to mutating admins only
+  it("Vulnerability 3: verifies dynamic_search_synonyms write is restricted to mutating admins only in firestore.rules", () => {
     const rulesCode = fs.readFileSync(path.resolve(__dirname, "../../firestore.rules"), "utf-8");
-    expect(rulesCode).toContain("match /dynamic_search_synonyms/{synonymId}");
-    expect(rulesCode).toMatch(/match \/dynamic_search_synonyms\/\{synonymId\}[\s\S]*?allow write: if isAdmin\(\);/);
+    const synonymMatch = rulesCode.match(/match \/dynamic_search_synonyms\/\{synonymId\} \{([\s\S]*?)\}/);
+    expect(synonymMatch).toBeTruthy();
+    expect(synonymMatch![1]).toContain("allow write: if isMutatingAdmin();");
   });
 
-  // Vulnerability 4: advertisements creation restricted to admins (server API only) and update/delete scoped to advertiser or admin
+  // Vulnerability 4: advertisements creation restricted to mutating admins (server API only) and update/delete scoped to advertiser or admin
   it("Vulnerability 4: verifies advertisements collection restricts create/update/delete by advertiserId or admin in firestore.rules", () => {
     const rulesCode = fs.readFileSync(path.resolve(__dirname, "../../firestore.rules"), "utf-8");
     expect(rulesCode).toContain("match /advertisements/{adId}");
     const adBlock = rulesCode.split("match /advertisements/{adId}")[1].split("match /public_ads/{adId}")[0];
-    expect(adBlock).toContain("allow create: if isAdmin();");
+    expect(adBlock).toContain("allow create: if isMutatingAdmin();");
     expect(adBlock).toContain("resource.data.advertiserUid == request.auth.uid");
     expect(adBlock).toContain("resource.data.get('advertiserId', '') == request.auth.uid");
   });

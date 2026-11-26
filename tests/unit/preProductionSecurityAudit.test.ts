@@ -204,7 +204,7 @@ describe("Pre-Production Security Audit Safeguards", () => {
       expect(appCode).toContain("function RoleRoute(");
       expect(appCode).toContain('<Route path="admin" element={<RoleRoute allowed="admin"><MasterAdminLayout /></RoleRoute>} />');
       expect(appCode).toContain('<Route path="ecosystem" element={<RoleRoute allowed="ecosystem"><EcosystemAdmin /></RoleRoute>} />');
-      expect(appCode).toContain('<Route path="ad-studio" element={<RoleRoute allowed="business"><TraderAdStudio /></RoleRoute>} />');
+      expect(appCode).toContain('<Route path="ad-studio" element={<RoleRoute allowed="trader"><TraderAdStudio /></RoleRoute>} />');
       expect(appCode).toContain('<Route path="driver-terminal" element={<RoleRoute allowed="driver"><DriverTerminal /></RoleRoute>} />');
       expect(appCode).toContain('<Route path="corporate" element={<RoleRoute allowed="corporate"><CorporatePortal /></RoleRoute>} />');
       expect(appCode).not.toContain('<Route path="/ad-studio" element={<TraderAdStudio />} />');

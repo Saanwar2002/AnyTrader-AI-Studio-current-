@@ -32,7 +32,7 @@ describe("Payment Ledger & Invariants", () => {
     ).rejects.toThrow(BadRequestError);
   });
 
-  it("calculates platform fee (12%) and net payout deterministically", async () => {
+  it("calculates canonical PAYG platform fee (5%) and net payout deterministically", async () => {
     const entry = await PaymentLedgerEngine.recordEscrowFunding(null, {
       jobId: "job_1",
       milestoneId: "ms_1",
@@ -45,10 +45,60 @@ describe("Payment Ledger & Invariants", () => {
     });
 
     expect(entry.amount).toBe(10000);
-    expect(entry.platformFee).toBe(1200); // 12%
-    expect(entry.netPayout).toBe(8800); // 88%
+    expect(entry.platformFee).toBe(500); // 5% PAYG
+    expect(entry.netPayout).toBe(9500); // 95%
+    expect(entry.appliedCommissionRate).toBe(0.05);
+    expect(entry.commissionCapGbp).toBe(250);
     expect(entry.status).toBe("completed");
     expect(entry.type).toBe("ESCROW_DEPOSIT");
+  });
+
+  it("applies canonical tier rates, £250 default cap, and custom Admin cap overrides", async () => {
+    // Large PAYG milestone £10,000 -> 5% would be £500, capped at £250 (25000p)
+    const cappedEntry = await PaymentLedgerEngine.recordEscrowFunding(null, {
+      jobId: "job_cap",
+      milestoneId: "ms_cap",
+      customerId: "cust_1",
+      traderId: "trader_1",
+      traderTier: "payg",
+      verifiedAmount: 1000000, // £10,000.00
+      currency: "gbp",
+      paymentIntentId: "pi_cap",
+      idempotencyKey: "idem_cap_1",
+    });
+    expect(cappedEntry.platformFee).toBe(25000); // £250 cap
+    expect(cappedEntry.netPayout).toBe(975000);
+
+    // Silver Pro tier (3.5%) on £1,000 -> £35.00 (3500p)
+    const proEntry = await PaymentLedgerEngine.recordEscrowFunding(null, {
+      jobId: "job_pro",
+      milestoneId: "ms_pro",
+      customerId: "cust_1",
+      traderId: "trader_pro",
+      traderTier: "Silver Professional",
+      verifiedAmount: 100000, // £1,000.00
+      currency: "gbp",
+      paymentIntentId: "pi_pro",
+      idempotencyKey: "idem_pro_1",
+    });
+    expect(proEntry.platformFee).toBe(3500);
+    expect(proEntry.netPayout).toBe(96500);
+
+    // Uncapped (commissionCapGbp = 0) on £10,000 PAYG -> full 5% (£500 = 50000p)
+    const uncappedEntry = await PaymentLedgerEngine.recordEscrowFunding(null, {
+      jobId: "job_uncapped",
+      milestoneId: "ms_uncapped",
+      customerId: "cust_1",
+      traderId: "trader_1",
+      traderTier: "payg",
+      commissionCapGbp: 0,
+      verifiedAmount: 1000000, // £10,000.00
+      currency: "gbp",
+      paymentIntentId: "pi_uncapped",
+      idempotencyKey: "idem_uncapped_1",
+    });
+    expect(uncappedEntry.platformFee).toBe(50000);
+    expect(uncappedEntry.netPayout).toBe(950000);
   });
 
   it("prevents duplicate execution under simulated in-memory idempotency", async () => {

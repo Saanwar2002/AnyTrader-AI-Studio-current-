@@ -587,13 +587,35 @@ export const SERVER_OWNED_PROTECTED_KEYS = new Set([
   "gothamSubscription",
   
   // Paid Add-ons & Subscriptions (Server / Stripe-Authoritative Only)
+  "landlordSubscriptionId",
+  "isLandlord",
+  "homeownerTierId",
+  "homeownerSubscriptionStatus",
+  "homeownerCancelAtPeriodEnd",
+  "homeownerCurrentPeriodEnd",
   "hasVerifiedVideoProSubscription",
   "videoProSubscribedAt",
   "videoProSubscriptionId",
+  "videoProSubscriptionStatus",
   "hasExclusiveAddon",
   "isExclusiveActive",
   "exclusiveSubscribedAt",
   "exclusiveSubscriptionId",
+  "exclusiveSubscriptionStatus",
+  "hasAppointmentsAddon",
+  "appointmentsSubscribedAt",
+  "appointmentsSubscriptionId",
+  "appointmentsSubscriptionStatus",
+  "appointmentsCancelAtPeriodEnd",
+  "appointmentsCurrentPeriodEnd",
+  "isGothamSubscriber",
+  "gothamSubscriptionId",
+  "gothamSubscriptionStatus",
+  "gothamDoorsCount",
+  "isGoldDriver",
+  "driverTier",
+  "driverSubscriptionId",
+  "driverSubscriptionStatus",
   "adWalletBalance",
   "adSpendTotal",
 
@@ -831,6 +853,7 @@ export function validateNotificationPayload(payload: Record<string, any>): {
   conversationId?: string;
   projectId?: string;
   rideId?: string;
+  appointmentId?: string;
 } {
   if (!payload || typeof payload !== "object") {
     throw new BadRequestError("Notification payload must be an object.");
@@ -898,6 +921,7 @@ export function validateNotificationPayload(payload: Record<string, any>): {
     conversationId: typeof payload.conversationId === "string" ? payload.conversationId.trim() : undefined,
     projectId: typeof payload.projectId === "string" ? payload.projectId.trim() : undefined,
     rideId: typeof payload.rideId === "string" ? payload.rideId.trim() : undefined,
+    appointmentId: typeof payload.appointmentId === "string" ? payload.appointmentId.trim() : undefined,
   };
 }
 
@@ -926,6 +950,7 @@ export async function authorizeNotificationRequest(
     conversationId?: string;
     projectId?: string;
     rideId?: string;
+    appointmentId?: string;
   }
 ): Promise<boolean> {
   if (!db || !callerUid || !payload || !payload.recipientId) {
@@ -944,11 +969,37 @@ export async function authorizeNotificationRequest(
     return true;
   }
 
+  // Rule 2B: Bidirectional Chat Block Enforcement (Slice 3)
+  // Prevent blocked users from spamming in-app/push/WhatsApp notifications to each other.
+  try {
+    const blocksCol = typeof db.collection === "function" ? db.collection("chat_user_blocks") : null;
+    if (blocksCol && typeof blocksCol.doc === "function") {
+      const [blockByRecipient, blockByCaller] = await Promise.all([
+        blocksCol.doc(`${recipientId}__${callerUid}`).get(),
+        blocksCol.doc(`${callerUid}__${recipientId}`).get(),
+      ]);
+      const recipientBlockedCaller = Boolean(
+        blockByRecipient?.exists &&
+          (typeof blockByRecipient.data === "function" ? blockByRecipient.data() : blockByRecipient.data)?.active === true
+      );
+      const callerBlockedRecipient = Boolean(
+        blockByCaller?.exists &&
+          (typeof blockByCaller.data === "function" ? blockByCaller.data() : blockByCaller.data)?.active === true
+      );
+      if (recipientBlockedCaller || callerBlockedRecipient) {
+        return false;
+      }
+    }
+  } catch {
+    // Non-blocking fallback for minimal unit-test mocks without chat_user_blocks collection
+  }
+
   // Infer context IDs from link if not explicitly provided
   let jobId = payload.jobId;
   let conversationId = payload.conversationId;
   let projectId = payload.projectId;
   let rideId = payload.rideId;
+  let appointmentId = payload.appointmentId;
 
   if (link) {
     if (!jobId) {
@@ -966,6 +1017,10 @@ export async function authorizeNotificationRequest(
     if (!rideId) {
       const rideMatch = link.match(/\/(?:rides?|ride|trips?|trip)\/([a-zA-Z0-9_-]+)/);
       if (rideMatch) rideId = rideMatch[1];
+    }
+    if (!appointmentId) {
+      const apptMatch = link.match(/\/(?:appointments?|appointment)\/([a-zA-Z0-9_-]+)/);
+      if (apptMatch) appointmentId = apptMatch[1];
     }
   }
 
@@ -1133,6 +1188,29 @@ export async function authorizeNotificationRequest(
       return false;
     } catch (err) {
       console.warn("[Notification Auth] Error evaluating ride relationship:", err);
+      return false;
+    }
+  }
+
+  // Rule 3E: Authoritative Appointment Relationship Check (Slice 3)
+  if (appointmentId) {
+    try {
+      const apptDoc = await db.collection("appointments").doc(appointmentId).get();
+      if (!apptDoc.exists) {
+        return false;
+      }
+      const apptData = (typeof apptDoc.data === "function" ? apptDoc.data() : apptDoc.data) || {};
+      const customerId = apptData.customerId || apptData.homeownerId || apptData.userId;
+      const traderId = apptData.traderId || apptData.tradespersonId;
+      if (
+        (callerUid === customerId && recipientId === traderId) ||
+        (callerUid === traderId && recipientId === customerId)
+      ) {
+        return true;
+      }
+      return false;
+    } catch (err) {
+      console.warn("[Notification Auth] Error evaluating appointment relationship:", err);
       return false;
     }
   }

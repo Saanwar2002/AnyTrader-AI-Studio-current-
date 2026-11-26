@@ -118,8 +118,8 @@ describe("Task 6 — Real Firestore Emulator Concurrency & Escrow Security Verif
     expect(ledgerSnap.docs.length).toBe(1);
     const ledgerData = ledgerSnap.docs[0].data();
     expect(ledgerData.amount).toBe(60000); // 600 * 100
-    expect(ledgerData.platformFee).toBe(7200); // 12%
-    expect(ledgerData.netPayout).toBe(52800); // 88%
+    expect(ledgerData.platformFee).toBe(3000); // canonical 5% PAYG
+    expect(ledgerData.netPayout).toBe(57000); // 95%
   });
 
   it("2. Real Emulator Test #2 — Simultaneous and sequential release requests with SAME idempotency key return identical result without duplicate effects", { timeout: 15000 }, async () => {

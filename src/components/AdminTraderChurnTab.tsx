@@ -71,10 +71,10 @@ export default function AdminTraderChurnTab({ users = [], onShowNotice }: AdminT
         setAppliedIds(prev => new Set(prev).add(profile.id));
         onShowNotice?.(res.outcomeMessage, "success");
       } else {
-        onShowNotice?.("Failed to apply retention incentive", "error");
+        onShowNotice?.(res.outcomeMessage || "Retention incentives must be applied from the authoritative Pricing or Users console.", "info");
       }
-    } catch (err) {
-      onShowNotice?.("Error applying retention action", "error");
+    } catch (err: any) {
+      onShowNotice?.(err?.message || "Retention incentives must be applied from the authoritative Pricing or Users console.", "info");
     } finally {
       setExecutingId(null);
     }

@@ -8,7 +8,8 @@ import { motion, AnimatePresence } from "motion/react";
 import { PropertyPassportModal } from "./PropertyPassportModal";
 import { lookupPostcode } from "@/src/services/postcodeService";
 import { toast } from "sonner";
-import { createPropertyViaCommand, deletePropertyViaCommand } from "../services/propertyCommandService";
+import { createPropertyViaCommand, deletePropertyViaCommand, syncPublicPropertyPassport } from "../services/propertyCommandService";
+import { compressPropertyImageFile } from "../utils/propertyPhotoUtils";
 
 export function PropertyManager() {
   const { user } = useAuth();
@@ -32,6 +33,8 @@ export function PropertyManager() {
   const [unitCount, setUnitCount] = useState("");
   const [photos, setPhotos] = useState<string[]>([]);
   const [savingProperty, setSavingProperty] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [locatingAddress, setLocatingAddress] = useState(false);
 
   useEffect(() => {
     if (!user) return;
@@ -88,6 +91,7 @@ export function PropertyManager() {
     setSavingProperty(true);
     try {
       if (editingPropertyId) {
+        const existingProp = properties.find((p) => p.id === editingPropertyId);
         await updateDoc(doc(db, "properties", editingPropertyId), {
           name: propertyName,
           "address.line1": addressLine1,
@@ -101,6 +105,11 @@ export function PropertyManager() {
           photos,
           updatedAt: new Date().toISOString()
         });
+        if (existingProp?.isPublicPassport === true && existingProp?.publicConsent === true) {
+          syncPublicPropertyPassport(user, editingPropertyId).catch((err) =>
+            console.warn("Non-fatal public passport sync after edit:", err)
+          );
+        }
         toast.success("Property updated successfully.");
       } else {
         await createPropertyViaCommand(user, {
@@ -133,33 +142,57 @@ export function PropertyManager() {
     }
   };
 
-  const handlePhotoFilesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoFilesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
     const remainingSlots = Math.max(0, 8 - photos.length);
     if (remainingSlots === 0) {
       toast.error("Maximum of 8 property photos allowed.");
+      e.target.value = "";
       return;
     }
-    files.slice(0, remainingSlots).forEach((file) => {
+    for (const file of files.slice(0, remainingSlots)) {
       if (!file.type.startsWith("image/")) {
         toast.error(`${file.name} is not a supported image file.`);
-        return;
+        continue;
       }
-      if (file.size > 2 * 1024 * 1024) {
-        toast.error(`${file.name} exceeds the 2 MB photo limit.`);
-        return;
+      if (file.size > 5 * 1024 * 1024) {
+        toast.error(`${file.name} exceeds the 5 MB upload limit.`);
+        continue;
       }
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = typeof reader.result === "string" ? reader.result : "";
-        if (result) {
-          setPhotos((prev) => (prev.length < 8 ? [...prev, result] : prev));
-        }
-      };
-      reader.readAsDataURL(file);
-    });
+      try {
+        const compressed = await compressPropertyImageFile(file);
+        setPhotos((prev) => (prev.length < 8 ? [...prev, compressed] : prev));
+      } catch (err: any) {
+        toast.error(err?.message || `Could not process ${file.name}.`);
+      }
+    }
     e.target.value = "";
+  };
+
+  const handleLocateAddress = async () => {
+    const candidate =
+      postcode.trim() ||
+      (addressLine1.match(/\b([A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9][A-Z]{2})\b/i)?.[1] || "");
+    if (!candidate) {
+      toast.info("Enter a UK postcode (or include it in Full Address) to look up location details.");
+      return;
+    }
+    setLocatingAddress(true);
+    try {
+      const lookup = await lookupPostcode(candidate);
+      if (lookup) {
+        setPostcode(lookup.postcode);
+        if (lookup.city) setCity(lookup.city);
+        toast.success(`Location verified: ${lookup.postcode}${lookup.city ? ` • ${lookup.city}` : ""}`);
+      } else {
+        toast.error("Could not verify that postcode. Please check and try again.");
+      }
+    } catch {
+      toast.error("Postcode lookup is temporarily unavailable.");
+    } finally {
+      setLocatingAddress(false);
+    }
   };
 
   const handleAddNewClick = () => {
@@ -225,6 +258,8 @@ export function PropertyManager() {
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
               <input 
                 type="text" 
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search by name, address or postcode" 
                 className="w-full pl-12 pr-4 py-3.5 rounded-xl border border-black bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm shadow-sm"
               />
@@ -239,11 +274,30 @@ export function PropertyManager() {
 
           <div className="pt-2 pb-6">
             <div className="space-y-3">
-              {properties.length === 0 ? (
-                 <div className="text-center py-8 text-slate-500 text-sm bg-white rounded-3xl shadow-sm border border-black">
-                   No properties added yet. Click + to add your first property.
-                 </div>
-              ) : properties.slice(0, 3).map(property => (
+              {(() => {
+                const q = searchQuery.trim().toLowerCase();
+                const filtered = q
+                  ? properties.filter((p) =>
+                      [p.name, p.address?.line1, p.address?.postcode, p.postcode, p.city, p.propertyType]
+                        .filter(Boolean)
+                        .some((v) => String(v).toLowerCase().includes(q))
+                    )
+                  : properties;
+                if (properties.length === 0) {
+                  return (
+                    <div className="text-center py-8 text-slate-500 text-sm bg-white rounded-3xl shadow-sm border border-black">
+                      No properties added yet. Click + to add your first property.
+                    </div>
+                  );
+                }
+                if (filtered.length === 0) {
+                  return (
+                    <div className="text-center py-8 text-slate-500 text-sm bg-white rounded-3xl shadow-sm border border-black">
+                      No properties match &ldquo;{searchQuery}&rdquo;.
+                    </div>
+                  );
+                }
+                return (q ? filtered : filtered.slice(0, 3)).map(property => (
                 <div key={property.id} className="flex items-stretch justify-between py-2 px-3 rounded-xl border border-black hover:bg-slate-50 transition group shadow-sm bg-white min-h-[72px]">
                   <div className="flex items-center gap-3 flex-1 min-w-0">
                     <div className="text-blue-600/80 shrink-0">
@@ -321,9 +375,10 @@ export function PropertyManager() {
                   </button>
                 </div>
               </div>
-            ))}
+            ));
+              })()}
             
-            {properties.length > 3 && (
+            {properties.length > 3 && !searchQuery.trim() && (
               <Link
                 to="/portfolio"
                 className="block text-center w-full py-2.5 text-sm font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors mt-2"
@@ -373,8 +428,13 @@ export function PropertyManager() {
                 <div className="space-y-1.5">
                   <div className="flex justify-between items-center">
                     <label className="block text-[15px] font-medium text-slate-900">Full Address</label>
-                    <button type="button" className="text-[13px] font-medium text-slate-500 flex items-center gap-1 hover:text-slate-900 transition">
-                      <MapPin className="w-3.5 h-3.5" /> Locate on Map
+                    <button
+                      type="button"
+                      onClick={handleLocateAddress}
+                      disabled={locatingAddress}
+                      className="text-[13px] font-medium text-blue-600 flex items-center gap-1 hover:text-blue-800 transition"
+                    >
+                      <MapPin className="w-3.5 h-3.5" /> {locatingAddress ? "Verifying..." : "Verify Postcode"}
                     </button>
                   </div>
                   <input 

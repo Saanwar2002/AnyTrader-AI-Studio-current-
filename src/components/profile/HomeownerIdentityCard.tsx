@@ -1,5 +1,6 @@
 import React from "react";
 import { Camera, Star, Pencil, Calendar, Mail, MapPin } from "lucide-react";
+import { resolveProfileRoleView } from "@/src/lib/accountRoles";
 
 interface HomeownerIdentityCardProps {
   profile: any;
@@ -62,7 +63,7 @@ export const HomeownerIdentityCard: React.FC<HomeownerIdentityCardProps> = ({
           </div>
         )}
 
-        {activePortal === "anyroller" && profile.role !== "driver" && (
+        {resolveProfileRoleView(profile, activePortal).shouldShowRiderRatingBadge && (
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-slate-100 rounded-full border border-black shadow-2xs mb-3">
             <Star className="w-4 h-4 text-slate-900 fill-slate-900" />
             <span className="font-black text-slate-900 text-sm">{profile.rating?.toFixed(1) || "5.0"}</span>

@@ -6,20 +6,21 @@ describe("Firestore Security Rules Second-Pass Comprehensive Audit & Verificatio
   const rulesContent = fs.readFileSync(path.resolve(process.cwd(), "firestore.rules"), "utf-8");
 
   describe("1. Static AST Invariants for Hardened Collections", () => {
-    it("RESTRICTS /admins to isAdmin() only (removes isConsultancyOwner() loophole)", () => {
+    it("RESTRICTS /admins to isAdmin() read and isSuperAdmin() write (removes isConsultancyOwner() loophole)", () => {
       const adminMatch = rulesContent.match(/match \/admins\/\{adminId\} \{([\s\S]*?)\}/);
       expect(adminMatch).toBeTruthy();
       const block = adminMatch![1];
-      expect(block).toContain("allow read, write: if isAdmin();");
+      expect(block).toContain("allow read: if isAdmin();");
+      expect(block).toContain("allow write: if isSuperAdmin();");
       expect(block).not.toContain("isConsultancyOwner");
     });
 
-    it("RESTRICTS /emergency_broadcasts creation strictly to admin (no arbitrary user spam)", () => {
+    it("RESTRICTS /emergency_broadcasts creation strictly to mutating admin (no arbitrary user spam)", () => {
       const match = rulesContent.match(/match \/emergency_broadcasts\/\{broadcastId\} \{([\s\S]*?)\}/);
       expect(match).toBeTruthy();
       const block = match![1];
       expect(block).toContain("allow read: if true;");
-      expect(block).toContain("allow write: if isAdmin();");
+      expect(block).toContain("allow write: if isMutatingAdmin();");
       expect(block).not.toMatch(/allow\s+create\s*:\s*if\s+isSignedIn\(\)/);
     });
 

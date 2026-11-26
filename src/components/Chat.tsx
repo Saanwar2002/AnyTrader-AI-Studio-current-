@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { db, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, handleFirestoreError, OperationType, updateDoc, doc, getDoc, sendNotification, uploadStorageFile, arrayUnion } from "@/src/firebase";
+import { increment } from "firebase/firestore";
 import { useAuth } from "./AuthProvider";
 import { motion, AnimatePresence } from "motion/react";
 import { Send, ChevronLeft, Loader2, User as UserIcon, Briefcase, Image as ImageIcon, X, Mic, Square, Play, Pause, MousePointer2, Trash2, FileText, Download, Maximize2, Paperclip, ShieldAlert, Ban } from "lucide-react";
@@ -28,6 +29,8 @@ export default function Chat() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [activeLightboxImage, setActiveLightboxImage] = useState<string | null>(null);
   const [blockedUserIds, setBlockedUserIds] = useState<string[]>([]);
+  const [blockedByUserIds, setBlockedByUserIds] = useState<string[]>([]);
+  const [peerProfile, setPeerProfile] = useState<{ name?: string; photoURL?: string } | null>(null);
   const [showSafetyModal, setShowSafetyModal] = useState(false);
   const [safetyAction, setSafetyAction] = useState<"report" | "block" | "report_and_block">("report_and_block");
   const [safetyReason, setSafetyReason] = useState("harassment_or_abuse");
@@ -80,6 +83,12 @@ export default function Chat() {
       }
       setMessages(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
       setLoading(false);
+      if (user?.uid && conversationId) {
+        updateDoc(doc(db, "conversations", conversationId), {
+          [`unreadCounts.${user.uid}`]: 0,
+          [`lastReadAt.${user.uid}`]: serverTimestamp(),
+        }).catch(() => {});
+      }
       // Scroll to bottom
       setTimeout(() => {
         scrollRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -95,7 +104,7 @@ export default function Chat() {
     });
 
     return () => unsubscribe();
-  }, [conversationId]);
+  }, [conversationId, user?.uid]);
 
   useEffect(() => {
     const timer = setTimeout(() => setShowHint(false), 8000);
@@ -129,10 +138,11 @@ export default function Chat() {
     };
   }, [user, conversationId]);
 
-  // AT-CJ-CHAT-03: Load user's active chat blocks from server
+  // AT-CJ-CHAT-03 & Slice 3: Load bidirectional chat block state from server
   useEffect(() => {
     if (!user) {
       setBlockedUserIds([]);
+      setBlockedByUserIds([]);
       return;
     }
     let cancelled = false;
@@ -146,6 +156,9 @@ export default function Chat() {
           const data = await res.json();
           if (Array.isArray(data.blockedUserIds)) {
             setBlockedUserIds(data.blockedUserIds);
+          }
+          if (Array.isArray(data.blockedByUserIds)) {
+            setBlockedByUserIds(data.blockedByUserIds);
           }
         }
       } catch (err) {
@@ -162,9 +175,46 @@ export default function Chat() {
       ? conversation.participants.find((pid: string) => pid !== user.uid) || null
       : null;
 
+  // Slice 3: Resolve counterparty display name & avatar when chat is opened directly (push, notification, reload)
+  useEffect(() => {
+    if (!otherParticipantId) {
+      setPeerProfile(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const pubSnap = await getDoc(doc(db, "public_profiles", otherParticipantId));
+        if (!cancelled && pubSnap.exists()) {
+          const pData = pubSnap.data() || {};
+          setPeerProfile({
+            name: pData.businessName || pData.companyName || pData.name || pData.displayName || undefined,
+            photoURL: pData.photoURL || pData.logoUrl || pData.avatarUrl || undefined,
+          });
+        }
+      } catch {
+        // Fallback to conversation participantNames or route state
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [otherParticipantId]);
+
+  const resolvedRecipientName =
+    recipientName ||
+    peerProfile?.name ||
+    (otherParticipantId && conversation?.participantNames?.[otherParticipantId]) ||
+    conversation?.recipientName ||
+    "Chat";
+
   const isOtherParticipantBlocked = Boolean(
     otherParticipantId && blockedUserIds.includes(otherParticipantId)
   );
+  const isBlockedByOtherParticipant = Boolean(
+    otherParticipantId && blockedByUserIds.includes(otherParticipantId)
+  );
+  const isChatBlocked = isOtherParticipantBlocked || isBlockedByOtherParticipant;
 
   const handleSubmitSafetyAction = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -237,6 +287,10 @@ export default function Chat() {
       toast.error("Unblock this participant before sending messages.");
       return;
     }
+    if (isBlockedByOtherParticipant) {
+      toast.error("You cannot send messages in this conversation.");
+      return;
+    }
 
     try {
       await addDoc(collection(db, "conversations", conversationId, "messages"), {
@@ -245,13 +299,21 @@ export default function Chat() {
         createdAt: serverTimestamp(),
       });
 
-      // Update conversation metadata
-      await updateDoc(doc(db, "conversations", conversationId), {
+      // Update conversation metadata & increment recipient unread counter
+      const textRecipientId = conversation?.participants?.find((id: string) => id !== user.uid);
+      const convUpdates: Record<string, any> = {
         lastMessage: text,
+        lastSenderId: user.uid,
         lastMessageAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-        deletedBy: [] // Re-show for everyone when a new message arrives
-      });
+        deletedBy: [], // Re-show for everyone when a new message arrives
+        [`unreadCounts.${user.uid}`]: 0,
+        [`lastReadAt.${user.uid}`]: serverTimestamp(),
+      };
+      if (textRecipientId) {
+        convUpdates[`unreadCounts.${textRecipientId}`] = increment(1);
+      }
+      await updateDoc(doc(db, "conversations", conversationId), convUpdates);
 
       // Notify recipient
       if (conversation) {
@@ -362,12 +424,20 @@ export default function Chat() {
 
         await addDoc(collection(db, "conversations", conversationId, "messages"), messageData);
 
-        await updateDoc(doc(db, "conversations", conversationId), {
+        const mediaRecipientId = conversation?.participants?.find((id: string) => id !== user.uid);
+        const mediaConvUpdates: Record<string, any> = {
           lastMessage: isImg ? "📷 Photo" : `📎 ${file.name}`,
+          lastSenderId: user.uid,
           lastMessageAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
-          deletedBy: []
-        });
+          deletedBy: [],
+          [`unreadCounts.${user.uid}`]: 0,
+          [`lastReadAt.${user.uid}`]: serverTimestamp(),
+        };
+        if (mediaRecipientId) {
+          mediaConvUpdates[`unreadCounts.${mediaRecipientId}`] = increment(1);
+        }
+        await updateDoc(doc(db, "conversations", conversationId), mediaConvUpdates);
 
         if (conversation) {
           const recipientId = conversation.participants?.find((id: string) => id !== user.uid);
@@ -449,12 +519,20 @@ export default function Chat() {
         createdAt: serverTimestamp(),
       });
 
-      await updateDoc(doc(db, "conversations", conversationId), {
+      const voiceRecipientId = conversation?.participants?.find((id: string) => id !== user.uid);
+      const voiceConvUpdates: Record<string, any> = {
         lastMessage: "🎤 Voice message",
+        lastSenderId: user.uid,
         lastMessageAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-        deletedBy: []
-      });
+        deletedBy: [],
+        [`unreadCounts.${user.uid}`]: 0,
+        [`lastReadAt.${user.uid}`]: serverTimestamp(),
+      };
+      if (voiceRecipientId) {
+        voiceConvUpdates[`unreadCounts.${voiceRecipientId}`] = increment(1);
+      }
+      await updateDoc(doc(db, "conversations", conversationId), voiceConvUpdates);
 
       if (conversation) {
         const recipientId = conversation.participants.find((id: string) => id !== user.uid);
@@ -516,8 +594,20 @@ export default function Chat() {
           <button onClick={() => navigate(-1)} className="p-2 sm:p-2.5 bg-white border border-black rounded-xl shadow-sm hover:bg-slate-50 hover:shadow-md transition-all group shrink-0">
             <ChevronLeft className="w-5 h-5 text-slate-800 group-hover:-translate-x-0.5 transition-transform" />
           </button>
+          {peerProfile?.photoURL ? (
+            <img
+              src={peerProfile.photoURL}
+              alt={resolvedRecipientName}
+              className="w-8 h-8 rounded-full object-cover border border-black shrink-0"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <div className="w-8 h-8 rounded-full bg-slate-100 border border-black flex items-center justify-center shrink-0">
+              <UserIcon className="w-4 h-4 text-slate-700" />
+            </div>
+          )}
           <div className="flex flex-col min-w-0">
-            <h3 className="font-bold text-slate-900 text-sm truncate">{recipientName || "Chat"}</h3>
+            <h3 className="font-bold text-slate-900 text-sm truncate">{resolvedRecipientName}</h3>
             {!conversation?.jobId && (
               <p className="text-xs text-slate-500 truncate">General Discussion</p>
             )}
@@ -613,6 +703,14 @@ export default function Chat() {
             >
               Unblock
             </button>
+          </div>
+        )}
+        {!isOtherParticipantBlocked && isBlockedByOtherParticipant && (
+          <div className="p-3 bg-slate-100 border border-black rounded-xl text-black text-xs flex items-center gap-2">
+            <Ban className="w-4 h-4 text-slate-700 shrink-0" />
+            <span className="font-semibold">
+              Messaging is disabled for this conversation.
+            </span>
           </div>
         )}
         {error && (
@@ -790,7 +888,7 @@ export default function Chat() {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={isUploading || isOtherParticipantBlocked}
+              disabled={isUploading || isChatBlocked}
               aria-label="Share photo or document"
               className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all disabled:opacity-50 flex-shrink-0"
               title="Share photo or document"
@@ -800,7 +898,7 @@ export default function Chat() {
             <button
               type="button"
               onClick={startRecording}
-              disabled={isUploading || isOtherParticipantBlocked}
+              disabled={isUploading || isChatBlocked}
               aria-label="Record voice message"
               className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all disabled:opacity-50 flex-shrink-0"
               title="Record voice message"
@@ -812,8 +910,14 @@ export default function Chat() {
               aria-label="Message input"
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
-              disabled={isOtherParticipantBlocked}
-              placeholder={isOtherParticipantBlocked ? "Participant blocked — unblock to send messages" : "Type a message..."}
+              disabled={isChatBlocked}
+              placeholder={
+                isOtherParticipantBlocked
+                  ? "Participant blocked — unblock to send messages"
+                  : isBlockedByOtherParticipant
+                  ? "Messaging is disabled for this conversation"
+                  : "Type a message..."
+              }
               className="flex-1 min-w-0 p-2 rounded-xl border border-black focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 text-sm disabled:bg-slate-100"
             />
             <button

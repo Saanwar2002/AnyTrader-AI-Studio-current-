@@ -57,7 +57,7 @@ export function ClaimPropertyPassportModal({ initialCode = "", onClose, onSucces
   const handleClaimProperty = async () => {
     if (!user) {
       toast.error("Please sign in or create an account to claim this property.");
-      navigate("/login");
+      navigate(`/login?redirect=${encodeURIComponent(`/claim-passport?code=${transferCode}`)}`);
       return;
     }
 
@@ -249,7 +249,7 @@ export function ClaimPropertyPassportModal({ initialCode = "", onClose, onSucces
                 <div className="p-4 bg-slate-50 border border-black rounded-2xl text-xs text-slate-700 space-y-2">
                   <div className="flex items-center gap-2 font-black text-slate-900 text-sm">
                     <KeyRound className="w-4 h-4 text-blue-600" />
-                    Enter Your 8-Character Transfer Code
+                    Enter Your Transfer Code
                   </div>
                   <p className="leading-relaxed">
                     If you are purchasing a home, your seller or conveyancer will have provided you with a unique AnyTrader transfer code (e.g. <code>TRF-8K92X4</code>).

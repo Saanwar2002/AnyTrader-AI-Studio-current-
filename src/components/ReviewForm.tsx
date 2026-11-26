@@ -42,7 +42,7 @@ export function ReviewForm({ jobId, reviewerId, revieweeId, type = "tradesperson
       onSuccess();
     } catch (err: any) {
       console.error(err);
-      setError("Failed to submit review. Please try again.");
+      setError(err?.message || "Failed to submit review. Please try again.");
     } finally {
       setLoading(false);
     }

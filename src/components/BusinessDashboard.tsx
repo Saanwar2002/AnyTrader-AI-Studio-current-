@@ -19,6 +19,7 @@ import { PropertyManager } from "./PropertyManager";
 import { FieldServicesManager } from "./FieldServicesManager";
 import { ConsultancyManager } from "./ConsultancyManager";
 import { useBusinessTab } from "@/src/store/businessTabStore";
+import { getAllowedBusinessLayers, getDefaultBusinessTab, isTradeProviderAccount } from "@/src/lib/accountRoles";
 
 export default function BusinessDashboard() {
   const { user, profile, setIsTradeBotOpen } = useAuth();
@@ -29,12 +30,17 @@ export default function BusinessDashboard() {
 
   const { activeTab, setActiveTab } = useBusinessTab();
   const location = useLocation();
+  const allowedLayers = getAllowedBusinessLayers(profile);
+  const defaultLayer = getDefaultBusinessTab(profile);
+  const effectiveTab = allowedLayers.includes(activeTab) ? activeTab : defaultLayer;
 
   useEffect(() => {
-    if (location.pathname.startsWith("/consultancy")) {
+    if (location.pathname.startsWith("/consultancy") && allowedLayers.includes("consultancy")) {
       setActiveTab("consultancy");
+    } else if (!allowedLayers.includes(activeTab)) {
+      setActiveTab(defaultLayer);
     }
-  }, [location.pathname, setActiveTab]);
+  }, [location.pathname, activeTab, defaultLayer, allowedLayers.join(","), setActiveTab]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -49,8 +55,8 @@ export default function BusinessDashboard() {
       return;
     }
 
-    // Fetch recent quotes across all business jobs/quotes
-    const isTraderUser = ["tradesperson", "trader", "business"].includes(profile?.role || "") || profile?.subscriptionType === "business";
+    // Fetch recent quotes across business jobs: only query by tradespersonId for actual trade providers
+    const isTraderUser = isTradeProviderAccount(profile);
     const quotesQuery = query(
       collectionGroup(db, "quotes"),
       where(isTraderUser ? "tradespersonId" : "homeownerId", "==", user.uid),
@@ -108,7 +114,7 @@ export default function BusinessDashboard() {
       />
       
       {/* Conditional Content Output Block */}
-      {activeTab === "properties" && (
+      {effectiveTab === "properties" && (
         <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
           
           {/* Plan Status Banner (Only visible if not subscribed) */}
@@ -121,7 +127,7 @@ export default function BusinessDashboard() {
                 </p>
               </div>
               <Link 
-                to="/settings?tab=subscription" 
+                to="/billing" 
                 className="bg-white text-orange-600 w-full py-2 rounded-lg font-bold text-[14px] hover:bg-orange-50 transition-colors shadow-sm text-center"
               >
                 Upgrade Now
@@ -265,14 +271,14 @@ export default function BusinessDashboard() {
     )}
 
       {/* Field Services Content */}
-      {activeTab === "field_services" && (
+      {effectiveTab === "field_services" && (
         <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
            <FieldServicesManager />
         </div>
       )}
 
       {/* Consultancy Content */}
-      {activeTab === "consultancy" && (
+      {effectiveTab === "consultancy" && (
         <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
            <ConsultancyManager />
         </div>

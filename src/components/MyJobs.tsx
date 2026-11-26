@@ -9,7 +9,9 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import { cn, getOutwardPostcode, formatJobLocation } from "@/src/lib/utils";
 import { EmergencyTimer } from "./EmergencyTimer";
 import MediaGalleryModal from "./MediaGalleryModal";
-import { createJobViaCommand, cancelJobViaCommand } from "../services/jobCommandService";
+import { createJobViaCommand, cancelJobViaCommand, deleteJobViaCommand } from "../services/jobCommandService";
+import { distributeJobNotifications } from "../services/notificationService";
+import { isOpenJobStatus } from "@/src/lib/marketplaceContracts";
 
 export default function MyJobs() {
   const { user, profile, isAuthReady, loading: authLoading } = useAuth();
@@ -111,72 +113,6 @@ export default function MyJobs() {
     return true;
   });
 
-  const handleSimulateJob = async () => {
-    setIsProcessing("simulating");
-    try {
-      if (!user) return;
-      
-      let tempJobId = "";
-      try {
-        const result = await createJobViaCommand({
-          user,
-          payload: {
-            title: "Fix leaking washing machine",
-            description: "My Bosch washing machine is leaking from the bottom front door when running a hot wash. Need someone to fix it ASAP.",
-            category: "Appliance Repair",
-            subCategory: "Washing Machine Repair",
-            urgency: "standard",
-            postcode: "HD5 9BW",
-            city: "Huddersfield",
-          },
-        });
-        tempJobId = result.jobId;
-      } catch (e: any) {
-        throw new Error(`Job creation failed: ${e.message}`);
-      }
-      
-      const quotesRef = collection(db, "jobs", tempJobId, "quotes");
-      
-      const mockPros = [
-        { id: "pro1", name: "Bob's Repairs", price: 65, rating: 4.8, reviews: 142, message: "Can do this tomorrow morning. Includes standard replacement seal." },
-        { id: "pro2", name: "QuickFix Appliances", price: 85, rating: 4.9, reviews: 310, message: "We can come today. fully insured and guaranteed." },
-        { id: "pro3", name: "Huddersfield Handyman", price: 45, rating: 4.5, reviews: 89, message: "I've fixed many of these. Labour only, parts extra if needed." },
-        { id: "pro4", name: "Elite Appliance Care", price: 110, rating: 5.0, reviews: 45, message: "Premium service with official Bosch parts. 1 year warranty." },
-        { id: "pro5", name: "Dave The Plumber", price: 70, rating: 4.7, reviews: 215, message: "Available next week. Sounds like a simple door seal issue." }
-      ];
-      
-      for (const pro of mockPros) {
-        try {
-          await addDoc(quotesRef, {
-            tradespersonId: pro.id,
-            homeownerId: user.uid,
-            proId: pro.id,
-            jobId: tempJobId,
-            businessName: pro.name,
-            price: pro.price,
-            projectTotal: pro.price,
-            estimatedHours: 1,
-            message: pro.message,
-            status: "pending",
-            createdAt: serverTimestamp(),
-            materialsFinalized: true,
-            averageRating: pro.rating,
-            totalReviews: pro.reviews,
-          });
-        } catch (e: any) {
-           throw new Error(`Quote creation failed for ${pro.id}: ${e.message}`);
-        }
-      }
-      
-      navigate(`/job/${tempJobId}`);
-    } catch (e: any) {
-      console.error("Simulation error", e);
-      alert(`Simulation error: ${e.message}`);
-    } finally {
-      setIsProcessing(null);
-    }
-  };
-
   const handleCancel = async (jobId: string) => {
     if (!user) return;
     setIsProcessing(jobId);
@@ -197,7 +133,7 @@ export default function MyJobs() {
     if (!user) return;
     setIsProcessing(job.id);
     try {
-      await createJobViaCommand({
+      const reposted = await createJobViaCommand({
         user,
         payload: {
           title: job.title || "Untitled Job",
@@ -208,13 +144,25 @@ export default function MyJobs() {
           city: job.city || null,
           area: job.area || null,
           urgency: job.urgency === "emergency" ? "emergency" : "standard",
+          urgencyLabel: job.urgencyLabel || job.urgency || "standard",
           budget: job.budget || null,
           photos: Array.isArray(job.photos) ? job.photos : [],
+          videos: Array.isArray(job.videos) ? job.videos : [],
+          documents: Array.isArray(job.documents) ? job.documents : [],
           propertyId: job.propertyId || null,
         },
       });
+      if (reposted?.jobId) {
+        distributeJobNotifications(
+          reposted.jobId,
+          job.category || "General Maintenance",
+          job.postcode || "SW1A 1AA",
+          job.urgency === "emergency" ? "emergency" : "standard",
+          false
+        ).catch((err) => console.warn("Repost lead distribution skipped:", err));
+      }
       setActionId(null);
-      toast.success("Job reposted successfully!");
+      toast.success("Job reposted successfully! Local tradespeople have been notified.");
     } catch (error: any) {
       console.error("Error reposting job:", error);
       toast.error(error.message || "Failed to repost job");
@@ -230,12 +178,15 @@ export default function MyJobs() {
   };
 
   const executeDelete = async (jobId: string) => {
+    if (!user) return;
     setIsProcessing(jobId);
     try {
-      await updateDoc(doc(db, "jobs", jobId), { clientDeleted: true });
+      await deleteJobViaCommand({ user, jobId, mode: "archive" });
       setActionId(null);
-    } catch (error) {
-      console.error("Error deleting job:", error);
+      toast.success("Job removed from your list and public feed.");
+    } catch (error: any) {
+      console.error("Error archiving job:", error);
+      toast.error(error?.message || "Failed to remove job.");
     } finally {
       setIsProcessing(null);
     }
@@ -303,14 +254,6 @@ export default function MyJobs() {
           </h1>
           {!isHistoryView && filter !== "completed" && filter !== "cancelled" && (
             <div className="flex items-center gap-3">
-              <button 
-                onClick={handleSimulateJob}
-                disabled={isProcessing === "simulating"}
-                className="text-purple-600 font-bold hover:underline flex items-center gap-1 disabled:opacity-50"
-              >
-                {isProcessing === "simulating" ? <Loader2 className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5" />}
-                Simulate Demo Job
-              </button>
               <Link 
                 to="/post-job"
                 className="text-orange-500 font-bold hover:underline flex items-center gap-1"
@@ -476,18 +419,21 @@ export default function MyJobs() {
                           {(() => {
                             const qCount = quoteCounts[job.id] || job.quoteCount || 0;
                             const isFull = qCount >= 5;
+                            const isOpen = isOpenJobStatus(job.status);
                             return (
                               <span className={cn(
                                 "px-2.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-black shadow-2xs uppercase tracking-wider transition-all",
-                                job.status === "posted"
+                                isOpen
                                   ? isFull
                                     ? "border-2 border-red-500 text-red-700 bg-red-50"
                                     : "border-2 border-emerald-500 text-emerald-800 bg-emerald-50 pulse-green-border"
                                   : job.status === "accepted"
                                   ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
-                                  : "bg-red-100 text-red-800 border border-red-200"
+                                  : job.status === "in_progress"
+                                  ? "bg-blue-100 text-blue-800 border border-blue-200"
+                                  : "bg-amber-100 text-amber-800 border border-amber-200"
                               )}>
-                                {job.status === 'posted' ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : job.status.replace(/_/g, " ")}
+                                {isOpen ? (isFull ? 'Max Quotes Reached' : 'Seeking Quotes') : String(job.status || "").replace(/_/g, " ")}
                               </span>
                             );
                           })()}
@@ -512,7 +458,7 @@ export default function MyJobs() {
                           </Link>
                         </>
                       )}
-                      {job.status === "posted" && job.boostTier === "instant_match" && (
+                      {isOpenJobStatus(job.status) && job.boostTier === "instant_match" && (
                         <span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-black shadow-2xs uppercase tracking-wider flex items-center gap-1 animate-pulse border border-amber-300">
                           <Zap className="w-2.5 h-2.5" />
                           Finding Pro

@@ -49,6 +49,27 @@ export default function EcosystemAdmin() {
   const [aiInsights, setAiInsights] = useState<MonetizationOpportunity[]>([]);
   const [isGeneratingInsights, setIsGeneratingInsights] = useState(false);
   const [showManual, setShowManual] = useState(false);
+  const [pendingDeleteTarget, setPendingDeleteTarget] = useState<{
+    type: "partner" | "campaign";
+    id: string;
+    label: string;
+  } | null>(null);
+  const [isDeletingTarget, setIsDeletingTarget] = useState(false);
+
+  const confirmDeleteTarget = async () => {
+    if (!pendingDeleteTarget) return;
+    setIsDeletingTarget(true);
+    try {
+      const col = pendingDeleteTarget.type === "partner" ? "partners" : "campaigns";
+      await deleteDoc(doc(db, col, pendingDeleteTarget.id));
+      toast.success(pendingDeleteTarget.type === "partner" ? "Partner deleted" : "Campaign deleted");
+      setPendingDeleteTarget(null);
+    } catch (err: any) {
+      toast.error(err?.message || `Failed to delete ${pendingDeleteTarget.type}`);
+    } finally {
+      setIsDeletingTarget(false);
+    }
+  };
 
   const isAuthorized = Boolean(user && (profile?.role === "admin" || profile?.role === "ecosystem_manager"));
 
@@ -396,12 +417,13 @@ export default function EcosystemAdmin() {
                         <Edit2 className="w-4 h-4" />
                       </button>
                       <button 
-                        onClick={async () => {
-                          if (confirm("Delete this partner?")) {
-                            await deleteDoc(doc(db, "partners", partner.id));
-                            toast.success("Partner deleted");
-                          }
-                        }}
+                        onClick={() =>
+                          setPendingDeleteTarget({
+                            type: "partner",
+                            id: partner.id,
+                            label: partner.name || "this partner",
+                          })
+                        }
                         className="p-2 text-slate-400 hover:text-red-500 transition-colors"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -460,12 +482,13 @@ export default function EcosystemAdmin() {
                         <Edit2 className="w-4 h-4" />
                       </button>
                       <button 
-                        onClick={async () => {
-                          if (confirm("Delete this campaign?")) {
-                            await deleteDoc(doc(db, "campaigns", campaign.id));
-                            toast.success("Campaign deleted");
-                          }
-                        }}
+                        onClick={() =>
+                          setPendingDeleteTarget({
+                            type: "campaign",
+                            id: campaign.id,
+                            label: campaign.title || "this campaign",
+                          })
+                        }
                         className="p-2 text-slate-400 hover:text-red-500 transition-colors"
                       >
                         <Trash2 className="w-4 h-4" />
@@ -953,6 +976,36 @@ export default function EcosystemAdmin() {
           </div>
         )}
       </AnimatePresence>
+      {pendingDeleteTarget && (
+        <div className="fixed inset-0 z-[120] bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white border border-black rounded-xl max-w-sm w-full p-5 space-y-4">
+            <h3 className="text-base font-black text-black">
+              Delete {pendingDeleteTarget.type === "partner" ? "Partner" : "Campaign"}?
+            </h3>
+            <p className="text-sm text-black">
+              Are you sure you want to permanently delete {pendingDeleteTarget.label}?
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingTarget}
+                onClick={() => setPendingDeleteTarget(null)}
+                className="px-4 py-2 text-xs font-bold text-black bg-slate-100 border border-black rounded-lg hover:bg-slate-200 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingTarget}
+                onClick={confirmDeleteTarget}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
+              >
+                {isDeletingTarget ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

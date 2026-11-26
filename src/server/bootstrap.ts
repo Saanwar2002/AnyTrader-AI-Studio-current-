@@ -189,7 +189,7 @@ export async function runBootstrapSequence(
     timestamp: new Date().toISOString(),
   };
 
-  console.log("[Bootstrap] Step 10: TradeQuote UK Enterprise Application READY.");
+  console.log("[Bootstrap] Step 10: AnyTrader UK Enterprise Application READY.");
   return result;
 }
 

@@ -15,6 +15,16 @@ service firebase.storage {
         firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/admins/$(request.auth.uid))
       );
     }
+    function isMutatingAdmin() {
+      return isSignedIn() && (
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        ('isAdmin' in request.auth.token && request.auth.token.isAdmin == true) ||
+        (
+          firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/admins/$(request.auth.uid)) &&
+          firestore.get(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/admins/$(request.auth.uid)).data.get('adminTier', 'super_admin') != 'support_readonly'
+        )
+      );
+    }
     function isSafeImageMimeType() {
       return request.resource.contentType.matches('image/(jpeg|jpg|png|webp|gif|heic|heif|avif)');
     }
@@ -26,7 +36,7 @@ service firebase.storage {
       return request.resource.size <= 25 * 1024 * 1024
         && (
           isSafeImageMimeType() ||
-          request.resource.contentType.matches('audio/.*|video/.*|application/pdf')
+          request.resource.contentType.matches('audio/.*|video/.*|application/pdf|application/msword|application/vnd\\.openxmlformats-officedocument\\.wordprocessingml\\.document')
         );
     }
     function isValidVideo() {
@@ -73,6 +83,10 @@ service firebase.storage {
       return isJobOwnerById(jobId) || isJobTradespersonById(jobId) || isAdmin();
     }
 
+    function isJobParticipantWrite(jobId) {
+      return isJobOwnerById(jobId) || isJobTradespersonById(jobId) || isMutatingAdmin();
+    }
+
     // --- Property Ownership & Tenant Helpers (Bound to Named Production DB) ---
     function isPropertyOwnerOrManagerInNamedDb(propertyId) {
       return firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/properties/$(propertyId)) &&
@@ -101,11 +115,26 @@ service firebase.storage {
       );
     }
 
+    function isPropertyOwnerOrMutatingAdmin(propertyId) {
+      return isSignedIn() && (
+        isPropertyOwnerOrManagerInNamedDb(propertyId) ||
+        isMutatingAdmin()
+      );
+    }
+
     function isPropertyTenantIssueParticipant(propertyId) {
       return isSignedIn() && (
         isPropertyOwnerOrManagerInNamedDb(propertyId) ||
         isPropertyTenantInNamedDb(propertyId) ||
         isAdmin()
+      );
+    }
+
+    function isPropertyTenantIssueParticipantWrite(propertyId) {
+      return isSignedIn() && (
+        isPropertyOwnerOrManagerInNamedDb(propertyId) ||
+        isPropertyTenantInNamedDb(propertyId) ||
+        isMutatingAdmin()
       );
     }
 
@@ -122,6 +151,13 @@ service firebase.storage {
       return isSignedIn() && (
         isChatParticipantInNamedDb(conversationId) ||
         isAdmin()
+      );
+    }
+
+    function isChatParticipantWrite(conversationId) {
+      return isSignedIn() && (
+        isChatParticipantInNamedDb(conversationId) ||
+        isMutatingAdmin()
       );
     }
 
@@ -142,6 +178,13 @@ service firebase.storage {
       return isSignedIn() && (
         isDisputeParticipantInNamedDb(jobId) ||
         isAdmin()
+      );
+    }
+
+    function isDisputeParticipantWrite(jobId) {
+      return isSignedIn() && (
+        isDisputeParticipantInNamedDb(jobId) ||
+        isMutatingAdmin()
       );
     }
 
@@ -176,6 +219,13 @@ service firebase.storage {
       );
     }
 
+    function isRideParticipantWrite(rideId) {
+      return isSignedIn() && (
+        isMutatingAdmin() ||
+        isRideParticipantInNamedDb(rideId)
+      );
+    }
+
     // --- Vehicle Participant Helper ---
     function isVehicleParticipantInNamedDb(vehicleId) {
       return firestore.exists(/databases/ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a/documents/vehicles/$(vehicleId)) &&
@@ -192,6 +242,13 @@ service firebase.storage {
       );
     }
 
+    function isVehicleParticipantWrite(vehicleId) {
+      return isSignedIn() && (
+        isVehicleParticipantInNamedDb(vehicleId) ||
+        isMutatingAdmin()
+      );
+    }
+
     // ==========================================
     // STORAGE PATH MATCHING RULES
     // ==========================================
@@ -200,13 +257,13 @@ service firebase.storage {
     // Recursive matching {allPaths=**} protects all nested subdirectories
     match /jobs/{jobId}/{allPaths=**} {
       allow read: if isJobParticipant(jobId);
-      allow write: if isJobParticipant(jobId) && isValidMedia();
+      allow write: if isJobParticipantWrite(jobId) && isValidMedia();
     }
 
     // 2. Public Job Media: Explicit separate derivative area for published marketplace showcases
     match /public_job_media/{jobId}/{allPaths=**} {
       allow read: if true;
-      allow write: if isSignedIn() && (isJobOwnerById(jobId) || isAdmin()) && isValidMedia();
+      allow write: if isSignedIn() && (isJobOwnerById(jobId) || isMutatingAdmin()) && isValidMedia();
     }
 
     // 3. Property Media (Private Passport docs, EPC, CP12/EICR, condition photos)
@@ -214,79 +271,81 @@ service firebase.storage {
     // Tenants are confined strictly to tenant-issue evidence subpaths.
     match /properties/{propertyId}/tenant-issues/{allPaths=**} {
       allow read: if isPropertyTenantIssueParticipant(propertyId);
-      allow write: if isPropertyTenantIssueParticipant(propertyId) && isValidMedia();
+      allow write: if isPropertyTenantIssueParticipantWrite(propertyId) && isValidMedia();
     }
     match /properties/{propertyId}/tenant_issues/{allPaths=**} {
       allow read: if isPropertyTenantIssueParticipant(propertyId);
-      allow write: if isPropertyTenantIssueParticipant(propertyId) && isValidMedia();
+      allow write: if isPropertyTenantIssueParticipantWrite(propertyId) && isValidMedia();
     }
     match /properties/{propertyId}/{allPaths=**} {
       allow read: if isPropertyOwnerOrAdmin(propertyId);
-      allow write: if isPropertyOwnerOrAdmin(propertyId) && isValidMedia();
+      allow write: if isPropertyOwnerOrMutatingAdmin(propertyId) && isValidMedia();
     }
 
     // 4. Public User Profiles (Public Avatars, Portfolio showcase items)
     match /users/{uid}/public/{allPaths=**} {
       allow read: if true;
-      allow write: if (isOwner(uid) || isAdmin()) && isValidMedia();
+      allow write: if (isOwner(uid) || isMutatingAdmin()) && isValidMedia();
     }
     match /avatars/{uid}/{allPaths=**} {
       allow read: if true;
-      allow write: if (isOwner(uid) || isAdmin()) && isValidImage();
+      allow write: if (isOwner(uid) || isMutatingAdmin()) && isValidImage();
     }
     match /portfolio/{uid}/{allPaths=**} {
       allow read: if true;
-      allow write: if (isOwner(uid) || isAdmin()) && isValidMedia();
+      allow write: if (isOwner(uid) || isMutatingAdmin()) && isValidMedia();
     }
 
     // 5. Private User Verification (KYC documents, ID cards, insurance policies, video verification)
     match /users/{uid}/private/{allPaths=**} {
       allow read: if isOwner(uid) || isAdmin();
-      allow write: if (isOwner(uid) || isAdmin()) && isValidMedia();
+      allow write: if (isOwner(uid) || isMutatingAdmin()) && isValidMedia();
     }
     match /verifications/{uid}/{allPaths=**} {
       allow read: if isOwner(uid) || isAdmin();
-      allow write: if (isOwner(uid) || isAdmin()) && isValidMedia();
+      allow write: if (isOwner(uid) || isMutatingAdmin()) && isValidMedia();
     }
     match /users/{uid}/video_verification/{fileName} {
       allow read: if isOwner(uid) || isAdmin();
-      allow write: if (isOwner(uid) || isAdmin()) && isValidVideo();
+      allow write: if (isOwner(uid) || isMutatingAdmin()) && isValidVideo();
     }
 
     // 6. Chat Attachments (Images, voice notes, files)
     match /chats/{conversationId}/{allPaths=**} {
       allow read: if isChatParticipant(conversationId);
-      allow write: if isChatParticipant(conversationId) && isValidMedia();
+      allow write: if isChatParticipantWrite(conversationId) && isValidMedia();
     }
 
     // 7. Disputes and Resolution Evidence
     match /disputes/{jobId}/{allPaths=**} {
       allow read: if isDisputeParticipant(jobId);
-      allow write: if isDisputeParticipant(jobId) && isValidMedia();
+      allow write: if isDisputeParticipantWrite(jobId) && isValidMedia();
     }
 
     // 8. Rides Portal (Chat attachments & trip receipts)
     match /rides/{rideId}/{allPaths=**} {
       allow read: if isRideParticipant(rideId);
-      allow write: if isRideParticipant(rideId) && isValidMedia();
+      allow write: if isRideParticipantWrite(rideId) && isValidMedia();
     }
 
     // 9. Vehicles and Driver Compliance Documents
     match /vehicles/{vehicleId}/{allPaths=**} {
       allow read: if isVehicleParticipant(vehicleId);
-      allow write: if isVehicleParticipant(vehicleId) && isValidMedia();
+      allow write: if isVehicleParticipantWrite(vehicleId) && isValidMedia();
     }
 
     // 10. V8.1 Structured Intelligence Raw Storage (Tier B)
     // Server/Admin SDK writes directly. Client reads and writes are DENIED.
     match /intelligence_raw/{aggregateId}/{allPaths=**} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     // 10b. V8.1 Structured Intelligence Evidence Storage
     // Server/Admin SDK writes directly. Client reads and writes are DENIED.
     match /intelligence_evidence/{evidenceId}/{allPaths=**} {
-      allow read, write: if isAdmin();
+      allow read: if isAdmin();
+      allow write: if isMutatingAdmin();
     }
 
     // 11. Default Deny on all other paths

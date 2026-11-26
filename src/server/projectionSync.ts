@@ -100,7 +100,7 @@ export interface PublicAdProjection {
   updatedAt?: any;
 }
 
-const PUBLIC_JOB_DISCOVERY_STATUSES = new Set(["posted", "quoting", "in_bidding", "open"]);
+const PUBLIC_JOB_DISCOVERY_STATUSES = new Set(["posted", "quoting", "quoted", "in_bidding", "open"]);
 
 /**
  * Extracts outward postcode safely (e.g., "SW1A 1AA" -> "SW1A", "EC1" -> "EC1").
@@ -231,18 +231,40 @@ export function sanitizeJobToPublicCard(jobId: string, jobData: Record<string, a
   const sanitizedTitle = sanitizePublicDescription(jobData.title) || "Trade Job";
   const sanitizedDescription = sanitizePublicDescription(jobData.description);
 
+  const resolvedSubCategory =
+    typeof jobData.subCategory === "string" && jobData.subCategory.trim()
+      ? jobData.subCategory.trim()
+      : typeof jobData.subcategory === "string" && jobData.subcategory.trim()
+      ? jobData.subcategory.trim()
+      : Array.isArray(jobData.subcategories) && typeof jobData.subcategories[0] === "string" && jobData.subcategories[0].trim()
+      ? jobData.subcategories[0].trim()
+      : undefined;
+
+  const safeRequiredCertifications = Array.isArray(jobData.requiredCertifications)
+    ? jobData.requiredCertifications
+        .filter((c: unknown): c is string => typeof c === "string" && c.trim().length > 0)
+        .map((c: string) => c.trim().slice(0, 80))
+        .slice(0, 10)
+    : undefined;
+
   return {
     id: jobId,
     jobNo: jobData.jobNo || undefined,
     category: jobData.category || "General",
-    subCategory: jobData.subCategory || undefined,
+    subCategory: resolvedSubCategory,
     title: sanitizedTitle,
     description: sanitizedDescription,
     postcodeArea: outwardCode || coarseCity || "Local Area",
     city: coarseCity,
     area: coarseArea,
     urgency: jobData.urgency || "standard",
-    status: jobData.status || "posted",
+    urgencyLabel: jobData.urgencyLabel || jobData.urgency || "standard",
+    preferredDate: jobData.preferredDate || jobData.jobDate || undefined,
+    quoteScope: jobData.quoteScope || undefined,
+    paymentPreference: jobData.paymentPreference || undefined,
+    estimatedCompletionTime: jobData.estimatedCompletionTime || undefined,
+    estimatedCompletionTimeUnit: jobData.estimatedCompletionTimeUnit || undefined,
+    status: jobData.status || "open",
     estimateMin: typeof jobData.estimateMin === "number" ? jobData.estimateMin : undefined,
     estimateMax: typeof jobData.estimateMax === "number" ? jobData.estimateMax : undefined,
     postedDate: jobData.postedDate || jobData.createdAt || undefined,
@@ -253,6 +275,9 @@ export function sanitizeJobToPublicCard(jobId: string, jobData: Record<string, a
     boostTier: jobData.boostTier || null,
     isInstantMatch: Boolean(jobData.isInstantMatch),
     exclusiveUntil: jobData.exclusiveUntil || null,
+    ...(safeRequiredCertifications && safeRequiredCertifications.length > 0
+      ? { requiredCertifications: safeRequiredCertifications }
+      : {}),
     photosCount: Array.isArray(jobData.photos) ? jobData.photos.length : (jobData.photosCount || 0),
     videosCount: Array.isArray(jobData.videos) ? jobData.videos.length : (jobData.videosCount || 0),
     documentsCount: Array.isArray(jobData.documents) ? jobData.documents.length : (jobData.documentsCount || 0),

@@ -198,19 +198,16 @@ export default function MoveInPackHub({
     }, 300);
   };
 
-  const handleShareWhatsApp = () => {
+  const handleShareWhatsApp = async () => {
     const text = `🏡 *New Home Move-In Trade Checklist*\n` +
       `Property: *${propertyAddress?.line1 || propertyName}*\n` +
       `Progress: *${completedCount}/${totalCount} completed (${progressPct}%)*\n\n` +
       `Explore recommended move-in trades & 1-click quotes on AnyTrader:\n${window.location.origin}/move-in?postcode=${encodeURIComponent(postcode || "")}&address=${encodeURIComponent(propertyAddress?.line1 || "")}`;
-    const waUrl = `https://wa.me/?text=${encodeURIComponent(text)}`;
     try {
-      const win = window.open(waUrl, "_blank", "noopener,noreferrer");
-      if (!win || win.closed || typeof win.closed === "undefined") {
-        window.location.href = waUrl;
-      }
-    } catch (e) {
-      window.location.href = waUrl;
+      await navigator.clipboard.writeText(text);
+      toast.success("Move-in checklist message copied — paste into WhatsApp to share.");
+    } catch {
+      toast.info("Copy this page URL to share your move-in checklist.");
     }
   };
 

@@ -156,6 +156,30 @@ export async function executeCreateTripPaymentCommand(
     throw new BadRequestError("No assigned driver found for this ride");
   }
 
+  // Defense-in-depth self-payment rejection (payerUid !== payeeUid):
+  // Prevents a driver or dual-role user from paying their own Stripe Connect account
+  // (e.g. card-testing, wash volume, or self-booked trip), even if invoked by an admin.
+  const normalizedDriverId = authoritativeDriverId.trim();
+  const passengerCandidates = [
+    rideData.passengerId,
+    rideData.userId,
+    rideData.riderId,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim() !== "")
+    .map((value) => value.trim());
+  const effectivePayerUid =
+    (typeof authoritativePassengerId === "string" && authoritativePassengerId.trim()) ||
+    (isCallerAdmin ? "" : callerUid.trim());
+
+  if (
+    passengerCandidates.includes(normalizedDriverId) ||
+    (effectivePayerUid !== "" && effectivePayerUid === normalizedDriverId)
+  ) {
+    throw new ForbiddenError(
+      "Self-payment is prohibited: the passenger and driver cannot be the same account."
+    );
+  }
+
   const clientSuppliedRecipient = body.driverId || body.recipientId || body.payeeId || body.driverUid;
   if (
     clientSuppliedRecipient &&

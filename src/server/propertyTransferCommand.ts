@@ -29,6 +29,17 @@ export function buildClaimPropertyTransferUpdate(
     managerId: admin.firestore.FieldValue.delete(),
     propertyManagerId: admin.firestore.FieldValue.delete(),
     assignedManagerId: admin.firestore.FieldValue.delete(),
+    // Revoke previous owner's public passport sharing consent so the new owner explicitly opts in
+    isPublicPassport: false,
+    publicConsent: false,
+    publicConsentRevokedAt: nowIso,
+    // Clear previous owner's tenant/contact PII and private access instructions
+    tenantName: admin.firestore.FieldValue.delete(),
+    tenantEmail: admin.firestore.FieldValue.delete(),
+    tenantPhone: admin.firestore.FieldValue.delete(),
+    contactName: admin.firestore.FieldValue.delete(),
+    contactPhone: admin.firestore.FieldValue.delete(),
+    accessInstructions: admin.firestore.FieldValue.delete(),
     transferStatus: "completed",
     transferCode: null,
     transferExpiresAt: null,

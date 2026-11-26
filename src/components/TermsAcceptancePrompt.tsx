@@ -58,34 +58,43 @@ export const TermsAcceptancePrompt: React.FC = () => {
 
     setIsSubmitting(true);
     try {
-      const timestamp = new Date().toISOString();
-      const userAgentStr = typeof navigator !== "undefined" ? navigator.userAgent : "Web";
+      const idToken = await user.getIdToken();
+      const response = await fetch("/api/account/accept-terms", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          termsVersion: CURRENT_TERMS_VERSION,
+          compulsoryAgreed: true,
+          marketingOptIn,
+          partnerDataSharingOptIn: partnerSharingOptIn,
+        }),
+      });
+
+      const data = await response.json().catch(() => ({} as any));
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.error || "Failed to save agreement.");
+      }
 
       const updateData: any = {
-        uid: user.uid,
-        email: user.email || "",
-        name: profile?.name || user.displayName || "User",
-        role: profile?.role || "homeowner",
-        termsAcceptedAt: timestamp,
-        termsAcceptedVersion: CURRENT_TERMS_VERSION,
-        termsAcceptedIp: userAgentStr,
-        marketingOptIn: marketingOptIn,
-        partnerDataSharingOptIn: partnerSharingOptIn,
-        updatedAt: timestamp
+        termsAccepted: true,
+        termsAcceptedAt: data.termsAcceptedAt || new Date().toISOString(),
+        termsAcceptedVersion: data.termsAcceptedVersion || CURRENT_TERMS_VERSION,
+        marketingOptIn: Boolean(data.marketingOptIn),
+        partnerDataSharingOptIn: Boolean(data.partnerDataSharingOptIn),
       };
 
-      // Use setDoc with merge: true so if the user doc is missing it is created seamlessly
-      await setDoc(doc(db, "users", user.uid), updateData, { merge: true });
-
-      // Update local profile state
-      setProfile((prev) => prev ? { ...prev, ...updateData } : updateData);
+      // Update local profile state immediately (Firestore onSnapshot will also confirm)
+      setProfile((prev) => (prev ? { ...prev, ...updateData } : updateData));
 
       toast.success("Terms & Conditions successfully accepted!", {
         description: `Agreed to Version ${CURRENT_TERMS_VERSION} on ${new Date().toLocaleDateString("en-GB")}`
       });
     } catch (err: any) {
       console.error("Error accepting terms:", err);
-      toast.error("Failed to save agreement. Please try again.");
+      toast.error(err?.message || "Failed to save agreement. Please try again.");
     } finally {
       setIsSubmitting(false);
     }

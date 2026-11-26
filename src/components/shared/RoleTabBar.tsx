@@ -6,13 +6,14 @@ import { useNavigate } from "react-router-dom";
 import { useBusinessTab } from "@/src/store/businessTabStore";
 import { useAuth } from "../AuthProvider";
 import { Building2, Wrench, Users, Briefcase, Search, ChevronDown, ChevronUp, Layers } from "lucide-react";
+import { getAllowedBusinessLayers, getDefaultBusinessTab } from "@/src/lib/accountRoles";
 
 export default function RoleTabBar() {
   const { activePortal, activeRole, setActiveRole, availableRoles } = usePortal();
   const navigate = useNavigate();
   const { activeTab, setActiveTab, activeSubTab, setActiveSubTab } = useBusinessTab();
   const { profile } = useAuth();
-  const hasInitialized = useRef(false);
+  const lastSyncedLayerKey = useRef<string | null>(null);
 
   // Collapsible & Auto-Close Timer State
   const [isExpanded, setIsExpanded] = useState(true);
@@ -43,18 +44,19 @@ export default function RoleTabBar() {
     };
   }, [isExpanded, resetAutoCloseTimer]);
 
+  const allowedBusinessLayers = getAllowedBusinessLayers(profile);
+  const defaultBusinessTab = getDefaultBusinessTab(profile);
+
   useEffect(() => {
-    if (!hasInitialized.current && profile?.businessLayer) {
-      if (profile.businessLayer === "consultancy") {
-        setActiveTab("consultancy");
-      } else if (profile.businessLayer === "field_services") {
-        setActiveTab("field_services");
-      } else {
-        setActiveTab("properties");
-      }
-      hasInitialized.current = true;
+    if (!profile) return;
+    const syncKey = `${profile.uid || ""}:${profile.businessLayer || ""}:${allowedBusinessLayers.join(",")}`;
+    if (lastSyncedLayerKey.current !== syncKey) {
+      setActiveTab(defaultBusinessTab);
+      lastSyncedLayerKey.current = syncKey;
+    } else if (!allowedBusinessLayers.includes(activeTab)) {
+      setActiveTab(defaultBusinessTab);
     }
-  }, [profile, setActiveTab]);
+  }, [profile, activeTab, defaultBusinessTab, allowedBusinessLayers.join(","), setActiveTab]);
 
   // If there's only one role, or they are admin/ecosystem, hide the tab bar unless business subtabs needed
   if (availableRoles.length <= 1 || activeRole === "admin" || activeRole === "ecosystem_manager") {
@@ -195,40 +197,48 @@ export default function RoleTabBar() {
             </div>
           )}
 
-          {/* Business Domain Tabs & Sub-Tabs (Ultra-compact Height) */}
+          {/* Business Domain Tabs & Sub-Tabs (Strictly scoped to account's businessLayer) */}
           {activeRole === "business" && (
             <div className="w-full flex flex-col gap-1">
-              {/* Main 3 Business Layers */}
-              <div className="grid grid-cols-3 p-0.5 bg-white border border-black/10 rounded-lg text-xs shadow-2xs">
-                {[
-                  { id: "properties", label: "Properties", icon: Building2, activeColor: "bg-slate-900 text-white" },
-                  { id: "field_services", label: "Trades & Services", icon: Wrench, activeColor: "bg-[#0055DD] text-white" },
-                  { id: "consultancy", label: "Consultancy", icon: Users, activeColor: "bg-purple-700 text-white" }
-                ].map((tab) => {
-                  const isActive = activeTab === tab.id;
-                  const Icon = tab.icon;
-                  return (
-                    <button
-                      key={tab.id}
-                      onClick={() => {
-                        setActiveTab(tab.id as any);
-                        resetAutoCloseTimer();
-                        navigate("/");
-                      }}
-                      className={cn(
-                        "flex items-center justify-center gap-1 py-1 px-1.5 rounded-md font-bold transition-all text-center whitespace-nowrap text-[10px] sm:text-[11px]",
-                        isActive ? `${tab.activeColor} shadow-xs` : "text-slate-600 hover:bg-slate-100/70"
-                      )}
-                    >
-                      <Icon className="w-3 h-3 shrink-0" />
-                      <span className="truncate">{tab.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
+              {allowedBusinessLayers.length > 1 && (
+                <div
+                  className={cn(
+                    "grid p-0.5 bg-white border border-black/10 rounded-lg text-xs shadow-2xs",
+                    allowedBusinessLayers.length === 2 ? "grid-cols-2" : "grid-cols-3"
+                  )}
+                >
+                  {[
+                    { id: "properties" as const, label: "Properties", icon: Building2, activeColor: "bg-slate-900 text-white" },
+                    { id: "field_services" as const, label: "Trades & Services", icon: Wrench, activeColor: "bg-[#0055DD] text-white" },
+                    { id: "consultancy" as const, label: "Consultancy", icon: Users, activeColor: "bg-purple-700 text-white" },
+                  ]
+                    .filter((tab) => allowedBusinessLayers.includes(tab.id))
+                    .map((tab) => {
+                      const isActive = activeTab === tab.id;
+                      const Icon = tab.icon;
+                      return (
+                        <button
+                          key={tab.id}
+                          onClick={() => {
+                            setActiveTab(tab.id);
+                            resetAutoCloseTimer();
+                            navigate("/");
+                          }}
+                          className={cn(
+                            "flex items-center justify-center gap-1 py-1 px-1.5 rounded-md font-bold transition-all text-center whitespace-nowrap text-[10px] sm:text-[11px]",
+                            isActive ? `${tab.activeColor} shadow-xs` : "text-slate-600 hover:bg-slate-100/70"
+                          )}
+                        >
+                          <Icon className="w-3 h-3 shrink-0" />
+                          <span className="truncate">{tab.label}</span>
+                        </button>
+                      );
+                    })}
+                </div>
+              )}
 
               {/* Field Services Sub-Segment (Work Hub vs Hire B2B) */}
-              {activeTab === "field_services" && (
+              {activeTab === "field_services" && allowedBusinessLayers.includes("field_services") && (
                 <div className="flex bg-blue-50/80 border border-blue-200/60 p-0.5 rounded-md shadow-2xs w-full gap-1">
                   <button
                     onClick={() => {

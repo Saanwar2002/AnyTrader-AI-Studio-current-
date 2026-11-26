@@ -1,14 +1,65 @@
 import crypto from "crypto";
 import { FieldValue } from "firebase-admin/firestore";
-import { ConflictError, ForbiddenError, NotFoundError, ServiceUnavailableError } from "./httpErrors.ts";
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, ServiceUnavailableError } from "./httpErrors.ts";
 
-const PAYOUT_ELIGIBLE_ROLES = new Set([
+import { isPayoutEligibleAccount } from "../lib/accountRoles.ts";
+
+export type StripeConnectBusinessType = "individual" | "company" | "non_profit";
+
+const BUSINESS_TYPE_ALIASES: Record<string, StripeConnectBusinessType> = {
+  individual: "individual",
+  sole_trader: "individual",
+  soletrader: "individual",
+  company: "company",
+  ltd: "company",
+  limited: "company",
+  limited_company: "company",
+  llp: "company",
+  partnership: "company",
+  non_profit: "non_profit",
+  nonprofit: "non_profit",
+  charity: "non_profit",
+};
+
+/**
+ * Resolves an optional Stripe Connect GB business_type.
+ * When omitted by both request and profile, returns `undefined` so Stripe Connect Express
+ * lets UK providers (Sole Traders, Partnerships, and UK Limited Companies / Ltd) choose
+ * their legal entity type natively during hosted onboarding.
+ */
+export function resolveStripeConnectBusinessType(
+  userData: Record<string, any> | null | undefined,
+  requestedBusinessType?: unknown
+): StripeConnectBusinessType | undefined {
+  if (requestedBusinessType !== undefined && requestedBusinessType !== null && String(requestedBusinessType).trim() !== "") {
+    const key = String(requestedBusinessType).trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const mapped = BUSINESS_TYPE_ALIASES[key];
+    if (!mapped) {
+      throw new BadRequestError(
+        "Invalid business entity type. Supported types are individual (sole trader), company (UK Ltd / LLP), or non_profit."
+      );
+    }
+    return mapped;
+  }
+
+  const profileRaw = userData?.stripeBusinessType ?? userData?.businessEntityType;
+  if (typeof profileRaw === "string" && profileRaw.trim() !== "") {
+    const key = profileRaw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (BUSINESS_TYPE_ALIASES[key]) {
+      return BUSINESS_TYPE_ALIASES[key];
+    }
+  }
+
+  return undefined;
+}
+
+const LEGACY_PAYOUT_ROLES = new Set([
   "tradesperson",
   "trader",
+  "contractor",
   "driver",
   "fleet_driver",
   "provider",
-  "business",
 ]);
 
 function serverTimestampOrIso() {
@@ -20,9 +71,9 @@ function serverTimestampOrIso() {
 export function isPayoutEligibleUser(userData: Record<string, any> | null | undefined): boolean {
   if (!userData || typeof userData !== "object") return false;
   const role = String(userData.role || "").trim().toLowerCase();
-  if (PAYOUT_ELIGIBLE_ROLES.has(role)) return true;
+  if (LEGACY_PAYOUT_ROLES.has(role)) return true;
   if (userData.isDriver === true || userData.isTradesperson === true) return true;
-  return false;
+  return isPayoutEligibleAccount(userData);
 }
 
 export function assertPayoutEligibleRole(userData: Record<string, any> | null | undefined): void {
@@ -38,6 +89,7 @@ export interface EnsureStripeAccountInput {
   stripe: any;
   authUid: string;
   userData: Record<string, any>;
+  requestedBusinessType?: unknown;
 }
 
 /**
@@ -50,7 +102,11 @@ export async function ensureStripeAccountForProvider({
   stripe,
   authUid,
   userData,
+  requestedBusinessType,
 }: EnsureStripeAccountInput): Promise<{ accountId: string; created: boolean; recovered: boolean }> {
+  // Validate explicit requestedBusinessType early so invalid inputs fail fast with 400
+  const preValidatedBusinessType = resolveStripeConnectBusinessType(userData, requestedBusinessType);
+
   const existingOnUser = typeof userData?.stripeAccountId === "string" ? userData.stripeAccountId.trim() : "";
   if (existingOnUser && !existingOnUser.startsWith("acct_mock_")) {
     return { accountId: existingOnUser, created: false, recovered: false };
@@ -124,11 +180,15 @@ export async function ensureStripeAccountForProvider({
       { merge: true }
     );
 
+    const resolvedBusinessType = resolveStripeConnectBusinessType(latestUser, requestedBusinessType) ?? preValidatedBusinessType;
+
     return {
       action: "create" as const,
       idempotencyKey,
       email: latestUser.email,
       role: latestUser.role || "tradesperson",
+      businessLayer: latestUser.businessLayer || null,
+      businessType: resolvedBusinessType,
     };
   });
 
@@ -150,10 +210,11 @@ export async function ensureStripeAccountForProvider({
           card_payments: { requested: true },
           transfers: { requested: true },
         },
-        business_type: "individual",
+        ...(reservation.businessType ? { business_type: reservation.businessType } : {}),
         metadata: {
           firebaseUid: authUid,
           role: String(reservation.role || "tradesperson"),
+          ...(reservation.businessLayer ? { businessLayer: String(reservation.businessLayer) } : {}),
         },
       },
       { idempotencyKey: reservation.idempotencyKey }
@@ -195,10 +256,16 @@ export async function ensureStripeAccountForProvider({
     const existingId = typeof latestUser.stripeAccountId === "string" ? latestUser.stripeAccountId.trim() : "";
     const finalId = existingId && !existingId.startsWith("acct_mock_") ? existingId : createdAccountId;
 
+    const resolvedStoredBusinessType =
+      typeof account?.business_type === "string" && account.business_type.trim()
+        ? account.business_type.trim()
+        : reservation.businessType;
+
     tx.set(
       userRef,
       {
         stripeAccountId: finalId,
+        ...(resolvedStoredBusinessType ? { stripeBusinessType: resolvedStoredBusinessType } : {}),
         updatedAt: serverTimestampOrIso(),
       },
       { merge: true }
@@ -376,6 +443,42 @@ export async function ensureStripeCustomerIdForUser({
 }
 
 /**
+ * Ensures the authenticated user has a persisted Stripe Customer ID (auto-provisioning
+ * one transactionally if they have not previously checked out) and opens a Stripe
+ * Billing Customer Portal session bound strictly to that customer ID.
+ */
+export async function createBillingPortalSessionForUser({
+  db,
+  stripe,
+  authUid,
+  returnUrl,
+}: {
+  db: any;
+  stripe: any;
+  authUid: string;
+  returnUrl: string;
+}): Promise<{ url: string; customerId: string }> {
+  const customerId = await ensureStripeCustomerIdForUser({
+    db,
+    stripe,
+    userId: authUid,
+  });
+
+  const portalSession = await stripe.billingPortal.sessions.create({
+    customer: customerId,
+    return_url: returnUrl,
+  });
+
+  if (!portalSession?.url) {
+    throw new ServiceUnavailableError(
+      "Stripe did not return a billing portal URL. Please retry or contact support."
+    );
+  }
+
+  return { url: portalSession.url, customerId };
+}
+
+/**
  * Reconciles a Stripe `account.updated` webhook event into canonical `users/{uid}`
  * and linked `driver_profiles/{uid}` records inside a fenced transaction.
  */
@@ -473,11 +576,17 @@ export async function reconcileStripeAccountUpdatedWebhook({
       currentlyDue,
     };
 
+    const syncedBusinessType =
+      typeof account?.business_type === "string" && account.business_type.trim()
+        ? account.business_type.trim()
+        : null;
+
     tx.update(targetUserRef, {
       stripeAccountId: accountId,
       payoutsEnabled,
       chargesEnabled,
       stripeOnboardingComplete: detailsSubmitted,
+      ...(syncedBusinessType ? { stripeBusinessType: syncedBusinessType } : {}),
       stripeCapabilities: capabilitiesPatch,
       stripeRequirements: requirementsPatch,
       stripeAccountLastEventCreated: Number(eventCreated || 0),

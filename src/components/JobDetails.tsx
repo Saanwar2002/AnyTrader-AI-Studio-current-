@@ -32,10 +32,12 @@ import {
   acceptQuoteViaServer
 } from "@/src/services/quoteCommandService";
 import { SEO } from "./SEO";
-import { INITIAL_MOCK_FLASH_DEALS } from "@/src/services/seedService";
 import { isDealApplicableOnDay, formatDealScheduleText } from "@/src/lib/flashDeals";
+import { normalizeQuoteScope, isCompletePackageScope } from "@/src/lib/marketplaceContracts";
+import { isTradeProviderAccount } from "@/src/lib/accountRoles";
 import { 
   calculatePayoutBreakdown, 
+  resolveClientCommissionConfig,
   getStripeOnboardingLink, 
   type PayoutBreakdown 
 } from "@/src/services/stripeIntegrationService";
@@ -50,6 +52,9 @@ import { BomOneClickOrderingModal } from "./BomOneClickOrderingModal";
 import { extractBillOfMaterials } from "@/src/services/bomMerchantService";
 import { 
   createJobViaCommand, 
+  updateJobViaCommand,
+  deleteJobViaCommand,
+  executeJobScheduleActionViaApi,
   startJobViaCommand, 
   completeJobViaCommand, 
   cancelJobViaCommand, 
@@ -57,6 +62,7 @@ import {
   submitMilestoneWorkViaApi,
   reviewMilestoneWorkViaApi
 } from "@/src/services/jobCommandService";
+import { distributeJobNotifications } from "@/src/services/notificationService";
 import {
   buildGoogleCalendarUrl,
   buildOutlookCalendarUrl,
@@ -124,7 +130,7 @@ export default function JobDetails() {
   const [myDeals, setMyDeals] = useState<any[]>([]);
 
   useEffect(() => {
-    if (!user || profile?.role !== 'tradesperson') return;
+    if (!user || !isTradeProviderAccount(profile)) return;
     const q = query(
       collection(db, "flash_deals"),
       where("traderId", "==", user.uid),
@@ -132,13 +138,10 @@ export default function JobDetails() {
     );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const dbDeals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const mockMatches = INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === user.uid);
-      const existingIds = new Set(dbDeals.map(d => d.id));
-      const merged = [...dbDeals, ...mockMatches.filter(m => !existingIds.has(m.id))];
-      setMyDeals(merged);
+      setMyDeals(dbDeals);
     }, (error) => {
       console.error("Error fetching my flash deals in JobDetails:", error);
-      setMyDeals(INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === user.uid));
+      setMyDeals([]);
     });
     return () => unsubscribe();
   }, [user, profile]);
@@ -222,26 +225,38 @@ export default function JobDetails() {
   const [homeownerArrivalPin, setHomeownerArrivalPin] = useState("");
   const [imElapsedSeconds, setImElapsedSeconds] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [isTimerPaused, setIsTimerPaused] = useState(false);
+  const [isUploadingAfterPhoto, setIsUploadingAfterPhoto] = useState(false);
+  const [showEmergencyBoostConfirm, setShowEmergencyBoostConfirm] = useState(false);
+  const [isStartingBoost, setIsStartingBoost] = useState(false);
   const acceptIdempotencyKeysRef = useRef<Record<string, string>>({});
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (job?.status === "in_progress" && job?.startedAt) {
-      const start = job.startedAt.seconds ? job.startedAt.seconds * 1000 : Date.now();
-      
+    let interval: ReturnType<typeof setInterval> | undefined;
+    if (job?.status === "in_progress" && job?.startedAt && !isTimerPaused) {
+      let start = Date.now();
+      if (typeof job.startedAt?.seconds === "number") {
+        start = job.startedAt.seconds * 1000;
+      } else if (typeof job.startedAt === "string") {
+        const parsed = Date.parse(job.startedAt);
+        if (Number.isFinite(parsed)) start = parsed;
+      } else if (typeof job.startedAt?.toMillis === "function") {
+        start = job.startedAt.toMillis();
+      }
+
       const updateTimer = () => {
         const now = Date.now();
         const seconds = Math.floor((now - start) / 1000);
         setElapsedSeconds(seconds >= 0 ? seconds : 0);
       };
-      
+
       updateTimer();
       interval = setInterval(updateTimer, 1000);
     }
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [job?.status, job?.startedAt]);
+  }, [job?.status, job?.startedAt, isTimerPaused]);
 
 const libraries: any[] = ['places', 'geometry'];
 
@@ -379,6 +394,18 @@ const libraries: any[] = ['places', 'geometry'];
       toast.success("⚡ Priority Boost activated! Your job is now pinned and prioritized.");
       window.history.replaceState({}, document.title, window.location.pathname);
     }
+    if (params.get('funding_success') === 'true') {
+      toast.success("Milestone escrow funded successfully! Your tradesperson has been notified.");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    if (params.get('mediation_paid') === 'true') {
+      toast.success("Mediation stake confirmed. Your dispute has been logged for AnyTrader arbitration.");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    if (params.get('mediation_cancelled') === 'true') {
+      toast.info("Mediation checkout was cancelled. Your job status remains unchanged.");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
     if (params.get('quickQuote') === 'true') {
       setTimeout(() => {
         const element = document.getElementById('quote-form-section');
@@ -460,7 +487,13 @@ const libraries: any[] = ['places', 'geometry'];
               const { getDocs } = await import("firebase/firestore");
               const reviewsQuery = query(collection(db, "reviews"), where("revieweeId", "==", quote.tradespersonId));
               const reviewsSnap = await getDocs(reviewsQuery);
-              const reviewsData = reviewsSnap.docs.map(d => d.data());
+              const reviewsData = reviewsSnap.docs
+                .map(d => d.data())
+                .filter(
+                  (r: any) =>
+                    r.isHidden !== true &&
+                    !["cooling_off", "hidden", "rejected"].includes(String(r.status || "published").toLowerCase())
+                );
 
               if (reviewsData.length > 0) {
                 const lastReviewTime = Math.max(...reviewsData.map(r => {
@@ -631,12 +664,16 @@ const libraries: any[] = ['places', 'geometry'];
         return;
       }
 
-      // Check limits via server-side API
+      // Check limits via server-side API (with verified Firebase Bearer token)
       let limitData: any = { allowed: true };
       try {
+        const idToken = await user.getIdToken();
         const limitResponse = await fetch("/api/check-quote-limit", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${idToken}`,
+          },
           body: JSON.stringify({ userId: user.uid, jobId: id })
         });
         if (limitResponse.ok) {
@@ -674,7 +711,17 @@ const libraries: any[] = ['places', 'geometry'];
       }
 
       const traderTier = profile?.tierId || profile?.tier || 'payg';
-      const payoutBreakdown = calculatePayoutBreakdown(finalAmount, traderTier);
+      const resolvedComm = resolveClientCommissionConfig(
+        traderTier,
+        livePricingConfig.globalTiers,
+        livePricingConfig.globalConfig
+      );
+      const payoutBreakdown = calculatePayoutBreakdown(
+        finalAmount,
+        traderTier,
+        resolvedComm.commissionRate,
+        resolvedComm.commissionCapGbp
+      );
 
       const isQuickTrack = finalAmount < 400;
       const defaultMilestones = !isQuickTrack ? [
@@ -689,6 +736,27 @@ const libraries: any[] = ['places', 'geometry'];
         ? new Date().toISOString().split('T')[0] 
         : (quoteStartDate || new Date().toISOString().split('T')[0]);
 
+      const normalizedScope = normalizeQuoteScope(quoteScope);
+      const validLineItems = useLineItems
+        ? lineItems
+            .filter((item: any) => String(item?.description || "").trim().length > 0 && Number(item?.amount || 0) > 0)
+            .map((item: any) => ({
+              description: String(item.description).trim(),
+              amount: Number(item.amount),
+            }))
+        : [];
+      const quoteMetadata: Record<string, any> = {
+        ...(isDiscountApplied
+          ? {
+              isDiscountApplied: true,
+              discountPercentage: discountPercentageVal,
+              appliedFlashDealId: appliedFlashDealIdVal,
+              originalAmount: originalAmountVal,
+            }
+          : {}),
+        ...(validLineItems.length > 0 ? { lineItems: validLineItems } : {}),
+      };
+
       const quotePayload = {
         amount: finalAmount,
         coverNote: (quoteMessage || "").trim(),
@@ -699,16 +767,35 @@ const libraries: any[] = ['places', 'geometry'];
         isImmediateStart: Boolean(isImmediateStart),
         paymentPreference: (paymentPreference || "fixed_price") as any,
         paymentTrack: isQuickTrack ? ("quick" as const) : ("project" as const),
-        quoteScope: (quoteScope || "labor_only") as any,
+        quoteScope: normalizedScope,
         depositTerm: depositTerm || "0_percent_completion",
         guaranteeTerm: guaranteeTerm || "1_year_workmanship",
         partsWarranty: partsWarranty || "standard_parts",
         milestones: defaultMilestones,
-        materialsIncluded: quoteScope === "materials_included" || quoteScope === "full_project",
+        materialsIncluded: isCompletePackageScope(quoteScope),
+        ...(validLineItems.length > 0 ? { materialsBreakdown: validLineItems } : {}),
+        ...(Object.keys(quoteMetadata).length > 0 ? { metadata: quoteMetadata } : {}),
       };
 
       let commandResult;
-      if (existingQuote) {
+      if (existingQuote && existingQuote.status === "requote_requested") {
+        commandResult = await respondToRequoteViaCommand({
+          user: user as any,
+          jobId: id,
+          quoteId: existingQuote.id,
+          payload: {
+            amount: finalAmount,
+            coverNote: (quoteMessage || "").trim(),
+            message: (quoteMessage || "").trim(),
+            estimatedDuration: estimatedTimeline || "1 Full day (8h)",
+            startDate: resolvedStartDate,
+            milestones: defaultMilestones,
+            materialsIncluded: isCompletePackageScope(quoteScope),
+            ...(validLineItems.length > 0 ? { materialsBreakdown: validLineItems } : {}),
+            ...(Object.keys(quoteMetadata).length > 0 ? { metadata: quoteMetadata } : {}),
+          },
+        });
+      } else if (existingQuote) {
         commandResult = await updateQuoteViaCommand({
           user: user as any,
           jobId: id,
@@ -723,33 +810,19 @@ const libraries: any[] = ['places', 'geometry'];
         });
       }
 
-      // Notify homeowner
-      if (job.homeownerId) {
-        await sendNotification(
-          job.homeownerId,
-          "Quote Received/Updated",
-          `A tradesperson has ${existingQuote ? 'updated their' : 'submitted a'} quote for: ${job.title}`,
-          "quote",
-          `/job/${id}`
-        );
-      }
-
-      // Track exclusive limits if applicable
+      // Server quoteCommands.ts atomically tracks Priority Offers quotas/cooldowns and notifies the homeowner.
       if (limitData.isJobExclusive) {
-        const { increment } = await import("firebase/firestore");
-        const cooldownDate = new Date(Date.now() + 2 * 60 * 60 * 1000); // 2 hours
-        await updateDoc(doc(db, "users", user.uid), {
-          exclusiveSlotsUsedToday: increment(1),
-          exclusiveCooldownUntil: cooldownDate,
-          lastExclusiveQuoteDate: serverTimestamp()
-        });
-
-        // Trigger Finalization Window for Materials
         setFinalizingQuoteId(commandResult.quoteId);
         setIsFinalizingMaterials(true);
       }
 
-      toast.success(existingQuote ? "Quote updated successfully!" : "Quote submitted successfully!");
+      toast.success(
+        existingQuote?.status === "requote_requested"
+          ? "Revised quote submitted successfully!"
+          : existingQuote
+          ? "Quote updated successfully!"
+          : "Quote submitted successfully!"
+      );
       setIsEditingSubmittedQuote(false);
       setQuoteAmount("");
       setQuoteMessage("");
@@ -815,41 +888,10 @@ const libraries: any[] = ['places', 'geometry'];
 
       delete acceptIdempotencyKeysRef.current[quote.id];
 
-      // 2. Notify tradesperson
-      await sendNotification(
-        quote.tradespersonId,
-        "Quote Accepted!",
-        `Your quote for "${job.title}" has been accepted. You can now start chatting with the homeowner.`,
-        "status",
-        `/job/${id}`
-      );
+      // Server AcceptQuote command authoritatively dispatches the consolidated acceptance alert
+      // (in-app + FCM push + WhatsApp fallback) to the winning tradesperson and notifies all
+      // auto-rejected competing quotes across pending/requoted/requote_requested statuses.
 
-      // 3. Notify tradesperson to confirm start date
-      await sendNotification(
-        quote.tradespersonId,
-        "Quote Accepted - Confirm Start Date",
-        `Your quote for "${job.title}" has been accepted! Please confirm the start date (${format(new Date(quote.startDate || Date.now()), 'dd MMM')}) or request a reschedule.`,
-        "status",
-        `/job/${id}`
-      );
-
-      // 4. Notify other tradespeople (competing quotes were atomically rejected server-side)
-      const otherQuotes = quotes.filter(q => q.id !== quote.id && q.status === "pending");
-      Promise.all(otherQuotes.map(async (q) => {
-        try {
-          const feedback = await getRejectionFeedback(job, q, quote);
-          await sendNotification(
-            q.tradespersonId,
-            "Job Awarded to Another Trader",
-            `The homeowner for "${job.title}" has accepted another quote. AI Insight: ${feedback?.reason || "Homeowner selected another proposal."}`,
-            "status",
-            `/job/${id}`
-          );
-        } catch (err) {
-          console.error(`Error sending rejection notification for quote ${q.id}:`, err);
-        }
-      })).catch(console.error);
-      
       // Refresh local job and quotes state with authoritative server response
       if (acceptResult.verificationPin) {
         setHomeownerArrivalPin(String(acceptResult.verificationPin));
@@ -867,7 +909,7 @@ const libraries: any[] = ['places', 'geometry'];
         prev.map((q) =>
           q.id === quote.id
             ? { ...q, status: "accepted" }
-            : q.status === "pending"
+            : ["pending", "requoted", "requote_requested", "submitted"].includes(String(q.status || ""))
             ? { ...q, status: "rejected" }
             : q
         )
@@ -897,7 +939,8 @@ const libraries: any[] = ['places', 'geometry'];
             "📦 1-Click Trade Materials Ready",
             `AI Bill of Materials generated for "${job.title}". 1-click trade counter pickup or Category 84 site delivery ready at Screwfix / Toolstation!`,
             "status",
-            `/job/${id}`
+            `/job/${id}`,
+            { jobId: id }
           );
         }
       } catch (bomErr) {
@@ -928,7 +971,8 @@ const libraries: any[] = ['places', 'geometry'];
                     "AI Tool Recommendations",
                     `Based on this job scope, we recommend: \n${recText}`,
                     "status",
-                    `/chat/${id}` // Or link to shop
+                    `/job/${id}`,
+                    { jobId: id }
                   );
                 }
               } catch (aiErr) {
@@ -977,16 +1021,8 @@ const libraries: any[] = ['places', 'geometry'];
         });
       }
 
+      // Server RejectQuote command dispatches the authoritative quote declined notification.
       toast.success("Quote declined.");
-
-      // Notify tradesperson
-      await sendNotification(
-        quote.tradespersonId,
-        "Quote Update",
-        `Your quote for "${job.title}" was not accepted this time.`,
-        "status",
-        `/job/${id}`
-      );
     } catch (err: any) {
       console.error("Error rejecting quote:", err);
       setError(err?.message || "Failed to reject quote.");
@@ -1013,16 +1049,8 @@ const libraries: any[] = ['places', 'geometry'];
         message,
       });
 
+      // Server RequestRequote command dispatches the authoritative notification + push/WhatsApp fallback.
       toast.success("Requote requested.");
-
-      // Notify tradesperson
-      await sendNotification(
-        quote.tradespersonId,
-        "Requote Requested",
-        `The homeowner has requested a requote for "${job.title}". Message: ${message}`,
-        "status",
-        `/job/${id}`
-      );
       if (!customMessage) setRequoteMessage("");
       setActiveQuoteId(null);
     } catch (err: any) {
@@ -1052,17 +1080,9 @@ const libraries: any[] = ['places', 'geometry'];
         jobId: id,
         verificationPin: enteredPin,
       });
-      setJob((prev: any) => ({ ...prev, status: "in_progress", startedAt: { seconds: Math.floor(Date.now() / 1000) } }));
+      setJob((prev: any) => ({ ...prev, status: "in_progress", startedAt: new Date().toISOString() }));
       setShowPinModal(false);
-      
-      // Notify homeowner
-      await sendNotification(
-        job.homeownerId,
-        "Job Started!",
-        `The tradesperson has started work on "${job.title}".`,
-        "status",
-        `/job/${id}`
-      );
+      toast.success("Work started! Homeowner has been notified.");
     } catch (err: any) {
       console.error("Error starting job:", err);
       const msg = err?.message || "Invalid PIN or start preconditions not met.";
@@ -1085,10 +1105,13 @@ const libraries: any[] = ['places', 'geometry'];
         "Tradesperson on route!",
         `Your assigned tradesperson is currently on route to your location.`,
         "status",
-        `/job/${id}`
+        `/job/${id}`,
+        { jobId: id }
       );
-    } catch (err) {
+      toast.success("Homeowner notified that you are on route.");
+    } catch (err: any) {
       console.error(err);
+      toast.error(err?.message || "Could not update on-route status.");
     }
   };
 
@@ -1104,10 +1127,13 @@ const libraries: any[] = ['places', 'geometry'];
         "Tradesperson arrived!",
         `Your assigned tradesperson has arrived at your location.`,
         "status",
-        `/job/${id}`
+        `/job/${id}`,
+        { jobId: id }
       );
-    } catch (err) {
+      toast.success("Homeowner notified of your arrival.");
+    } catch (err: any) {
       console.error(err);
+      toast.error(err?.message || "Could not update arrival status.");
     }
   };
 
@@ -1133,7 +1159,7 @@ const libraries: any[] = ['places', 'geometry'];
       setFinalizingQuoteId(null);
     } catch (err) {
       console.error("Error finalizing material list:", err);
-      alert("Failed to save material list. Please try again.");
+      toast.error("Failed to save material list. Please try again.");
     } finally {
       setIsProcessing(false);
     }
@@ -1143,7 +1169,11 @@ const libraries: any[] = ['places', 'geometry'];
     if (!id || !user) return;
     setLoading(true);
     try {
-      const newPaymentStatus = job.paymentStatus === "handshake_complete" || job.isPaid ? job.paymentStatus : "pending";
+      const preservedStatuses = new Set(["paid", "handshake_complete", "funded", "partially_released"]);
+      const newPaymentStatus =
+        job.isPaid || preservedStatuses.has(String(job.paymentStatus || "").toLowerCase())
+          ? (job.paymentStatus || "paid")
+          : "pending";
       await completeJobViaCommand({
         user,
         jobId: id,
@@ -1158,13 +1188,10 @@ const libraries: any[] = ['places', 'geometry'];
         paymentStatus: newPaymentStatus
       }));
       
-      // Determine who initiated and notify the other party
-      const isHomeownerCall = user?.uid === job.homeownerId;
       const acceptedQuote = quotes.find(q => q.status === "accepted");
-      const otherUserId = isHomeownerCall ? (acceptedQuote?.tradespersonId) : job.homeownerId;
       
       if (acceptedQuote) {
-        // Trader completion & savings metrics are updated transactionally on the server in CompleteJob (AT-CJ-COMPLETE-01).
+        // Trader completion & savings metrics and counterparty notifications are handled authoritatively on the server in CompleteJob.
         // Automated Free & Pro Invoicing System
         try {
           const tpProf = tradespersonProfiles[acceptedQuote.tradespersonId] || profile;
@@ -1174,19 +1201,10 @@ const libraries: any[] = ['places', 'geometry'];
         }
       }
 
-      if (otherUserId) {
-        await sendNotification(
-          otherUserId,
-          isHomeownerCall ? "Job Completed!" : "Payment Requested",
-          isHomeownerCall 
-            ? `The homeowner has marked "${job.title}" as completed. You can now review them.`
-            : `The tradesperson has marked "${job.title}" as completed and requested payment.`,
-          "status",
-          `/job/${id}`
-        );
-      }
-    } catch (err) {
+      toast.success("Job marked as completed and counterparty notified.");
+    } catch (err: any) {
       console.error("Error completing job:", err);
+      toast.error(err?.message || "Failed to mark job as completed.");
     } finally {
       setLoading(false);
     }
@@ -1468,26 +1486,60 @@ const libraries: any[] = ['places', 'geometry'];
     sms: false
   });
   const [payoutSummary, setPayoutSummary] = useState<PayoutBreakdown | null>(null);
+  const [livePricingConfig, setLivePricingConfig] = useState<{ globalTiers: any; globalConfig: any }>({
+    globalTiers: null,
+    globalConfig: null,
+  });
   const [confirmAcceptQuoteId, setConfirmAcceptQuoteId] = useState<string | null>(null);
   const [confirmDeclineQuoteId, setConfirmDeclineQuoteId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    Promise.all([
+      getDoc(doc(db, "platform_config", "global_tiers")).catch(() => null),
+      getDoc(doc(db, "platform_config", "global")).catch(() => null),
+    ]).then(([tiersSnap, globalSnap]) => {
+      if (!mounted) return;
+      setLivePricingConfig({
+        globalTiers: tiersSnap?.exists() ? tiersSnap.data() : null,
+        globalConfig: globalSnap?.exists() ? globalSnap.data() : null,
+      });
+    });
+    return () => { mounted = false; };
+  }, []);
   
   useEffect(() => {
     const amount = parseFloat(quoteAmount);
     if (!isNaN(amount) && amount > 0) {
       const traderTier = profile?.tierId || profile?.tier || 'payg';
-      const summary = calculatePayoutBreakdown(amount, traderTier);
+      const resolvedComm = resolveClientCommissionConfig(
+        traderTier,
+        livePricingConfig.globalTiers,
+        livePricingConfig.globalConfig
+      );
+      const summary = calculatePayoutBreakdown(
+        amount,
+        traderTier,
+        resolvedComm.commissionRate,
+        resolvedComm.commissionCapGbp
+      );
       setPayoutSummary(summary);
     } else {
       setPayoutSummary(null);
     }
-  }, [quoteAmount, profile?.tier, profile?.tierId]);
+  }, [quoteAmount, profile?.tier, profile?.tierId, livePricingConfig]);
+
+  const liveMediationStakeGbp = (() => {
+    const raw = Number(livePricingConfig.globalConfig?.paidAddons?.milestoneEscrow?.homeownerMediationStake);
+    return Number.isFinite(raw) && raw > 0 ? raw : 25;
+  })();
 
   const handleRaiseDispute = async () => {
     if (!id || !user || !disputeReason) return;
     
     // Fairness Engine Enforcement
     if (!mediationStakePaid) {
-      toast.error("To raise a dispute, please authorize the £25.00 Mediation Stake (refunded if valid).");
+      toast.error(`To raise a dispute, please authorize the £${liveMediationStakeGbp.toFixed(2)} Mediation Stake (refunded if valid).`);
       return;
     }
 
@@ -1512,14 +1564,7 @@ const libraries: any[] = ['places', 'geometry'];
 
       const isHandshakeVerified = job.paymentStatus === "handshake_complete";
 
-      // 1. Initial save of the dispute via authoritative command
-      await disputeJobViaCommand({
-        user: user as any,
-        jobId: id,
-        reason: disputeReason,
-      });
-
-      // 2. Redirect to Stripe
+      // Lock the job into 'disputed' ONLY after Stripe mediation stake payment confirms via webhook
       const token = await user.getIdToken();
       if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
       const res = await fetch("/api/create-checkout-session", {
@@ -1530,16 +1575,9 @@ const libraries: any[] = ['places', 'geometry'];
           "Idempotency-Key": crypto.randomUUID()
         },
         body: JSON.stringify({
-          price_data: {
-            currency: 'gbp',
-            product_data: {
-              name: 'Mediation Stake',
-              description: '£25.00 Mediation Stake (Refundable if claim is valid)',
-            },
-            unit_amount: 2500,
-          },
           userId: user.uid,
           mode: 'payment',
+          disputePhotoUrls: photoUrls,
           metadata: {
             type: 'mediation_stake',
             jobId: id,
@@ -1553,17 +1591,18 @@ const libraries: any[] = ['places', 'geometry'];
         })
       });
 
-      const data = await res.json();
-      if (data.url) {
-        window.location.href = data.url;
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || "Could not start mediation stake checkout. Your job has not been locked.");
       }
-      
-      setJob((prev: any) => ({ ...prev, status: "disputed" }));
+
       setShowDisputeModal(false);
       setDisputeReason("");
       setDisputePhotos([]);
-    } catch (err) {
+      window.location.href = data.url;
+    } catch (err: any) {
       console.error("Error raising dispute:", err);
+      toast.error(err?.message || "Failed to initiate dispute mediation checkout.");
     } finally {
       setIsProcessing(false);
       setIsUploadingDispute(false);
@@ -1574,30 +1613,26 @@ const libraries: any[] = ['places', 'geometry'];
     if (!id || !user || !rescheduleDate || !rescheduleReason) return;
     setIsRescheduling(true);
     try {
-      await updateDoc(doc(db, "jobs", id), {
-        rescheduleProposal: {
-          proposedDate: rescheduleDate,
-          reason: rescheduleReason,
-          proposedBy: user.uid,
-          status: "pending",
-          createdAt: serverTimestamp()
-        }
+      const result = await executeJobScheduleActionViaApi({
+        user,
+        jobId: id,
+        action: "propose_reschedule",
+        proposedDate: rescheduleDate,
+        reason: rescheduleReason,
       });
 
-      // Notify homeowner
-      await sendNotification(
-        job.homeownerId,
-        "Reschedule Proposed",
-        `Tradesperson proposed a new start date for "${job.title}": ${format(new Date(rescheduleDate), 'dd MMM yyyy')}`,
-        "status",
-        `/job/${id}`
-      );
+      setJob((prev: any) => ({
+        ...prev,
+        rescheduleProposal: result.rescheduleProposal,
+      }));
 
       setShowRescheduleModal(false);
       setRescheduleDate("");
       setRescheduleReason("");
-    } catch (err) {
+      toast.success("Reschedule proposal sent.");
+    } catch (err: any) {
       console.error("Error proposing reschedule:", err);
+      toast.error(err?.message || "Failed to propose reschedule.");
     } finally {
       setIsRescheduling(false);
     }
@@ -1622,16 +1657,28 @@ const libraries: any[] = ['places', 'geometry'];
     setIsProcessingQr(true);
     try {
       const token = await user.getIdToken();
+      const milestones = Array.isArray(quote?.milestones) ? quote.milestones : [];
+      const targetMilestone =
+        milestones.find((m: any) =>
+          ["funded", "submitted", "approved"].includes(String(m?.status || "").toLowerCase())
+        ) || milestones[0];
+      const targetMilestoneId = targetMilestone?.id || "deposit";
+      const idempotencyKey = qrCodeData
+        ? `rel_${qrCodeData}`
+        : `rel_qr_${id}_${targetMilestoneId}_${Date.now().toString(36)}`;
+
       const response = await fetch("/api/release-milestone", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Authorization": `Bearer ${token}`,
+          "Idempotency-Key": idempotencyKey
         },
         body: JSON.stringify({
           jobId: id,
           quoteId: quote.id,
-          milestoneId: quote.milestones?.[0]?.id || "deposit",
+          milestoneId: targetMilestoneId,
+          idempotencyKey,
           isQrHandshake: true,
           handshakeCode: homeownerArrivalPin || enteredPin || job.verificationPin || job.handshakeCode
         })
@@ -1639,102 +1686,63 @@ const libraries: any[] = ['places', 'geometry'];
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
-        throw new Error(err.error || "Failed to finalize QR handshake");
+        throw new Error(err.error || "Failed to finalize QR handshake release.");
       }
 
+      toast.success("QR handshake payment released!");
       setShowQrModal(false);
       setQrCodeData(null);
-    } catch (err) {
+    } catch (err: any) {
       console.error("QR Handshake failed:", err);
+      toast.error(err?.message || "Failed to finalize QR handshake release.");
     } finally {
       setIsProcessingQr(false);
     }
   };
 
   const handleAcceptReschedule = async () => {
-    if (!id || !job.rescheduleProposal) return;
+    if (!id || !user || !job.rescheduleProposal) return;
     setIsProcessing(true);
     try {
-      const newDate = job.rescheduleProposal.proposedDate;
-      const oldDate = job.scheduledDate;
-      const tradespersonId = job.acceptedTradespersonId;
-
-      // 1. Update Job
-      await updateDoc(doc(db, "jobs", id), {
-        scheduledDate: newDate,
-        "rescheduleProposal.status": "accepted",
-        updatedAt: serverTimestamp()
+      const result = await executeJobScheduleActionViaApi({
+        user,
+        jobId: id,
+        action: "accept_reschedule",
       });
 
-      // 2. Update Tradesperson Calendar
-      try {
-        const tpRef = doc(db, "users", tradespersonId);
-        const tpSnap = await getDoc(tpRef);
-        if (tpSnap.exists()) {
-          const tpData = tpSnap.data();
-          const dateOverrides = tpData.dateOverrides || {};
-          
-          // Unbook old date
-          if (oldDate) {
-            delete dateOverrides[oldDate];
-          }
-          
-          // Book new date
-          dateOverrides[newDate] = "booked";
-
-          await updateDoc(tpRef, {
-            dateOverrides
-          });
-        }
-      } catch (err) {
-        console.error("Error updating tradesperson availability for reschedule:", err);
-      }
-
-      // 3. Notify Tradesperson
-      await sendNotification(
-        tradespersonId,
-        "Reschedule Accepted",
-        `Homeowner accepted the new start date for "${job.title}": ${format(new Date(newDate), 'dd MMM yyyy')}`,
-        "status",
-        `/job/${id}`
-      );
-
-      setJob(prev => ({
+      setJob((prev: any) => ({
         ...prev,
-        scheduledDate: newDate,
-        rescheduleProposal: { ...prev.rescheduleProposal, status: "accepted" }
+        scheduledDate: result.scheduledDate || prev.rescheduleProposal?.proposedDate,
+        isConfirmedByTradesperson: true,
+        rescheduleProposal: result.rescheduleProposal || { ...prev.rescheduleProposal, status: "accepted" },
       }));
-    } catch (err) {
+      toast.success("Reschedule accepted and calendar updated.");
+    } catch (err: any) {
       console.error("Error accepting reschedule:", err);
+      toast.error(err?.message || "Failed to accept reschedule.");
     } finally {
       setIsProcessing(false);
     }
   };
 
   const handleRejectReschedule = async () => {
-    if (!id || !job.rescheduleProposal) return;
+    if (!id || !user || !job.rescheduleProposal) return;
     setIsProcessing(true);
     try {
-      await updateDoc(doc(db, "jobs", id), {
-        "rescheduleProposal.status": "rejected",
-        updatedAt: serverTimestamp()
+      const result = await executeJobScheduleActionViaApi({
+        user,
+        jobId: id,
+        action: "reject_reschedule",
       });
 
-      // Notify Tradesperson
-      await sendNotification(
-        job.acceptedTradespersonId,
-        "Reschedule Rejected",
-        `Homeowner declined the reschedule request for "${job.title}".`,
-        "status",
-        `/job/${id}`
-      );
-
-      setJob(prev => ({
+      setJob((prev: any) => ({
         ...prev,
-        rescheduleProposal: { ...prev.rescheduleProposal, status: "rejected" }
+        rescheduleProposal: result.rescheduleProposal || { ...prev.rescheduleProposal, status: "rejected" },
       }));
-    } catch (err) {
+      toast.success("Reschedule request declined.");
+    } catch (err: any) {
       console.error("Error rejecting reschedule:", err);
+      toast.error(err?.message || "Failed to decline reschedule.");
     } finally {
       setIsProcessing(false);
     }
@@ -1744,41 +1752,17 @@ const libraries: any[] = ['places', 'geometry'];
     if (!id || !user || !job.scheduledDate) return;
     setIsProcessing(true);
     try {
-      // 1. Update Job
-      await updateDoc(doc(db, "jobs", id), {
-        isConfirmedByTradesperson: true,
-        updatedAt: serverTimestamp()
+      await executeJobScheduleActionViaApi({
+        user,
+        jobId: id,
+        action: "confirm_booking",
       });
 
-      // 2. Update Tradesperson Availability
-      try {
-        const tpRef = doc(db, "users", user.uid);
-        const tpSnap = await getDoc(tpRef);
-        if (tpSnap.exists()) {
-          const tpData = tpSnap.data();
-          const dateOverrides = tpData.dateOverrides || {};
-          dateOverrides[job.scheduledDate] = "booked";
-
-          await updateDoc(tpRef, {
-            dateOverrides
-          });
-        }
-      } catch (err) {
-        console.error("Error updating availability on confirmation:", err);
-      }
-
-      // 3. Notify Homeowner
-      await sendNotification(
-        job.homeownerId,
-        "Job Confirmed",
-        `Tradesperson confirmed the start date for "${job.title}": ${format(new Date(job.scheduledDate), 'dd MMM yyyy')}`,
-        "status",
-        `/job/${id}`
-      );
-
-      setJob(prev => ({ ...prev, isConfirmedByTradesperson: true }));
-    } catch (err) {
+      setJob((prev: any) => ({ ...prev, isConfirmedByTradesperson: true }));
+      toast.success("Booking confirmed and added to your calendar.");
+    } catch (err: any) {
       console.error("Error confirming job:", err);
+      toast.error(err?.message || "Failed to confirm booking.");
     } finally {
       setIsProcessing(false);
     }
@@ -1822,15 +1806,7 @@ const libraries: any[] = ['places', 'geometry'];
         });
       }
       
-      // Notify homeowner
-      await sendNotification(
-        job.homeownerId,
-        "Quote Revision Submitted",
-        `The tradesperson has submitted a revised quote of £${revAmount} for "${job.title}".`,
-        "quote",
-        `/job/${id}`
-      );
-      
+      // Server quote command authoritatively notifies the homeowner.
       setIsEditingRevision(false);
       setRevisionAmount("");
       setRevisionMessage("");
@@ -1883,14 +1859,7 @@ const libraries: any[] = ['places', 'geometry'];
         });
       }
       
-      // Notify tradesperson
-      await sendNotification(
-        quote.tradespersonId,
-        "Revision Declined",
-        `The homeowner has declined your quote revision for "${job.title}".`,
-        "status",
-        `/job/${id}`
-      );
+      // Server RejectQuote command authoritatively notifies the tradesperson.
       toast.success("Quote revision declined.");
     } catch (err: any) {
       console.error("Error rejecting revision:", err);
@@ -1970,14 +1939,14 @@ const libraries: any[] = ['places', 'geometry'];
   };
 
   const handleDeleteJob = async () => {
-    if (!id || !job) return;
+    if (!id || !job || !user) return;
     if (!isJobDeletable) {
       toast.error("Funded, assigned, or disputed jobs cannot be deleted to protect escrow and dispute evidence.");
       return;
     }
     setIsProcessing(true);
     try {
-      await deleteDoc(doc(db, "jobs", id));
+      await deleteJobViaCommand({ user, jobId: id, mode: "delete" });
       toast.success("Job deleted successfully.");
       navigate("/my-jobs");
     } catch (err: any) {
@@ -2030,8 +1999,17 @@ const libraries: any[] = ['places', 'geometry'];
         await setDoc(conversationRef, {
           id: conversationId,
           participants: [job.homeownerId, quote.tradespersonId],
+          participantNames: {
+            [job.homeownerId]: homeownerProfile?.name || job.homeownerName || "Homeowner",
+            [quote.tradespersonId]: tpProfile?.businessName || tpProfile?.name || "Tradesperson",
+          },
           jobId: id,
           jobTitle: job.title,
+          unreadCounts: {
+            [job.homeownerId]: 0,
+            [quote.tradespersonId]: 0,
+          },
+          createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
@@ -2039,7 +2017,7 @@ const libraries: any[] = ['places', 'geometry'];
       navigate(`/chat/${conversationId}`, { 
         state: { 
           jobTitle: job.title,
-          recipientName: isHomeowner ? (tpProfile?.name || "Tradesperson") : (homeownerProfile?.name || "Homeowner")
+          recipientName: isHomeowner ? (tpProfile?.businessName || tpProfile?.name || "Tradesperson") : (homeownerProfile?.name || "Homeowner")
         }
       });
     } catch (err) {
@@ -2079,11 +2057,41 @@ const libraries: any[] = ['places', 'geometry'];
       await updateDoc(doc(db, "jobs", id), {
         beforePhotos: arrayUnion(...urls)
       });
-      
+      toast.success("Before photo(s) uploaded.");
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, `jobs/${id}`);
     } finally {
       setIsUploadingBeforePhoto(false);
+    }
+  };
+
+  const handleAfterPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0 || !id || !user) return;
+
+    setIsUploadingAfterPhoto(true);
+    try {
+      const files = Array.from(e.target.files) as File[];
+      const urls: string[] = [];
+
+      for (const file of files) {
+        const url = await uploadStorageFile(file, `jobs/${id}/after_photos/${Date.now()}_${file.name}`, { contentType: file.type });
+        urls.push(url);
+      }
+
+      await updateDoc(doc(db, "jobs", id), {
+        photosAfter: arrayUnion(...urls),
+      });
+      setJob((prev: any) => ({
+        ...prev,
+        photosAfter: [...(Array.isArray(prev?.photosAfter) ? prev.photosAfter : []), ...urls],
+      }));
+      toast.success("Work progress photo(s) uploaded.");
+    } catch (error: any) {
+      console.error("After photo upload error:", error);
+      toast.error(error?.message || "Failed to upload progress photo.");
+    } finally {
+      setIsUploadingAfterPhoto(false);
+      e.target.value = "";
     }
   };
 
@@ -2116,20 +2124,23 @@ const libraries: any[] = ['places', 'geometry'];
         createdAt: serverTimestamp()
       });
 
-      // Notify the other party
+      // Notify the other party with authoritative jobId context
       await sendNotification(
         otherPartyId,
         "Recurring Schedule Proposed",
         `${isHomeowner ? "Homeowner" : "Tradesperson"} proposed a ${recurringFrequency} schedule for "${job.title}".`,
         "status",
-        `/profile`
+        `/profile`,
+        { jobId: id }
       );
 
       setShowRecurringModal(false);
+      toast.success("Recurring schedule proposal sent.");
       // Automatically dismiss the prompt for this user so they don't see it again
       await handleDismissRecurring();
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error proposing recurring schedule:", err);
+      toast.error(err?.message || "Failed to propose recurring schedule.");
     } finally {
       setIsProposingRecurring(false);
     }
@@ -2168,41 +2179,51 @@ const libraries: any[] = ['places', 'geometry'];
   const handleSendPaymentReminder = async () => {
     if (!job || !id) return;
     
-    // In job details, sometimes isHomeowner might be true, but since this is for the tradesperson, it should be called by the tradesperson
     const acceptedQuote = quotes.find(q => q.status === "accepted");
-    const amount = ((acceptedQuote?.amount || 0) * 1.20).toFixed(2);
+    const invoiceSummary = calculateInvoiceSummary(acceptedQuote, job, profile);
+    const amount = invoiceSummary.totalAmount.toFixed(2);
     
     const invoiceSubject = encodeURIComponent(`Payment Reminder: Invoice for ${job.title}`);
-    const messageBody = `Hi ${job?.homeownerName || 'Customer'},\n\nThis is a gentle reminder that the payment for "${job.title}" is still pending.\n\nThe total amount due is £${amount}.\n\nPlease settle the payment at your earliest convenience.\n\nThank you!`;
+    const messageBody = `Hi ${job?.homeownerName || 'Customer'},\n\nThis is a gentle reminder that the payment for "${job.title}" is still pending.\n\nThe total amount due is £${amount}${invoiceSummary.vatEligible ? " (incl. 20% VAT)" : ""}.\n\nPlease settle the payment at your earliest convenience.\n\nThank you!`;
     const encodedBodyText = encodeURIComponent(messageBody);
 
     try {
+      if (!reminderChannels.app && !reminderChannels.email && !reminderChannels.whatsapp && !reminderChannels.sms) {
+        toast.error("Please select at least one channel to send the reminder.");
+        return;
+      }
+
       if (reminderChannels.app) {
         await sendNotification(
           job.homeownerId,
           "Payment Reminder",
           `Friendly reminder: Payment of £${amount} for "${job.title}" is pending.`,
           "status",
-          `/job/${id}`
+          `/job/${id}`,
+          { jobId: id }
         );
         toast.success("App notification sent.");
       }
 
       if (reminderChannels.email) {
-        window.location.href = `mailto:?subject=${invoiceSubject}&body=${encodedBodyText}`;
+        const a = document.createElement("a");
+        a.href = `mailto:?subject=${invoiceSubject}&body=${encodedBodyText}`;
+        a.click();
       }
 
-      if (reminderChannels.whatsapp) {
-        window.open(`https://wa.me/?text=${encodedBodyText}`, '_blank');
-      }
-
-      if (reminderChannels.sms) {
-        window.open(`sms:?body=${encodedBodyText}`, '_blank');
-      }
-      
-      if (!reminderChannels.app && !reminderChannels.email && !reminderChannels.whatsapp && !reminderChannels.sms) {
-        toast.error("Please select at least one channel to send the reminder.");
-        return;
+      if (reminderChannels.whatsapp || reminderChannels.sms) {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(messageBody).catch(() => {});
+        }
+        const shareUrl = reminderChannels.whatsapp
+          ? `https://wa.me/?text=${encodedBodyText}`
+          : `sms:?body=${encodedBodyText}`;
+        const a = document.createElement("a");
+        a.href = shareUrl;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.click();
+        toast.success("Reminder copied to clipboard & share link opened.");
       }
 
       setShowPaymentReminder(false);
@@ -2428,159 +2449,7 @@ const libraries: any[] = ['places', 'geometry'];
             contextLabel={job.title || job.category || "this job"}
           />
         )}
-        {(!isHomeowner && job.status === "in_progress") ? (
-          <div className="space-y-6 pb-[100px] mt-4">
-            {/* UK Active Job Tracker Header */}
-            <div className="bg-white rounded-[2rem] p-8 shadow-sm border border-black flex flex-col items-center">
-              <div className="w-full flex justify-between items-center mb-8">
-                <h2 className="font-bold text-lg text-slate-900">UK Active Job Tracker</h2>
-                <div className="flex items-center gap-1.5 text-green-600 font-bold text-sm bg-green-50 px-3 py-1 rounded-full border border-green-100">
-                  <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                  LIVE
-                </div>
-              </div>
-              <div className="text-[4.5rem] font-black text-blue-600 tracking-tighter leading-none mb-2 tabular-nums">
-                {formatTimer(elapsedSeconds)}
-              </div>
-            </div>
-
-            {/* Job Progress */}
-            <div className="bg-white rounded-[2rem] p-6 shadow-sm border border-black">
-              <h3 className="font-bold text-2xl text-slate-900 mb-2 tracking-tight">Job Progress</h3>
-              <p className="text-slate-600 font-medium pb-4 border-b border-black mb-6">{job.category} Repair at {job.fullAddress || job.houseNumber || job.postcode}</p>
-              
-              <div className="space-y-5">
-                <label className="flex items-start gap-4 cursor-pointer group">
-                  <div className="w-7 h-7 rounded-lg border-2 border-green-500 bg-green-500 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-sm">
-                    <Check className="w-4 h-4" strokeWidth={3} />
-                  </div>
-                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Secure Area (HSE Guidelines)</span>
-                </label>
-                <label className="flex items-start gap-4 cursor-pointer group">
-                  <div className="w-7 h-7 rounded-lg border-2 border-green-500 bg-green-500 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-sm">
-                    <Check className="w-4 h-4" strokeWidth={3} />
-                  </div>
-                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Isolate Water Supply</span>
-                </label>
-                <label className="flex items-start gap-4 cursor-pointer group">
-                  <div className="w-7 h-7 rounded-lg border-2 border-black flex items-center justify-center shrink-0 mt-0.5 bg-white group-hover:border-blue-500 transition-colors">
-                  </div>
-                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Initial Assessment & Risk Check</span>
-                </label>
-                <label className="flex items-start gap-4 cursor-pointer group">
-                  <div className="w-7 h-7 rounded-lg border-2 border-black flex items-center justify-center shrink-0 mt-0.5 bg-white group-hover:border-blue-500 transition-colors">
-                  </div>
-                  <span className="text-slate-900 font-medium group-hover:text-black transition-colors text-lg pt-0.5 leading-snug">Commence Repair Work</span>
-                </label>
-              </div>
-            </div>
-
-            {/* Media Gallery */}
-            <div className="bg-white rounded-[2rem] p-6 shadow-sm border border-black">
-              <h3 className="font-bold text-2xl text-slate-900 tracking-tight mb-1">Media Gallery</h3>
-              <p className="text-slate-600 font-medium mb-5">During Work</p>
-              
-              <div className="flex gap-4 overflow-x-auto pb-4 snap-x hide-scrollbar">
-                <div className="w-32 h-32 bg-slate-900 rounded-[1.5rem] shrink-0 relative overflow-hidden snap-start shadow-sm border border-white/20">
-                   <img src="https://images.unsplash.com/photo-1581092921461-7031e4bfb83e?auto=format&fit=crop&w=300&q=80" alt="Work 1" className="w-full h-full object-cover opacity-90" />
-                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent"></div>
-                   <span className="absolute bottom-3 left-0 right-0 text-center text-white text-xs font-semibold tracking-wide shadow-black">10:02 AM</span>
-                </div>
-                <div className="w-32 h-32 bg-slate-900 rounded-[1.5rem] shrink-0 relative overflow-hidden snap-start shadow-sm border border-white/20">
-                   <img src="https://images.unsplash.com/photo-1581092160607-ee22621dd758?auto=format&fit=crop&w=300&q=80" alt="Work 2" className="w-full h-full object-cover opacity-90" />
-                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent"></div>
-                   <span className="absolute bottom-3 left-0 right-0 text-center text-white text-xs font-semibold tracking-wide shadow-black">10:10 AM</span>
-                </div>
-                <button className="w-32 h-32 border-2 border-dashed border-black bg-slate-50 hover:bg-slate-100 transition-colors rounded-[1.5rem] shrink-0 flex flex-col items-center justify-center gap-3 text-slate-500 snap-start">
-                  <div className="w-10 h-10 rounded-full bg-white shadow-sm flex items-center justify-center text-slate-400">
-                    <Plus className="w-6 h-6" />
-                  </div>
-                  <span className="text-sm font-semibold text-slate-600 tracking-tight">Add Photo</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Bottom Actions Fixed Area */}
-            <div className="fixed bottom-[100px] sm:bottom-[80px] left-0 right-0 p-4 bg-slate-50/90 backdrop-blur-md border-t border-black/50 z-40">
-              <div className="max-w-2xl mx-auto flex items-center justify-between gap-3">
-                <button className="flex-1 bg-slate-500 text-white py-4 rounded-[1.2rem] font-bold shadow-sm active:scale-95 transition-all text-[17px] tracking-tight">
-                  Pause
-                </button>
-                <button 
-                  onClick={() => setShowJobSummary(true)}
-                  className="flex-[2] bg-green-600 text-white py-4 rounded-[1.2rem] font-bold shadow-sm active:scale-95 transition-all text-[17px] tracking-tight hover:bg-green-700"
-                >
-                  Complete Job
-                </button>
-                <button 
-                  onClick={() => setShowDigitalId(true)}
-                  className="px-6 bg-blue-700 text-white py-4 rounded-[1.2rem] font-bold shadow-sm active:scale-95 transition-all text-[15px] tracking-tight text-center"
-                >
-                  CSCS Card
-                </button>
-              </div>
-            </div>
-
-            {/* Trader Tools for Dispute/Revision */}
-            {isAssignedTrader && (
-              <div className="space-y-3 pt-6 border-t border-black mt-8 mb-16 px-4">
-                <button 
-                  onClick={() => setShowDisputeModal(true)}
-                  className="w-full bg-white border border-red-200 text-red-600 p-4 rounded-[1.5rem] font-bold hover:bg-red-50 transition-all flex items-center justify-center gap-2"
-                >
-                  <AlertTriangle className="w-5 h-5" /> Raise a Dispute
-                </button>
-                
-                {!isEditingRevision ? (
-                  <button 
-                    onClick={() => {
-                      const myQuote = quotes.find(q => q.tradespersonId === user?.uid);
-                      if (myQuote) {
-                        setRevisionAmount(myQuote.amount.toString());
-                        setIsEditingRevision(true);
-                      }
-                    }}
-                    className="w-full bg-white border border-black text-slate-700 p-4 rounded-[1.5rem] font-bold hover:bg-slate-50 transition-all flex items-center justify-center gap-2"
-                  >
-                    <Edit2 className="w-5 h-5" /> Request Job Revision
-                  </button>
-                ) : (
-                  <div className="bg-white border border-black p-5 rounded-[1.5rem] space-y-4">
-                    <p className="font-bold text-sm text-slate-900">Request Revision</p>
-                    <input
-                      type="number"
-                      value={revisionAmount}
-                      onChange={(e) => setRevisionAmount(e.target.value)}
-                      placeholder="New total amount"
-                      className="w-full px-4 py-3 rounded-xl border border-black focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
-                    />
-                    <textarea
-                      value={revisionReason}
-                      onChange={(e) => setRevisionReason(e.target.value)}
-                      placeholder="Reason for revision (e.g. additional parts needed)"
-                      className="w-full px-4 py-3 rounded-xl border border-black resize-none h-24 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
-                    />
-                    <div className="flex gap-2">
-                       <button 
-                         onClick={() => setIsEditingRevision(false)}
-                         className="flex-1 px-4 py-3 border border-black text-slate-600 rounded-xl font-bold hover:bg-slate-50"
-                       >
-                         Cancel
-                       </button>
-                       <button 
-                         onClick={handleRequestRevision}
-                         disabled={!revisionAmount || !revisionReason || isProcessing}
-                         className="flex-1 px-4 py-3 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 disabled:opacity-50"
-                       >
-                         Submit
-                       </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        ) : (!isHomeowner && job.status === "accepted") ? (
+        {(isAssignedTrader && job.status === "accepted") ? (
           <div className="bg-white min-h-screen px-4 pt-6 pb-6 relative">
             {/* Header & Status */}
             <div className="space-y-3">
@@ -2659,12 +2528,14 @@ const libraries: any[] = ['places', 'geometry'];
                     <div className="w-32 h-32 rounded-full border border-blue-400 bg-blue-400/20 absolute"></div>
                   </div>
                 </div>
-                <button onClick={() => {
-                  const address = encodeURIComponent((job?.fullAddress && job.houseNumber ? `${job.houseNumber} ${job.fullAddress}` : job?.fullAddress) || job?.postcode || job?.area || '');
-                  window.open(`https://www.google.com/maps/dir/?api=1&destination=${address}`, '_blank');
-                }} className="w-full bg-[#2D68C4] text-white py-4 font-bold text-[15px] flex items-center justify-center gap-2 hover:bg-blue-700 transition-colors active:bg-blue-800">
+                <a
+                  href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent((job?.fullAddress && job.houseNumber ? `${job.houseNumber} ${job.fullAddress}` : job?.fullAddress) || job?.postcode || job?.area || '')}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full bg-[#2D68C4] text-white py-4 font-bold text-[15px] flex items-center justify-center gap-2 hover:bg-blue-700 transition-colors active:bg-blue-800"
+                >
                   <Navigation className="w-4 h-4 fill-white" /> Get Directions
-                </button>
+                </a>
               </div>
             </div>
 
@@ -2775,6 +2646,92 @@ const libraries: any[] = ['places', 'geometry'];
           </div>
         ) : (
           <>
+        {/* Active Job Execution Card for Assigned Tradesperson (preserves Milestones, Chat, BOM & full details below) */}
+        {isAssignedTrader && job.status === "in_progress" && (
+          <div className="bg-white rounded-2xl p-5 shadow-sm border border-black space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h2 className="font-bold text-base text-black">Active Job Execution</h2>
+                <p className="text-xs text-black/70">{job.category} — {job.fullAddress || job.houseNumber || job.postcode}</p>
+              </div>
+              <div className="flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-lg border border-black bg-emerald-50 text-black">
+                <span className={cn("w-2 h-2 rounded-full", isTimerPaused ? "bg-amber-500" : "bg-emerald-600 animate-pulse")}></span>
+                {isTimerPaused ? "PAUSED" : "LIVE"}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between bg-slate-50 rounded-xl p-4 border border-black">
+              <div>
+                <p className="text-[11px] font-bold uppercase tracking-wider text-black/60">Elapsed On-Site Time</p>
+                <p className="text-3xl font-black text-blue-700 tabular-nums">{formatTimer(elapsedSeconds)}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsTimerPaused((prev) => !prev)}
+                className="px-4 py-2 rounded-xl border border-black bg-white hover:bg-slate-100 text-black text-xs font-bold transition-colors"
+              >
+                {isTimerPaused ? "Resume Timer" : "Pause Timer"}
+              </button>
+            </div>
+
+            {/* Real Work Progress / Completion Photos */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-bold uppercase tracking-wider text-black">Work Progress &amp; Completion Photos</p>
+                <span className="text-[11px] font-medium text-black/60">
+                  {((job.photosAfter || job.afterPhotos || job.completionPhotos || []) as string[]).length} uploaded
+                </span>
+              </div>
+              <div className="flex gap-3 overflow-x-auto pb-1">
+                {((job.photosAfter || job.afterPhotos || job.completionPhotos || []) as string[]).map((url: string, idx: number) => (
+                  <img
+                    key={`after-${idx}`}
+                    src={url}
+                    alt={`Work photo ${idx + 1}`}
+                    className="w-20 h-20 rounded-xl object-cover border border-black shrink-0"
+                    referrerPolicy="no-referrer"
+                  />
+                ))}
+                <label className="w-20 h-20 rounded-xl border-2 border-dashed border-black bg-slate-50 hover:bg-slate-100 flex flex-col items-center justify-center gap-1 cursor-pointer shrink-0 transition-colors">
+                  {isUploadingAfterPhoto ? (
+                    <Loader2 className="w-5 h-5 animate-spin text-black" />
+                  ) : (
+                    <>
+                      <Plus className="w-5 h-5 text-black" />
+                      <span className="text-[10px] font-bold text-black">Add Photo</span>
+                    </>
+                  )}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    disabled={isUploadingAfterPhoto}
+                    onChange={handleAfterPhotoUpload}
+                    className="sr-only"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowJobSummary(true)}
+                className="bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold text-sm border border-black transition-colors"
+              >
+                Complete Job
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowDigitalId(true)}
+                className="bg-blue-700 hover:bg-blue-800 text-white py-3 rounded-xl font-bold text-sm border border-black transition-colors"
+              >
+                Digital ID / CSCS
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Instant Match Searching Banner */}
         {isHomeowner && job.status === "posted" && job.boostTier === "instant_match" && (
           <div className="bg-[#0f2c59] p-8 rounded-[2rem] space-y-6 shadow-2xl shadow-blue-900/40 relative overflow-hidden text-center flex flex-col items-center">
@@ -2807,71 +2764,32 @@ const libraries: any[] = ['places', 'geometry'];
              </div>
 
            <div className="relative z-10 w-full px-4">
-               <p className="text-blue-100 text-[15px] font-medium max-w-xs mx-auto mb-6">
-                 Broadcasting your emergency request to the nearest 10 experts...
+               <p className="text-blue-100 text-[15px] font-medium max-w-xs mx-auto mb-4">
+                 Contacting verified local {job.category || "trade"} specialists in sequence. You will be notified as soon as a tradesperson confirms dispatch.
                </p>
-               <button 
-                 onClick={async () => {
-                   if (!id || !user) return;
-                   try {
-                     const matchRef = doc(collection(db, "instant_matches"));
-                     const attemptRef = doc(collection(db, "instant_match_attempts"));
-                     const batch = writeBatch(db);
-
-                     batch.set(matchRef, {
-                       jobId: id,
-                       customerId: user.uid,
-                       status: "searching",
-                       createdAt: serverTimestamp()
-                     });
-
-                     batch.set(attemptRef, {
-                       instantMatchId: matchRef.id,
-                       traderId: user.uid,
-                       status: "pending",
-                       attemptNumber: 1,
-                       createdAt: serverTimestamp(),
-                       expiresAt: new Date(Date.now() + 60000).toISOString()
-                     });
-                     
-                     await batch.commit();
-                     toast.success("Simulation triggered! Switch to Trader portal to see the alert.");
-                   } catch(e: any) {
-                     toast.error("Error creating match: " + e.message);
-                   }
-                 }}
-                 className="w-full bg-orange-500 text-white font-bold py-3 px-4 flex justify-center items-center gap-2 rounded-2xl hover:bg-orange-600 transition-colors mb-4"
-               >
-                 <Zap className="w-5 h-5" />
-                 Simulate: Send Match Alert to ME
-               </button>
              </div>
 
-             <div className="w-full space-y-3 relative z-10">
-                {/* Mock Traders being notified */}
-                {['Mike P.', 'Sarah L.', 'David K.'].map((name, i) => (
-                  <div key={i} className="bg-white rounded-[1.25rem] p-4 flex items-center justify-between shadow-lg">
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 rounded-full bg-slate-200 overflow-hidden shrink-0 border-2 border-black shadow-sm">
-                         <img src={`https://i.pravatar.cc/150?u=${name}`} alt={name} className="w-full h-full object-cover" />
-                      </div>
-                      <div className="text-left">
-                        <p className="font-bold text-slate-900 text-[15px]">{name} <span className="text-slate-400 font-normal">- {job.category}</span></p>
-                        <div className="flex items-center gap-1 mt-0.5 text-slate-500 text-xs font-semibold">
-                          <Zap className="w-3 h-3 text-slate-400" />
-                          <span>{job.category}</span>
-                        </div>
-                      </div>
+             <div className="w-full space-y-2 relative z-10">
+                <div className="bg-white rounded-[1.25rem] p-4 flex items-center justify-between shadow-lg border border-black">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center shrink-0 border border-black">
+                      <Zap className="w-5 h-5 text-blue-600" />
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium text-slate-500">Notified...</span>
-                      <div className="relative flex h-2.5 w-2.5">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75"></span>
-                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-orange-500"></span>
-                      </div>
+                    <div className="text-left">
+                      <p className="font-bold text-black text-sm">Live Instant Match Queue Active</p>
+                      <p className="text-slate-600 text-xs font-medium">
+                        Matching verified {job.category || "trade"} pros near {getOutwardPostcode(job.postcode) || job.city || "your area"}
+                      </p>
                     </div>
                   </div>
-                ))}
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-xs font-bold text-black">Searching</span>
+                    <div className="relative flex h-2.5 w-2.5">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-orange-500"></span>
+                    </div>
+                  </div>
+                </div>
              </div>
           </div>
         )}
@@ -3236,7 +3154,21 @@ const libraries: any[] = ['places', 'geometry'];
             </div>
             <div className="flex items-center gap-2 text-[10px] text-red-400">
               <Clock className="w-3 h-3" />
-              <span>Raised on {new Date(job.dispute?.createdAt?.seconds * 1000).toLocaleDateString()}</span>
+              <span>
+                Raised on{" "}
+                {(() => {
+                  const raw = job.dispute?.createdAt || job.disputedAt;
+                  const dt =
+                    typeof raw?.toDate === "function"
+                      ? raw.toDate()
+                      : typeof raw?.seconds === "number"
+                        ? new Date(raw.seconds * 1000)
+                        : raw
+                          ? new Date(raw)
+                          : null;
+                  return dt && !isNaN(dt.getTime()) ? dt.toLocaleDateString("en-GB") : "Recently";
+                })()}
+              </span>
             </div>
           </div>
         )}
@@ -3432,88 +3364,90 @@ const libraries: any[] = ['places', 'geometry'];
               <p className="text-red-600 text-sm mb-4">No traders responded to your emergency request in time. What would you like to do?</p>
               <div className="flex flex-wrap gap-2">
                 {(!job.isBoosted && (job.retryCount || 0) >= 2) ? (
-                  <button onClick={async () => {
-                    const confirmBoost = window.confirm("Tradespeople are currently very busy. Boost your emergency job to the top of their feeds for £5 to get immediate attention. Proceed to checkout?");
-                    if (!confirmBoost) return;
-
-                    try {
-                      if (!user) throw new Error("Please sign in to purchase a job boost.");
-                      const token = await user.getIdToken();
-                      if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
-                      const response = await fetch("/api/create-checkout-session", {
-                        method: "POST",
-                        headers: {
-                          "Content-Type": "application/json",
-                          Authorization: `Bearer ${token}`,
-                          "Idempotency-Key": crypto.randomUUID()
-                        },
-                        body: JSON.stringify({
-                          userId: user?.uid,
-                          price_data: {
-                            currency: 'gbp',
-                            unit_amount: 500,
-                            product_data: {
-                              name: 'Emergency Job Boost',
-                              description: 'Priority placement at the top of trader feeds'
-                            }
-                          },
-                          priceId: "price_mock_boost",
-                          mode: "payment",
-                          metadata: {
-                            type: "boost",
-                            jobId: id
-                          },
-                          successUrl: `${window.location.origin}/job/${id}?boost_success=true`,
-                          cancelUrl: `${window.location.origin}/job/${id}`
-                        }),
-                      });
-
-                      const data = await response.json();
-                      if (data.url) {
-                        window.location.href = data.url;
-                      } else {
-                        throw new Error(data.error || "Failed to initiate checkout");
-                      }
-                    } catch (err: any) {
-                      console.error("Boost payment init failed:", err);
-                      alert(err.message || "Failed to start checkout. Please try again later.");
-                    }
-                  }} className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2">
-                    <Zap className="w-4 h-4" /> Boost for £5
+                  <button
+                    type="button"
+                    onClick={() => setShowEmergencyBoostConfirm(true)}
+                    className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold flex items-center gap-2 cursor-pointer"
+                  >
+                    <Zap className="w-4 h-4" /> Boost for £{Number(
+                      livePricingConfig.globalConfig?.paidAddons?.emergencyBoost?.price ??
+                      livePricingConfig.globalConfig?.emergencyBoostFee ??
+                      4.99
+                    ).toFixed(2)}
                   </button>
                 ) : (
-                  <button onClick={async () => {
-                    await updateDoc(doc(db, "jobs", id!), { 
-                      postedDate: serverTimestamp(), 
-                      createdAt: serverTimestamp(),
-                      retryCount: (job.retryCount || 0) + 1
-                    });
-                    setJob((prev: any) => ({ 
-                      ...prev, 
-                      postedDate: new Date(), 
-                      createdAt: new Date(),
-                      retryCount: (prev.retryCount || 0) + 1
-                    }));
-                  }} className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold">Re-post as Emergency</button>
-                )}
-                <button onClick={async () => {
-                  await updateDoc(doc(db, "jobs", id!), { urgency: "asap", expiryAcknowledged: true });
-                  setJob((prev: any) => ({ ...prev, urgency: "asap", expiryAcknowledged: true }));
-                }} className="bg-white text-red-600 border border-red-200 px-4 py-2 rounded-xl text-sm font-bold">Convert to Standard</button>
-                <button onClick={async () => {
-                  try {
-                    if (user && id) {
-                      const cancelResult = await cancelJobViaCommand({ user, jobId: id, reason: "Cancelled via expiry banner" });
-                      if (!cancelResult?.success || cancelResult.status !== "cancelled") {
-                        throw new Error("Server did not confirm cancellation.");
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!user || !id) return;
+                      try {
+                        const res = await updateJobViaCommand({
+                          user,
+                          jobId: id,
+                          payload: { repostAsEmergency: true },
+                        });
+                        setJob((prev: any) => ({
+                          ...prev,
+                          ...(res.job || {}),
+                          retryCount: (prev.retryCount || 0) + 1,
+                        }));
+                        await distributeJobNotifications(id, job.category, job.postcode, "emergency", false).catch(() => {});
+                        toast.success("Emergency job re-posted and local tradespeople re-notified.");
+                      } catch (err: any) {
+                        toast.error(err?.message || "Failed to re-post emergency job.");
                       }
-                      toast.success("Job cancelled.");
+                    }}
+                    className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm font-bold"
+                  >
+                    Re-post as Emergency
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!user || !id) return;
+                    try {
+                      const res = await updateJobViaCommand({
+                        user,
+                        jobId: id,
+                        payload: { convertToStandard: true },
+                      });
+                      setJob((prev: any) => ({
+                        ...prev,
+                        ...(res.job || {}),
+                        urgency: "standard",
+                        isEmergency: false,
+                        expiryAcknowledged: true,
+                      }));
+                      toast.success("Job converted to Standard and synced to the public feed.");
+                    } catch (err: any) {
+                      toast.error(err?.message || "Failed to convert job to standard.");
                     }
-                    navigate("/my-jobs");
-                  } catch (cancelErr: any) {
-                    toast.error(cancelErr?.message || "Failed to cancel job.");
-                  }
-                }} className="bg-white text-slate-600 border border-black px-4 py-2 rounded-xl text-sm font-bold">Delete Post</button>
+                  }}
+                  className="bg-white text-red-600 border border-red-200 px-4 py-2 rounded-xl text-sm font-bold"
+                >
+                  Convert to Standard
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      if (user && id) {
+                        const cancelResult = await cancelJobViaCommand({ user, jobId: id, reason: "Cancelled via expiry banner" });
+                        if (!cancelResult?.success || cancelResult.status !== "cancelled") {
+                          throw new Error("Server did not confirm cancellation.");
+                        }
+                        toast.success("Job cancelled.");
+                      }
+                      navigate("/my-jobs");
+                    } catch (cancelErr: any) {
+                      toast.error(cancelErr?.message || "Failed to cancel job.");
+                    }
+                  }}
+                  className="bg-white text-slate-600 border border-black px-4 py-2 rounded-xl text-sm font-bold"
+                >
+                  Delete Post
+                </button>
               </div>
             </div>
           )}
@@ -5721,9 +5655,13 @@ const libraries: any[] = ['places', 'geometry'];
                     );
                   })()}
                 </div>
-                {(job.isPaid === true || job.paymentStatus === "handshake_complete") ? (
+                {(job.isPaid === true || job.paymentStatus === "paid" || job.paymentStatus === "handshake_complete") ? (
                   <div className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
                     <CheckCircle2 className="w-3.5 h-3.5" /> Fully Paid
+                  </div>
+                ) : job.paymentStatus === "partially_released" ? (
+                  <div className="bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5" /> Escrow Partially Released
                   </div>
                 ) : job.paymentStatus === "funded" ? (
                   <div className="bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
@@ -5775,7 +5713,7 @@ const libraries: any[] = ['places', 'geometry'];
                     )}
                     <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
                     <div className="flex justify-between items-center pt-1">
-                      <span className="text-black font-black text-[18px]">Total {(job.isPaid === true || job.paymentStatus === "handshake_complete") ? "Paid" : "Due"}:</span>
+                      <span className="text-black font-black text-[18px]">Total {(job.isPaid === true || job.paymentStatus === "paid" || job.paymentStatus === "handshake_complete") ? "Paid" : "Due"}:</span>
                       <span className="text-black font-black text-[18px]">£{invSummary.totalAmount.toFixed(2)}</span>
                     </div>
                   </div>
@@ -5791,8 +5729,8 @@ const libraries: any[] = ['places', 'geometry'];
           </div>
         )}
 
-        {isHomeowner && job.status === "completed" && !job.hasReview && (
-          <div className="space-y-4">
+        {isHomeowner && job.status === "completed" && !(job.hasHomeownerReview || job.hasReview) && (
+          <div id="review-section" className="space-y-4">
             {!showReviewForm ? (
               <button 
                 onClick={() => setShowReviewForm(true)}
@@ -5809,7 +5747,8 @@ const libraries: any[] = ['places', 'geometry'];
                 type="tradesperson_review"
                 onSuccess={() => {
                   setShowReviewForm(false);
-                  setJob((prev: any) => ({ ...prev, hasReview: true }));
+                  setJob((prev: any) => ({ ...prev, hasReview: true, hasHomeownerReview: true }));
+                  toast.success("Thank you! Your review has been submitted.");
                 }}
                 onCancel={() => setShowReviewForm(false)}
               />
@@ -6077,9 +6016,9 @@ const libraries: any[] = ['places', 'geometry'];
                       className="mt-1 w-4 h-4 text-blue-600 border-black rounded focus:ring-blue-500"
                     />
                     <label htmlFor="mediationStake" className="space-y-1 cursor-pointer">
-                      <p className="text-sm font-bold text-blue-900 leading-tight">Authorize £25.00 Mediation Stake</p>
+                      <p className="text-sm font-bold text-blue-900 leading-tight">Authorize £{liveMediationStakeGbp.toFixed(2)} Mediation Stake</p>
                       <p className="text-[10px] text-blue-700 leading-normal">
-                        To prevent frivolous claims, you must stake £25.00. This is **refunded** if the dispute is valid. If the dispute is found to be unreasonable (petty), the stake will be released to the trader as Inconvenience Pay.
+                        To prevent frivolous claims, you must stake £{liveMediationStakeGbp.toFixed(2)}. This is refunded if the dispute is valid. If the dispute is found to be unreasonable, the stake may be released to the trader as inconvenience compensation.
                       </p>
                     </label>
                   </div>
@@ -6555,116 +6494,166 @@ const libraries: any[] = ['places', 'geometry'];
                   <p className="text-slate-600 font-medium mt-0.5 text-[17px]">Duration: {formatTimer(elapsedSeconds)}</p>
                 </div>
 
-                <div className="space-y-6">
-                  {/* Financial Summary */}
-                  <div>
-                    <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Financial Summary</h3>
-                    <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black space-y-3">
-                      <div className="flex justify-between items-center bg-white">
-                         <span className="text-slate-600 font-medium text-[17px]">Labour Cost:</span>
-                         <span className="text-slate-900 font-medium text-[17px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.714).toFixed(2)}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                         <span className="text-slate-600 font-medium text-[17px]">Materials:</span>
-                         <div className="flex flex-col items-end">
-                           <span className="text-slate-900 font-medium text-[17px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.286).toFixed(2)}</span>
-                           <span className="text-blue-600 text-[13px] font-medium leading-none">(View Receipt link)</span>
-                         </div>
-                      </div>
-                      <div className="h-px bg-slate-100 w-full my-1"></div>
-                      <div className="flex justify-between items-center">
-                         <span className="text-[#1e3a8a] font-medium text-[17px]">Subtotal:</span>
-                         <span className="text-slate-900 font-medium text-[17px]">£{(quotes.find(q => q.status === "accepted")?.amount || 0).toFixed(2)}</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                         <span className="text-[#1e3a8a] font-medium text-[17px]">VAT (20%):</span>
-                         <span className="text-slate-900 font-medium text-[17px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 0.20).toFixed(2)}</span>
-                      </div>
-                      <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
-                      <div className="flex justify-between items-center pt-1">
-                         <span className="text-black font-black text-[20px]">Total:</span>
-                         <span className="text-black font-black text-[20px]">£{((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}</span>
-                      </div>
-                    </div>
-                  </div>
+                {(() => {
+                  const acceptedQuote = quotes.find(q => q.status === "accepted");
+                  const agreedSubtotal = Number(acceptedQuote?.amount || job?.agreedAmount || 0);
+                  const acceptedTraderId = acceptedQuote?.tradespersonId || job?.acceptedTradespersonId;
+                  const acceptedTrader = acceptedTraderId ? tradespersonProfiles[acceptedTraderId] : null;
+                  const isVatRegistered = Boolean(acceptedTrader?.vatRegistered || acceptedTrader?.vatNumber || (!isHomeowner && (profile?.vatRegistered || profile?.vatNumber)));
+                  const vatAmount = isVatRegistered ? Math.round(agreedSubtotal * 0.2 * 100) / 100 : 0;
+                  const finalTotal = Math.round((agreedSubtotal + vatAmount) * 100) / 100;
+                  const beforePhoto = (Array.isArray(job?.beforePhotos) && job.beforePhotos[0]) || (Array.isArray(job?.photos) && job.photos[0]) || null;
+                  const afterPhoto = (Array.isArray(job?.photosAfter) && job.photosAfter[0]) || (Array.isArray(job?.afterPhotos) && job.afterPhotos[0]) || (Array.isArray(job?.completionPhotos) && job.completionPhotos[0]) || null;
+                  const milestonesList = Array.isArray(acceptedQuote?.milestones) ? acceptedQuote.milestones : [];
 
-                  {/* Media */}
-                  <div>
-                    <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Media</h3>
-                    <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black">
-                      <div className="flex gap-4">
-                        <div className="w-[100px] h-[100px] shrink-0 relative rounded-[1rem] overflow-hidden shadow-sm">
-                           <img src="https://images.unsplash.com/photo-1584622650111-993a426fbf0a?auto=format&fit=crop&w=200&q=80" alt="Before" className="w-full h-full object-cover" />
-                           <div className="absolute inset-x-0 bottom-0 py-1px px-2 bg-black/60 flex items-center gap-1.5 h-6">
-                             <Camera className="w-3 h-3 text-white shrink-0" />
-                             <span className="text-white text-[11px] font-medium tracking-wide">Before</span>
-                           </div>
-                        </div>
-                        <div className="w-[100px] h-[100px] shrink-0 relative rounded-[1rem] overflow-hidden shadow-sm">
-                           <img src="https://images.unsplash.com/photo-1581092160607-ee22621dd758?auto=format&fit=crop&w=200&q=80" alt="After" className="w-full h-full object-cover" />
-                           <div className="absolute inset-x-0 bottom-0 py-1px px-2 bg-black/60 flex items-center gap-1.5 h-6">
-                             <Camera className="w-3 h-3 text-white shrink-0" />
-                             <span className="text-white text-[11px] font-medium tracking-wide">After</span>
-                           </div>
+                  return (
+                    <div className="space-y-6">
+                      {/* Financial Summary */}
+                      <div>
+                        <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Financial Summary</h3>
+                        <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black space-y-3">
+                          {milestonesList.length > 0 ? (
+                            milestonesList.map((ms: any, idx: number) => (
+                              <div key={ms.id || idx} className="flex justify-between items-center text-sm">
+                                <span className="text-black font-medium truncate pr-2">{ms.title || `Milestone ${idx + 1}`}</span>
+                                <span className="text-black font-bold shrink-0">£{Number(ms.amount || 0).toFixed(2)}</span>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="flex justify-between items-center">
+                              <span className="text-black font-medium text-[16px]">Agreed Quote Amount:</span>
+                              <span className="text-black font-bold text-[16px]">£{agreedSubtotal.toFixed(2)}</span>
+                            </div>
+                          )}
+                          <div className="h-px bg-slate-200 w-full my-1"></div>
+                          <div className="flex justify-between items-center">
+                            <span className="text-[#1e3a8a] font-medium text-[16px]">Subtotal:</span>
+                            <span className="text-black font-bold text-[16px]">£{agreedSubtotal.toFixed(2)}</span>
+                          </div>
+                          {isVatRegistered && (
+                            <div className="flex justify-between items-center">
+                              <span className="text-[#1e3a8a] font-medium text-[16px]">VAT (20%):</span>
+                              <span className="text-black font-bold text-[16px]">£{vatAmount.toFixed(2)}</span>
+                            </div>
+                          )}
+                          <div className="h-px bg-slate-100 w-full my-1 border-b-2 border-dashed border-black"></div>
+                          <div className="flex justify-between items-center pt-1">
+                            <span className="text-black font-black text-[20px]">Total:</span>
+                            <span className="text-black font-black text-[20px]">£{finalTotal.toFixed(2)}</span>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </div>
 
-                  {/* Share Financial Summary */}
-                  <div>
-                    <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Share Financial Summary</h3>
-                    <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black flex flex-col gap-3">
-                      <button 
-                        onClick={() => {
-                          const subject = encodeURIComponent(`Invoice: ${job?.title || 'Job Completed'}`);
-                          const body = encodeURIComponent(`Hi ${job?.homeownerName || ''},\n\nHere is the financial summary for the completed job.\n\nTotal: £${((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}\n\nPlease let me know if you have any questions.`);
-                          window.location.href = `mailto:?subject=${subject}&body=${body}`;
-                        }}
-                        className="w-full py-4 border-[1.5px] border-blue-600 text-[#004bb4] rounded-[1rem] font-semibold text-[17px] flex items-center justify-center gap-2 hover:bg-blue-50 transition-colors"
-                      >
-                        <Mail className="w-5 h-5 text-[#004bb4]" />
-                        Email VAT Invoice
-                      </button>
-                      <button 
-                        onClick={() => {
-                           const text = encodeURIComponent(`Hi ${job?.homeownerName || ''}, the job "${job?.title || ''}" is complete. The total amount is £${((quotes.find(q => q.status === "accepted")?.amount || 0) * 1.20).toFixed(2)}.`);
-                           window.open(`https://wa.me/?text=${text}`, '_blank');
-                        }}
-                        className="w-full py-4 bg-[#25D366] hover:bg-[#1ebd59] text-white rounded-[1rem] font-semibold text-[17px] flex items-center justify-center gap-2 transition-colors"
-                      >
-                        <MessageCircle className="w-5 h-5 text-white" />
-                        Share via WhatsApp
-                      </button>
-                      <button 
-                        onClick={() => {
-                           setShowJobSummary(false);
-                           navigate(`/chat/${job.id}`);
-                        }}
-                        className="w-full py-4 bg-slate-900 hover:bg-slate-800 text-white rounded-[1rem] font-semibold text-[17px] flex items-center justify-center gap-2 transition-colors"
-                      >
-                        <MessageSquare className="w-5 h-5 text-white" />
-                        Send In-App Message
-                      </button>
+                      {/* Real Job Media */}
+                      <div>
+                        <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Job Photos</h3>
+                        <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black">
+                          {(beforePhoto || afterPhoto) ? (
+                            <div className="flex gap-4">
+                              {beforePhoto && (
+                                <div className="w-[100px] h-[100px] shrink-0 relative rounded-[1rem] overflow-hidden shadow-sm border border-black">
+                                  <img src={beforePhoto} alt="Before" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                  <div className="absolute inset-x-0 bottom-0 px-2 bg-black/70 flex items-center gap-1.5 h-6">
+                                    <Camera className="w-3 h-3 text-white shrink-0" />
+                                    <span className="text-white text-[11px] font-medium tracking-wide">Before</span>
+                                  </div>
+                                </div>
+                              )}
+                              {afterPhoto && (
+                                <div className="w-[100px] h-[100px] shrink-0 relative rounded-[1rem] overflow-hidden shadow-sm border border-black">
+                                  <img src={afterPhoto} alt="After" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                  <div className="absolute inset-x-0 bottom-0 px-2 bg-black/70 flex items-center gap-1.5 h-6">
+                                    <Camera className="w-3 h-3 text-white shrink-0" />
+                                    <span className="text-white text-[11px] font-medium tracking-wide">After</span>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="text-xs font-medium text-slate-600">No before/after photos attached to this job yet.</p>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Share Financial Summary */}
+                      <div>
+                        <h3 className="font-bold text-[#1e3a8a] text-[19px] mb-3 px-1">Share Financial Summary</h3>
+                        <div className="bg-white rounded-[1.5rem] p-5 shadow-sm border border-black flex flex-col gap-3">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const subject = encodeURIComponent(`Invoice Summary: ${job?.title || 'Job Completed'}`);
+                              const body = encodeURIComponent(`Hi ${job?.homeownerName || ''},\n\nHere is the financial summary for "${job?.title || 'your job'}".\n\nSubtotal: £${agreedSubtotal.toFixed(2)}${isVatRegistered ? `\nVAT (20%): £${vatAmount.toFixed(2)}` : ''}\nTotal: £${finalTotal.toFixed(2)}\n\nPlease let me know if you have any questions.`);
+                              window.location.href = `mailto:?subject=${subject}&body=${body}`;
+                            }}
+                            className="w-full py-3.5 border border-black text-[#004bb4] rounded-[1rem] font-semibold text-[15px] flex items-center justify-center gap-2 hover:bg-blue-50 transition-colors"
+                          >
+                            <Mail className="w-5 h-5 text-[#004bb4]" />
+                            {isVatRegistered ? "Email VAT Summary" : "Email Summary"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const summaryText = `Job "${job?.title || ''}" summary: £${finalTotal.toFixed(2)}${isVatRegistered ? ' (incl. VAT)' : ''}. View on AnyTrader: ${window.location.origin}/job/${job.id}`;
+                              try {
+                                await navigator.clipboard.writeText(summaryText);
+                                toast.success("Summary copied to clipboard for sharing.");
+                              } catch {
+                                toast.info(summaryText);
+                              }
+                            }}
+                            className="w-full py-3.5 bg-[#25D366] hover:bg-[#1ebd59] text-white rounded-[1rem] font-semibold text-[15px] flex items-center justify-center gap-2 transition-colors border border-black"
+                          >
+                            <MessageCircle className="w-5 h-5 text-white" />
+                            Copy Shareable Summary
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowJobSummary(false);
+                              if (acceptedTraderId) {
+                                handleStartChat(acceptedQuote || { jobId: job.id, amount: agreedSubtotal, tradespersonId: acceptedTraderId }, acceptedTrader);
+                              }
+                            }}
+                            className="w-full py-3.5 bg-slate-900 hover:bg-slate-800 text-white rounded-[1rem] font-semibold text-[15px] flex items-center justify-center gap-2 transition-colors border border-black"
+                          >
+                            <MessageSquare className="w-5 h-5 text-white" />
+                            Send In-App Message
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                </div>
+                  );
+                })()}
               </div>
 
               {/* Bottom Actions Form Menu */}
               <div className="fixed sm:absolute bottom-0 left-0 right-0 p-4 bg-white border-t border-black shadow-[0_-4px_20px_-10px_rgba(0,0,0,0.1)] z-20">
                 <div className="space-y-3">
-                  <button 
-                    className="w-full bg-[#004bb4] hover:bg-[#003c90] text-white py-4 rounded-[1rem] font-bold text-[17px] transition-colors"
+                  <button
+                    type="button"
+                    className="w-full bg-[#004bb4] hover:bg-[#003c90] text-white py-3.5 rounded-[1rem] font-bold text-[16px] transition-colors border border-black"
                     onClick={() => {
-                        setShowJobSummary(false);
-                        handleCompleteJob();
+                      setShowJobSummary(false);
+                      handleCompleteJob();
                     }}
                   >
                     Confirm & Request Payment
                   </button>
-                  <button className="w-full bg-white border-2 border-[#1e3a8a] text-[#1e3a8a] py-4 rounded-[1rem] font-bold text-[17px] hover:bg-slate-50 transition-colors">
-                    Leave Customer Review
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowJobSummary(false);
+                      const reviewEl = document.getElementById("review-section");
+                      if (reviewEl) {
+                        reviewEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                      } else {
+                        toast.info("Once payment is confirmed and the job is completed, you can leave a verified review below.");
+                      }
+                    }}
+                    className="w-full bg-white border border-black text-black py-3.5 rounded-[1rem] font-bold text-[16px] hover:bg-slate-50 transition-colors"
+                  >
+                    {isHomeowner ? "Leave Tradesperson Review" : "Close Summary"}
                   </button>
                 </div>
               </div>
@@ -6805,6 +6794,95 @@ const libraries: any[] = ['places', 'geometry'];
           }));
         }}
       />
+
+      {showEmergencyBoostConfirm && (() => {
+        const emergencyBoostPrice = Number(
+          livePricingConfig.globalConfig?.paidAddons?.emergencyBoost?.price ??
+          livePricingConfig.globalConfig?.emergencyBoostFee ??
+          5
+        );
+        const safeBoostPrice = Number.isFinite(emergencyBoostPrice) && emergencyBoostPrice > 0 ? emergencyBoostPrice : 5;
+        const formattedBoostPrice = `£${safeBoostPrice.toFixed(2)}`;
+        return (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[130] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="text-center space-y-2">
+              <div className="w-12 h-12 bg-red-50 rounded-2xl border border-black flex items-center justify-center mx-auto">
+                <Zap className="w-6 h-6 text-red-600" />
+              </div>
+              <h4 className="text-base font-black text-black">Boost Emergency Job ({formattedBoostPrice})?</h4>
+              <p className="text-xs text-black leading-relaxed">
+                Tradespeople are currently busy. Boosting pins your emergency job to the top of local trader feeds via secure Stripe Checkout.
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                disabled={isStartingBoost}
+                onClick={() => setShowEmergencyBoostConfirm(false)}
+                className="flex-1 py-2.5 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isStartingBoost}
+                onClick={async () => {
+                  setIsStartingBoost(true);
+                  try {
+                    if (!user) throw new Error("Please sign in to purchase a job boost.");
+                    const token = await user.getIdToken();
+                    if (!token) throw new Error("Your sign-in session has expired. Please sign in again.");
+                    const response = await fetch("/api/create-checkout-session", {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${token}`,
+                        "Idempotency-Key": crypto.randomUUID()
+                      },
+                      body: JSON.stringify({
+                        userId: user?.uid,
+                        price_data: {
+                          currency: 'gbp',
+                          unit_amount: Math.round(safeBoostPrice * 100),
+                          product_data: {
+                            name: 'Emergency Job Boost',
+                            description: 'Priority placement at the top of trader feeds'
+                          }
+                        },
+                        priceId: "price_mock_boost",
+                        mode: "payment",
+                        metadata: {
+                          type: "boost",
+                          jobId: id
+                        },
+                        successUrl: `${window.location.origin}/job/${id}?boost_success=true`,
+                        cancelUrl: `${window.location.origin}/job/${id}`
+                      }),
+                    });
+                    const data = await response.json();
+                    if (data.url) {
+                      window.location.href = data.url;
+                    } else {
+                      throw new Error(data.error || "Failed to initiate checkout");
+                    }
+                  } catch (err: any) {
+                    console.error("Boost payment init failed:", err);
+                    toast.error(err.message || "Failed to start checkout. Please try again later.");
+                    setShowEmergencyBoostConfirm(false);
+                  } finally {
+                    setIsStartingBoost(false);
+                  }
+                }}
+                className="flex-1 py-2.5 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 cursor-pointer disabled:opacity-50"
+              >
+                {isStartingBoost ? "Opening Stripe..." : `Proceed (${formattedBoostPrice})`}
+              </button>
+            </div>
+          </div>
+        </div>
+        );
+      })()}
     </div>
   );
 }

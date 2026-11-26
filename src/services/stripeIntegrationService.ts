@@ -7,12 +7,21 @@ import { doc, updateDoc, getDoc } from "firebase/firestore";
  * Shared between AnyTrader Home and AnyTrader Rides.
  */
 
+export const DEFAULT_ANYTRADER_COMMISSIONS: Record<NormalizedTraderTier, number> = {
+  payg: 0.05,
+  pro: 0.035,
+  premium: 0.025,
+  platinum: 0.015,
+};
+
+export const DEFAULT_ANYTRADER_COMMISSION_CAP_GBP = 250.00;
+
 export const STRIPE_CONFIG = {
   CARD_FEE_PERCENT: 0.024, // 2.4% standard card fee
   CARD_FEE_FLAT: 0.20,     // 20p flat fee
   BANK_TRANSFER_FEE_MAX: 10.00, // Capped at £10 for large jobs
   BANK_TRANSFER_FEE_PERCENT: 0.005, // 0.5% for bank pay
-  COMMISSION_CAP: 250.00,   // Max platform commission per job
+  COMMISSION_CAP: DEFAULT_ANYTRADER_COMMISSION_CAP_GBP,   // Default max platform commission per job
   PAYMENT_RAIL_THRESHOLD: 400.00, // Jobs >= 400 use Bank Transfer
 };
 
@@ -22,6 +31,8 @@ export interface PayoutBreakdown {
   platformCommission: number;
   netPayout: number;
   paymentRail: 'card' | 'bank_transfer';
+  appliedCommissionRate: number;
+  commissionCapGbp: number;
 }
 
 export type NormalizedTraderTier = 'payg' | 'pro' | 'premium' | 'platinum';
@@ -47,14 +58,57 @@ export function normalizeTraderTier(rawTier?: string): NormalizedTraderTier {
 }
 
 /**
+ * Resolves live Admin-configured commission rate (decimal 0..1) and commission cap (£, 0 = no cap)
+ * from Firestore platform_config/global_tiers and platform_config/global, falling back to canonical defaults.
+ */
+export function resolveClientCommissionConfig(
+  tier: string = 'payg',
+  globalTiers?: any,
+  platformConfig?: any
+): { normalizedTier: NormalizedTraderTier; commissionRate: number; commissionCapGbp: number } {
+  const normalizedTier = normalizeTraderTier(tier);
+  let commissionRate = DEFAULT_ANYTRADER_COMMISSIONS[normalizedTier];
+
+  const tierEntry = globalTiers?.providerModels?.one_off_trades?.tiers?.[normalizedTier];
+  if (tierEntry && typeof tierEntry.commission === 'number' && Number.isFinite(tierEntry.commission) && tierEntry.commission >= 0) {
+    commissionRate = tierEntry.commission > 1 ? tierEntry.commission / 100 : tierEntry.commission;
+  } else if (Array.isArray(platformConfig?.feeTiers)) {
+    const matched = platformConfig.feeTiers.find(
+      (ft: any) => normalizeTraderTier(ft?.name) === normalizedTier
+    );
+    if (matched && typeof matched.commission === 'number' && Number.isFinite(matched.commission) && matched.commission >= 0) {
+      // platform_config/global.feeTiers always stores percentage (e.g. 5, 3.5, 1, 0.5)
+      commissionRate = Math.round((matched.commission / 100) * 1000000) / 1000000;
+    }
+  }
+
+  const rawCap =
+    globalTiers?.providerModels?.one_off_trades?.commissionCapGbp ??
+    globalTiers?.commissionCapGbp ??
+    platformConfig?.commissionCapGbp;
+  const parsedCap = rawCap === undefined || rawCap === null || rawCap === '' ? NaN : Number(rawCap);
+  const commissionCapGbp =
+    Number.isFinite(parsedCap) && parsedCap >= 0
+      ? parsedCap
+      : DEFAULT_ANYTRADER_COMMISSION_CAP_GBP;
+
+  return { normalizedTier, commissionRate, commissionCapGbp };
+}
+
+/**
  * Calculates the financial breakdown for a quote based on the user's tier.
- * Canonical platform rates:
+ * Canonical platform rates (overridable via Admin controls):
  * - PAYG (Free Explorer): 5.0% platform commission
  * - Pro (Silver Professional): 3.5% platform commission
  * - Premium (Gold Elite): 2.5% platform commission
  * - Platinum (Platinum Enterprise): 1.5% platform commission
  */
-export function calculatePayoutBreakdown(amount: number, tier: string = 'payg', customCommissionRate?: number): PayoutBreakdown {
+export function calculatePayoutBreakdown(
+  amount: number,
+  tier: string = 'payg',
+  customCommissionRate?: number,
+  customCommissionCapGbp?: number
+): PayoutBreakdown {
   const normalizedTier = normalizeTraderTier(tier);
   const isLargeJob = amount >= STRIPE_CONFIG.PAYMENT_RAIL_THRESHOLD;
   const paymentRail = isLargeJob ? 'bank_transfer' : 'card';
@@ -68,16 +122,21 @@ export function calculatePayoutBreakdown(amount: number, tier: string = 'payg', 
   }
 
   // 2. Calculate Platform Commission based on Tier or Custom Config
-  let commissionRate = 0.05; // Default PAYG (5%)
-  if (typeof customCommissionRate === 'number' && customCommissionRate >= 0) {
+  let commissionRate = DEFAULT_ANYTRADER_COMMISSIONS[normalizedTier];
+  if (typeof customCommissionRate === 'number' && Number.isFinite(customCommissionRate) && customCommissionRate >= 0) {
     commissionRate = customCommissionRate;
-  } else {
-    if (normalizedTier === 'pro') commissionRate = 0.035; // Silver Professional (3.5%)
-    else if (normalizedTier === 'premium') commissionRate = 0.025; // Gold Elite (2.5%)
-    else if (normalizedTier === 'platinum') commissionRate = 0.015; // Platinum Enterprise (1.5%)
   }
 
-  let platformCommission = Math.min(amount * commissionRate, STRIPE_CONFIG.COMMISSION_CAP);
+  const commissionCapGbp =
+    typeof customCommissionCapGbp === 'number' && Number.isFinite(customCommissionCapGbp) && customCommissionCapGbp >= 0
+      ? customCommissionCapGbp
+      : STRIPE_CONFIG.COMMISSION_CAP;
+
+  const rawCommission = amount * commissionRate;
+  const platformCommission =
+    commissionCapGbp > 0
+      ? Math.min(rawCommission, commissionCapGbp, amount)
+      : Math.min(rawCommission, amount);
 
   // 3. Final Net
   const netPayout = amount - stripeFee - platformCommission;
@@ -87,7 +146,9 @@ export function calculatePayoutBreakdown(amount: number, tier: string = 'payg', 
     stripeFee,
     platformCommission,
     netPayout,
-    paymentRail
+    paymentRail,
+    appliedCommissionRate: commissionRate,
+    commissionCapGbp,
   };
 }
 
@@ -243,14 +304,23 @@ export function calculateFlexiPayMerchantFee(
  * Generates the Stripe Onboarding Link for a trader or driver.
  * Calls real server endpoint /api/stripe/create-connect-account with user auth token.
  */
-export async function getStripeOnboardingLink(_userId: string): Promise<string> {
+export async function getStripeOnboardingLink(
+  _userId: string,
+  returnTarget?: "billing" | "profile",
+  businessType?: "individual" | "company" | "non_profit"
+): Promise<string> {
   const token = await auth.currentUser?.getIdToken();
+  const payload: Record<string, string> = {};
+  if (returnTarget) payload.returnTarget = returnTarget;
+  if (businessType) payload.businessType = businessType;
+
   const res = await fetch("/api/stripe/create-connect-account", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {})
-    }
+    },
+    ...(Object.keys(payload).length > 0 ? { body: JSON.stringify(payload) } : {})
   });
 
   const data = await res.json().catch(() => ({}));
@@ -269,6 +339,7 @@ export async function getStripeAccountStatus(): Promise<{
   payoutsEnabled?: boolean;
   chargesEnabled?: boolean;
   detailsSubmitted?: boolean;
+  error?: string;
 }> {
   try {
     const token = await auth.currentUser?.getIdToken();
@@ -280,10 +351,18 @@ export async function getStripeAccountStatus(): Promise<{
     if (res.ok) {
       return await res.json();
     }
+    const errData = await res.json().catch(() => ({}));
+    return {
+      connected: false,
+      payoutsEnabled: false,
+      chargesEnabled: false,
+      detailsSubmitted: false,
+      error: errData?.error || `Unable to check Stripe status (${res.status})`
+    };
   } catch (err) {
     console.warn("Failed to fetch Stripe account status:", err);
   }
-  return { connected: false, payoutsEnabled: false, chargesEnabled: false };
+  return { connected: false, payoutsEnabled: false, chargesEnabled: false, detailsSubmitted: false };
 }
 
 /**

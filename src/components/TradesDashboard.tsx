@@ -26,7 +26,6 @@ import { getRegionalDemandData, RegionalDemand } from "@/src/services/demandHeat
 import { InstantMatchTraderAlert } from "./InstantMatchTraderAlert";
 import { FinancialDashboardWidget } from "./FinancialDashboardWidget";
 import { TraderMonetizationBanners } from "./TraderMonetizationBanners";
-import { INITIAL_MOCK_FLASH_DEALS } from "@/src/services/seedService";
 import { 
   isDealSoldOut, 
   isDealPaused, 
@@ -37,7 +36,17 @@ import {
   formatDealScheduleText 
 } from "@/src/lib/flashDeals";
 import TraderNotificationPreferencesModal from "./TraderNotificationPreferencesModal";
+import DocumentComplianceReminderBanner from "./shared/DocumentComplianceReminderBanner";
 import { checkAndNotifyTraderMatches } from "@/src/services/traderNotificationEngine";
+import { isTradeProviderAccount } from "@/src/lib/accountRoles";
+import { PUBLIC_OPEN_JOB_STATUSES, isOpenJobStatus, isProfileAcceptingNewWork } from "@/src/lib/marketplaceContracts";
+import { calculateJobFitForTrader } from "@/src/services/matchingEngine";
+import {
+  evaluateGeographicFit,
+  extractTraderCategories,
+  hasExclusiveLeadAccess,
+  isWithinExclusiveWindow,
+} from "@/src/lib/unifiedJobMatching";
 
 const iconMap: Record<string, any> = {
   Briefcase, Clock, MessageSquare, CheckCircle2, ChevronRight, Star, Search, BarChart3, PoundSterling, ShieldCheck, Zap, UserPlus, ImageIcon, VideoIcon
@@ -46,7 +55,6 @@ const iconMap: Record<string, any> = {
 export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) {
   const { user, profile } = useAuth();
   const navigate = useNavigate();
-  const [showTestAlert, setShowTestAlert] = useState(false);
   const [activeQuotes, setActiveQuotes] = useState<any[]>([]);
   const [activeJobs, setActiveJobs] = useState<any[]>([]);
   const [postedJobs, setPostedJobs] = useState<any[]>([]);
@@ -74,6 +82,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
   const [isSavingIM, setIsSavingIM] = useState(false);
   const [showSavingsInfo, setShowSavingsInfo] = useState(false);
   const [showTimingModal, setShowTimingModal] = useState(false);
+  const [pendingDeleteDealId, setPendingDeleteDealId] = useState<string | null>(null);
 
   // Background check for newly matched jobs according to schedule & emergency bypass
   useEffect(() => {
@@ -160,16 +169,49 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
         attemptArray.sort((a: any, b: any) => b.attemptNumber - a.attemptNumber);
         const attempt = attemptArray[0];
         
-        // Fetch Job Details
+        // Use embedded non-PII job summary from attempt doc first, falling back to public_job_cards (never crash on private jobs/{id})
         try {
-          const matchDoc = await getDoc(doc(db, "instant_matches", attempt.instantMatchId));
-          if (matchDoc.exists() && matchDoc.data().jobId) {
-             const jobDoc = await getDoc(doc(db, "jobs", matchDoc.data().jobId));
-             if (jobDoc.exists()) {
-                setActiveIMJob({id: jobDoc.id, ...jobDoc.data()});
-                setActiveIMAttempt(attempt);
-                setShowIMAlert(true);
-             }
+          let resolvedJobId = attempt.jobId || null;
+          if (!resolvedJobId && attempt.instantMatchId) {
+            const matchDoc = await getDoc(doc(db, "instant_matches", attempt.instantMatchId)).catch(() => null);
+            if (matchDoc && matchDoc.exists()) {
+              resolvedJobId = matchDoc.data()?.jobId || null;
+            }
+          }
+
+          if (attempt.jobTitle || attempt.jobCategory) {
+            setActiveIMJob({
+              id: resolvedJobId || attempt.id,
+              title: attempt.jobTitle || `Emergency ${attempt.jobCategory || "Trade"} Job`,
+              category: attempt.jobCategory || "Emergency",
+              description: attempt.jobDescription || "",
+              postcode: attempt.jobPostcodeArea || "",
+              urgency: attempt.jobUrgency || "emergency",
+              location: { address: attempt.jobPostcodeArea || "Local area" },
+            });
+            setActiveIMAttempt(attempt);
+            setShowIMAlert(true);
+          } else if (resolvedJobId) {
+            const cardDoc = await getDoc(doc(db, "public_job_cards", resolvedJobId)).catch(() => null);
+            if (cardDoc && cardDoc.exists()) {
+              const cardData = cardDoc.data();
+              setActiveIMJob({
+                id: cardDoc.id,
+                ...cardData,
+                location: { address: cardData?.postcodeArea || cardData?.city || "Local area" },
+              });
+              setActiveIMAttempt(attempt);
+              setShowIMAlert(true);
+            } else {
+              setActiveIMJob({
+                id: resolvedJobId,
+                title: "Urgent Instant Match Job",
+                category: "Emergency",
+                location: { address: "Local area" },
+              });
+              setActiveIMAttempt(attempt);
+              setShowIMAlert(true);
+            }
           }
         } catch (e) {
           console.error("Failed to load instant match job details:", e);
@@ -289,10 +331,10 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
               description: sysConfig?.paidAddons?.exclusiveLeads?.description || 'Early-access priority notifications and exclusive trade leads'
             }
           },
-          priceId: "price_mock_exclusive_addon",
+          priceId: "price_exclusive_leads",
           successUrl: `${window.location.origin}/dashboard?exclusive_success=true`,
           cancelUrl: `${window.location.origin}/dashboard`,
-          metadata: { isExclusiveAddon: "true" }
+          metadata: { isExclusiveAddon: "true", type: "exclusive_leads", userId: user.uid }
         }),
       });
 
@@ -414,20 +456,17 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
 
     const unsubscribeDeals = onSnapshot(dealsQuery, (snapshot) => {
       const dbDeals = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const mockMatches = INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === user.uid);
-      const existingIds = new Set(dbDeals.map(d => d.id));
-      const merged = [...dbDeals, ...mockMatches.filter(m => !existingIds.has(m.id))];
-      setMyDeals(merged);
+      setMyDeals(dbDeals);
     }, (error) => {
       console.error("Error fetching my flash deals:", error);
-      setMyDeals(INITIAL_MOCK_FLASH_DEALS.filter(m => m.traderId === user.uid));
+      setMyDeals([]);
     });
 
     // Fetch incoming direct quote requests and claimed flash deals
     const directRequestsQuery = query(
       collection(db, "jobs"),
       where("targetTradespersonId", "==", user.uid),
-      where("status", "in", ["posted", "open"])
+      where("status", "in", [...PUBLIC_OPEN_JOB_STATUSES])
     );
 
     const unsubscribeDirectRequests = onSnapshot(directRequestsQuery, (snapshot) => {
@@ -448,77 +487,114 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
   }, [user, profile]);
 
   const fetchRecommendations = async (bypassCache = false) => {
-    if (!user || !profile || profile.role !== "tradesperson") return;
+    if (!user || !profile || !isTradeProviderAccount(profile)) return;
     
     setIsRecommending(true);
     try {
       const cacheRef = doc(db, "users", user.uid, "recommendations", "current");
+      const CACHE_TTL_MS = 15 * 60 * 1000; // 15-minute fresh cache (prevents showing day-old closed jobs)
       
       if (!bypassCache) {
-        // 1. Attempt to load from 24h Firestore cache
         const cacheSnap = await getDoc(cacheRef);
         if (cacheSnap.exists()) {
           const cacheData = cacheSnap.data();
           const createdAt = cacheData.createdAt;
           const cacheTime = createdAt ? new Date(createdAt).getTime() : 0;
-          if (Date.now() - cacheTime < 24 * 60 * 60 * 1000) {
-            setRecommendedJobs(cacheData.jobs || []);
+          if (Date.now() - cacheTime < CACHE_TTL_MS) {
+            const freshOpenJobs = (cacheData.jobs || []).filter((j: any) => isOpenJobStatus(j?.status));
+            setRecommendedJobs(freshOpenJobs);
             setIsRecommending(false);
             return;
           }
         }
       }
 
-      // Use profile trades, or default to null for guests/incomplete profiles
-      const categoryToMatch = (profile.trades && profile.trades.length > 0) ? profile.trades[0] : null;
+      // Match across ALL registered trader categories (up to Firestore `in` limit of 10), not just trades[0]
+      const traderCategories = extractTraderCategories(profile).slice(0, 10);
       
-      // Fetch some recent jobs (filtered by category if available)
-      let q;
-      if (categoryToMatch) {
-        q = query(
-          collection(db, "jobs"),
-          where("status", "==", "posted"),
-          where("category", "==", categoryToMatch),
-          orderBy("postedDate", "desc"),
-          limit(10)
-        );
-      } else {
-        q = query(
-          collection(db, "jobs"),
-          where("status", "==", "posted"),
-          orderBy("postedDate", "desc"),
-          limit(10)
-        );
-      }
+      // Query public_job_cards discovery projection (never private jobs collection; max 1 `in` clause per Firestore query)
+      const q =
+        traderCategories.length > 0
+          ? query(
+              collection(db, "public_job_cards"),
+              where("category", "in", traderCategories),
+              limit(40)
+            )
+          : query(
+              collection(db, "public_job_cards"),
+              where("status", "in", [...PUBLIC_OPEN_JOB_STATUSES]),
+              limit(30)
+            );
       
       const snapshot = await getDocs(q);
 
-      const jobs = snapshot.docs.map((doc: any) => ({ id: doc.id, ...doc.data() }));
-      if (jobs.length > 0) {
-        const recommendations = await getRecommendedJobs(
-          { ...profile, category: categoryToMatch }, 
-          jobs, 
-          activeJobs, 
-          {
-            standard: profile.availability,
-            overrides: profile.dateOverrides
-          }
-        );
-        
-        const enriched = recommendations
-          .map(rec => {
-            const job = jobs.find(j => j.id === rec.id);
-            if (!job) return null;
-            return { ...job, aiReason: rec.reason };
-          })
-          .filter(Boolean);
+      // Filter by open status, Priority Offers exclusive window, and unified geodesic/postcode-centroid radius,
+      // then pre-rank with honest trader-facing Job Fit Score before Gemini refinement
+      const eligibleJobs = snapshot.docs
+        .map((docSnap: any) => ({ id: docSnap.id, ...docSnap.data() }))
+        .filter((job: any) => {
+          if (!isOpenJobStatus(job.status)) return false;
+          if (isWithinExclusiveWindow(job) && !hasExclusiveLeadAccess(profile)) return false;
+          if (Number(job.quoteCount || 0) >= 5) return false;
+          const geo = evaluateGeographicFit(profile, job);
+          return geo.withinRadius;
+        })
+        .map((job: any) => {
+          const fit = calculateJobFitForTrader(profile, job, { mode: "strict" });
+          return {
+            ...job,
+            matchScore: fit.compositeScore,
+            distanceMiles: fit.distanceMiles,
+            matchHighlights: fit.keyHighlights,
+          };
+        })
+        .filter((job: any) => job.matchScore > 10)
+        .sort((a: any, b: any) => b.matchScore - a.matchScore)
+        .slice(0, 15);
+
+      if (eligibleJobs.length > 0) {
+        let enriched: any[] = [];
+        try {
+          const recommendations = await getRecommendedJobs(
+            { ...profile, category: traderCategories.join(", ") || profile.category || "" },
+            eligibleJobs,
+            activeJobs,
+            {
+              standard: profile.availability,
+              overrides: profile.dateOverrides,
+            }
+          );
+          enriched = recommendations
+            .map((rec) => {
+              const job = eligibleJobs.find((j) => j.id === rec.id);
+              if (!job) return null;
+              return { ...job, aiReason: rec.reason };
+            })
+            .filter(Boolean);
+        } catch {
+          // Graceful deterministic fallback using unified Job Fit ranking if Gemini is unavailable
+          enriched = eligibleJobs.slice(0, 5).map((job: any) => ({
+            ...job,
+            aiReason:
+              job.matchHighlights?.length > 0
+                ? `${job.matchScore}% match · ${job.matchHighlights.slice(0, 2).join(" • ")}`
+                : `${job.matchScore}% unified match for your trade and coverage area`,
+          }));
+        }
+
+        if (enriched.length === 0) {
+          enriched = eligibleJobs.slice(0, 5).map((job: any) => ({
+            ...job,
+            aiReason: `${job.matchScore}% unified match for your trade and coverage area`,
+          }));
+        }
 
         setRecommendedJobs(enriched);
 
-        // Save to 24h Firestore cache
+        // Save to 15-minute Firestore cache
         await setDoc(cacheRef, {
           jobs: enriched,
-          createdAt: new Date().toISOString()
+          createdAt: new Date().toISOString(),
         });
       } else {
         setRecommendedJobs([]);
@@ -544,6 +620,9 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
           description="Manage your quotes, active jobs, and find new work opportunities on AnyTrader."
         />
       )}
+
+      {/* Persistent Document Upload Grace Period / Admin Approval Reminder */}
+      <DocumentComplianceReminderBanner profile={profile} />
       
       <motion.div 
         layout
@@ -572,7 +651,8 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                   <CheckCircle2 className="w-2 h-2" />
                   {profile?.verificationStatus === "auditioned" ? "Auditioned Pro" : 
                    profile?.verificationStatus === "vetted" ? "Vetted Pro" : 
-                   profile?.verificationStatus === "verified" ? "Verified Status" : "Onboarding"}
+                   profile?.verificationStatus === "verified" ? "Verified Status" :
+                   profile?.verificationStatus === "provisional" ? "Provisional Access" : "Onboarding"}
                 </div>
               </div>
               
@@ -602,7 +682,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
               >
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
                   <p className="text-blue-100/70 text-sm font-medium max-w-md">
-                    As a beta member, we've waived the standard 15% success fee on your completed jobs. Enjoy 100% of your earnings.
+                    Zero lead fees and no pay-per-click bidding. Only pay when you win and complete work through AnyTrader.
                   </p>
                   
                   <div className="bg-white/10 backdrop-blur-md p-4 rounded-3xl border border-black/10 flex items-center gap-4 shrink-0">
@@ -629,7 +709,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
       </motion.div>
 
       {/* Availability Status Banner */}
-      {profile?.isAcceptingRequests === false && (
+      {!isProfileAcceptingNewWork(profile) && (
         <div className="bg-amber-50 border border-amber-200 p-4 rounded-2xl flex items-center justify-between gap-4 animate-in slide-in-from-top-4">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center shrink-0">
@@ -669,12 +749,16 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
               setConfirmingEmergency(false);
               setShowEmergencyToast(false);
               try {
+                const nextEmergency = !profile?.isAvailableForEmergency;
                 await updateDoc(doc(db, "users", user.uid), {
-                  isAvailableForEmergency: !profile?.isAvailableForEmergency
+                  isAvailableForEmergency: nextEmergency
                 });
+                await setDoc(doc(db, "public_profiles", user.uid), {
+                  isAvailableForEmergency: nextEmergency
+                }, { merge: true }).catch(() => {});
               } catch (error) {
                 console.error("Error updating emergency status:", error);
-                alert("Unable to update emergency status.");
+                toast.error("Unable to update emergency status.");
               }
             }}
             className={cn(
@@ -724,12 +808,16 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
               setConfirmingIM(false);
               setShowIMToast(false);
               try {
+                const nextIM = !profile?.isAvailableForInstantMatch;
                 await updateDoc(doc(db, "users", user.uid), {
-                  isAvailableForInstantMatch: !profile?.isAvailableForInstantMatch
+                  isAvailableForInstantMatch: nextIM
                 });
+                await setDoc(doc(db, "public_profiles", user.uid), {
+                  isAvailableForInstantMatch: nextIM
+                }, { merge: true }).catch(() => {});
               } catch (error) {
                 console.error("Error updating Instant Match status:", error);
-                alert("Unable to update Instant Match status.");
+                toast.error("Unable to update Instant Match status.");
               }
             }}
             className={cn(
@@ -772,7 +860,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                     
                     // Brief toast explanation
                     if (newState) {
-                       alert("Priority Offer Activated: You will now receive early-access notifications for new jobs matching your profile.");
+                       toast.success("Priority Offers Activated: You will now receive early-access notifications for matching jobs.");
                     }
                   } catch (error) {
                     console.error("Error toggling exclusive status", error);
@@ -800,17 +888,6 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
               </div>
             </div>
           )}
-
-          {/* Test Alert Button (Integrated into row with no overlap) */}
-          <button
-            type="button"
-            onClick={() => setShowTestAlert(true)}
-            className="flex items-center gap-1.5 bg-zinc-900 hover:bg-zinc-800 text-white px-3 py-2 rounded-[10px] shadow-xs transition-all shrink-0 active:scale-95 border border-black"
-            title="Test Instant Match Alert notification"
-          >
-            <Zap className="w-4 h-4 text-red-500 fill-red-500 animate-pulse shrink-0" />
-            <span className="text-[13px] font-extrabold whitespace-nowrap">Test IM Alert</span>
-          </button>
         </div>
       </div>
 
@@ -831,7 +908,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                   });
                 } else {
                   await navigator.clipboard.writeText(profileUrl);
-                  alert('Profile link copied to clipboard!');
+                  toast.success("Profile link copied to clipboard!");
                 }
               } catch (err: any) {
                 if (err.name === 'AbortError') {
@@ -913,9 +990,16 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
           </div>
           <p className={cn(
             "text-xs sm:text-xs font-black truncate leading-none",
-            profile?.verificationStatus === "verified" ? "text-green-600" : "text-amber-600"
+            profile?.verificationStatus === "verified" ? "text-green-600" :
+            profile?.verificationStatus === "provisional" ? "text-blue-700" : "text-amber-600"
           )}>
-            {profile?.verificationStatus === "verified" ? "Verified" : "Unverified"}
+            {profile?.verificationStatus === "verified"
+              ? "Verified"
+              : profile?.verificationStatus === "provisional"
+                ? "Provisional"
+                : profile?.verificationStatus === "pending" || profile?.verificationStatus === "pending_review"
+                  ? "Pending Review"
+                  : "Action Needed"}
           </p>
         </div>
         <div className="bg-white p-2.5 rounded-xl border border-black shadow-sm flex flex-col justify-between min-w-0 h-20">
@@ -1033,7 +1117,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
       )}
 
       {/* AI Recommendations */}
-      {profile?.role === "tradesperson" && (
+      {isTradeProviderAccount(profile) && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -1906,17 +1990,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                       </span>
                       <button
                         type="button"
-                        onClick={async () => {
-                          if (!confirm("Are you sure you want to delete this deal?")) return;
-                          try {
-                            const { deleteDoc, doc } = await import("firebase/firestore");
-                            await deleteDoc(doc(db, "flash_deals", deal.id));
-                            toast.success("Deal deleted successfully.");
-                          } catch (e) {
-                            console.error("Error deleting deal:", e);
-                            toast.error("Failed to delete deal.");
-                          }
-                        }}
+                        onClick={() => setPendingDeleteDealId(deal.id)}
                         className="text-xs font-bold text-red-500 hover:text-red-700 transition-colors cursor-pointer"
                       >
                         Remove Deal
@@ -1964,7 +2038,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                   <div className="flex items-center gap-2 mt-1">
                     <span className={cn(
                       "text-[10px] font-bold uppercase px-2 py-0.5 rounded-full",
-                      job.status === "posted" ? "bg-blue-50 text-blue-600" :
+                      isOpenJobStatus(job.status) ? "bg-blue-50 text-blue-600" :
                       job.status === "in_progress" ? "bg-amber-50 text-amber-600" :
                       job.status === "completed" ? "bg-green-50 text-green-600" :
                       "bg-slate-100 text-slate-600"
@@ -1972,7 +2046,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                       {job.status.replace('_', ' ')}
                     </span>
                     <span className="text-xs text-slate-400">•</span>
-                    <span className="text-xs text-slate-500">{job.quotesCount || 0} quotes</span>
+                    <span className="text-xs text-slate-500">{job.quoteCount ?? job.quotesCount ?? 0} quotes</span>
                   </div>
                 </div>
                 <ChevronRight className="w-5 h-5 text-slate-300 group-hover:text-blue-600 transition-colors" />
@@ -2043,7 +2117,7 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                     </div>
                     <div>
                       <h4 className="font-bold text-slate-900 text-sm">Time-Gated Leads</h4>
-                      <p className="text-xs text-slate-500">Access emergency jobs early and normal jobs 15 mins early.</p>
+                      <p className="text-xs text-slate-500">Access emergency jobs early and standard jobs 30 mins early.</p>
                     </div>
                   </div>
                   <div className="flex items-start gap-3">
@@ -2089,21 +2163,6 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
           </div>
         )}
       </AnimatePresence>
-      {/* Instant Match Trader Alert Demo */}
-      <AnimatePresence>
-        {showTestAlert && (
-          <InstantMatchTraderAlert 
-            job={{ id: '1', title: 'Burst Pipe', location: { address: 'Peckham, SE15' }, assetName: 'Main House' }}
-            expiresAt={new Date(Date.now() + 60000).toISOString()}
-            onAccept={() => {
-              alert('Job Accepted!');
-              setShowTestAlert(false);
-            }}
-            onDecline={() => setShowTestAlert(false)}
-          />
-        )}
-      </AnimatePresence>
-
       {/* Actual Instant Match Worker Notification */}
       <AnimatePresence>
         {showIMAlert && activeIMJob && activeIMAttempt && (
@@ -2228,10 +2287,13 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
                         },
                         isAvailableForInstantMatch: true
                       });
+                      await setDoc(doc(db, "public_profiles", user!.uid), {
+                        isAvailableForInstantMatch: true
+                      }, { merge: true }).catch(() => {});
                       setShowInstantMatchSetup(false);
                     } catch (error) {
                       console.error("Failed to save instant match settings", error);
-                      alert("Error saving settings.");
+                      toast.error("Error saving Instant Match settings.");
                     } finally {
                       setIsSavingIM(false);
                     }
@@ -2245,6 +2307,47 @@ export default function TradesDashboard({ isSubView }: { isSubView?: boolean }) 
           </div>
         )}
       </AnimatePresence>
+
+      {/* Delete Flash Deal Confirmation Modal */}
+      {pendingDeleteDealId && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[130] flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full shadow-2xl border border-black space-y-4">
+            <div className="text-center space-y-2">
+              <h4 className="text-base font-black text-black">Delete Flash Deal?</h4>
+              <p className="text-xs text-black leading-relaxed">
+                Are you sure you want to remove this deal? Homeowners will no longer see it on your profile or offers feed.
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteDealId(null)}
+                className="flex-1 py-2.5 rounded-xl border border-black text-black text-xs font-bold hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const dealId = pendingDeleteDealId;
+                  setPendingDeleteDealId(null);
+                  try {
+                    const { deleteDoc, doc } = await import("firebase/firestore");
+                    await deleteDoc(doc(db, "flash_deals", dealId));
+                    toast.success("Deal deleted successfully.");
+                  } catch (e) {
+                    console.error("Error deleting deal:", e);
+                    toast.error("Failed to delete deal.");
+                  }
+                }}
+                className="flex-1 py-2.5 rounded-xl bg-red-600 text-white text-xs font-black border border-black hover:bg-red-700 cursor-pointer"
+              >
+                Delete Deal
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Trader Match Notification Timing & Radius Preferences Modal */}
       <TraderNotificationPreferencesModal

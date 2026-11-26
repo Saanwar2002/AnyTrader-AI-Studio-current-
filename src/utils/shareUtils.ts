@@ -1,3 +1,5 @@
+import { toast } from "sonner";
+
 /**
  * TradeOS / AnyTrader Privacy Share Utility (Strategy 1)
  * Enables secure sharing of Jobs, Quotes, Invoices, and Property Passports
@@ -40,7 +42,7 @@ export function getPrivacyShareUrl(type: ShareType, id: string): string {
 }
 
 /**
- * Prepares formatted WhatsApp share text and triggers opening WhatsApp.
+ * Prepares formatted WhatsApp share text and copies it safely without calling window.open.
  */
 export function shareToWhatsApp(options: ShareOptions): void {
   const shareUrl = getPrivacyShareUrl(options.type, options.id);
@@ -61,8 +63,18 @@ export function shareToWhatsApp(options: ShareOptions): void {
       break;
   }
 
-  const whatsappUrl = `https://wa.me/?text=${encodeURIComponent(message)}`;
-  window.open(whatsappUrl, "_blank", "noopener,noreferrer");
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    navigator.clipboard
+      .writeText(message)
+      .then(() => {
+        toast.success("WhatsApp share message copied to clipboard — paste in WhatsApp to send.");
+      })
+      .catch(() => {
+        toast.info("Use Copy Link to share this item securely.");
+      });
+  } else {
+    toast.info("Use Copy Link to share this item securely.");
+  }
 }
 
 /**

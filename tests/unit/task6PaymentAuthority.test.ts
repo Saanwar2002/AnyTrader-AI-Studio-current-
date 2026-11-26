@@ -453,8 +453,8 @@ describe("Task 6: Comprehensive Payment Authority & Escrow Security Suite", () =
       expect(ledgerSnap.docs.length).toBe(1); // Exactly 1 ledger effect
       const ledgerData = ledgerSnap.docs[0].data();
       expect(ledgerData.amount).toBe(50000); // £500 * 100
-      expect(ledgerData.platformFee).toBe(6000); // 12%
-      expect(ledgerData.netPayout).toBe(44000); // 88%
+      expect(ledgerData.platformFee).toBe(2500); // canonical 5% PAYG
+      expect(ledgerData.netPayout).toBe(47500); // 95%
 
       // Stripe Transfer verification
       expect(stripeTransfers.length).toBe(1); // Exactly 1 Stripe transfer request
@@ -712,8 +712,8 @@ describe("Task 6: Comprehensive Payment Authority & Escrow Security Suite", () =
       expect(ledgerSnap.docs.length).toBe(1);
       const data = ledgerSnap.docs[0].data();
       expect(data.amount).toBe(50000); // 500 * 100, read from DB
-      expect(data.platformFee).toBe(6000); // calculated on server
-      expect(data.netPayout).toBe(44000); // calculated on server
+      expect(data.platformFee).toBe(2500); // calculated on server (5% PAYG)
+      expect(data.netPayout).toBe(47500); // calculated on server
       expect(data.stripeTransferId).toBe("tr_honest"); // assigned by server/stripe, ignoring "attacker-transfer"
     });
   });

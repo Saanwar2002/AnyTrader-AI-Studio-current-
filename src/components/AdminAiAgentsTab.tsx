@@ -255,10 +255,10 @@ export default function AdminAiAgentsTab({ users, jobs, reviews, logs }: AdminAi
         showNotice(res.outcomeMessage, "success");
         setDisputes(prev => prev.filter(item => item.id !== c.id));
       } else {
-        showNotice("Failed to execute dispute settlement", "error");
+        showNotice(res.outcomeMessage || "Dispute settlement must be executed from the authoritative Disputes console.", "info");
       }
-    } catch (err) {
-      showNotice("Error executing dispute payout", "error");
+    } catch (err: any) {
+      showNotice(err?.message || "Dispute settlement must be executed from the authoritative Disputes console.", "info");
     } finally {
       setExecutingDisputeId(null);
     }
@@ -283,10 +283,10 @@ export default function AdminAiAgentsTab({ users, jobs, reviews, logs }: AdminAi
         showNotice(res.outcomeMessage, "success");
         setComplianceAlerts(prev => prev.map(a => a.id === alert.id ? { ...a, autoActionTaken: true } : a));
       } else {
-        showNotice("Failed to auto-dispatch compliance pro", "error");
+        showNotice(res.outcomeMessage || "Compliance dispatch must be executed from the authoritative Jobs or Gotham console.", "info");
       }
-    } catch (err) {
-      showNotice("Error auto-dispatching pro", "error");
+    } catch (err: any) {
+      showNotice(err?.message || "Compliance dispatch must be executed from the authoritative Jobs or Gotham console.", "info");
     } finally {
       setExecutingComplianceId(null);
     }

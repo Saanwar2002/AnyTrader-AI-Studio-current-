@@ -24,8 +24,10 @@ describe("Security Remediation H3 — Notification & Queue Abuse Prevention Audi
     });
 
     it("locks /sms_queue from all client direct read/write operations", () => {
-      expect(rulesCode).toContain("match /sms_queue/{queueId}");
-      expect(rulesCode).toContain("allow read, write: if isAdmin();");
+      const smsBlockMatch = rulesCode.match(/match \/sms_queue\/\{queueId\} \{([\s\S]*?)\}/);
+      expect(smsBlockMatch).toBeTruthy();
+      expect(smsBlockMatch![1]).toContain("allow read: if isAdmin();");
+      expect(smsBlockMatch![1]).toContain("allow write: if isMutatingAdmin();");
     });
 
     it("locks /email_queue and /email_alerts_queue from all client direct read/write operations", () => {

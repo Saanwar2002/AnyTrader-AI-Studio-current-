@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { cn } from "@/src/lib/utils";
 
 interface TrustPulseProps {
-  status: "verified" | "vetted" | "auditioned" | "unverified";
+  status: "verified" | "vetted" | "auditioned" | "provisional" | "pending" | "unverified" | string;
   className?: string;
   traderId: string;
 }
@@ -14,8 +14,12 @@ export const TrustPulse = ({ status, className, traderId }: TrustPulseProps) => 
   const [lastCheck, setLastCheck] = useState<Date>(new Date());
   const [pulseColor, setPulseColor] = useState("emerald");
 
+  const normalizedStatus = String(status || "unverified").toLowerCase();
+  const isVerifiedTier = ["verified", "vetted", "auditioned"].includes(normalizedStatus);
+
   useEffect(() => {
-    // Simulate periodic "Live Pulse" checks
+    if (!isVerifiedTier) return;
+    // Simulate periodic "Live Pulse" checks for verified tiers only
     const interval = setInterval(() => {
       setIsVerifying(true);
       setTimeout(() => {
@@ -25,10 +29,35 @@ export const TrustPulse = ({ status, className, traderId }: TrustPulseProps) => 
     }, 15000); // Check every 15 seconds
 
     return () => clearInterval(interval);
-  }, []);
+  }, [isVerifiedTier]);
+
+  if (normalizedStatus === "unverified") return null;
+
+  if (normalizedStatus === "provisional" || normalizedStatus === "pending") {
+    const isDocsPendingReview = normalizedStatus === "pending";
+    return (
+      <div className={cn("inline-flex flex-col gap-1", className)}>
+        <div className="inline-flex items-center gap-2 px-2.5 py-1 bg-amber-50 border border-black rounded-xl shadow-xs">
+          <Clock className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+          <div className="flex flex-col">
+            <span className="text-[10px] font-black uppercase tracking-wider text-black leading-none">
+              {isDocsPendingReview ? "Verification In Review" : "New Trader · Verification Pending"}
+            </span>
+            <span className="text-[9px] font-semibold text-black/80 mt-0.5 leading-none">
+              {isDocsPendingReview
+                ? "Documents submitted · Awaiting Admin check"
+                : "ID & insurance upload pending"}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isVerifiedTier) return null;
 
   const getTierData = () => {
-    switch (status) {
+    switch (normalizedStatus) {
       case "auditioned":
         return {
           label: "Auditioned Pro",
@@ -61,8 +90,6 @@ export const TrustPulse = ({ status, className, traderId }: TrustPulseProps) => 
   };
 
   const data = getTierData();
-
-  if (status === "unverified") return null;
 
   return (
     <div className={cn("inline-flex flex-col gap-1.5", className)}>

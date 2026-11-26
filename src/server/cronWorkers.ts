@@ -611,3 +611,185 @@ export async function fetchPostcodeWithTimeout(
     clearTimeout(timeoutId);
   }
 }
+
+function parseTimestampMs(raw: unknown): number {
+  if (!raw) return 0;
+  if (typeof (raw as any)?.toMillis === "function") return Number((raw as any).toMillis()) || 0;
+  if (typeof (raw as any)?.toDate === "function") return (raw as any).toDate().getTime() || 0;
+  if (typeof (raw as any)?.seconds === "number") return (raw as any).seconds * 1000;
+  const parsed = Date.parse(String(raw));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Slice 4: Publishes mature 14-day cooling-off reviews whose publishAt <= now,
+ * recalculating both users/{revieweeId} and public_profiles/{revieweeId} aggregates atomically.
+ */
+export async function publishMatureCoolingOffReviewsCommand(
+  db: any,
+  options: { maintenanceActive?: boolean; nowMs?: number; limit?: number } = {}
+): Promise<CronWorkerRunSummary> {
+  const { maintenanceActive = false, nowMs = Date.now(), limit = 100 } = options;
+
+  if (!db) {
+    return {
+      worker: "cooling_off_reviews",
+      status: "skipped",
+      executedCount: 0,
+      skippedCount: 1,
+      failedCount: 0,
+      errors: [],
+      reason: "database_unavailable",
+    };
+  }
+  if (maintenanceActive) {
+    return {
+      worker: "cooling_off_reviews",
+      status: "skipped",
+      executedCount: 0,
+      skippedCount: 1,
+      failedCount: 0,
+      errors: [],
+      reason: "maintenance_mode_active",
+    };
+  }
+
+  let executedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+  const errors: string[] = [];
+  const nowIso = new Date(nowMs).toISOString();
+
+  try {
+    const snap = await db
+      .collection("reviews")
+      .where("status", "==", "cooling_off")
+      .limit(limit)
+      .get();
+    const docs = Array.isArray(snap?.docs) ? snap.docs : [];
+
+    for (const reviewDoc of docs) {
+      const review = (typeof reviewDoc.data === "function" ? reviewDoc.data() : reviewDoc.data) || {};
+      const publishAtMs = parseTimestampMs(review.publishAt);
+      if (review.isHidden === true || !publishAtMs || publishAtMs > nowMs) {
+        skippedCount++;
+        continue;
+      }
+
+      const revieweeId = String(review.revieweeId || review.targetId || review.tradespersonId || "").trim();
+      const reviewType = review.type === "homeowner_review" ? "homeowner_review" : "tradesperson_review";
+      const numRating = Number(review.rating);
+
+      try {
+        await db.runTransaction(async (tx: any) => {
+          const rRef = db.collection("reviews").doc(reviewDoc.id);
+          const uRef = revieweeId ? db.collection("users").doc(revieweeId) : null;
+          const pRef = revieweeId ? db.collection("public_profiles").doc(revieweeId) : null;
+
+          const [freshReviewSnap, userSnap, pubSnap] = await Promise.all([
+            tx.get(rRef),
+            uRef ? tx.get(uRef) : Promise.resolve(null),
+            pRef ? tx.get(pRef) : Promise.resolve(null),
+          ]);
+
+          if (!freshReviewSnap?.exists) return;
+          const freshReview =
+            (typeof freshReviewSnap.data === "function" ? freshReviewSnap.data() : freshReviewSnap.data) || {};
+          if (freshReview.status !== "cooling_off" || freshReview.isHidden === true) {
+            return;
+          }
+
+          tx.update(rRef, {
+            status: "published",
+            publishedAt: nowIso,
+            updatedAt: nowIso,
+          });
+
+          if (revieweeId && Number.isFinite(numRating) && numRating >= 1 && numRating <= 5) {
+            const userExists = userSnap ? (typeof userSnap.exists === "function" ? userSnap.exists() : Boolean(userSnap.exists)) : false;
+            const pubExists = pubSnap ? (typeof pubSnap.exists === "function" ? pubSnap.exists() : Boolean(pubSnap.exists)) : false;
+            const userData = userExists
+              ? (typeof userSnap.data === "function" ? userSnap.data() : userSnap.data) || {}
+              : {};
+
+            if (reviewType === "tradesperson_review") {
+              const currRating = Number(userData.rating) || 0;
+              const currTotal = Number(userData.totalReviews) || 0;
+              const currRecs = Number(userData.totalRecommendations) || 0;
+              const nextTotal = currTotal + 1;
+              const nextRating = Number((((currRating * currTotal) + numRating) / nextTotal).toFixed(2));
+              const nextRecs = freshReview.recommended === true ? currRecs + 1 : currRecs;
+              const patch = {
+                rating: nextRating,
+                totalReviews: nextTotal,
+                totalRecommendations: nextRecs,
+                updatedAt: nowIso,
+              };
+              if (userExists && uRef) tx.update(uRef, patch);
+              if (pubExists && pRef) tx.update(pRef, patch);
+            } else {
+              const currRating = Number(userData.homeownerRating) || 0;
+              const currTotal = Number(userData.totalHomeownerReviews) || 0;
+              const nextTotal = currTotal + 1;
+              const nextRating = Number((((currRating * currTotal) + numRating) / nextTotal).toFixed(2));
+              const patch = {
+                homeownerRating: nextRating,
+                totalHomeownerReviews: nextTotal,
+                updatedAt: nowIso,
+              };
+              if (userExists && uRef) tx.update(uRef, patch);
+              if (pubExists && pRef) tx.update(pRef, patch);
+            }
+
+            tx.set(
+              db.collection("notifications").doc(`review_pub_${reviewDoc.id}_${revieweeId}`),
+              {
+                userId: revieweeId,
+                title: "Review Published",
+                message: `A ${numRating}-star review from a completed job has finished its 14-day review window and is now published.`,
+                type: "system",
+                read: false,
+                jobId: freshReview.jobId || null,
+                link: freshReview.jobId ? `/job/${freshReview.jobId}` : "/profile",
+                createdAt: nowIso,
+              },
+              { merge: true }
+            );
+          }
+        });
+        executedCount++;
+      } catch (itemErr: any) {
+        failedCount++;
+        errors.push(`review:${reviewDoc.id}: ${itemErr?.message || String(itemErr)}`);
+      }
+    }
+
+    const status: CronWorkerRunSummary["status"] =
+      failedCount > 0 && executedCount === 0
+        ? "failed"
+        : failedCount > 0
+          ? "partial"
+          : "executed";
+
+    return {
+      worker: "cooling_off_reviews",
+      status,
+      executedCount,
+      skippedCount,
+      failedCount,
+      errors,
+      details: { inspectedReviews: docs.length },
+    };
+  } catch (err: any) {
+    return {
+      worker: "cooling_off_reviews",
+      status: "failed",
+      executedCount,
+      skippedCount,
+      failedCount: failedCount + 1,
+      errors: [...errors, err?.message || String(err)],
+      reason: "cooling_off_reviews_worker_error",
+    };
+  }
+}
+

@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from "motion/react";
 import { useAuth } from "./AuthProvider";
 import { usePortal } from "@/src/lib/PortalContext";
 import { cn } from "@/src/lib/utils";
+import { db, doc, onSnapshot } from "@/src/firebase";
+import { resolveFlexiPayMode, type FlexiPayMode } from "@/src/lib/marketplaceContracts";
 
 interface TextSticker {
   id: string;
@@ -75,6 +77,29 @@ export function HeaderSmartTicker() {
   const { activePortal } = usePortal();
 
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [flexiPayMode, setFlexiPayMode] = useState<FlexiPayMode>("coming_soon");
+  const [taxiPortalMode, setTaxiPortalMode] = useState<string>("off");
+
+  useEffect(() => {
+    const unsub = onSnapshot(
+      doc(db, "platform_config", "global"),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() || {};
+          setFlexiPayMode(resolveFlexiPayMode(data));
+          setTaxiPortalMode(String(data.taxiPortalMode || "off").toLowerCase());
+        } else {
+          setFlexiPayMode("coming_soon");
+          setTaxiPortalMode("off");
+        }
+      },
+      () => {
+        setFlexiPayMode("coming_soon");
+        setTaxiPortalMode("off");
+      }
+    );
+    return () => unsub();
+  }, []);
 
   const isDriver = profile?.role === "driver" || profile?.role === "fleet_driver";
   const isTrader = profile?.role === "tradesperson";
@@ -210,17 +235,21 @@ export function HeaderSmartTicker() {
         cardBg: "bg-red-50",
         tagColor: "text-red-900 bg-red-200/90",
         titleColor: "text-black",
-        tag: "⚡ 14M AVG",
+        tag: "⚡ 24/7 RAPID",
         title: "Fast Emergency Dispatch",
       },
-      {
-        id: "home-flexipay",
-        cardBg: "bg-emerald-50",
-        tagColor: "text-emerald-900 bg-emerald-200/90",
-        titleColor: "text-black",
-        tag: "0% APR",
-        title: "FlexiPay 3–12 Mo Financing",
-      },
+      ...(flexiPayMode === "live"
+        ? [
+            {
+              id: "home-flexipay",
+              cardBg: "bg-emerald-50",
+              tagColor: "text-emerald-900 bg-emerald-200/90",
+              titleColor: "text-black",
+              tag: "0% APR",
+              title: "FlexiPay 3–12 Mo Financing",
+            },
+          ]
+        : []),
       {
         id: "home-passport",
         cardBg: "bg-purple-50",
@@ -245,14 +274,18 @@ export function HeaderSmartTicker() {
         tag: "AI GUIDE",
         title: "Real-Time UK Price Estimator",
       },
-      {
-        id: "home-rides",
-        cardBg: "bg-slate-100",
-        tagColor: "text-black bg-amber-300",
-        titleColor: "text-black",
-        tag: "RIDES & VAN",
-        title: "AnyRoller Rides & Couriers",
-      },
+      ...(taxiPortalMode === "live"
+        ? [
+            {
+              id: "home-rides",
+              cardBg: "bg-slate-100",
+              tagColor: "text-black bg-amber-300",
+              titleColor: "text-black",
+              tag: "RIDES & VAN",
+              title: "AnyRoller Rides & Couriers",
+            },
+          ]
+        : []),
     ];
 
     // Interleave home value props with the 10 hot search stickers

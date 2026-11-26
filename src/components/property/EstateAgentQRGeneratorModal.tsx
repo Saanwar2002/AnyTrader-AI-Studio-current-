@@ -19,9 +19,9 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
   const [address, setAddress] = useState(initialProperty?.name || initialProperty?.address?.line1 || "");
   const [postcode, setPostcode] = useState(initialProperty?.address?.postcode || "");
   const [passportId, setPassportId] = useState(initialProperty?.id || "");
-  const [agencyName, setAgencyName] = useState("Connells Estate Agents");
-  const [branchTown, setBranchTown] = useState("London Central Branch");
-  const [agentId, setAgentId] = useState("CONN-LON-01");
+  const [agencyName, setAgencyName] = useState("");
+  const [branchTown, setBranchTown] = useState("");
+  const [agentId, setAgentId] = useState("");
   const [activeFormat, setActiveFormat] = useState<"desk_stand" | "wall_poster" | "keytag" | "a4_sheet" | "link">("desk_stand");
   const [copiedLink, setCopiedLink] = useState(false);
 
@@ -54,15 +54,23 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
     window.print();
   };
 
-  const handleShareWhatsApp = () => {
+  const displayAgencyName = agencyName.trim() || "Partner Estate Agency";
+  const displayBranchTown = branchTown.trim() || "Local Branch";
+
+  const handleShareWhatsApp = async () => {
     const text = mode === "property"
       ? `🏡 *Key Handover: Move-In Trade Pack & Property Passport*\n` +
-        `Property: *${address || "New Home"} (${postcode})*\n` +
-        `Agency: *${agencyName}*\n\n` +
+        `Property: *${address || "New Home"}${postcode ? ` (${postcode})` : ""}*\n` +
+        `Agency: *${displayAgencyName}*\n\n` +
         `Scan or tap below to unlock your Digital Property Passport, security lock re-keying & move-in trade recommendations:\n${targetUrl}`
-      : `🏢 *${agencyName} (${branchTown}) - Move-In & Trade Concierge Hub*\n\n` +
+      : `🏢 *${displayAgencyName} (${displayBranchTown}) - Move-In & Trade Concierge Hub*\n\n` +
         `Scan or tap below to access our official TradeOS Move-In Hub, verified zero-lead-fee local trades, and Digital Property Passports:\n${targetUrl}`;
-    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank", "noopener,noreferrer");
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success("WhatsApp message copied to clipboard — paste in WhatsApp to share.");
+    } catch {
+      toast.info("Use the Copy Link button to share via WhatsApp.");
+    }
   };
 
   return (
@@ -128,7 +136,7 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
             </label>
             <input
               type="text"
-              placeholder="e.g. Connells Estate Agents"
+              placeholder="e.g. Your Estate Agency"
               value={agencyName}
               onChange={(e) => setAgencyName(e.target.value)}
               className="w-full px-3 py-2 bg-white border border-black rounded-xl text-xs font-bold text-slate-900 focus:outline-none"
@@ -185,7 +193,7 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
             </label>
             <input
               type="text"
-              placeholder="e.g. CONN-LON-04"
+              placeholder="e.g. BRANCH-01"
               value={agentId}
               onChange={(e) => setAgentId(e.target.value)}
               className="w-full px-3 py-2 bg-white border border-black rounded-xl text-xs font-bold text-slate-900 focus:outline-none"
@@ -227,8 +235,8 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
                   <span className="text-[10px] font-black uppercase tracking-wider text-amber-400">Official Partner</span>
                   <span className="bg-blue-600 text-white text-[9px] font-black uppercase px-2 py-0.5 rounded">AnyTrader</span>
                 </div>
-                <h3 className="text-base font-black tracking-tight">{agencyName}</h3>
-                <p className="text-[10px] text-slate-300 font-bold">{branchTown}</p>
+                <h3 className="text-base font-black tracking-tight">{displayAgencyName}</h3>
+                <p className="text-[10px] text-slate-300 font-bold">{displayBranchTown}</p>
               </div>
 
               <div className="space-y-1 pt-1">
@@ -275,8 +283,8 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
             <div className="bg-white rounded-3xl border-2 border-black p-8 max-w-md w-full shadow-2xl space-y-6 text-center">
               <div className="flex items-center justify-between border-b-2 border-black pb-4">
                 <div className="text-left">
-                  <h3 className="text-lg font-black text-slate-900 leading-tight">{agencyName}</h3>
-                  <p className="text-xs font-bold text-slate-500">{branchTown}</p>
+                  <h3 className="text-lg font-black text-slate-900 leading-tight">{displayAgencyName}</h3>
+                  <p className="text-xs font-bold text-slate-500">{displayBranchTown}</p>
                 </div>
                 <span className="bg-slate-900 text-amber-400 border border-black text-xs font-black uppercase px-3 py-1.5 rounded-xl">
                   TradeOS
@@ -330,12 +338,12 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
             <div className="bg-white rounded-2xl border-2 border-black p-5 max-w-sm w-full shadow-lg space-y-4 text-center">
               <div className="flex items-center justify-between border-b pb-2">
                 <span className="text-[10px] font-black uppercase tracking-wider text-blue-600">AnyTrader</span>
-                <span className="text-[10px] font-bold text-slate-500">{agencyName}</span>
+                <span className="text-[10px] font-bold text-slate-500">{displayAgencyName}</span>
               </div>
 
               <div className="py-1">
                 <p className="text-xs font-black text-slate-900 leading-tight">{address || "New Home Key Tag"}</p>
-                <p className="text-[10px] font-bold text-slate-500">{postcode || branchTown}</p>
+                <p className="text-[10px] font-bold text-slate-500">{postcode || displayBranchTown}</p>
               </div>
 
               <div className="bg-slate-50 p-3 rounded-xl border border-black inline-block shadow-inner">
@@ -361,7 +369,7 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
             <div className="bg-white rounded-2xl border border-black p-6 max-w-md w-full shadow-lg space-y-4">
               <div className="flex items-center justify-between border-b pb-3">
                 <div>
-                  <h4 className="text-sm font-black text-slate-900">{agencyName}</h4>
+                  <h4 className="text-sm font-black text-slate-900">{displayAgencyName}</h4>
                   <p className="text-[10px] font-bold text-slate-400">Official Key Handover Certificate</p>
                 </div>
                 <span className="bg-blue-600 text-white text-[10px] font-black uppercase px-2 py-0.5 rounded">
@@ -371,7 +379,7 @@ export function EstateAgentQRGeneratorModal({ initialProperty, onClose }: Estate
 
               <div className="space-y-1">
                 <h3 className="text-base font-black text-slate-900">Welcome to Your New Home!</h3>
-                <p className="text-xs font-extrabold text-blue-600">{address || branchTown} {postcode}</p>
+                <p className="text-xs font-extrabold text-blue-600">{address || displayBranchTown} {postcode}</p>
               </div>
 
               <div className="flex items-center gap-4 bg-slate-50 p-3 rounded-xl border border-slate-200">

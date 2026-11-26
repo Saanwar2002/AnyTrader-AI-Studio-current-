@@ -153,7 +153,7 @@ describe("Batch 15 — Scheduling, Calendar, Chat Safety, Google Docs & Accessib
       expect(availabilitySrc).not.toContain('collection(db, "bidding_jobs")');
       expect(availabilitySrc).not.toMatch(/\balert\(/);
       expect(availabilitySrc).toContain('collection(db, "jobs")');
-      expect(availabilitySrc).toContain('where("assignedTradespersonId", "==", user.uid)');
+      expect(availabilitySrc).toContain('where("acceptedTradespersonId", "==", user.uid)');
     });
   });
 

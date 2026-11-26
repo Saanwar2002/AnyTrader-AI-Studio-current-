@@ -200,7 +200,8 @@ export function createStripeWebhookHandler(deps: StripeWebhookDependencies): Req
       }
 
       if (!db) {
-        return res.json({ received: true });
+        console.error("[Stripe Webhook] Database unavailable; returning 503 so Stripe retries.");
+        return res.status(503).json({ error: "Database service temporarily unavailable" });
       }
 
       let claimResult: ClaimLeaseResult;

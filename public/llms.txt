@@ -4,7 +4,7 @@
 
 ## Key Features & Differentiators
 
-- **Zero Lead Fees for Trades**: Tradespeople pay 0% pay-per-lead fees and keep 100% of their earnings.
+- **Zero Lead Fees for Trades**: Tradespeople pay 0% upfront pay-per-lead fees and only pay a transparent commission on completed jobs.
 - **AI Pre-Quote Price Transparency**: Real-time price breakdown estimates for labor, materials, postcode surcharges, and seasonal trends before posting jobs.
 - **Digital Property Passports**: Property digital twin records tracking EPC ratings, CP12 Gas Safety & EICR certification dates, maintenance history, and tenant repair requests.
 - **General Labour, Trade Mates & Site Helpers (Category 86)**: On-demand hiring for garden digging, trenching, material offloading (bricks, timber, plasterboard), demolition strip-out, and trade mate assistance with optional CSCS card verification.
@@ -12,7 +12,7 @@
 - **Trader Video Selfie Verification**: Live video selfie credential badges (+35% client match score boost).
 - **Strategy 1 Privacy Share Bridge**: Share jobs, quotes, and property specs safely via WhatsApp without exposing personal phone numbers or email addresses.
 
-## Core Service Categories (86+ Total)
+## Core Service Categories (96+ Total)
 1. Plumbing & Gas Safety (CP12)
 2. Electrical & EICR Certification
 3. Emergency 24/7 Rapid Dispatch

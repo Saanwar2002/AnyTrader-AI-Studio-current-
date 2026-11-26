@@ -4,11 +4,12 @@ import {
   X, PoundSterling, Calendar, Clock, Sparkles, Send, 
   CheckCircle2, AlertCircle, Loader2, Info, FileText, ChevronRight, ShieldCheck, Zap
 } from "lucide-react";
-import { db, doc, collection, setDoc, updateDoc, serverTimestamp, sendNotification, handleFirestoreError, OperationType } from "@/src/firebase";
+import { db, doc, getDoc, collection } from "@/src/firebase";
 import { generateQuoteDraft } from "@/src/services/gemini";
-import { calculatePayoutBreakdown } from "@/src/services/stripeIntegrationService";
+import { calculatePayoutBreakdown, resolveClientCommissionConfig } from "@/src/services/stripeIntegrationService";
 import { toast } from "sonner";
 import { cn, formatJobLocation } from "@/src/lib/utils";
+import { normalizeQuoteScope } from "@/src/lib/marketplaceContracts";
 
 import { createQuoteViaCommand, updateQuoteViaCommand } from "../../services/quoteCommandService.ts";
 
@@ -41,10 +42,30 @@ export const QuickQuoteModal: React.FC<QuickQuoteModalProps> = ({
   const [startDateType, setStartDateType] = useState<"immediate" | "tomorrow" | "3_days" | "next_week" | "custom">("immediate");
   const [customStartDate, setCustomStartDate] = useState<string>("");
   const [estimatedDuration, setEstimatedDuration] = useState<string>("1_day");
-  const [quoteScope, setQuoteScope] = useState<string>("complete_package");
+  const [quoteScope, setQuoteScope] = useState<string>("full_project");
   const [existingQuoteId, setExistingQuoteId] = useState<string | null>(null);
   const [isGeneratingAiDraft, setIsGeneratingAiDraft] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [livePricingConfig, setLivePricingConfig] = useState<{ globalTiers: any; globalConfig: any }>({
+    globalTiers: null,
+    globalConfig: null,
+  });
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let mounted = true;
+    Promise.all([
+      getDoc(doc(db, "platform_config", "global_tiers")).catch(() => null),
+      getDoc(doc(db, "platform_config", "global")).catch(() => null),
+    ]).then(([tiersSnap, globalSnap]) => {
+      if (!mounted) return;
+      setLivePricingConfig({
+        globalTiers: tiersSnap?.exists() ? tiersSnap.data() : null,
+        globalConfig: globalSnap?.exists() ? globalSnap.data() : null,
+      });
+    });
+    return () => { mounted = false; };
+  }, [isOpen]);
 
   // Check if user has already submitted a quote for this job & prefill
   useEffect(() => {
@@ -78,7 +99,17 @@ export const QuickQuoteModal: React.FC<QuickQuoteModalProps> = ({
 
   const numAmount = parseFloat(quoteAmount) || 0;
   const traderTier = profile?.tierId || profile?.tier || "payg";
-  const payout = calculatePayoutBreakdown(numAmount, traderTier);
+  const resolvedCommission = resolveClientCommissionConfig(
+    traderTier,
+    livePricingConfig.globalTiers,
+    livePricingConfig.globalConfig
+  );
+  const payout = calculatePayoutBreakdown(
+    numAmount,
+    traderTier,
+    resolvedCommission.commissionRate,
+    resolvedCommission.commissionCapGbp
+  );
 
   const handleGenerateAiDraft = async () => {
     setIsGeneratingAiDraft(true);
@@ -158,6 +189,9 @@ export const QuickQuoteModal: React.FC<QuickQuoteModalProps> = ({
       const mappedStartDateType: "immediate" | "flexible" | "specific" =
         startDateType === "immediate" ? "immediate" : (startDateType === "custom" ? "specific" : "flexible");
 
+      const mappedPaymentPreference: "fixed_price" | "hourly" | "daily" =
+        pricingType === "hourly" ? "hourly" : pricingType === "daily" ? "daily" : "fixed_price";
+
       const quotePayload = {
         amount: numAmount,
         coverNote: (quoteMessage || "").trim(),
@@ -166,9 +200,9 @@ export const QuickQuoteModal: React.FC<QuickQuoteModalProps> = ({
         startDate: resolvedStartDate,
         startDateType: mappedStartDateType,
         isImmediateStart: startDateType === "immediate",
-        paymentPreference: "fixed_price" as const,
+        paymentPreference: mappedPaymentPreference,
         paymentTrack: isQuickTrack ? ("quick" as const) : ("project" as const),
-        quoteScope: quoteScope as "labor_only" | "materials_included" | "custom" | "full_project",
+        quoteScope: normalizeQuoteScope(quoteScope),
         depositTerm: "0_percent_completion",
         guaranteeTerm: "1_year_workmanship",
         partsWarranty: "standard_parts",
@@ -191,17 +225,7 @@ export const QuickQuoteModal: React.FC<QuickQuoteModalProps> = ({
         });
       }
 
-      // Send in-app notification to homeowner
-      if (job.homeownerId) {
-        await sendNotification(
-          job.homeownerId,
-          existingQuoteId ? "Quote Updated" : "New Quote Received",
-          `${profile?.businessName || profile?.name || "A tradesperson"} ${existingQuoteId ? 'updated their quote to' : 'submitted a quote of'} £${numAmount} for: ${job.title}`,
-          "quote",
-          `/job/${job.id}`
-        );
-      }
-
+      // Server quoteCommands.ts atomically dispatches authoritative homeowner notifications.
       toast.success(existingQuoteId ? `Quote updated to £${numAmount}!` : `Quote of £${numAmount} submitted successfully!`);
       if (onQuoteSubmitted) {
         onQuoteSubmitted(job.id, commandResult.quote || { id: commandResult.quoteId, ...quotePayload });
@@ -252,6 +276,22 @@ export const QuickQuoteModal: React.FC<QuickQuoteModalProps> = ({
           </div>
 
           <form onSubmit={handleSubmitQuote} className="p-5 space-y-5">
+            {/* Upfront Trader Readiness Hints */}
+            {(profile?.verificationStatus === "provisional" || !profile?.stripeAccountId) && (
+              <div className="bg-amber-50 border border-black rounded-2xl p-3 space-y-1 text-xs text-black">
+                {profile?.verificationStatus === "provisional" && (
+                  <p className="font-bold">
+                    Provisional Access: {Math.max(0, 5 - Number(profile?.provisionalQuotesUsed || 0))} of 5 provisional quotes remaining before document verification is required.
+                  </p>
+                )}
+                {!profile?.stripeAccountId && (
+                  <p className="font-medium text-slate-800">
+                    Tip: Connect your Stripe payout account in Billing before this job completes so payouts release smoothly.
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* AI Benchmark Budget Helper */}
             {(minEstimate > 0 || maxEstimate > 0) && (
               <div className="bg-blue-50 border border-blue-200 rounded-2xl p-3.5 flex items-center justify-between">

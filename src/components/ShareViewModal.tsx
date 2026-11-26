@@ -37,9 +37,17 @@ export function ShareViewModal({ shareType, shareId, onClose, onOpenChat }: Shar
             const privateRef = doc(db, "jobs", shareId);
             snapshot = await getDoc(privateRef);
           }
+        } else if (shareType === "quote") {
+          const params = new URLSearchParams(window.location.search);
+          const jobIdParam = params.get("jobId");
+          if (!jobIdParam) {
+            setError("This shared quote requires its associated job link. Please sign in and view the quote from your dashboard.");
+            setLoading(false);
+            return;
+          }
+          snapshot = await getDoc(doc(db, "jobs", jobIdParam, "quotes", shareId));
         } else {
-          const collectionName = shareType === "quote" ? "quotes" : "invoices";
-          const docRef = doc(db, collectionName, shareId);
+          const docRef = doc(db, "invoices", shareId);
           snapshot = await getDoc(docRef);
         }
 
@@ -48,9 +56,13 @@ export function ShareViewModal({ shareType, shareId, onClose, onOpenChat }: Shar
         } else {
           setError(`Shared ${shareType} record not found or link has expired.`);
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error("Error fetching shared link:", err);
-        setError("Failed to load shared details. Please check your network connection.");
+        if (err?.code === "permission-denied") {
+          setError("This shared record is private. Please sign in with an authorized account to view it.");
+        } else {
+          setError("Failed to load shared details. Please try again later.");
+        }
       } finally {
         setLoading(false);
       }
@@ -185,7 +197,10 @@ export function ShareViewModal({ shareType, shareId, onClose, onOpenChat }: Shar
                     onClick={() => {
                       onClose();
                       if (onOpenChat) {
-                        onOpenChat(data.ownerId || data.traderId || data.userId, data.title || `${shareType} #${shareId}`);
+                        onOpenChat(
+                          data.ownerId || data.homeownerId || data.traderId || data.userId,
+                          data.title || `${shareType} #${shareId}`
+                        );
                       }
                     }}
                     className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-extrabold text-sm rounded-xl border border-black shadow-md flex items-center justify-center gap-2 active:scale-98 transition"

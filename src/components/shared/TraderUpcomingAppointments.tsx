@@ -160,7 +160,7 @@ export function TraderUpcomingAppointments() {
                       )}
                       <span>{syncedIds.includes(apt.id) ? "Synced" : "Sync GCal"}</span>
                     </button>
-                    <Link to="/calendar" className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-full whitespace-nowrap uppercase tracking-wider border border-indigo-100 hover:bg-indigo-100 transition-colors">
+                    <Link to="/trader/calendar" className="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-full whitespace-nowrap uppercase tracking-wider border border-indigo-100 hover:bg-indigo-100 transition-colors">
                       View
                     </Link>
                   </div>
