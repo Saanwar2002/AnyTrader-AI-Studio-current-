@@ -405,10 +405,12 @@ service cloud.firestore {
     }
 
     function isAnyRollerDriver() {
+      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
       return isSignedIn() && (
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') in ['driver', 'fleet_driver'] ||
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isDriver', false) == true
-      );
+        u.get('role', '') in ['driver', 'fleet_driver', 'taxi_driver'] ||
+        u.get('isDriver', false) == true ||
+        u.get('accountType', '') == 'driver'
+      ) && u.get('driverApproved', false) == true;
     }
 
     match /ride_requests/{rideId} {

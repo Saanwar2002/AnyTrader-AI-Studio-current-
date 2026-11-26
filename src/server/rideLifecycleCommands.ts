@@ -550,6 +550,23 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
       }
     }
 
+    if (assignedDriverId) {
+      tx.set(
+        db.collection("live_tracking").doc(assignedDriverId),
+        {
+          driverId: assignedDriverId,
+          status: "available",
+          activeRideId: admin.firestore.FieldValue.delete(),
+          passengerId: admin.firestore.FieldValue.delete(),
+          riderId: admin.firestore.FieldValue.delete(),
+          dropoffLat: null,
+          dropoffLng: null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
     return {
       success: true,
       rideId,
@@ -718,12 +735,31 @@ export async function executeCancelRideCommand(input: CancelRideInput) {
       );
     }
 
+    if (assignedDriverId) {
+      tx.set(
+        db.collection("live_tracking").doc(assignedDriverId),
+        {
+          driverId: assignedDriverId,
+          status: "available",
+          activeRideId: admin.firestore.FieldValue.delete(),
+          passengerId: admin.firestore.FieldValue.delete(),
+          riderId: admin.firestore.FieldValue.delete(),
+          dropoffLat: null,
+          dropoffLng: null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
     return {
       success: true,
       rideId,
       status: "cancelled",
       cancelledBy: effectiveCancelledBy,
       cancellationFee,
+      ...(assignedDriverId ? { assignedDriverId } : {}),
+      ...(passengerId ? { passengerId } : {}),
     };
   });
 }
@@ -931,6 +967,23 @@ export async function fulfillTaxiTripCheckout(params: {
           { merge: true }
         );
       }
+    }
+
+    if (assignedDriverId) {
+      tx.set(
+        db.collection("live_tracking").doc(assignedDriverId),
+        {
+          driverId: assignedDriverId,
+          status: "available",
+          activeRideId: admin.firestore.FieldValue.delete(),
+          passengerId: admin.firestore.FieldValue.delete(),
+          riderId: admin.firestore.FieldValue.delete(),
+          dropoffLat: null,
+          dropoffLng: null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
     }
 
     tx.create(ledgerRef, {

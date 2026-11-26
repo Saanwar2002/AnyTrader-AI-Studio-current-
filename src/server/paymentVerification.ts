@@ -205,6 +205,8 @@ const ALLOWED_REDIRECT_PATHS = new Set([
   "/payment-complete",
   "/platform-fee-success",
   "/driver-dashboard",
+  "/driver-terminal",
+  "/driver-return",
 ]);
 
 function isPathAllowed(pathname: string): boolean {

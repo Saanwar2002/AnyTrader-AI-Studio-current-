@@ -1856,12 +1856,27 @@ export default function PassengerBooking() {
       };
       
       const activeId = editId || currentRideId;
+      let dispatchedRideId = activeId;
       if (activeId) {
          await updateDoc(doc(db, "ride_requests", activeId), { ...rideData, updatedAt: serverTimestamp(), isModifiedByPassenger: true });
          setCurrentRideId(activeId);
       } else {
          const docRef = await addDoc(collection(db, "ride_requests"), { ...rideData, createdAt: serverTimestamp() });
          setCurrentRideId(docRef.id);
+         dispatchedRideId = docRef.id;
+      }
+
+      if (dispatchedRideId && !isUpdatingActiveRide) {
+         user.getIdToken().then((token) =>
+           fetch(`/api/rides/${encodeURIComponent(dispatchedRideId)}/dispatch-offers`, {
+             method: "POST",
+             headers: {
+               "Content-Type": "application/json",
+               Authorization: `Bearer ${token}`,
+             },
+             body: JSON.stringify({}),
+           })
+         ).catch(() => {});
       }
     } catch (err) { setStep("details"); }
   };

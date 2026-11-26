@@ -91,6 +91,7 @@ export interface AcceptRideCommandResult {
   success: boolean;
   rideId: string;
   driverId: string;
+  passengerId?: string;
 }
 
 /**
@@ -124,6 +125,7 @@ export async function executeAcceptRideCommand(
   }
 
   const effectiveDriverId = callerUid;
+  let resolvedPassengerId: string | undefined;
 
   await db.runTransaction(async (transaction: any) => {
     // 1. Authoritative User Profile Lookup (Read)
@@ -156,9 +158,11 @@ export async function executeAcceptRideCommand(
     if (passengerId === callerUid) {
       throw new BadRequestError("Passengers cannot accept their own ride requests as a driver.");
     }
+    resolvedPassengerId = passengerId || undefined;
 
     // 4. Atomic Transaction Writes
     const driverRef = db.collection("driver_status").doc(effectiveDriverId);
+    const liveTrackingRef = db.collection("live_tracking").doc(effectiveDriverId);
 
     transaction.update(rideRef, {
       driverId: effectiveDriverId,
@@ -175,6 +179,22 @@ export async function executeAcceptRideCommand(
         isBusy: true,
         currentRideId: rideId,
         lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // Sync live_tracking visibility so the assigned passenger satisfies firestore.rules immediately
+    transaction.set(
+      liveTrackingRef,
+      {
+        driverId: effectiveDriverId,
+        activeRideId: rideId,
+        passengerId: passengerId || null,
+        riderId: passengerId || null,
+        status: "on_ride",
+        dropoffLat: rideData.dropoffLat ?? null,
+        dropoffLng: rideData.dropoffLng ?? null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
@@ -195,5 +215,6 @@ export async function executeAcceptRideCommand(
     success: true,
     rideId,
     driverId: effectiveDriverId,
+    ...(resolvedPassengerId ? { passengerId: resolvedPassengerId } : {}),
   };
 }

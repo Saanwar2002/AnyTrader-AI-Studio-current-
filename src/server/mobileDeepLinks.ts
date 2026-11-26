@@ -70,6 +70,18 @@ export function isValidReverseDomainId(pkg: string): boolean {
   return /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_-]*){1,}$/.test(clean);
 }
 
+function parseValidFingerprints(raw: string): string[] | null {
+  const fingerprints = raw
+    .split(",")
+    .map((fp) => fp.trim().toUpperCase())
+    .filter(Boolean);
+
+  if (fingerprints.length === 0 || !fingerprints.every(isValidAndroidSha256Fingerprint)) {
+    return null;
+  }
+  return Array.from(new Set(fingerprints));
+}
+
 export function buildAndroidAssetLinksPayload(
   env: Record<string, string | undefined> = process.env
 ): {
@@ -87,44 +99,96 @@ export function buildAndroidAssetLinksPayload(
   const packageName = String(env.ANDROID_APP_PACKAGE || "com.anytrader.app").trim();
   const rawFingerprints = String(env.ANDROID_SHA256_CERT_FINGERPRINTS || "").trim();
 
-  if (!isValidReverseDomainId(packageName)) {
-    return {
-      configured: false,
-      reason: "ANDROID_APP_PACKAGE is invalid or uses a placeholder package name.",
+  const driverPackageName = String(env.ANDROID_DRIVER_APP_PACKAGE || "com.anyroller.driver").trim();
+  const rawDriverFingerprints = String(env.ANDROID_DRIVER_SHA256_CERT_FINGERPRINTS || "").trim();
+
+  const statements: Array<{
+    relation: string[];
+    target: {
+      namespace: "android_app";
+      package_name: string;
+      sha256_cert_fingerprints: string[];
     };
+  }> = [];
+
+  // Validate primary AnyTrader Android package whenever configured or when no driver package is provided
+  if (rawFingerprints || !rawDriverFingerprints) {
+    if (!isValidReverseDomainId(packageName)) {
+      return {
+        configured: false,
+        reason: "ANDROID_APP_PACKAGE is invalid or uses a placeholder package name.",
+      };
+    }
+
+    if (!rawFingerprints) {
+      return {
+        configured: false,
+        reason: "ANDROID_SHA256_CERT_FINGERPRINTS is not configured.",
+      };
+    }
+
+    const fingerprints = parseValidFingerprints(rawFingerprints);
+    if (!fingerprints) {
+      return {
+        configured: false,
+        reason: "ANDROID_SHA256_CERT_FINGERPRINTS contains an invalid or placeholder SHA-256 fingerprint.",
+      };
+    }
+
+    statements.push({
+      relation: ["delegate_permission/common.handle_all_urls"],
+      target: {
+        namespace: "android_app",
+        package_name: packageName,
+        sha256_cert_fingerprints: fingerprints,
+      },
+    });
   }
 
-  if (!rawFingerprints) {
+  // Optional secondary statement for the standalone AnyRoller Driver Android app
+  if (rawDriverFingerprints) {
+    if (!isValidReverseDomainId(driverPackageName)) {
+      return {
+        configured: false,
+        reason: "ANDROID_DRIVER_APP_PACKAGE is invalid or uses a placeholder package name.",
+      };
+    }
+
+    const driverFingerprints = parseValidFingerprints(rawDriverFingerprints);
+    if (!driverFingerprints) {
+      return {
+        configured: false,
+        reason: "ANDROID_DRIVER_SHA256_CERT_FINGERPRINTS contains an invalid or placeholder SHA-256 fingerprint.",
+      };
+    }
+
+    const existing = statements.find((s) => s.target.package_name === driverPackageName);
+    if (existing) {
+      existing.target.sha256_cert_fingerprints = Array.from(
+        new Set([...existing.target.sha256_cert_fingerprints, ...driverFingerprints])
+      );
+    } else {
+      statements.push({
+        relation: ["delegate_permission/common.handle_all_urls"],
+        target: {
+          namespace: "android_app",
+          package_name: driverPackageName,
+          sha256_cert_fingerprints: driverFingerprints,
+        },
+      });
+    }
+  }
+
+  if (statements.length === 0) {
     return {
       configured: false,
       reason: "ANDROID_SHA256_CERT_FINGERPRINTS is not configured.",
     };
   }
 
-  const fingerprints = rawFingerprints
-    .split(",")
-    .map((fp) => fp.trim().toUpperCase())
-    .filter(Boolean);
-
-  if (fingerprints.length === 0 || !fingerprints.every(isValidAndroidSha256Fingerprint)) {
-    return {
-      configured: false,
-      reason: "ANDROID_SHA256_CERT_FINGERPRINTS contains an invalid or placeholder SHA-256 fingerprint.",
-    };
-  }
-
   return {
     configured: true,
-    payload: [
-      {
-        relation: ["delegate_permission/common.handle_all_urls"],
-        target: {
-          namespace: "android_app",
-          package_name: packageName,
-          sha256_cert_fingerprints: Array.from(new Set(fingerprints)),
-        },
-      },
-    ],
+    payload: statements,
   };
 }
 

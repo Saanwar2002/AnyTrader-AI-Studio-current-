@@ -1,6 +1,6 @@
 # AnyRoller Native Driver App — Complete Handoff & Architecture Specification
 
-> **Last Updated**: November 26, 2026 (Synchronized after AnyTrader Full-Platform Pre-Live Hardening — Slices 1–8 Complete)  
+> **Last Updated**: November 26, 2026 (Synchronized after Slices 1–8 Hardening + AnyRoller Standalone Android Driver Backend Prep Complete)  
 > **Purpose of this document**: Give this file to an AI Studio coding agent when starting the **separate AnyRoller Native Driver App** project. It explains **why** this app exists separately, **how** it connects to the existing live AnyTrader / AnyRoller platform without duplicating the backend, and the **exact Firestore schemas, Storage constraints, API contracts, security boundaries, and UI requirements** it must implement.
 
 ---
@@ -85,8 +85,8 @@ Configure `API_BASE_URL` via `BuildConfig` / environment config (never hardcode 
 
 ### 3.3 Android App Links Verification (`/.well-known/assetlinks.json`)
 - The main web server dynamically serves `GET /.well-known/assetlinks.json` via `src/server/mobileDeepLinks.ts` and excludes `/.well-known/` from PWA Service Worker fallback.
-- **Fail-Closed Rule**: The endpoint returns HTTP `503` (`ANDROID_ASSETLINKS_UNCONFIGURED`) until real production `ANDROID_APP_PACKAGE` and colon-separated uppercase 32-byte `ANDROID_SHA256_CERT_FINGERPRINTS` are configured in the main backend's environment (placeholder values are rejected).
-- **Important Multi-App Note**: The main server defaults `ANDROID_APP_PACKAGE` to `com.anytrader.app`. When publishing the separate AnyRoller Driver Android package (e.g., `com.anyroller.driver`), either coordinate a multi-package `assetlinks.json` update on the main server or host driver deep links on a dedicated AnyRoller subdomain with its own `assetlinks.json`.
+- **Multi-App Support (Ready Now)**: `buildAndroidAssetLinksPayload` natively emits statements for **both** the primary AnyTrader Android app (`ANDROID_APP_PACKAGE` + `ANDROID_SHA256_CERT_FINGERPRINTS`) and the standalone AnyRoller Driver Android app (`ANDROID_DRIVER_APP_PACKAGE`, default `com.anyroller.driver`, + `ANDROID_DRIVER_SHA256_CERT_FINGERPRINTS`).
+- **Fail-Closed Rule**: The endpoint returns HTTP `503` (`ANDROID_ASSETLINKS_UNCONFIGURED`) until real production colon-separated uppercase 32-byte SHA-256 signing fingerprints are configured in the main backend's environment (placeholder values are rejected). Once the Driver APK's Play App Signing SHA-256 is added to `ANDROID_DRIVER_SHA256_CERT_FINGERPRINTS`, Android App Links verify automatically.
 
 ### 3.4 Security & Secrets Hygiene
 - Never hardcode Google Maps API keys, Stripe keys, or private credentials in source code. Load the Android Maps API key from `local.properties` / `BuildConfig` / manifest placeholder restricted by Android package name + SHA-1 in Google Cloud Console.
@@ -154,6 +154,8 @@ Written immediately when going Online/Offline, and throttled during active Foreg
 }
 ```
 When going **Offline**, update `isOnline: false`.
+- **Automatic Server Visibility Sync (Live)**: You do **not** need to manually write `passengerId`, `riderId`, or `activeRideId` onto `live_tracking/{driverUid}`. The server atomically stamps `passengerId`, `riderId`, `activeRideId`, `dropoffLat`/`dropoffLng`, and `status: "on_ride"` inside `POST /api/rides/accept` (so the assigned passenger immediately passes `firestore.rules` to track the car) and atomically clears those fields back to `status: "available"` on `POST /api/rides/complete`, Stripe taxi webhook fulfillment, and `POST /api/rides/cancel`. Always use `{ merge: true }` on GPS updates so the client never overwrites server-stamped ride fields.
+- **Firestore Rules Driver Parity (Live)**: `isAnyRollerDriver()` in `firestore.rules` matches `assertAuthoritativeDriverEligibility`, allowing `role in ['driver', 'fleet_driver', 'taxi_driver']`, `isDriver == true`, or `accountType == 'driver'` AND enforcing `driverApproved == true`.
 
 #### B. `driver_status/{driverUid}` (Driver writes online toggle state)
 ```json
@@ -272,17 +274,19 @@ The main server implements a **4-Tier Cost-Controlled Notification Waterfall** s
 | `GET /api/rides/demand-zones` | Query params (optional area/coords) | Rate-limited (`generalLimiter`). Fetches live high/moderate/low demand & surge heatmap zones for the Home map. |
 | `POST /api/driver/analytics-pulse` | `{ ... }` | Rate-limited (`aiLimiter`). Optional server-side AI earnings/demand insights for the Earnings tab (never call Gemini directly from Android). |
 
-### 6.3 Server-Authoritative Ride Lifecycle (ALL mutations go through here)
-| Method & Endpoint | Body | Purpose |
+### 6.3 Server-Authoritative Ride Lifecycle & Offer Push Dispatch (ALL mutations go through here)
+| Method & Endpoint | Body / Params | Purpose |
 |---|---|---|
-| `POST /api/rides/accept` | `{ "rideId": "<rideId>" }` | Atomically claims a `pending`/`searching`/`offered` ride in a Firestore transaction after verifying `driverApproved == true`. Returns `409 Conflict` if another driver claimed it first. |
+| `POST /api/rides/:rideId/dispatch-offers` | `{ "radiusMiles"?: number, "maxDrivers"?: number, "force"?: boolean }` (Passenger/Admin auth) | **Server-Side Ride Offer Push Engine**: Automatically triggered by web passenger booking (`PassengerBooking.tsx`) right after creating a ride. Queries online `live_tracking` drivers, applies distance, category, job-stacking, last-job, destination-mode, zone, and `declinedBy` filters, verifies `driverApproved == true`, enforces a 10s cooldown, and dispatches high-priority FCM pushes on Android channel **`ride_offers_urgent`** containing full offer metadata (`type: "ride_offer"`, `rideId`, pickup/dropoff coords & addresses, `fareEstimate`, `surgeMultiplier`, `vehicleCategory`, `distanceMiles`, `offeredAtMs`, `expiresAtMs`). |
+| `GET /api/rides/nearby-drivers` | `?lat=<num>&lng=<num>&radiusMiles=<num>&vehicleCategory=<str>` | Privacy-safe endpoint for passenger apps returning coarse (~110m rounded) available driver pins (`lat`, `lng`, `heading`, `vehicleCategory`, `vehicleCategories`, `status`, `distanceMiles`) with zero driver UIDs or PII. |
+| `POST /api/rides/accept` | `{ "rideId": "<rideId>" }` | Atomically claims a `pending`/`searching`/`offered` ride in a Firestore transaction after verifying `driverApproved == true`, stamps `passengerId`/`riderId`/`activeRideId`/`status: "on_ride"` onto `live_tracking/{driverUid}`, and dispatches a `ride_accepted` FCM push (`ride_chat_updates`) to the passenger. Returns `409 Conflict` if another driver claimed it first. |
 | `POST /api/rides/transition` | `{ "rideId": "<rideId>", "action": "arrived" \| "in_progress" \| "stop_progress" \| "early_completion_reason", "paidWaitSeconds"?: number, "currentStopIndex"?: number, "earlyCompletionReason"?: string }` | Server-authoritative state machine transitions: `accepted → arrived → in_progress`, multi-stop progression, and early completion reason logging. |
 | `POST /api/rides/create-trip-payment` | `{ "rideId": "<rideId>", ... }` | Generates/reuses Stripe Checkout payment link / QR URL (`url`, `intentId`, `effectiveBaseFare`, `sanitizedTip`, `totalAmount`) for card/QR trip payment. |
 | `POST /api/rides/complete` | `{ "rideId": "<rideId>", "action": "auto_card" \| "qr_pending" \| "qr_manual_close" \| "cash_report" \| "cash_finalize" \| "abandonment", "paidWaitSeconds"?: number, "cashCollected"?: number, "earlyCompletionReason"?: string, "paymentUrl"?: string, "abandonmentFee"?: number }` | Server-authoritative completion, canonical `v2_excl_tip` fare + commission settlement, and transactional `driver_metrics` earnings update. |
-| `POST /api/rides/cancel` | `{ "rideId": "<rideId>", "cancelledBy": "driver" }` | Server-authoritative driver cancellation with state machine enforcement. |
+| `POST /api/rides/cancel` | `{ "rideId": "<rideId>", "cancelledBy": "driver" }` | Server-authoritative cancellation with state machine enforcement, automatic reset of `live_tracking/{driverUid}` back to `status: "available"`, and automatic post-commit `ride_cancelled` FCM push (`ride_chat_updates`) to the counterparty (so passenger cancellations immediately wake the driver even while navigating in Google Maps/Waze). |
 
 ### 6.4 Driver Earnings, Stripe Connect, Fee Settlements & Gold Tier Subscriptions
-> **Browser / Payment UX Rule**: Always open Stripe Connect onboarding, Stripe Express dashboard links, fee-settlement Checkout sessions, and subscription Checkout/Billing Portal URLs in **Android Chrome Custom Tabs** (never inside an embedded `WebView`). Never trust client-side redirect query parameters as proof of payment — always reflect authoritative Firestore state written by Stripe webhooks.
+> **Browser / Payment UX Rule**: Always open Stripe Connect onboarding, Stripe Express dashboard links, fee-settlement Checkout sessions, and subscription Checkout/Billing Portal URLs in **Android Chrome Custom Tabs** (never inside an embedded `WebView`). Supported server-allowlisted return paths for Android App Link / Custom Tab interception include `/driver-dashboard`, `/driver-terminal`, `/driver-return`, and `/platform-fee-success`. Never trust client-side redirect query parameters as proof of payment — always reflect authoritative Firestore state written by Stripe webhooks.
 
 | Method & Endpoint | Purpose |
 |---|---|
@@ -314,10 +318,10 @@ The main server implements a **4-Tier Cost-Controlled Notification Waterfall** s
   2. Stop `DriverLocationService` cleanly so battery is never drained offline.
 
 ### 7.2 High-Priority Ride Offer Push Notifications (`AnyRollerMessagingService`)
-- Create two Android Notification Channels on app startup:
-  1. `ride_offers_urgent` (`IMPORTANCE_HIGH`, loud custom alert sound, strong vibration pattern `[0, 400, 200, 400, 200, 600]`, bypasses lock screen / shows heads-up + full-screen intent when screen is locked).
-  2. `ride_chat_updates` (`IMPORTANCE_HIGH`, standard chime + vibration for passenger messages & cancellations).
-- Handle both **data-only** and **notification+data** FCM payloads so tapping a ride offer opens the full-screen **Incoming Ride Offer** overlay immediately with the live remaining countdown.
+- Create two Android Notification Channels on app startup matching the exact server-sent `android.notification.channelId` values:
+  1. `ride_offers_urgent` (`IMPORTANCE_HIGH`, loud custom alert sound, strong vibration pattern `[0, 400, 200, 400, 200, 600]`, bypasses lock screen / shows heads-up + full-screen intent when screen is locked) — used by `POST /api/rides/:rideId/dispatch-offers` (`data.type == "ride_offer"`).
+  2. `ride_chat_updates` (`IMPORTANCE_HIGH`, standard chime + vibration) — used automatically by `POST /api/chat-push` whenever `rideId` is present and by server-dispatched `ride_accepted` / `ride_cancelled` lifecycle pushes.
+- Handle both **data-only** and **notification+data** FCM payloads so tapping a `ride_offer` opens the full-screen **Incoming Ride Offer** overlay immediately with the live remaining countdown (`expiresAtMs - System.currentTimeMillis()`), and receiving `ride_cancelled` dismisses the active trip cleanly.
 
 ### 7.3 One-Tap External Navigation (Google Maps & Waze)
 - During **En Route to Pickup** and **Trip in Progress**, provide a prominent **"Navigate"** button allowing drivers to launch Google Maps (`google.navigation:q=lat,lng&mode=d`) or Waze (`https://waze.com/ul?ll=lat,lng&navigate=yes`) directly.

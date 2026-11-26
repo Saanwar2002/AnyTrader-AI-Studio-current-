@@ -1,5 +1,22 @@
 # AnyTrader Platform Maintenance & Multi-Portal Development Guide
 
+## 🚕 AnyRoller Standalone Android Driver App — Backend & Rules Readiness (November 26, 2026)
+- **Scope (Owner-Authorized)**: Implemented 5 targeted AnyRoller backend & Firestore rules updates so the standalone native Android AnyRoller Driver App (`com.anyroller.driver`) operates end-to-end against the shared Firebase project (`anytradercombined`, named DB `ai-studio-anytrader-44dab8b3-bbc9-4352-b725-2cbe7a1dfd2a`) and Express API without `PERMISSION_DENIED` tracking errors, missed background ride offers, or rejected Chrome Custom Tab redirects. AnyTrader locked subsystems (`aiRecommendationService.ts`, `TradeBot.tsx`, `fuzzyMatch.ts`) and `DriverTerminal` locked HUD styling remain untouched.
+- **1. Server-Side Ride Offer FCM Push Dispatch & Sanitized Nearby Drivers (`src/server/rideOfferDispatch.ts`, `server.ts`, `src/components/passenger/PassengerBooking.tsx`)**:
+  - Added `POST /api/rides/:rideId/dispatch-offers` (`dispatchRideOffersCommand`): verifies passenger/admin ownership and open ride state, matches online `live_tracking` drivers against radius, vehicle category, job stacking, last-job mode, destination mode, working zone, and `declinedBy`, verifies `assertAuthoritativeDriverEligibility` (`driverApproved == true`), enforces a 10s dispatch cooldown, and sends high-priority FCM pushes on Android channel `ride_offers_urgent` with full offer metadata. Wired non-fatally into `PassengerBooking.tsx` right after ride creation.
+  - Added `GET /api/rides/nearby-drivers` (`getSanitizedNearbyDrivers`): returns coarse (~110m rounded) available driver map pins with zero driver UIDs, names, or PII.
+  - Wired non-fatal post-commit counterparty FCM pushes (`notifyRideCounterpartyPush`, channel `ride_chat_updates`) onto `POST /api/rides/accept` (`ride_accepted` to passenger) and `POST /api/rides/cancel` (`ride_cancelled` to assigned driver/passenger).
+- **2. Live GPS Visibility Sync Across Ride Lifecycle (`src/server/driverAuthorization.ts`, `src/server/rideLifecycleCommands.ts`)**:
+  - Updated `executeAcceptRideCommand` to atomically stamp `driverId`, `activeRideId`, `passengerId`, `riderId`, `status: "on_ride"`, and `dropoffLat`/`dropoffLng` onto `live_tracking/{driverUid}` so the assigned passenger immediately satisfies `firestore.rules` to stream driver GPS.
+  - Updated `executeCompleteRideCommand`, `fulfillTaxiTripCheckout`, and `executeCancelRideCommand` to atomically clear `activeRideId`/`passengerId`/`riderId` and restore `status: "available"` on `live_tracking/{driverUid}`.
+- **3. Firestore Rules Driver Role Parity (`firestore.rules`)**:
+  - Updated `isAnyRollerDriver()` to recognize `role in ['driver', 'fleet_driver', 'taxi_driver']`, `isDriver == true`, or `accountType == 'driver'` AND enforce `driverApproved == true` (matching `assertAuthoritativeDriverEligibility`). Deployed via `fax.DeployRules`.
+- **4. Multi-App Android App Links & Chrome Custom Tab Redirects (`src/server/mobileDeepLinks.ts`, `src/server/paymentVerification.ts`, `src/server/notificationEngine.ts`, `.env.example`)**:
+  - Extended `buildAndroidAssetLinksPayload` to emit a second `assetlinks.json` statement for optional `ANDROID_DRIVER_APP_PACKAGE` + `ANDROID_DRIVER_SHA256_CERT_FINGERPRINTS` alongside `com.anytrader.app` with fail-closed fingerprint validation.
+  - Added `/driver-terminal` and `/driver-return` to `ALLOWED_REDIRECT_PATHS` in `paymentVerification.ts`, and defaulted Android `channelId` to `ride_chat_updates` on ride chat pushes in `sendAuthoritativeChatPush`.
+- **5. Verification & Handoff**:
+  - Updated `/ANYROLLER_DRIVER_APP_HANDOFF.md` and added `/tests/unit/anyrollerDriverAppPrep.test.ts`.
+
 ## 🚀 Slice 8B — Production Readiness, Infrastructure & Staging Dry-Run Hardening (November 26, 2026)
 - **Scope**: Completed the final slice of the staged full-platform pre-live audit & hardening across production CORS/CSP boundaries, terminal Express error handling, graceful container shutdown, background cron scheduling, Firestore composite indexes, Firebase Storage admin write tiering, PWA manifest consolidation, UI production hygiene, and full-platform test alignment. **AnyRoller screens/rides logic (`src/components/AnyRollerAdmin.tsx`, `src/components/anyroller/*`, `src/components/driver/*`, `/corporate` route) and locked subsystems (`aiRecommendationService.ts`, `TradeBot.tsx`, `fuzzyMatch.ts`) remain untouched.**
 - **Server Production Hardening (`server.ts`, `src/server/bootstrap.ts`, `.env.example`)**:

@@ -38,6 +38,12 @@ import {
   fulfillDriverFeeSettlementWebhook,
   recordDriverOnlineHeartbeat,
 } from "./src/server/rideLifecycleCommands.ts";
+import {
+  dispatchRideOffersCommand,
+  getSanitizedNearbyDrivers,
+  notifyRideCounterpartyPush,
+  RIDE_UPDATES_CHANNEL_ID,
+} from "./src/server/rideOfferDispatch.ts";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import crypto from "crypto";
@@ -4619,6 +4625,57 @@ async function startServer() {
     }
   });
 
+  // Privacy-safe nearby online drivers for passenger map (no driver UIDs, names, or PII)
+  app.get("/api/rides/nearby-drivers", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const lat = Number(req.query.lat);
+      const lng = Number(req.query.lng);
+      const radiusMiles = req.query.radiusMiles !== undefined ? Number(req.query.radiusMiles) : undefined;
+      const vehicleCategory =
+        typeof req.query.vehicleCategory === "string" ? req.query.vehicleCategory : undefined;
+
+      const result = await getSanitizedNearbyDrivers({
+        db,
+        lat,
+        lng,
+        radiusMiles,
+        vehicleCategory,
+        excludeUid: caller?.uid,
+      });
+      res.json(result);
+    } catch (error: any) {
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // Server-Authoritative Ride Offer FCM Push Dispatch (wakes backgrounded native Android AnyRoller Drivers)
+  app.post(
+    "/api/rides/:rideId/dispatch-offers",
+    requireAuth,
+    AbuseDefenseEngine.createMiddleware("NOTIFICATION_SEND"),
+    async (req, res) => {
+      try {
+        if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+        const caller = (req as any).user;
+        const result = await dispatchRideOffersCommand({
+          db,
+          caller,
+          rideId: req.params.rideId,
+          messagingClient: getFirebaseMessagingClient(),
+          radiusMiles: req.body?.radiusMiles,
+          maxDrivers: req.body?.maxDrivers,
+          force: req.body?.force === true,
+        });
+        res.json(result);
+      } catch (error: any) {
+        console.error("Dispatch Ride Offers Error:", error);
+        sendHttpError(res, error, req);
+      }
+    }
+  );
+
   // Server-Authoritative Ride Acceptance (V8.3 Task 35-B Hardened against Driver Privilege Escalation & Impersonation)
   app.post("/api/rides/accept", requireAuth, async (req, res) => {
     try {
@@ -4630,6 +4687,20 @@ async function startServer() {
         caller,
         body: req.body || {},
       });
+
+      if (result.passengerId) {
+        void notifyRideCounterpartyPush({
+          db,
+          messagingClient: getFirebaseMessagingClient(),
+          rideId: result.rideId,
+          recipientId: result.passengerId,
+          title: "Driver On The Way",
+          body: "A driver has accepted your ride request and is heading to your pickup.",
+          eventType: "ride_accepted",
+          channelId: RIDE_UPDATES_CHANNEL_ID,
+          extraData: { driverId: result.driverId },
+        });
+      }
 
       res.json(result);
     } catch (error: any) {
@@ -4729,12 +4800,69 @@ async function startServer() {
     try {
       if (!db) return res.status(503).json({ error: "Database backend unavailable" });
       const caller = (req as any).user;
-      const result = await executeCancelRideCommand({
+      const result: any = await executeCancelRideCommand({
         db,
         caller,
         rideId: req.body?.rideId,
         cancelledBy: req.body?.cancelledBy,
       });
+
+      if (result?.success && !result.alreadyCancelled) {
+        const messaging = getFirebaseMessagingClient();
+        if (result.cancelledBy === "passenger" && result.assignedDriverId) {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.assignedDriverId,
+            title: "Ride Cancelled by Passenger",
+            body: "The passenger cancelled your assigned ride.",
+            eventType: "ride_cancelled",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+            extraData: { cancelledBy: "passenger" },
+          });
+        } else if (result.cancelledBy === "driver" && result.passengerId) {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Ride Cancelled by Driver",
+            body: "Your assigned driver cancelled the ride. Please request another driver.",
+            eventType: "ride_cancelled",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+            extraData: { cancelledBy: "driver" },
+          });
+        } else if (result.cancelledBy === "admin") {
+          if (result.assignedDriverId) {
+            void notifyRideCounterpartyPush({
+              db,
+              messagingClient: messaging,
+              rideId: result.rideId,
+              recipientId: result.assignedDriverId,
+              title: "Ride Cancelled",
+              body: "This ride was cancelled by support.",
+              eventType: "ride_cancelled",
+              channelId: RIDE_UPDATES_CHANNEL_ID,
+              extraData: { cancelledBy: "admin" },
+            });
+          }
+          if (result.passengerId) {
+            void notifyRideCounterpartyPush({
+              db,
+              messagingClient: messaging,
+              rideId: result.rideId,
+              recipientId: result.passengerId,
+              title: "Ride Cancelled",
+              body: "This ride was cancelled by support.",
+              eventType: "ride_cancelled",
+              channelId: RIDE_UPDATES_CHANNEL_ID,
+              extraData: { cancelledBy: "admin" },
+            });
+          }
+        }
+      }
+
       res.json(result);
     } catch (error: any) {
       console.error("Ride Cancel Error:", error);

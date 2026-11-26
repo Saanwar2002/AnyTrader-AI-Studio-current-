@@ -931,11 +931,13 @@ export async function sendAuthoritativeChatPush(
     throw new ForbiddenError("You do not have authorization to send push notifications to this recipient.");
   }
 
+  const resolvedChannelId = channelId || (rideId ? "ride_chat_updates" : "chat_messages");
+
   const dispatchResult = await dispatchAuthoritativeFcmPush(db, messagingClient, {
     recipientId: sanitizedRecipientId,
     title: title || "New Message",
     body: body || message || "You have a new message",
-    channelId: channelId || "chat_messages",
+    channelId: resolvedChannelId,
     notificationId,
     eventType: type || "chat_message",
     data: {
