@@ -196,12 +196,16 @@ export function evaluateDriverOfferCandidate(params: {
     return { eligible: false, distanceMiles: Infinity, reason: "stale_heartbeat" };
   }
 
-  if (trackingData.lastJobMode === true) {
+  const isLastJob = trackingData.isLastJob === true || trackingData.lastJobMode === true;
+  if (isLastJob) {
     return { eligible: false, distanceMiles: Infinity, reason: "last_job_mode" };
   }
 
   const declinedBy = Array.isArray(rideData.declinedBy) ? rideData.declinedBy : [];
-  if (declinedBy.includes(driverUid)) {
+  const declinedDriverIds = Array.isArray(rideData.declinedDriverIds)
+    ? rideData.declinedDriverIds
+    : [];
+  if (declinedBy.includes(driverUid) || declinedDriverIds.includes(driverUid)) {
     return { eligible: false, distanceMiles: Infinity, reason: "declined" };
   }
 
@@ -224,7 +228,9 @@ export function evaluateDriverOfferCandidate(params: {
   let distanceMiles = calculateHaversineMiles(driverLat, driverLng, pickupLat, pickupLng);
 
   if (isBusyOnRide) {
-    if (trackingData.allowJobStacking !== true) {
+    const canStack =
+      trackingData.isStackingEnabled === true || trackingData.allowJobStacking === true;
+    if (!canStack) {
       return { eligible: false, distanceMiles, reason: "busy_no_stacking" };
     }
     const activeDropoffLat = Number(trackingData.dropoffLat);
@@ -254,41 +260,59 @@ export function evaluateDriverOfferCandidate(params: {
     return { eligible: false, distanceMiles, reason: "category_mismatch" };
   }
 
-  if (rideData.isPetFriendly === true && trackingData.petFriendly === false) {
+  const driverPetFriendly = trackingData.isPetFriendly ?? trackingData.petFriendly;
+  if (rideData.isPetFriendly === true && driverPetFriendly === false) {
     return { eligible: false, distanceMiles, reason: "not_pet_friendly" };
   }
 
-  // Destination filter (driver heading home)
-  if (trackingData.destinationMode === true) {
-    const destLat = Number(trackingData.destinationLat);
-    const destLng = Number(trackingData.destinationLng);
+  // Destination filter (driver heading home — supports both Android and legacy field names)
+  const isDestMode =
+    trackingData.destinationModeActive === true || trackingData.destinationMode === true;
+  if (isDestMode) {
+    const destLat = Number(trackingData.homeLat ?? trackingData.destinationLat);
+    const destLng = Number(trackingData.homeLng ?? trackingData.destinationLng);
     const rideDropoffLat = Number(rideData.dropoffLat);
     const rideDropoffLng = Number(rideData.dropoffLng);
-    const destRadius = Number(trackingData.destinationRadiusMiles) || 8;
     if (
       Number.isFinite(destLat) &&
       Number.isFinite(destLng) &&
       Number.isFinite(rideDropoffLat) &&
       Number.isFinite(rideDropoffLng)
     ) {
-      const dropoffToDest = calculateHaversineMiles(
-        rideDropoffLat,
-        rideDropoffLng,
-        destLat,
-        destLng
-      );
-      if (dropoffToDest > destRadius) {
-        return { eligible: false, distanceMiles, reason: "destination_mismatch" };
+      const destRadius = Number(trackingData.destinationRadiusMiles);
+      if (Number.isFinite(destRadius) && destRadius > 0) {
+        const dropoffToDest = calculateHaversineMiles(
+          rideDropoffLat,
+          rideDropoffLng,
+          destLat,
+          destLng
+        );
+        if (dropoffToDest > destRadius) {
+          return { eligible: false, distanceMiles, reason: "destination_mismatch" };
+        }
+      } else {
+        const pickupToHome = calculateHaversineMiles(pickupLat, pickupLng, destLat, destLng);
+        const dropoffToHome = calculateHaversineMiles(
+          rideDropoffLat,
+          rideDropoffLng,
+          destLat,
+          destLng
+        );
+        if (dropoffToHome > pickupToHome) {
+          return { eligible: false, distanceMiles, reason: "destination_mismatch" };
+        }
       }
     }
   }
 
-  // Working zone filter
-  if (trackingData.zoneFilterEnabled === true) {
-    const zoneLat = Number(trackingData.zoneCenterLat);
-    const zoneLng = Number(trackingData.zoneCenterLng);
-    const zoneRadius = Number(trackingData.zoneRadiusMiles) || 5;
-    if (Number.isFinite(zoneLat) && Number.isFinite(zoneLng)) {
+  // Working zone filter (supports both Android zoneEnabled/zoneMaxDistance/homeLat and legacy fields)
+  const isZoneEnabled =
+    trackingData.zoneEnabled === true || trackingData.zoneFilterEnabled === true;
+  if (isZoneEnabled) {
+    const zoneLat = Number(trackingData.zoneCenterLat ?? trackingData.homeLat);
+    const zoneLng = Number(trackingData.zoneCenterLng ?? trackingData.homeLng);
+    const zoneRadius = Number(trackingData.zoneMaxDistance ?? trackingData.zoneRadiusMiles) || 5;
+    if (Number.isFinite(zoneLat) && Number.isFinite(zoneLng) && zoneRadius > 0) {
       const pickupToZone = calculateHaversineMiles(pickupLat, pickupLng, zoneLat, zoneLng);
       if (pickupToZone > zoneRadius) {
         return { eligible: false, distanceMiles, reason: "outside_driver_zone" };
@@ -560,6 +584,217 @@ export async function dispatchRideOffersCommand(
     skippedNoTokensCount,
     expiresAtMs,
   };
+}
+
+/**
+ * P1-2: Server-authoritative Ride Offer Decline for instant re-dispatch.
+ * Atomically releases an "offered" ride back to "pending" and records the declining driver
+ * in both `declinedDriverIds` and `declinedBy` so fairness dispatch immediately pings the next driver.
+ */
+export async function executeDeclineRideOfferCommand(params: {
+  db: any;
+  caller: CallerContext;
+  rideId: string;
+}): Promise<{ success: true; rideId: string; status: string }> {
+  const { db, caller, rideId } = params;
+  if (!caller?.uid) throw new UnauthorizedError("Authentication required.");
+  if (!db) throw new BadRequestError("Database backend unavailable.");
+  if (!rideId || typeof rideId !== "string" || !rideId.trim()) {
+    throw new BadRequestError("Valid rideId is required.");
+  }
+
+  const cleanRideId = rideId.trim();
+  const callerUid = caller.uid;
+  const rideRef = db.collection("ride_requests").doc(cleanRideId);
+  const driverStatusRef = db.collection("driver_status").doc(callerUid);
+
+  return db.runTransaction(async (tx: any) => {
+    const rideSnap = await tx.get(rideRef);
+    const exists =
+      rideSnap && (typeof rideSnap.exists === "function" ? rideSnap.exists() : rideSnap.exists);
+    if (!exists) throw new NotFoundError("Ride request not found.");
+
+    const rideData =
+      (typeof rideSnap.data === "function" ? rideSnap.data() : rideSnap.data) || {};
+
+    if (rideData.driverId) {
+      throw new ConflictError("Ride has already been accepted.");
+    }
+
+    const isOfferedToCaller =
+      rideData.status === "offered" && rideData.assignedDriverId === callerUid;
+    const isOpenBroadcast =
+      rideData.status === "pending" || rideData.status === "searching";
+
+    if (!isOfferedToCaller && !isOpenBroadcast) {
+      throw new ForbiddenError("You cannot decline a ride that is not offered to you.");
+    }
+
+    const existingDeclined = Array.from(
+      new Set([
+        ...(Array.isArray(rideData.declinedDriverIds) ? rideData.declinedDriverIds : []),
+        ...(Array.isArray(rideData.declinedBy) ? rideData.declinedBy : []),
+        callerUid,
+      ])
+    ).slice(0, 100);
+
+    const ridePatch: Record<string, any> = {
+      declinedDriverIds: existingDeclined,
+      declinedBy: existingDeclined,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (isOfferedToCaller) {
+      ridePatch.status = "pending";
+      ridePatch.assignedDriverId = admin.firestore.FieldValue.delete();
+      ridePatch.offerExpiresAt = admin.firestore.FieldValue.delete();
+    }
+
+    tx.update(rideRef, ridePatch);
+
+    tx.set(
+      driverStatusRef,
+      {
+        pendingRideId: admin.firestore.FieldValue.delete(),
+        consecutiveDeclines: admin.firestore.FieldValue.increment(1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return {
+      success: true as const,
+      rideId: cleanRideId,
+      status: isOfferedToCaller ? "pending" : String(rideData.status || "pending"),
+    };
+  });
+}
+
+/**
+ * P1-4: Server-authoritative Driver -> Passenger Rating.
+ * Persists review to `passenger_reviews/{rideId}` and updates rolling `passengerRating` on `users/{passengerId}`.
+ */
+export async function executeRatePassengerCommand(params: {
+  db: any;
+  caller: CallerContext;
+  rideId: string;
+  rating: number;
+  tags?: string[];
+  comment?: string;
+}): Promise<{
+  success: true;
+  rideId: string;
+  passengerId: string;
+  rating: number;
+  passengerAverageRating: number;
+}> {
+  const { db, caller, rideId, rating, tags, comment } = params;
+  if (!caller?.uid) throw new UnauthorizedError("Authentication required.");
+  if (!db) throw new BadRequestError("Database backend unavailable.");
+  if (!rideId || typeof rideId !== "string" || !rideId.trim()) {
+    throw new BadRequestError("Valid rideId is required.");
+  }
+
+  const numericRating = Number(rating);
+  if (!Number.isFinite(numericRating) || numericRating < 1 || numericRating > 5) {
+    throw new BadRequestError("Rating must be a number between 1 and 5.");
+  }
+  const roundedRating = Math.round(numericRating * 10) / 10;
+  const cleanTags = Array.isArray(tags)
+    ? tags
+        .filter((t) => typeof t === "string" && t.trim().length > 0)
+        .map((t) => t.trim().slice(0, 40))
+        .slice(0, 8)
+    : [];
+  const cleanComment = typeof comment === "string" ? comment.trim().slice(0, 500) : "";
+
+  const cleanRideId = rideId.trim();
+  const isAdmin = caller.isAdmin === true || caller.admin === true;
+  const rideRef = db.collection("ride_requests").doc(cleanRideId);
+  const reviewRef = db.collection("passenger_reviews").doc(cleanRideId);
+
+  return db.runTransaction(async (tx: any) => {
+    const [rideSnap, existingReviewSnap] = await Promise.all([
+      tx.get(rideRef),
+      tx.get(reviewRef),
+    ]);
+    const rideExists =
+      rideSnap && (typeof rideSnap.exists === "function" ? rideSnap.exists() : rideSnap.exists);
+    if (!rideExists) throw new NotFoundError("Ride request not found.");
+
+    const ride = (typeof rideSnap.data === "function" ? rideSnap.data() : rideSnap.data) || {};
+    const assignedDriverId = ride.driverId || ride.assignedDriverId;
+    const passengerId = ride.passengerId || ride.riderId || ride.userId;
+
+    if (!isAdmin && (!assignedDriverId || assignedDriverId !== caller.uid)) {
+      throw new ForbiddenError("Only the assigned driver can rate the passenger for this ride.");
+    }
+    if (!["completed", "rider_abandoned"].includes(String(ride.status || ""))) {
+      throw new ConflictError("Passengers can only be rated after trip completion.");
+    }
+    if (!passengerId || typeof passengerId !== "string") {
+      throw new BadRequestError("Ride has no associated passenger account to rate.");
+    }
+
+    const reviewExists =
+      existingReviewSnap &&
+      (typeof existingReviewSnap.exists === "function"
+        ? existingReviewSnap.exists()
+        : existingReviewSnap.exists);
+    if (reviewExists) {
+      throw new ConflictError("Passenger has already been rated for this trip.");
+    }
+
+    const passengerRef = db.collection("users").doc(passengerId);
+    const passengerSnap = await tx.get(passengerRef);
+    const passengerExists =
+      passengerSnap &&
+      (typeof passengerSnap.exists === "function" ? passengerSnap.exists() : passengerSnap.exists);
+    const passengerData = passengerExists
+      ? (typeof passengerSnap.data === "function" ? passengerSnap.data() : passengerSnap.data) || {}
+      : {};
+
+    const prevCount = Number(passengerData.passengerRatingCount || 0);
+    const prevAvg = Number(passengerData.passengerRating || 5.0);
+    const nextCount = prevCount + 1;
+    const nextAvg = Math.round(((prevAvg * prevCount + roundedRating) / nextCount) * 100) / 100;
+
+    tx.set(
+      reviewRef,
+      {
+        rideId: cleanRideId,
+        driverId: assignedDriverId || caller.uid,
+        passengerId,
+        rating: roundedRating,
+        tags: cleanTags,
+        comment: cleanComment,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: false }
+    );
+
+    if (passengerExists) {
+      tx.update(passengerRef, {
+        passengerRating: nextAvg,
+        passengerRatingCount: nextCount,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    tx.update(rideRef, {
+      driverRatedPassenger: true,
+      passengerRatingGiven: roundedRating,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return {
+      success: true as const,
+      rideId: cleanRideId,
+      passengerId,
+      rating: roundedRating,
+      passengerAverageRating: nextAvg,
+    };
+  });
 }
 
 /**

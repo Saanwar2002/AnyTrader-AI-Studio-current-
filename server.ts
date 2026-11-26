@@ -40,8 +40,11 @@ import {
 } from "./src/server/rideLifecycleCommands.ts";
 import {
   dispatchRideOffersCommand,
+  executeDeclineRideOfferCommand,
+  executeRatePassengerCommand,
   getSanitizedNearbyDrivers,
   notifyRideCounterpartyPush,
+  RIDE_OFFER_CHANNEL_ID,
   RIDE_UPDATES_CHANNEL_ID,
 } from "./src/server/rideOfferDispatch.ts";
 import { createServer as createViteServer } from "vite";
@@ -1200,12 +1203,19 @@ async function runMatchingCycle(leaseCtx?: { isFenced: () => boolean }) {
             let bestDriver: any = null;
             let highestScore = -1000;
 
+            const declinedSet = new Set<string>([
+              ...(Array.isArray(ride.declinedDriverIds) ? ride.declinedDriverIds : []),
+              ...(Array.isArray(ride.declinedBy) ? ride.declinedBy : []),
+            ].map((id: any) => String(id)));
+
             for (const statusDoc of onlineDriversSnapshot.docs) {
               const driverId = statusDoc.id;
               const statusData = statusDoc.data();
               
-              // Skip if busy
+              // Skip if busy, already considering an offer, or previously declined this ride
               if (statusData.isBusy) continue;
+              if (statusData.pendingRideId && statusData.pendingRideId !== rideDoc.id) continue;
+              if (declinedSet.has(driverId)) continue;
 
               // 1. Get Live Tracking (Distance)
               const trackingDoc = await db.collection("live_tracking").doc(driverId).get();
@@ -1280,18 +1290,60 @@ async function runMatchingCycle(leaseCtx?: { isFenced: () => boolean }) {
 
             if (bestDriver) {
               console.log(`Dispatching Ride ${rideDoc.id} to Driver ${bestDriver} (Score: ${highestScore.toFixed(2)})`);
+              const nowMs = Date.now();
+              const expiresAtMs = nowMs + 15000;
               
               // Move to 'offered' state with 15s timer
               await rideDoc.ref.update({ 
                 status: "offered", 
                 assignedDriverId: bestDriver,
-                offerExpiresAt: new Date(Date.now() + 15000).toISOString(),
-                dispatchAttempts: admin.firestore.FieldValue.increment(1)
+                offerExpiresAt: new Date(expiresAtMs).toISOString(),
+                dispatchAttempts: admin.firestore.FieldValue.increment(1),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
               });
 
-              // Mark driver as temporarily considering (so they don't get multiple offers)
-              await db.collection("driver_status").doc(bestDriver).update({
-                pendingRideId: rideDoc.id
+              // Mark driver as temporarily considering (merge: true avoids NotFound if doc is newly created)
+              await db.collection("driver_status").doc(bestDriver).set({
+                pendingRideId: rideDoc.id,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
+
+              // P0-6: Wake native Android & Web drivers via high-priority FCM push
+              const fareEstimateNum = Number(ride.estimatedFare ?? ride.fare ?? 0);
+              const fareStr = Number.isFinite(fareEstimateNum) && fareEstimateNum > 0
+                ? fareEstimateNum.toFixed(2)
+                : "";
+              const pickupAddress = String(ride.pickupAddress || "Nearby pickup");
+              const dropoffAddress = String(ride.dropoffAddress || "");
+              const vehicleCategory = String(ride.vehicleCategory || ride.carCategory || "Standard");
+              const surgeMultiplier = Number(ride.surgeMultiplier || 1);
+
+              void dispatchAuthoritativeFcmPush(db, getFirebaseMessagingClient(), {
+                recipientId: bestDriver,
+                title: fareStr ? `New Ride Offer — £${fareStr}` : "New Ride Offer Nearby",
+                body: dropoffAddress
+                  ? `${pickupAddress} → ${dropoffAddress}`
+                  : `Pickup: ${pickupAddress}`,
+                channelId: RIDE_OFFER_CHANNEL_ID,
+                eventType: "ride_offer",
+                data: {
+                  type: "ride_offer",
+                  rideId: rideDoc.id,
+                  pickupAddress,
+                  dropoffAddress,
+                  pickupLat: String(pickupLat ?? ""),
+                  pickupLng: String(pickupLng ?? ""),
+                  dropoffLat: String(dropoffLat ?? ""),
+                  dropoffLng: String(dropoffLng ?? ""),
+                  fareEstimate: fareStr,
+                  surgeMultiplier: String(surgeMultiplier),
+                  vehicleCategory,
+                  isPriority: String(Boolean(ride.isPriority)),
+                  isPetFriendly: String(Boolean(ride.isPetFriendly || ride.petFriendly)),
+                  offeredAtMs: String(nowMs),
+                  expiresAtMs: String(expiresAtMs),
+                  route: `/driver-terminal?rideId=${encodeURIComponent(rideDoc.id)}`,
+                },
               });
             }
           }
@@ -1305,23 +1357,30 @@ async function runMatchingCycle(leaseCtx?: { isFenced: () => boolean }) {
         for (const rideDoc of expiredOffersSnapshot.docs) {
           if (leaseCtx?.isFenced()) break;
           const ride = rideDoc.data();
-          if (new Date(ride.offerExpiresAt).getTime() < Date.now()) {
+          if (ride.offerExpiresAt && new Date(ride.offerExpiresAt).getTime() < Date.now()) {
             console.log(`Offer for Ride ${rideDoc.id} expired. Auto-declining for driver ${ride.assignedDriverId}`);
             
-            // Revert driver status
+            // Revert driver status (merge: true safe if doc absent)
             if (ride.assignedDriverId) {
-              await db.collection("driver_status").doc(ride.assignedDriverId).update({
+              await db.collection("driver_status").doc(ride.assignedDriverId).set({
                 pendingRideId: admin.firestore.FieldValue.delete(),
-                consecutiveDeclines: admin.firestore.FieldValue.increment(1)
-              });
+                consecutiveDeclines: admin.firestore.FieldValue.increment(1),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              }, { merge: true });
             }
 
-            // Put ride back in pool
-            await rideDoc.ref.update({
+            // Put ride back in pool & record timed-out driver to prevent immediate re-offer loop
+            const expiredPatch: Record<string, any> = {
               status: "pending",
               assignedDriverId: admin.firestore.FieldValue.delete(),
-              offerExpiresAt: admin.firestore.FieldValue.delete()
-            });
+              offerExpiresAt: admin.firestore.FieldValue.delete(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            };
+            if (ride.assignedDriverId) {
+              expiredPatch.declinedDriverIds = admin.firestore.FieldValue.arrayUnion(ride.assignedDriverId);
+              expiredPatch.declinedBy = admin.firestore.FieldValue.arrayUnion(ride.assignedDriverId);
+            }
+            await rideDoc.ref.update(expiredPatch);
           }
         }
       } catch (err) {
@@ -4739,6 +4798,7 @@ async function startServer() {
       });
 
       res.json({
+        success: true,
         url: result.url,
         intentId: result.intentId,
         reused: result.reused === true,
@@ -4756,7 +4816,7 @@ async function startServer() {
     try {
       if (!db) return res.status(503).json({ error: "Database backend unavailable" });
       const caller = (req as any).user;
-      const result = await executeTransitionRideCommand({
+      const result: any = await executeTransitionRideCommand({
         db,
         caller,
         rideId: req.body?.rideId,
@@ -4764,7 +4824,49 @@ async function startServer() {
         paidWaitSeconds: req.body?.paidWaitSeconds,
         currentStopIndex: req.body?.currentStopIndex,
         earlyCompletionReason: req.body?.earlyCompletionReason,
+        liveEtaSeconds: req.body?.liveEtaSeconds,
+        stackedDriverDelay: req.body?.stackedDriverDelay,
       });
+
+      if (result?.success && result.passengerId) {
+        const action = req.body?.action;
+        const messaging = getFirebaseMessagingClient();
+        if (action === "arrived") {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Your Driver Has Arrived",
+            body: "Your AnyRoller driver is waiting at the pickup point.",
+            eventType: "ride_arrived",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+          });
+        } else if (action === "in_progress") {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Trip Started",
+            body: "You are on your way. Have a safe journey!",
+            eventType: "ride_started",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+          });
+        } else if (action === "stop_progress") {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Stop Completed",
+            body: "Continuing onward to your next destination.",
+            eventType: "ride_stop_progress",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+          });
+        }
+      }
+
       res.json(result);
     } catch (error: any) {
       console.error("Ride Transition Error:", error);
@@ -4776,7 +4878,7 @@ async function startServer() {
     try {
       if (!db) return res.status(503).json({ error: "Database backend unavailable" });
       const caller = (req as any).user;
-      const result = await executeCompleteRideCommand({
+      const result: any = await executeCompleteRideCommand({
         db,
         caller,
         rideId: req.body?.rideId,
@@ -4789,9 +4891,117 @@ async function startServer() {
         paymentUrl: req.body?.paymentUrl,
         abandonmentFee: req.body?.abandonmentFee,
       });
+
+      if (result?.success && !result.idempotent) {
+        const messaging = getFirebaseMessagingClient();
+        const action = req.body?.action;
+        const fareLabel = typeof result.totalFarePaid === "number" ? `£${result.totalFarePaid.toFixed(2)}` : "";
+        if (result.status === "awaiting_payment" && result.passengerId) {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Trip Finished — Payment Due",
+            body: fareLabel
+              ? `Your total fare is ${fareLabel}. Please complete payment.`
+              : "Your trip is finished. Please complete payment.",
+            eventType: "ride_payment_required",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+          });
+        } else if (result.status === "awaiting_cash_confirm" && result.passengerId) {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Confirm Cash Payment",
+            body: "Your driver reported a cash balance difference. Please confirm in the app.",
+            eventType: "ride_cash_confirm",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+          });
+        } else if (result.status === "rider_abandoned" && result.passengerId) {
+          void notifyRideCounterpartyPush({
+            db,
+            messagingClient: messaging,
+            rideId: result.rideId,
+            recipientId: result.passengerId,
+            title: "Ride Marked Abandoned",
+            body: "Your driver ended the ride as abandoned. View your receipt in AnyRoller.",
+            eventType: "ride_abandoned",
+            channelId: RIDE_UPDATES_CHANNEL_ID,
+          });
+        } else if (result.status === "completed") {
+          const isPassengerTriggered =
+            action === "cash_confirm_passenger" || action === "force_complete_passenger";
+          if (isPassengerTriggered && result.assignedDriverId) {
+            void notifyRideCounterpartyPush({
+              db,
+              messagingClient: messaging,
+              rideId: result.rideId,
+              recipientId: result.assignedDriverId,
+              title: "Cash Balance Confirmed",
+              body: "The passenger confirmed the cash payment. Your trip is now closed.",
+              eventType: "ride_completed",
+              channelId: RIDE_UPDATES_CHANNEL_ID,
+            });
+          } else if (!isPassengerTriggered && result.passengerId) {
+            void notifyRideCounterpartyPush({
+              db,
+              messagingClient: messaging,
+              rideId: result.rideId,
+              recipientId: result.passengerId,
+              title: "Trip Completed",
+              body: fareLabel
+                ? `Thanks for riding with AnyRoller! Final fare: ${fareLabel}.`
+                : "Thanks for riding with AnyRoller!",
+              eventType: "ride_completed",
+              channelId: RIDE_UPDATES_CHANNEL_ID,
+            });
+          }
+        }
+      }
+
       res.json(result);
     } catch (error: any) {
       console.error("Ride Completion Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // P1-2: Explicit server-authoritative ride offer decline (instant re-dispatch)
+  app.post("/api/rides/decline", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const result = await executeDeclineRideOfferCommand({
+        db,
+        caller,
+        rideId: req.body?.rideId,
+      });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Ride Decline Error:", error);
+      sendHttpError(res, error, req);
+    }
+  });
+
+  // P1-4: Server-authoritative driver-to-passenger rating after ride completion
+  app.post("/api/rides/rate-passenger", requireAuth, generalLimiter, async (req, res) => {
+    try {
+      if (!db) return res.status(503).json({ error: "Database backend unavailable" });
+      const caller = (req as any).user;
+      const result = await executeRatePassengerCommand({
+        db,
+        caller,
+        rideId: req.body?.rideId,
+        rating: req.body?.rating,
+        tags: req.body?.tags,
+        comment: req.body?.comment,
+      });
+      res.json(result);
+    } catch (error: any) {
+      console.error("Rate Passenger Error:", error);
       sendHttpError(res, error, req);
     }
   });
@@ -6269,7 +6479,16 @@ async function startServer() {
       assertPayoutEligibleRole(userData);
 
       const rawReturnTarget = typeof req.body?.returnTarget === "string" ? req.body.returnTarget.trim().toLowerCase() : "";
-      const safeReturnBasePath = rawReturnTarget === "profile" ? "/profile" : "/billing";
+      const safeReturnBasePath =
+        rawReturnTarget === "profile"
+          ? "/profile"
+          : rawReturnTarget === "driver-terminal"
+            ? "/driver-terminal"
+            : rawReturnTarget === "driver-dashboard"
+              ? "/driver-dashboard"
+              : rawReturnTarget === "driver-return"
+                ? "/driver-return"
+                : "/billing";
       const safeHashSuffix = rawReturnTarget === "profile" ? "#payments" : "";
 
       const appUrl = getAuthoritativeAppUrl();

@@ -504,6 +504,7 @@ service cloud.firestore {
       allow get, list: if isRegistered() && (
         resource.data.get('driverId', '') == request.auth.uid || 
         resource.data.get('passengerId', '') == request.auth.uid || 
+        resource.data.get('queuedPassengerId', '') == request.auth.uid ||
         resource.data.get('riderId', '') == request.auth.uid || 
         rideId == request.auth.uid || 
         isAdmin()
@@ -535,6 +536,17 @@ service cloud.firestore {
         resource.data.get('passengerId', '') == request.auth.uid || 
         isAdmin()
       );
+    }
+
+    match /passenger_reviews/{rideId} {
+      allow read: if isSignedIn() && (
+        resource == null ||
+        resource.data.get('driverId', '') == request.auth.uid ||
+        resource.data.get('passengerId', '') == request.auth.uid ||
+        isAdmin()
+      );
+      // Server-authoritative only via POST /api/rides/rate-passenger (Admin SDK)
+      allow create, update, delete: if false;
     }
 
     match /driver_status/{driverId} {

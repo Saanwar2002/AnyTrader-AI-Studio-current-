@@ -88,16 +88,24 @@ export default function RideChat({ rideId, isOpen, onClose, otherPartyName, othe
         createdAt: serverTimestamp()
       });
       if (passengerId) {
-        fetch("/api/chat-push", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recipientId: passengerId,
-            title: "New Message",
-            body: messageText,
-            rideId: rideId
-          })
-        }).catch(err => console.error("FCM API error:", err));
+        const token = await user.getIdToken().catch(() => null);
+        if (token) {
+          fetch("/api/chat-push", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              recipientId: passengerId,
+              title: "New Message",
+              body: messageText,
+              rideId: rideId,
+              type: "chat",
+              channelId: "ride_chat_updates",
+            })
+          }).catch(err => console.error("FCM API error:", err));
+        }
       }
     } catch (error) {
       console.error("Error sending message:", error);
@@ -126,16 +134,24 @@ export default function RideChat({ rideId, isOpen, onClose, otherPartyName, othe
       });
 
       if (passengerId) {
-        fetch("/api/chat-push", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recipientId: passengerId,
-            title: "New Photo",
-            body: "📷 Sent a photo",
-            rideId: rideId
-          })
-        }).catch(err => console.error("FCM API error:", err));
+        const token = await user.getIdToken().catch(() => null);
+        if (token) {
+          fetch("/api/chat-push", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              recipientId: passengerId,
+              title: "New Photo",
+              body: "📷 Sent a photo",
+              rideId: rideId,
+              type: "chat",
+              channelId: "ride_chat_updates",
+            })
+          }).catch(err => console.error("FCM API error:", err));
+        }
       }
       toast.success("Photo sent");
     } catch (err: any) {
@@ -156,16 +172,24 @@ export default function RideChat({ rideId, isOpen, onClose, otherPartyName, othe
         createdAt: serverTimestamp()
       });
       if (passengerId) {
-        fetch("/api/chat-push", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recipientId: passengerId,
-            title: "New Message",
-            body: text,
-            rideId: rideId
-          })
-        }).catch(err => console.error("FCM API error:", err));
+        const token = await user.getIdToken().catch(() => null);
+        if (token) {
+          fetch("/api/chat-push", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              recipientId: passengerId,
+              title: "New Message",
+              body: text,
+              rideId: rideId,
+              type: "chat",
+              channelId: "ride_chat_updates",
+            })
+          }).catch(err => console.error("FCM API error:", err));
+        }
       }
     } catch (error) {
       console.error("Error sending quick reply:", error);

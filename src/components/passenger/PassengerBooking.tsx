@@ -621,17 +621,26 @@ export default function PassengerBooking() {
       setIncomingPopupMessage(null);
 
       // Trigger remote FCM push notification to driver
-      if (assignedDriverInfo?.driverId) {
-        fetch("/api/chat-push", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recipientId: assignedDriverInfo.driverId,
-            title: "New Message from Passenger",
-            body: replyText,
-            rideId: currentRideId
-          })
-        }).catch(err => console.error("FCM API error:", err));
+      const driverRecipientId = assignedDriverInfo?.uid || (assignedDriverInfo as any)?.driverId;
+      if (driverRecipientId) {
+        const token = await user.getIdToken().catch(() => null);
+        if (token) {
+          fetch("/api/chat-push", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              recipientId: driverRecipientId,
+              title: "New Message from Passenger",
+              body: replyText,
+              rideId: currentRideId,
+              type: "chat",
+              channelId: "ride_chat_updates",
+            })
+          }).catch(err => console.error("FCM API error:", err));
+        }
       }
     } catch (err) {
       console.error("Failed to send quick reply", err);
@@ -1844,6 +1853,7 @@ export default function PassengerBooking() {
         surgeModel: activeSurge.isFixed ? 'fixed' : 'multiplier',
         surgeFixedAmount: activeSurge.fee,
         carCategory: selectedCategory,
+        vehicleCategory: selectedCategory,
         isPetFriendly,
         isPriority,
         waitTolerance,
@@ -2229,17 +2239,26 @@ export default function PassengerBooking() {
       }, 120000);
 
       // Trigger remote FCM push notification to driver
-      if (assignedDriverInfo?.driverId) {
-        fetch("/api/chat-push", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            recipientId: assignedDriverInfo.driverId,
-            title: "New Message from Passenger",
-            body: text,
-            rideId: currentRideId
-          })
-        }).catch(err => console.error("FCM API error:", err));
+      const driverRecipientId = assignedDriverInfo?.uid || (assignedDriverInfo as any)?.driverId;
+      if (driverRecipientId) {
+        const token = await user.getIdToken().catch(() => null);
+        if (token) {
+          fetch("/api/chat-push", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              recipientId: driverRecipientId,
+              title: "New Message from Passenger",
+              body: text,
+              rideId: currentRideId,
+              type: "chat",
+              channelId: "ride_chat_updates",
+            })
+          }).catch(err => console.error("FCM API error:", err));
+        }
       }
     } catch (err) {
       console.error(err);
@@ -2447,18 +2466,24 @@ export default function PassengerBooking() {
           });
           
           // Trigger remote FCM push notification to driver for new ride offer
-          fetch("/api/chat-push", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              recipientId: bestDriver,
-              title: "New Ride Offer",
-              body: "You have a new incoming ride request",
-              rideId: currentRideId,
-              type: "ride_offer",
-              channelId: "ride_offers"
-            })
-          }).catch(err => console.error("FCM API error:", err));
+          const token = await user?.getIdToken().catch(() => null);
+          if (token) {
+            fetch("/api/chat-push", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                recipientId: bestDriver,
+                title: "New Ride Offer",
+                body: "You have a new incoming ride request",
+                rideId: currentRideId,
+                type: "ride_offer",
+                channelId: "ride_offers_urgent"
+              })
+            }).catch(err => console.error("FCM API error:", err));
+          }
        }
     };
 
@@ -2670,6 +2695,22 @@ export default function PassengerBooking() {
           clearBookingInputsAndState();
           toast.info("This ride was cancelled.");
           navigate("/my-rides");
+        }
+        if (data.status === 'rider_abandoned') {
+          setCompletedRideData({ ...data, id: currentRideId });
+          setStep("receipt");
+          setCurrentRideId(null);
+          setAssignedDriverInfo(null);
+          lastSoundStatusRef.current = null;
+          hasTriggeredTipModalRef.current = false;
+          setShowTipModal(false);
+          localStorage.removeItem("passenger_temp_pickup");
+          localStorage.removeItem("passenger_temp_dropoff");
+          localStorage.removeItem("passenger_temp_comments");
+          localStorage.removeItem("passenger_temp_pickup_coords");
+          localStorage.removeItem("passenger_temp_dropoff_coords");
+          localStorage.removeItem("passenger_temp_stops");
+          toast.warning("This ride was ended as abandoned. Any applicable fee is shown on your receipt.");
         }
       }
     }, (err) => console.error("onSnapshot ERROR ride config step:", err));

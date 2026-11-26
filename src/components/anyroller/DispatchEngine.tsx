@@ -6,7 +6,7 @@ import {
   Navigation, Check, RotateCcw, RefreshCw, Star, Info,
   Search, Play, ShieldAlert, SlidersHorizontal, Eye, ShieldCheck, ChevronRight
 } from "lucide-react";
-import { db, collection, doc, onSnapshot, getDoc, setDoc, updateDoc, serverTimestamp, query, where, deleteField } from "@/src/firebase";
+import { auth, db, collection, doc, onSnapshot, getDoc, setDoc, updateDoc, serverTimestamp, query, where, deleteField } from "@/src/firebase";
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindowF, PolylineF } from "@react-google-maps/api";
 import { getGoogleMapsApiKey } from "@/src/lib/capacitor";
 import { toast } from "sonner";
@@ -297,18 +297,24 @@ export default function DispatchEngine() {
       });
 
       // Trigger remote FCM push notification to driver for new ride offer from admin
-      fetch("/api/chat-push", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          recipientId: driver.id,
-          title: "New Ride Offer",
-          body: "You have a new incoming ride request from Dispatch",
-          rideId: currentFocusedRide.id,
-          type: "ride_offer",
-          channelId: "ride_offers"
-        })
-      }).catch(err => console.error("FCM API error:", err));
+      const dispatchToken = await auth.currentUser?.getIdToken().catch(() => null);
+      if (dispatchToken) {
+        fetch("/api/chat-push", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${dispatchToken}`,
+          },
+          body: JSON.stringify({
+            recipientId: driver.id,
+            title: "New Ride Offer",
+            body: "You have a new incoming ride request from Dispatch",
+            rideId: currentFocusedRide.id,
+            type: "ride_offer",
+            channelId: "ride_offers_urgent"
+          })
+        }).catch(err => console.error("FCM API error:", err));
+      }
 
       // Update driver status busy indicator to prevent overlapping automatic offers
       await updateDoc(doc(db, "live_tracking", driver.id), {

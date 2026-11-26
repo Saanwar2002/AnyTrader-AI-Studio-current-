@@ -50,10 +50,12 @@ export interface TransitionRideInput {
   db: any;
   caller: CallerIdentity;
   rideId: string;
-  action: "arrived" | "in_progress" | "stop_progress" | "early_completion_reason";
+  action: "arrived" | "in_progress" | "stop_progress" | "early_completion_reason" | "update_eta";
   paidWaitSeconds?: number;
   currentStopIndex?: number;
   earlyCompletionReason?: string;
+  liveEtaSeconds?: number;
+  stackedDriverDelay?: number;
 }
 
 export async function executeTransitionRideCommand(input: TransitionRideInput) {
@@ -74,6 +76,7 @@ export async function executeTransitionRideCommand(input: TransitionRideInput) {
 
     const ride = typeof rideSnap.data === "function" ? rideSnap.data() : rideSnap.data;
     const assignedDriverId = ride.assignedDriverId || ride.driverId;
+    const passengerId = ride.passengerId || ride.riderId || ride.userId;
     if (!isAdmin && assignedDriverId !== caller.uid) {
       throw new ForbiddenError("Only the assigned driver can update ride progress.");
     }
@@ -103,6 +106,24 @@ export async function executeTransitionRideCommand(input: TransitionRideInput) {
       const cleanReason = String(input.earlyCompletionReason || "").trim().slice(0, 200);
       if (!cleanReason) throw new BadRequestError("earlyCompletionReason is required");
       patch.earlyCompletionReason = cleanReason;
+    } else if (action === "update_eta") {
+      if (!["accepted", "arrived", "in_progress"].includes(currentStatus)) {
+        throw new ConflictError("ETA can only be updated on active rides.");
+      }
+      let hasField = false;
+      if (input.liveEtaSeconds !== undefined && Number.isFinite(Number(input.liveEtaSeconds))) {
+        const clampedSec = Math.max(0, Math.min(14400, Math.round(Number(input.liveEtaSeconds))));
+        patch.liveEtaSeconds = clampedSec;
+        patch.durationMinutes = Math.max(1, Math.ceil(clampedSec / 60));
+        hasField = true;
+      }
+      if (input.stackedDriverDelay !== undefined && Number.isFinite(Number(input.stackedDriverDelay))) {
+        patch.stackedDriverDelay = Math.max(0, Math.min(60, Math.round(Number(input.stackedDriverDelay))));
+        hasField = true;
+      }
+      if (!hasField) {
+        throw new BadRequestError("liveEtaSeconds or stackedDriverDelay is required for update_eta.");
+      }
     } else {
       throw new BadRequestError(`Unsupported ride transition action '${action}'`);
     }
@@ -113,10 +134,164 @@ export async function executeTransitionRideCommand(input: TransitionRideInput) {
       rideId,
       action,
       status: patch.status || currentStatus,
+      ...(passengerId ? { passengerId } : {}),
     };
   });
 
   return result;
+}
+
+/**
+ * Helper to release/promote driver & passenger live_tracking docs atomically when a ride ends.
+ * - If the ended ride was active and the driver has a stacked queuedRideId, promotes the queued
+ *   ride to activeRideId and stamps driverId onto live_tracking/{queuedPassengerId}.
+ * - If the ended ride was the queued ride itself, clears only queuedRideId/queuedPassengerId.
+ * - Always clears driverId/activeRideId from live_tracking/{endedPassengerId} so former driver
+ *   immediately loses read access to the passenger's live GPS.
+ */
+function releaseOrPromoteTrackingInTx(params: {
+  tx: any;
+  db: any;
+  rideId: string;
+  assignedDriverId?: string | null;
+  passengerId?: string | null;
+  driverTrackingData?: Record<string, any> | null;
+  driverStatusRef?: any;
+}) {
+  const { tx, db, rideId, assignedDriverId, passengerId, driverTrackingData, driverStatusRef } = params;
+
+  if (passengerId && typeof passengerId === "string" && passengerId.trim()) {
+    tx.set(
+      db.collection("live_tracking").doc(passengerId.trim()),
+      {
+        driverId: admin.firestore.FieldValue.delete(),
+        activeRideId: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
+  if (!assignedDriverId || typeof assignedDriverId !== "string" || !assignedDriverId.trim()) {
+    return;
+  }
+
+  const driverUid = assignedDriverId.trim();
+  const liveTrackingRef = db.collection("live_tracking").doc(driverUid);
+  const tracking = driverTrackingData || {};
+  const isCancellingQueuedOnly =
+    typeof tracking.queuedRideId === "string" &&
+    tracking.queuedRideId === rideId &&
+    typeof tracking.activeRideId === "string" &&
+    tracking.activeRideId.length > 0 &&
+    tracking.activeRideId !== rideId;
+
+  if (isCancellingQueuedOnly) {
+    tx.set(
+      liveTrackingRef,
+      {
+        queuedRideId: admin.firestore.FieldValue.delete(),
+        queuedPassengerId: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    if (driverStatusRef) {
+      tx.set(
+        driverStatusRef,
+        {
+          queuedRideId: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+    return;
+  }
+
+  const nextRideId =
+    typeof tracking.queuedRideId === "string" &&
+    tracking.queuedRideId.trim() &&
+    tracking.queuedRideId !== rideId
+      ? tracking.queuedRideId.trim()
+      : null;
+  const nextPassengerId =
+    typeof tracking.queuedPassengerId === "string" && tracking.queuedPassengerId.trim()
+      ? tracking.queuedPassengerId.trim()
+      : null;
+
+  if (nextRideId) {
+    tx.set(
+      liveTrackingRef,
+      {
+        driverId: driverUid,
+        status: "on_ride",
+        activeRideId: nextRideId,
+        passengerId: nextPassengerId,
+        riderId: nextPassengerId,
+        queuedRideId: admin.firestore.FieldValue.delete(),
+        queuedPassengerId: admin.firestore.FieldValue.delete(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    if (nextPassengerId) {
+      tx.set(
+        db.collection("live_tracking").doc(nextPassengerId),
+        {
+          passengerId: nextPassengerId,
+          driverId: driverUid,
+          activeRideId: nextRideId,
+          isPassenger: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+    if (driverStatusRef) {
+      tx.set(
+        driverStatusRef,
+        {
+          isBusy: true,
+          status: "busy",
+          currentRideId: nextRideId,
+          queuedRideId: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  } else {
+    tx.set(
+      liveTrackingRef,
+      {
+        driverId: driverUid,
+        status: "available",
+        activeRideId: admin.firestore.FieldValue.delete(),
+        passengerId: admin.firestore.FieldValue.delete(),
+        riderId: admin.firestore.FieldValue.delete(),
+        queuedRideId: admin.firestore.FieldValue.delete(),
+        queuedPassengerId: admin.firestore.FieldValue.delete(),
+        dropoffLat: null,
+        dropoffLng: null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    if (driverStatusRef) {
+      tx.set(
+        driverStatusRef,
+        {
+          isBusy: false,
+          currentRideId: admin.firestore.FieldValue.delete(),
+          queuedRideId: admin.firestore.FieldValue.delete(),
+          status: "online",
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  }
 }
 
 export interface CompleteRideInput {
@@ -177,15 +352,17 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
     const driverRef = assignedDriverId ? db.collection("users").doc(assignedDriverId) : null;
     const driverMetricsRef = assignedDriverId ? db.collection("driver_metrics").doc(assignedDriverId) : null;
     const driverStatusRef = assignedDriverId ? db.collection("driver_status").doc(assignedDriverId) : null;
+    const driverTrackingRef = assignedDriverId ? db.collection("live_tracking").doc(assignedDriverId) : null;
     const passengerRef =
       passengerId && typeof passengerId === "string" && passengerId.trim()
         ? db.collection("users").doc(passengerId)
         : null;
 
-    const [driverSnap, metricsSnap, passengerSnap] = await Promise.all([
+    const [driverSnap, metricsSnap, passengerSnap, driverTrackingSnap] = await Promise.all([
       driverRef ? tx.get(driverRef) : Promise.resolve(null),
       driverMetricsRef ? tx.get(driverMetricsRef) : Promise.resolve(null),
       passengerRef ? tx.get(passengerRef) : Promise.resolve(null),
+      driverTrackingRef ? tx.get(driverTrackingRef) : Promise.resolve(null),
     ]);
 
     const driverData =
@@ -195,6 +372,10 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
     const metricsData =
       metricsSnap && (typeof metricsSnap.exists === "function" ? metricsSnap.exists() : metricsSnap.exists)
         ? (typeof metricsSnap.data === "function" ? metricsSnap.data() : metricsSnap.data)
+        : null;
+    const driverTrackingData =
+      driverTrackingSnap && (typeof driverTrackingSnap.exists === "function" ? driverTrackingSnap.exists() : driverTrackingSnap.exists)
+        ? (typeof driverTrackingSnap.data === "function" ? driverTrackingSnap.data() : driverTrackingSnap.data)
         : null;
     const passengerExists = Boolean(
       passengerSnap && (typeof passengerSnap.exists === "function" ? passengerSnap.exists() : passengerSnap.exists)
@@ -255,6 +436,7 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
         totalFarePaid: fareBreakdown.totalCollectedGbp,
         driverEarnings: fareBreakdown.driverEarningsGbp,
         platformFee: fareBreakdown.platformFeeGbp,
+        ...(passengerId ? { passengerId } : {}),
       };
     }
 
@@ -308,6 +490,16 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
         });
       }
 
+      releaseOrPromoteTrackingInTx({
+        tx,
+        db,
+        rideId,
+        assignedDriverId,
+        passengerId,
+        driverTrackingData,
+        driverStatusRef,
+      });
+
       return {
         success: true,
         rideId,
@@ -317,6 +509,7 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
         totalFarePaid: fareBreakdown.totalCollectedGbp,
         driverEarnings: fareBreakdown.driverEarningsGbp,
         platformFee: fareBreakdown.platformFeeGbp,
+        ...(passengerId ? { passengerId } : {}),
       };
     }
 
@@ -364,6 +557,7 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
           totalFarePaid: fareBreakdown.totalCollectedGbp,
           driverEarnings: fareBreakdown.driverEarningsGbp,
           platformFee: fareBreakdown.platformFeeGbp,
+          ...(passengerId ? { passengerId } : {}),
         };
       }
     }
@@ -521,7 +715,7 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
       if (driverMetricsRef) {
         const isSameDay = metricsData?.date === today;
         const baseDailyEarnings = isSameDay ? Number(metricsData?.dailyEarnings || 0) : 0;
-        const baseJobsToday = isSameDay ? Number(metricsData?.jobsDoneToday || 0) : 0;
+        const baseJobsToday = isSameDay ? Number(metricsData?.jobsDoneToday ?? metricsData?.ridesToday ?? 0) : 0;
         tx.set(
           driverMetricsRef,
           {
@@ -529,43 +723,24 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
             date: today,
             dailyEarnings: penceToGbp(roundToPence(baseDailyEarnings + fareBreakdown.driverEarningsGbp)),
             jobsDoneToday: baseJobsToday + 1,
+            ridesToday: baseJobsToday + 1,
             ...(!isSameDay ? { onlineSecondsToday: 0, lastHeartbeatAtMs: null } : {}),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true }
         );
       }
-
-      if (driverStatusRef) {
-        tx.set(
-          driverStatusRef,
-          {
-            isBusy: false,
-            currentRideId: admin.firestore.FieldValue.delete(),
-            status: "online",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
     }
 
-    if (assignedDriverId) {
-      tx.set(
-        db.collection("live_tracking").doc(assignedDriverId),
-        {
-          driverId: assignedDriverId,
-          status: "available",
-          activeRideId: admin.firestore.FieldValue.delete(),
-          passengerId: admin.firestore.FieldValue.delete(),
-          riderId: admin.firestore.FieldValue.delete(),
-          dropoffLat: null,
-          dropoffLng: null,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
+    releaseOrPromoteTrackingInTx({
+      tx,
+      db,
+      rideId,
+      assignedDriverId,
+      passengerId,
+      driverTrackingData,
+      driverStatusRef,
+    });
 
     return {
       success: true,
@@ -579,6 +754,8 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
       platformFee: fareBreakdown.platformFeeGbp,
       reportedCashCollected: isCashCompletion ? cashCollectedRounded : undefined,
       reportedCashDiscrepancy: isCashCompletion ? discrepancy : undefined,
+      ...(passengerId ? { passengerId } : {}),
+      ...(assignedDriverId ? { assignedDriverId } : {}),
     };
   });
 }
@@ -638,10 +815,12 @@ export async function executeCancelRideCommand(input: CancelRideInput) {
     const passengerRef = passengerId ? db.collection("users").doc(passengerId) : null;
     const driverMetricsRef = assignedDriverId ? db.collection("driver_metrics").doc(assignedDriverId) : null;
     const driverStatusRef = assignedDriverId ? db.collection("driver_status").doc(assignedDriverId) : null;
+    const driverTrackingRef = assignedDriverId ? db.collection("live_tracking").doc(assignedDriverId) : null;
 
-    const [passengerSnap, metricsSnap] = await Promise.all([
+    const [passengerSnap, metricsSnap, driverTrackingSnap] = await Promise.all([
       passengerRef ? tx.get(passengerRef) : Promise.resolve(null),
       driverMetricsRef ? tx.get(driverMetricsRef) : Promise.resolve(null),
+      driverTrackingRef ? tx.get(driverTrackingRef) : Promise.resolve(null),
     ]);
 
     const passengerExists = Boolean(
@@ -650,6 +829,10 @@ export async function executeCancelRideCommand(input: CancelRideInput) {
     const metricsData =
       metricsSnap && (typeof metricsSnap.exists === "function" ? metricsSnap.exists() : metricsSnap.exists)
         ? (typeof metricsSnap.data === "function" ? metricsSnap.data() : metricsSnap.data)
+        : null;
+    const driverTrackingData =
+      driverTrackingSnap && (typeof driverTrackingSnap.exists === "function" ? driverTrackingSnap.exists() : driverTrackingSnap.exists)
+        ? (typeof driverTrackingSnap.data === "function" ? driverTrackingSnap.data() : driverTrackingSnap.data)
         : null;
 
     // Server-authoritative cancellation fee calculation
@@ -722,35 +905,15 @@ export async function executeCancelRideCommand(input: CancelRideInput) {
       );
     }
 
-    if (driverStatusRef) {
-      tx.set(
-        driverStatusRef,
-        {
-          isBusy: false,
-          currentRideId: admin.firestore.FieldValue.delete(),
-          status: "online",
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
-
-    if (assignedDriverId) {
-      tx.set(
-        db.collection("live_tracking").doc(assignedDriverId),
-        {
-          driverId: assignedDriverId,
-          status: "available",
-          activeRideId: admin.firestore.FieldValue.delete(),
-          passengerId: admin.firestore.FieldValue.delete(),
-          riderId: admin.firestore.FieldValue.delete(),
-          dropoffLat: null,
-          dropoffLng: null,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
+    releaseOrPromoteTrackingInTx({
+      tx,
+      db,
+      rideId,
+      assignedDriverId,
+      passengerId,
+      driverTrackingData,
+      driverStatusRef,
+    });
 
     return {
       success: true,
@@ -831,11 +994,13 @@ export async function fulfillTaxiTripCheckout(params: {
     const passengerRef = passengerId ? db.collection("users").doc(passengerId) : null;
     const metricsRef = assignedDriverId ? db.collection("driver_metrics").doc(assignedDriverId) : null;
     const driverStatusRef = assignedDriverId ? db.collection("driver_status").doc(assignedDriverId) : null;
+    const driverTrackingRef = assignedDriverId ? db.collection("live_tracking").doc(assignedDriverId) : null;
 
-    const [driverSnap, passengerSnap, metricsSnap] = await Promise.all([
+    const [driverSnap, passengerSnap, metricsSnap, driverTrackingSnap] = await Promise.all([
       driverRef ? tx.get(driverRef) : Promise.resolve(null),
       passengerRef ? tx.get(passengerRef) : Promise.resolve(null),
       metricsRef ? tx.get(metricsRef) : Promise.resolve(null),
+      driverTrackingRef ? tx.get(driverTrackingRef) : Promise.resolve(null),
     ]);
 
     const driverData =
@@ -848,6 +1013,10 @@ export async function fulfillTaxiTripCheckout(params: {
     const metricsData =
       metricsSnap && (typeof metricsSnap.exists === "function" ? metricsSnap.exists() : metricsSnap.exists)
         ? (typeof metricsSnap.data === "function" ? metricsSnap.data() : metricsSnap.data)
+        : null;
+    const driverTrackingData =
+      driverTrackingSnap && (typeof driverTrackingSnap.exists === "function" ? driverTrackingSnap.exists() : driverTrackingSnap.exists)
+        ? (typeof driverTrackingSnap.data === "function" ? driverTrackingSnap.data() : driverTrackingSnap.data)
         : null;
 
     const expectedTotalPence = Number(meta.totalAmountPence || intent.amount || 0);
@@ -941,7 +1110,7 @@ export async function fulfillTaxiTripCheckout(params: {
       if (metricsRef) {
         const isSameDay = metricsData?.date === today;
         const baseDailyEarnings = isSameDay ? Number(metricsData?.dailyEarnings || 0) : 0;
-        const baseJobsToday = isSameDay ? Number(metricsData?.jobsDoneToday || 0) : 0;
+        const baseJobsToday = isSameDay ? Number(metricsData?.jobsDoneToday ?? metricsData?.ridesToday ?? 0) : 0;
         tx.set(
           metricsRef,
           {
@@ -949,19 +1118,8 @@ export async function fulfillTaxiTripCheckout(params: {
             date: today,
             dailyEarnings: penceToGbp(roundToPence(baseDailyEarnings + driverEarningsGbp)),
             jobsDoneToday: baseJobsToday + 1,
+            ridesToday: baseJobsToday + 1,
             ...(!isSameDay ? { onlineSecondsToday: 0, lastHeartbeatAtMs: null } : {}),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
-      if (driverStatusRef) {
-        tx.set(
-          driverStatusRef,
-          {
-            isBusy: false,
-            currentRideId: admin.firestore.FieldValue.delete(),
-            status: "online",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true }
@@ -969,22 +1127,15 @@ export async function fulfillTaxiTripCheckout(params: {
       }
     }
 
-    if (assignedDriverId) {
-      tx.set(
-        db.collection("live_tracking").doc(assignedDriverId),
-        {
-          driverId: assignedDriverId,
-          status: "available",
-          activeRideId: admin.firestore.FieldValue.delete(),
-          passengerId: admin.firestore.FieldValue.delete(),
-          riderId: admin.firestore.FieldValue.delete(),
-          dropoffLat: null,
-          dropoffLng: null,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
+    releaseOrPromoteTrackingInTx({
+      tx,
+      db,
+      rideId,
+      assignedDriverId,
+      passengerId,
+      driverTrackingData,
+      driverStatusRef,
+    });
 
     tx.create(ledgerRef, {
       type: "RIDE_PAYMENT",

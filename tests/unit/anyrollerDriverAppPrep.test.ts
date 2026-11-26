@@ -5,6 +5,8 @@ import {
   calculateHaversineMiles,
   dispatchRideOffersCommand,
   evaluateDriverOfferCandidate,
+  executeDeclineRideOfferCommand,
+  executeRatePassengerCommand,
   getSanitizedNearbyDrivers,
   notifyRideCounterpartyPush,
   RIDE_OFFER_CHANNEL_ID,
@@ -14,7 +16,9 @@ import { executeAcceptRideCommand } from "../../src/server/driverAuthorization.t
 import {
   executeCancelRideCommand,
   executeCompleteRideCommand,
+  executeTransitionRideCommand,
 } from "../../src/server/rideLifecycleCommands.ts";
+import { reportOrBlockChatParticipantCommand } from "../../src/server/chatSafety.ts";
 import { buildAndroidAssetLinksPayload } from "../../src/server/mobileDeepLinks.ts";
 import { sanitizeRedirectUrl } from "../../src/server/paymentVerification.ts";
 import { sendAuthoritativeChatPush } from "../../src/server/notificationEngine.ts";
@@ -30,6 +34,13 @@ function createInMemoryFirestore(initialDocs: Record<string, Record<string, any>
     for (const [key, val] of Object.entries(patch)) {
       if (val && typeof val === "object" && (val._methodName === "FieldValue.delete" || val.constructor?.name === "DeleteTransform")) {
         delete next[key];
+      } else if (val && typeof val === "object" && (val._methodName === "FieldValue.arrayUnion" || val.constructor?.name === "ArrayUnionTransform" || Array.isArray(val.elements))) {
+        const existingArr = Array.isArray(next[key]) ? [...next[key]] : [];
+        const toAdd = Array.isArray(val.elements) ? val.elements : Array.isArray(val._elements) ? val._elements : [];
+        for (const item of toAdd) {
+          if (!existingArr.includes(item)) existingArr.push(item);
+        }
+        next[key] = existingArr;
       } else if (val && typeof val === "object" && (val._methodName === "FieldValue.increment" || typeof val.operand === "number")) {
         const delta = Number(val.operand ?? val._operand ?? 0);
         next[key] = Number(next[key] || 0) + delta;
@@ -622,6 +633,350 @@ describe("AnyRoller Standalone Android Driver App Backend Prep", () => {
       expect(fnBody).toContain("'taxi_driver'");
       expect(fnBody).toContain("accountType");
       expect(fnBody).toContain("driverApproved");
+    });
+  });
+
+  describe("4. Android Driver App Live Sync Reconciliation (P0-1..P0-6 & P1-1..P1-5)", () => {
+    it("P0-1 & P0-2: allows offered driver to accept offered ride, blocks competing driver before expiry, and stamps authoritative driver profile fields", async () => {
+      const futureIso = new Date(Date.now() + 30_000).toISOString();
+      const db = createInMemoryFirestore({
+        "users/driver_offered": {
+          role: "taxi_driver",
+          driverApproved: true,
+          firstName: "Amina",
+          lastName: "Khan",
+          phone: "+447700900111",
+          vehicle: "Black Skoda Octavia",
+          vehicleRegistration: "YD72 KLM",
+          rating: 4.92,
+          requirePasscode: true,
+          photoURL: "https://example.com/amina.jpg",
+        },
+        "users/driver_other": {
+          role: "driver",
+          driverApproved: true,
+          firstName: "Bob",
+        },
+        "ride_requests/ride_offered_1": {
+          passengerId: "passenger_1",
+          status: "offered",
+          assignedDriverId: "driver_offered",
+          offerExpiresAt: futureIso,
+          dropoffLat: 53.66,
+          dropoffLng: -1.77,
+        },
+        "live_tracking/driver_offered": {
+          driverId: "driver_offered",
+          isOnline: true,
+          status: "available",
+          lat: 53.645,
+          lng: -1.785,
+        },
+      });
+
+      // Competing driver blocked while offer is active
+      await expect(
+        executeAcceptRideCommand({
+          db,
+          caller: { uid: "driver_other" },
+          body: { rideId: "ride_offered_1" },
+        })
+      ).rejects.toThrow(/already been accepted|currently offered/i);
+
+      // Offered driver succeeds and authoritative profile fields + passenger live_tracking link are stamped
+      const res = await executeAcceptRideCommand({
+        db,
+        caller: { uid: "driver_offered" },
+        body: { rideId: "ride_offered_1" },
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.driverId).toBe("driver_offered");
+      expect(res.isStackedAccept).toBeFalsy();
+
+      const ride = db._store.get("ride_requests/ride_offered_1");
+      expect(ride?.status).toBe("accepted");
+      expect(ride?.driverId).toBe("driver_offered");
+      expect(ride?.assignedDriverId).toBe("driver_offered");
+      expect(ride?.driverName).toBe("Amina Khan");
+      expect(ride?.driverPhone).toBe("+447700900111");
+      expect(ride?.vehicleInfo).toBe("Black Skoda Octavia");
+      expect(ride?.vehiclePlate).toBe("YD72 KLM");
+      expect(ride?.driverRating).toBe(4.92);
+      expect(ride?.driverRequirePasscode).toBe(true);
+      expect(ride?.driverPhotoUrl).toBe("https://example.com/amina.jpg");
+      expect(ride?.acceptedAt).toBeDefined();
+
+      // P0-3: Passenger live_tracking doc stamped with driverId so driver sees passenger GPS blue dot
+      const passengerTracking = db._store.get("live_tracking/passenger_1");
+      expect(passengerTracking?.driverId).toBe("driver_offered");
+      expect(passengerTracking?.activeRideId).toBe("ride_offered_1");
+      expect(passengerTracking?.passengerId).toBe("passenger_1");
+      expect(passengerTracking?.isPassenger).toBe(true);
+    });
+
+    it("P0-3 & P0-6: preserves active passenger on stacked accept and promotes queued ride on completion with ridesToday metric mirror", async () => {
+      const db = createInMemoryFirestore({
+        "users/driver_stack": {
+          role: "driver",
+          driverApproved: true,
+          firstName: "Tariq",
+        },
+        "users/passenger_A": { role: "homeowner", pendingCharges: 0 },
+        "users/passenger_B": { role: "homeowner", pendingCharges: 0 },
+        "ride_requests/ride_A": {
+          passengerId: "passenger_A",
+          driverId: "driver_stack",
+          assignedDriverId: "driver_stack",
+          status: "in_progress",
+          fareEstimate: 12,
+          paymentMethod: "cash",
+        },
+        "ride_requests/ride_B": {
+          passengerId: "passenger_B",
+          status: "offered",
+          assignedDriverId: "driver_stack",
+          dropoffLat: 53.68,
+          dropoffLng: -1.75,
+        },
+        "live_tracking/driver_stack": {
+          driverId: "driver_stack",
+          isOnline: true,
+          status: "on_ride",
+          activeRideId: "ride_A",
+          passengerId: "passenger_A",
+          riderId: "passenger_A",
+          isStackingEnabled: true,
+        },
+        "live_tracking/passenger_A": {
+          passengerId: "passenger_A",
+          driverId: "driver_stack",
+          activeRideId: "ride_A",
+          isPassenger: true,
+        },
+      });
+
+      // Accept Ride B while on Ride A -> stacked accept
+      const stackRes = await executeAcceptRideCommand({
+        db,
+        caller: { uid: "driver_stack" },
+        body: { rideId: "ride_B" },
+      });
+      expect(stackRes.success).toBe(true);
+      expect(stackRes.isStackedAccept).toBe(true);
+
+      let driverTrack = db._store.get("live_tracking/driver_stack");
+      expect(driverTrack?.activeRideId).toBe("ride_A");
+      expect(driverTrack?.passengerId).toBe("passenger_A");
+      expect(driverTrack?.queuedRideId).toBe("ride_B");
+      expect(driverTrack?.queuedPassengerId).toBe("passenger_B");
+      expect(driverTrack?.isStackingEnabled).toBe(false);
+
+      // Complete Ride A -> promotes Ride B to active and clears passenger_A's driverId
+      await executeCompleteRideCommand({
+        db,
+        caller: { uid: "driver_stack" },
+        rideId: "ride_A",
+        action: "cash_finalize",
+        cashCollected: 12,
+      });
+
+      driverTrack = db._store.get("live_tracking/driver_stack");
+      expect(driverTrack?.status).toBe("on_ride");
+      expect(driverTrack?.activeRideId).toBe("ride_B");
+      expect(driverTrack?.passengerId).toBe("passenger_B");
+      expect(driverTrack?.queuedRideId).toBeUndefined();
+      expect(driverTrack?.queuedPassengerId).toBeUndefined();
+
+      const paxATrack = db._store.get("live_tracking/passenger_A");
+      expect(paxATrack?.driverId).toBeUndefined();
+      expect(paxATrack?.activeRideId).toBeUndefined();
+
+      const paxBTrack = db._store.get("live_tracking/passenger_B");
+      expect(paxBTrack?.driverId).toBe("driver_stack");
+      expect(paxBTrack?.activeRideId).toBe("ride_B");
+
+      // Android driver_metrics parity: both jobsDoneToday and ridesToday updated
+      const metrics = db._store.get("driver_metrics/driver_stack");
+      expect(metrics?.jobsDoneToday).toBe(1);
+      expect(metrics?.ridesToday).toBe(1);
+    });
+
+    it("supports Android live_tracking filter field aliases (isStackingEnabled, isLastJob, destinationModeActive, zoneEnabled, declinedDriverIds)", () => {
+      const nowMs = 1_750_000_000_000;
+      const baseRide = {
+        pickupLat: huddersfieldLat,
+        pickupLng: huddersfieldLng,
+        dropoffLat: 53.7997,
+        dropoffLng: -1.5492,
+        vehicleCategory: "standard",
+        declinedDriverIds: ["d_declined_android"],
+      };
+
+      expect(
+        evaluateDriverOfferCandidate({
+          driverUid: "d_declined_android",
+          trackingData: { isOnline: true, status: "available", lat: nearbyLat, lng: nearbyLng, lastHeartbeatAtMs: nowMs },
+          rideData: baseRide,
+          radiusMiles: 15,
+          nowMs,
+        }).reason
+      ).toBe("declined");
+
+      expect(
+        evaluateDriverOfferCandidate({
+          driverUid: "d_last_job_android",
+          trackingData: { isOnline: true, status: "available", isLastJob: true, lat: nearbyLat, lng: nearbyLng, lastHeartbeatAtMs: nowMs },
+          rideData: baseRide,
+          radiusMiles: 15,
+          nowMs,
+        }).reason
+      ).toBe("last_job_mode");
+
+      expect(
+        evaluateDriverOfferCandidate({
+          driverUid: "d_stack_android",
+          trackingData: {
+            isOnline: true,
+            status: "on_ride",
+            isStackingEnabled: true,
+            lat: farLat,
+            lng: farLng,
+            dropoffLat: nearbyLat,
+            dropoffLng: nearbyLng,
+            lastHeartbeatAtMs: nowMs,
+          },
+          rideData: baseRide,
+          radiusMiles: 15,
+          nowMs,
+        }).eligible
+      ).toBe(true);
+
+      expect(
+        evaluateDriverOfferCandidate({
+          driverUid: "d_zone_android",
+          trackingData: {
+            isOnline: true,
+            status: "available",
+            lat: nearbyLat,
+            lng: nearbyLng,
+            zoneEnabled: true,
+            homeLat: 53.4808,
+            homeLng: -2.2426,
+            zoneMaxDistance: 3,
+            lastHeartbeatAtMs: nowMs,
+          },
+          rideData: baseRide,
+          radiusMiles: 15,
+          nowMs,
+        }).reason
+      ).toBe("outside_driver_zone");
+    });
+
+    it("P1-2, P1-3 & P1-4: executes ride offer decline, live ETA update_eta, and driver-to-passenger rating", async () => {
+      const db = createInMemoryFirestore({
+        "users/driver_1": { role: "driver", driverApproved: true },
+        "users/passenger_1": { role: "homeowner", passengerRating: 5.0, passengerRatingCount: 1 },
+        "ride_requests/ride_decline_1": {
+          passengerId: "passenger_1",
+          status: "offered",
+          assignedDriverId: "driver_1",
+          offerExpiresAt: new Date(Date.now() + 15_000).toISOString(),
+        },
+        "ride_requests/ride_eta_1": {
+          passengerId: "passenger_1",
+          assignedDriverId: "driver_1",
+          driverId: "driver_1",
+          status: "accepted",
+        },
+        "ride_requests/ride_done_1": {
+          passengerId: "passenger_1",
+          assignedDriverId: "driver_1",
+          driverId: "driver_1",
+          status: "completed",
+        },
+      });
+
+      // P1-2 Decline
+      const declineRes = await executeDeclineRideOfferCommand({
+        db,
+        caller: { uid: "driver_1" },
+        rideId: "ride_decline_1",
+      });
+      expect(declineRes.success).toBe(true);
+      expect(declineRes.status).toBe("pending");
+      const declinedRide = db._store.get("ride_requests/ride_decline_1");
+      expect(declinedRide?.status).toBe("pending");
+      expect(declinedRide?.assignedDriverId).toBeUndefined();
+      expect(declinedRide?.declinedDriverIds).toContain("driver_1");
+      expect(declinedRide?.declinedBy).toContain("driver_1");
+
+      // P1-3 update_eta
+      const etaRes = await executeTransitionRideCommand({
+        db,
+        caller: { uid: "driver_1" },
+        rideId: "ride_eta_1",
+        action: "update_eta",
+        liveEtaSeconds: 240,
+        stackedDriverDelay: 5,
+      });
+      expect(etaRes.success).toBe(true);
+      const etaRide = db._store.get("ride_requests/ride_eta_1");
+      expect(etaRide?.liveEtaSeconds).toBe(240);
+      expect(etaRide?.durationMinutes).toBe(4);
+      expect(etaRide?.stackedDriverDelay).toBe(5);
+
+      // P1-4 rate-passenger
+      const rateRes = await executeRatePassengerCommand({
+        db,
+        caller: { uid: "driver_1" },
+        rideId: "ride_done_1",
+        rating: 4,
+        tags: ["Polite", "Ready on time"],
+        comment: "Smooth pickup",
+      });
+      expect(rateRes.success).toBe(true);
+      expect(rateRes.passengerAverageRating).toBe(4.5);
+      const passengerDoc = db._store.get("users/passenger_1");
+      expect(passengerDoc?.passengerRating).toBe(4.5);
+      expect(passengerDoc?.passengerRatingCount).toBe(2);
+      const reviewDoc = db._store.get("passenger_reviews/ride_done_1");
+      expect(reviewDoc?.rating).toBe(4);
+      expect(reviewDoc?.driverId).toBe("driver_1");
+      const doneRide = db._store.get("ride_requests/ride_done_1");
+      expect(doneRide?.driverRatedPassenger).toBe(true);
+    });
+
+    it("chatSafety supports AnyRoller rideId & blockUser boolean payload from native Android", async () => {
+      const db = createInMemoryFirestore({
+        "ride_requests/ride_chat_safety": {
+          passengerId: "passenger_bad",
+          driverId: "driver_1",
+          assignedDriverId: "driver_1",
+          status: "in_progress",
+        },
+      });
+
+      const res = await reportOrBlockChatParticipantCommand(
+        db,
+        { uid: "driver_1" },
+        {
+          rideId: "ride_chat_safety",
+          targetUserId: "passenger_bad",
+          reason: "abusive_language",
+          blockUser: true,
+        }
+      );
+
+      expect(res.action).toBe("report_and_block");
+      expect(res.blockRecord?.blockedUid).toBe("passenger_bad");
+      expect(res.reportRecord?.id).toBeTruthy();
+    });
+
+    it("P1-5: firestore.rules allows queuedPassengerId read on live_tracking and protects passenger_reviews", () => {
+      const rules = fs.readFileSync(path.resolve(process.cwd(), "firestore.rules"), "utf8");
+      expect(rules).toContain("resource.data.get('queuedPassengerId', '') == request.auth.uid");
+      expect(rules).toContain("match /passenger_reviews/{rideId}");
     });
   });
 });

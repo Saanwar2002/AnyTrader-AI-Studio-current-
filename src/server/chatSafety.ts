@@ -10,9 +10,11 @@ import {
 export type ChatSafetyAction = "report" | "block" | "report_and_block";
 
 export interface ReportOrBlockInput {
-  conversationId: string;
+  conversationId?: string;
+  rideId?: string;
   targetUserId: string;
-  action: ChatSafetyAction;
+  action?: ChatSafetyAction;
+  blockUser?: boolean;
   reason?: string;
   details?: string;
 }
@@ -60,13 +62,22 @@ export async function reportOrBlockChatParticipantCommand(
     throw new ServiceUnavailableError("Database service unavailable.");
   }
 
-  const conversationId = String(input?.conversationId || "").trim();
+  const rawConversationId = String(input?.conversationId || "").trim();
+  const rawRideId = String(input?.rideId || "").trim();
   const targetUserId = String(input?.targetUserId || "").trim();
-  const action = String(input?.action || "").trim() as ChatSafetyAction;
+  const derivedAction: ChatSafetyAction =
+    typeof input?.action === "string" && input.action.trim()
+      ? (input.action.trim() as ChatSafetyAction)
+      : input?.blockUser === false
+        ? "report"
+        : input?.blockUser === true
+          ? "report_and_block"
+          : ("" as ChatSafetyAction);
+  const action = derivedAction;
   const reason = String(input?.reason || "inappropriate_behavior").trim().slice(0, 120);
   const details = String(input?.details || "").trim().slice(0, 1000);
 
-  if (!conversationId) {
+  if (!rawConversationId && !rawRideId) {
     throw new BadRequestError("conversationId is required.");
   }
   if (!targetUserId) {
@@ -82,20 +93,49 @@ export async function reportOrBlockChatParticipantCommand(
     throw new BadRequestError("Please provide a valid reason for reporting this participant.");
   }
 
-  // Verify conversation exists and BOTH caller and targetUserId are participants
-  const convRef = db.collection("conversations").doc(conversationId);
-  const convSnap = await convRef.get();
-  if (!convSnap.exists) {
-    throw new NotFoundError("Conversation not found.");
-  }
-  const convData = convSnap.data() || {};
-  const participants: string[] = Array.isArray(convData.participants) ? convData.participants : [];
+  let conversationId = rawConversationId;
+  let convData: Record<string, any> = {};
 
-  if (!participants.includes(caller.uid)) {
-    throw new ForbiddenError("You are not a participant in this conversation.");
-  }
-  if (!participants.includes(targetUserId)) {
-    throw new BadRequestError("The specified user is not a participant in this conversation.");
+  if (rawConversationId) {
+    // Verify conversation exists and BOTH caller and targetUserId are participants
+    const convRef = db.collection("conversations").doc(rawConversationId);
+    const convSnap = await convRef.get();
+    if (!convSnap.exists) {
+      throw new NotFoundError("Conversation not found.");
+    }
+    convData = convSnap.data() || {};
+    const participants: string[] = Array.isArray(convData.participants) ? convData.participants : [];
+
+    if (!participants.includes(caller.uid)) {
+      throw new ForbiddenError("You are not a participant in this conversation.");
+    }
+    if (!participants.includes(targetUserId)) {
+      throw new BadRequestError("The specified user is not a participant in this conversation.");
+    }
+  } else {
+    // AnyRoller ride-scoped participant verification
+    const rideRef = db.collection("ride_requests").doc(rawRideId);
+    const rideSnap = await rideRef.get();
+    if (!rideSnap.exists) {
+      throw new NotFoundError("Ride request not found.");
+    }
+    const rideData = rideSnap.data() || {};
+    const rideParticipants = [
+      rideData.passengerId,
+      rideData.riderId,
+      rideData.userId,
+      rideData.driverId,
+      rideData.assignedDriverId,
+    ].filter((v): v is string => typeof v === "string" && v.trim().length > 0);
+
+    if (!rideParticipants.includes(caller.uid)) {
+      throw new ForbiddenError("You are not a participant in this ride.");
+    }
+    if (!rideParticipants.includes(targetUserId)) {
+      throw new BadRequestError("The specified user is not a participant in this ride.");
+    }
+    conversationId = `ride:${rawRideId}`;
+    convData = { jobId: null };
   }
 
   const nowIso = new Date().toISOString();
