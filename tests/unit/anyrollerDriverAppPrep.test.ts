@@ -22,6 +22,7 @@ import { reportOrBlockChatParticipantCommand } from "../../src/server/chatSafety
 import { buildAndroidAssetLinksPayload } from "../../src/server/mobileDeepLinks.ts";
 import { sanitizeRedirectUrl } from "../../src/server/paymentVerification.ts";
 import { sendAuthoritativeChatPush } from "../../src/server/notificationEngine.ts";
+import { analyzeOfferIntelligence } from "../../src/lib/offerIntelligence.ts";
 
 function createInMemoryFirestore(initialDocs: Record<string, Record<string, any>> = {}) {
   const store = new Map<string, Record<string, any>>();
@@ -977,6 +978,164 @@ describe("AnyRoller Standalone Android Driver App Backend Prep", () => {
       const rules = fs.readFileSync(path.resolve(process.cwd(), "firestore.rules"), "utf8");
       expect(rules).toContain("resource.data.get('queuedPassengerId', '') == request.auth.uid");
       expect(rules).toContain("match /passenger_reviews/{rideId}");
+    });
+  });
+
+  describe("5. Web Driver Terminal ↔ Android Driver App Parity & Break/Stacked-Push Sync", () => {
+    it("rejects drivers on Coffee Cup Break (onBreak=true or status=busy) even if stacking is enabled", () => {
+      const nowMs = 1_750_000_000_000;
+      const baseRide = {
+        pickupLat: huddersfieldLat,
+        pickupLng: huddersfieldLng,
+        dropoffLat: 53.7997,
+        dropoffLng: -1.5492,
+        vehicleCategory: "standard",
+      };
+
+      const resBusy = evaluateDriverOfferCandidate({
+        driverUid: "d_break_busy",
+        trackingData: {
+          isOnline: true,
+          status: "busy",
+          isStackingEnabled: true,
+          lat: nearbyLat,
+          lng: nearbyLng,
+          lastHeartbeatAtMs: nowMs,
+        },
+        rideData: baseRide,
+        radiusMiles: 15,
+        nowMs,
+      });
+      expect(resBusy.eligible).toBe(false);
+      expect(resBusy.reason).toBe("on_break");
+
+      const resOnBreakFlag = evaluateDriverOfferCandidate({
+        driverUid: "d_break_flag",
+        trackingData: {
+          isOnline: true,
+          status: "available",
+          onBreak: true,
+          lat: nearbyLat,
+          lng: nearbyLng,
+          lastHeartbeatAtMs: nowMs,
+        },
+        rideData: baseRide,
+        radiusMiles: 15,
+        nowMs,
+      });
+      expect(resOnBreakFlag.eligible).toBe(false);
+      expect(resOnBreakFlag.reason).toBe("on_break");
+    });
+
+    it("tags stacked ride offer FCM pushes with type=stacked_ride_offer when dispatching to an on_ride driver", async () => {
+      const nowMs = 1_750_000_000_000;
+      const db = createInMemoryFirestore({
+        "ride_requests/ride_stack_push": {
+          passengerId: "passenger_stack",
+          status: "pending",
+          pickup: "Huddersfield Rail Station",
+          dropoff: "Leeds Station",
+          pickupLat: huddersfieldLat,
+          pickupLng: huddersfieldLng,
+          dropoffLat: 53.795,
+          dropoffLng: -1.547,
+          fareEstimate: 26.5,
+          vehicleCategory: "standard",
+        },
+        "live_tracking/driver_on_ride": {
+          driverId: "driver_on_ride",
+          isOnline: true,
+          status: "on_ride",
+          isStackingEnabled: true,
+          lat: farLat,
+          lng: farLng,
+          dropoffLat: nearbyLat,
+          dropoffLng: nearbyLng,
+          lastHeartbeatAtMs: nowMs - 2_000,
+        },
+        "users/driver_on_ride": {
+          role: "driver",
+          driverApproved: true,
+          fcmToken: "fcm_stacked_driver_token",
+        },
+      });
+
+      const sendMock = vi.fn().mockResolvedValue("projects/anytradercombined/messages/stack_1");
+      const res = await dispatchRideOffersCommand({
+        db,
+        caller: { uid: "passenger_stack" },
+        rideId: "ride_stack_push",
+        messagingClient: { send: sendMock },
+        nowMs,
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.matchedDrivers).toBe(1);
+      expect(res.dispatchedCount).toBe(1);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      expect(sendMock.mock.calls[0][0].data?.type).toBe("stacked_ride_offer");
+      expect(sendMock.mock.calls[0][0].android?.notification?.channelId).toBe(RIDE_OFFER_CHANNEL_ID);
+    });
+
+    it("analyzeOfferIntelligence computes £/hr, £/mi, smart tags, compass direction, and Toward Home parity", () => {
+      const airportIntel = analyzeOfferIntelligence({
+        offer: {
+          pickupAddress: "Huddersfield Town Centre",
+          dropoffAddress: "Manchester Airport Terminal 2",
+          pickupLat: 53.6458,
+          pickupLng: -1.785,
+          dropoffLat: 53.365,
+          dropoffLng: -2.2728,
+          fareEstimate: 54.0,
+          distanceMiles: 29.0,
+          durationMinutes: 45,
+        },
+        driverLat: 53.648,
+        driverLng: -1.782,
+        homeLat: 53.35,
+        homeLng: -2.28,
+      });
+
+      expect(airportIntel.smartTag).toBe("AIRPORT");
+      expect(airportIntel.estimatedGbpPerHour).toBeGreaterThan(50);
+      expect(airportIntel.estimatedGbpPerMile).toBeGreaterThan(1.5);
+      expect(airportIntel.compassShort).toBe("SW");
+      expect(airportIntel.isHeadingTowardHome).toBe(true);
+
+      const stationIntel = analyzeOfferIntelligence({
+        offer: {
+          pickupAddress: "10 High Street",
+          dropoffAddress: "Leeds Railway Station",
+          pickupLat: 53.6458,
+          pickupLng: -1.785,
+          dropoffLat: 53.7946,
+          dropoffLng: -1.5476,
+          fareEstimate: 24.0,
+          distanceMiles: 12.0,
+          durationMinutes: 25,
+        },
+        driverLat: 53.6458,
+        driverLng: -1.785,
+      });
+      expect(stationIntel.smartTag).toBe("RAIL STATION");
+      expect(stationIntel.compassShort).toBe("NE");
+
+      const longTripIntel = analyzeOfferIntelligence({
+        offer: {
+          pickupAddress: "10 High Street",
+          dropoffAddress: "York City Centre",
+          pickupLat: 53.6458,
+          pickupLng: -1.785,
+          dropoffLat: 53.9591,
+          dropoffLng: -1.0815,
+          fareEstimate: 65.0,
+          distanceMiles: 35.0,
+          durationMinutes: 55,
+        },
+        driverLat: 53.6458,
+        driverLng: -1.785,
+      });
+      expect(longTripIntel.smartTag).toBe("LONG TRIP");
     });
   });
 });

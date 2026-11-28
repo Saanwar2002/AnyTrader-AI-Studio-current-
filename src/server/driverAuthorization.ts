@@ -283,6 +283,20 @@ export async function executeAcceptRideCommand(
       { merge: true }
     );
 
+    const driverMetricsRef = db.collection("driver_metrics").doc(effectiveDriverId);
+    const assignedNowMs = Date.now();
+    transaction.set(
+      driverMetricsRef,
+      {
+        driverId: effectiveDriverId,
+        lastAssignmentAt: new Date(assignedNowMs).toISOString(),
+        lastAssignmentAtMs: assignedNowMs,
+        acceptedOffersCount: admin.firestore.FieldValue.increment(1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
     if (isStackedAccept) {
       transaction.set(
         liveTrackingRef,

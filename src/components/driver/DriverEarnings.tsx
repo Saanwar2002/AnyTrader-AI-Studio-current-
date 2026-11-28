@@ -78,6 +78,20 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
     pending: 0,
     loading: true,
   });
+  const [connectStatus, setConnectStatus] = useState<{
+    connected: boolean;
+    payoutsEnabled: boolean;
+    chargesEnabled: boolean;
+    detailsSubmitted: boolean;
+    loading: boolean;
+  }>({
+    connected: false,
+    payoutsEnabled: false,
+    chargesEnabled: false,
+    detailsSubmitted: false,
+    loading: true,
+  });
+  const [isLaunchingConnect, setIsLaunchingConnect] = useState(false);
   const [recentTrips, setRecentTrips] = useState<any[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isEditingGoal, setIsEditingGoal] = useState(false);
@@ -534,25 +548,57 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
       },
     );
 
-    // 3. Fetch Stripe Balance
-    const fetchBalance = async () => {
+    // 3. Fetch Stripe Balance & Connect Verification Status
+    const fetchStripeOverview = async () => {
       try {
         const token = await user.getIdToken();
-        const res = await fetch(`/api/driver/stripe-balance/${user.uid}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (res.ok) {
-          const data = await res.json();
+        const [balRes, statusRes] = await Promise.all([
+          fetch(`/api/driver/stripe-balance/${user.uid}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch("/api/stripe/account-status", {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        ]);
+        if (balRes.ok) {
+          const data = await balRes.json();
           setStripeBalance({ ...data, loading: false });
         } else {
           setStripeBalance((prev) => ({ ...prev, loading: false }));
         }
+        if (statusRes.ok) {
+          const st = await statusRes.json();
+          setConnectStatus({
+            connected: st.connected === true,
+            payoutsEnabled: st.payoutsEnabled === true,
+            chargesEnabled: st.chargesEnabled === true,
+            detailsSubmitted: st.detailsSubmitted === true,
+            loading: false,
+          });
+        } else {
+          setConnectStatus((prev) => ({ ...prev, loading: false }));
+        }
       } catch (err) {
-        console.error("Error fetching balance:", err);
+        console.error("Error fetching Stripe overview:", err);
         setStripeBalance((prev) => ({ ...prev, loading: false }));
+        setConnectStatus((prev) => ({ ...prev, loading: false }));
       }
     };
-    fetchBalance();
+    fetchStripeOverview();
+
+    const params = new URLSearchParams(window.location.search);
+    const connectParam = params.get("stripe_connect");
+    if (connectParam === "success" || connectParam === "refresh") {
+      if (connectParam === "success") {
+        toast.success("Stripe Connect updated! Verifying payout status...");
+      } else {
+        toast.info("Please complete any remaining Stripe Connect details to enable payouts.");
+      }
+      params.delete("stripe_connect");
+      params.delete("account_id");
+      const cleanQuery = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`);
+    }
 
     return () => {
       unsubGlobalTiers();
@@ -561,19 +607,86 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
     };
   }, [user]);
 
+  const handleStartStripeConnect = async () => {
+    if (!user || isLaunchingConnect) return;
+    setIsLaunchingConnect(true);
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch("/api/stripe/create-connect-account", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ returnTarget: "billing" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.url) {
+        window.location.href = data.url;
+        return;
+      }
+      toast.error(data.error || "Unable to open Stripe Connect setup.");
+    } catch {
+      toast.error("Failed to connect to Stripe onboarding.");
+    } finally {
+      setIsLaunchingConnect(false);
+    }
+  };
+
+  const handleOpenExpressDashboard = async () => {
+    if (!user || isLaunchingConnect) return;
+    setIsLaunchingConnect(true);
+    try {
+      const token = await user.getIdToken();
+      const res = await fetch("/api/stripe/create-login-link", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.url) {
+        window.location.href = data.url;
+        return;
+      }
+      toast.error(data.error || "Unable to open Stripe Express Dashboard.");
+    } catch {
+      toast.error("Failed to open Stripe Express Dashboard.");
+    } finally {
+      setIsLaunchingConnect(false);
+    }
+  };
+
   const handleRefresh = async () => {
     if (isRefreshing || !user) return;
     setIsRefreshing(true);
 
     try {
       const token = await user.getIdToken();
-      const res = await fetch(`/api/driver/stripe-balance/${user.uid}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const [res, statusRes] = await Promise.all([
+        fetch(`/api/driver/stripe-balance/${user.uid}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch("/api/stripe/account-status", {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      ]);
       if (res.ok) {
         const data = await res.json();
         setStripeBalance({ ...data, loading: false });
         toast.success("Balance updated");
+      }
+      if (statusRes.ok) {
+        const st = await statusRes.json();
+        setConnectStatus({
+          connected: st.connected === true,
+          payoutsEnabled: st.payoutsEnabled === true,
+          chargesEnabled: st.chargesEnabled === true,
+          detailsSubmitted: st.detailsSubmitted === true,
+          loading: false,
+        });
       }
     } catch (e) {}
 
@@ -674,6 +787,58 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
 
       {mainTab === "earnings" ? (
         <>
+        {/* Stripe Connect Payout Onboarding / Status Banner */}
+        {!connectStatus.loading && (
+          !connectStatus.connected || !connectStatus.chargesEnabled || !connectStatus.payoutsEnabled ? (
+            <div className="bg-[#1A1A1E] border border-white/20 rounded-2xl p-4 mb-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-[#AF52DE]/20 border border-white/20 flex items-center justify-center shrink-0">
+                  <CreditCard className="w-5 h-5 text-[#AF52DE]" />
+                </div>
+                <div>
+                  <p className="text-xs font-black uppercase tracking-wider text-white">
+                    {connectStatus.connected ? "Complete Stripe Verification" : "Stripe Payouts Not Connected"}
+                  </p>
+                  <p className="text-[11px] text-[#E4E4E7] font-medium mt-0.5">
+                    {connectStatus.connected
+                      ? "Finish ID & bank verification in Stripe to receive instant card & QR ride payouts."
+                      : "Connect your Stripe Express account to accept card & QR ride payments and withdraw earnings."}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={isLaunchingConnect}
+                onClick={handleStartStripeConnect}
+                className="px-4 py-2.5 rounded-xl bg-[#AF52DE] text-white text-[10px] font-black uppercase tracking-widest border border-white/20 active:scale-95 transition-transform shrink-0 disabled:opacity-50"
+              >
+                {isLaunchingConnect
+                  ? "Opening Stripe..."
+                  : connectStatus.connected
+                    ? "Finish Verification"
+                    : "Connect Stripe"}
+              </button>
+            </div>
+          ) : (
+            <div className="bg-[#1A1A1E] border border-white/20 rounded-2xl px-4 py-3 mb-5 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-[#00D26A] shrink-0" />
+                <span className="text-xs font-black text-white tracking-tight">
+                  Stripe Direct Payouts Active
+                </span>
+              </div>
+              <button
+                type="button"
+                disabled={isLaunchingConnect}
+                onClick={handleOpenExpressDashboard}
+                className="px-3 py-1.5 rounded-lg bg-[#252529] text-[10px] font-black uppercase tracking-widest text-white border border-white/20 hover:bg-[#2C2C30] active:scale-95 transition-all disabled:opacity-50"
+              >
+                {isLaunchingConnect ? "Opening..." : "Express Dashboard"}
+              </button>
+            </div>
+          )
+        )}
+
         <div className="flex items-center gap-2 mb-4">
           <div className="bg-[#1A1A1E] rounded-full p-1 flex w-fit">
             {(["today", "week", "month"] as const).map((p) => (
@@ -856,9 +1021,18 @@ export default function DriverEarnings({ onClose }: { onClose?: () => void }) {
           <p className="text-2xl font-black text-[#FF3B30] -mt-1 leading-none relative z-10 flex items-baseline gap-1">
             £{(profile?.pendingPlatformFees || 0).toFixed(2)}
           </p>
-          <p className="text-[10px] font-bold text-[#FF3B30]/60 uppercase tracking-wider mt-2 relative z-10">
+          <p className="text-[10px] font-bold text-[#FF3B30]/80 uppercase tracking-wider mt-2 relative z-10">
             Fees Owed
           </p>
+          {(profile?.pendingPlatformFees || 0) >= 50 ? (
+            <p className="text-[9px] font-black text-[#FF3B30] mt-1 relative z-10">
+              Dispatch paused (£50 cap) — settle to go online
+            </p>
+          ) : (profile?.pendingPlatformFees || 0) > 0 ? (
+            <p className="text-[9px] font-semibold text-[#A1A1AA] mt-1 relative z-10">
+              Auto-deducted from future card trips
+            </p>
+          ) : null}
           {profile?.pendingPlatformFees > 0 && (
             <button
               onClick={async () => {

@@ -207,6 +207,7 @@ const ALLOWED_REDIRECT_PATHS = new Set([
   "/driver-dashboard",
   "/driver-terminal",
   "/driver-return",
+  "/book-ride",
 ]);
 
 function isPathAllowed(pathname: string): boolean {

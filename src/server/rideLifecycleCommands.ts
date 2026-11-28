@@ -28,6 +28,10 @@ import {
 } from "./rideFareCalculator.ts";
 import { sanitizeRedirectUrl } from "./paymentVerification.ts";
 import { ownsStripeWebhookClaim } from "./stripeWebhookIdempotency.ts";
+import {
+  executeAutoCardRideChargeCommand,
+  executeCreateTripPaymentCommand,
+} from "./tripPaymentAuthorization.ts";
 
 export interface CallerIdentity {
   uid: string;
@@ -50,7 +54,14 @@ export interface TransitionRideInput {
   db: any;
   caller: CallerIdentity;
   rideId: string;
-  action: "arrived" | "in_progress" | "stop_progress" | "early_completion_reason" | "update_eta";
+  action:
+    | "arrived"
+    | "in_progress"
+    | "stop_progress"
+    | "early_completion_reason"
+    | "update_eta"
+    | "sync_wait"
+    | "cancel_cash_confirm";
   paidWaitSeconds?: number;
   currentStopIndex?: number;
   earlyCompletionReason?: string;
@@ -124,6 +135,21 @@ export async function executeTransitionRideCommand(input: TransitionRideInput) {
       if (!hasField) {
         throw new BadRequestError("liveEtaSeconds or stackedDriverDelay is required for update_eta.");
       }
+    } else if (action === "sync_wait") {
+      if (!["arrived", "in_progress"].includes(currentStatus)) {
+        throw new ConflictError("Wait time can only be synced while arrived or in progress.");
+      }
+      if (input.paidWaitSeconds === undefined || !Number.isFinite(Number(input.paidWaitSeconds))) {
+        throw new BadRequestError("Valid paidWaitSeconds is required for sync_wait.");
+      }
+      patch.paidWaitSeconds = Math.max(0, Math.min(7200, Math.round(Number(input.paidWaitSeconds))));
+    } else if (action === "cancel_cash_confirm") {
+      if (currentStatus !== "awaiting_cash_confirm") {
+        throw new ConflictError("Ride is not awaiting cash confirmation.");
+      }
+      patch.status = "in_progress";
+      patch.reportedCashCollected = admin.firestore.FieldValue.delete();
+      patch.reportedCashDiscrepancy = admin.firestore.FieldValue.delete();
     } else {
       throw new BadRequestError(`Unsupported ride transition action '${action}'`);
     }
@@ -305,15 +331,130 @@ export interface CompleteRideInput {
   forceCompleteReason?: string | null;
   earlyCompletionReason?: string | null;
   paymentUrl?: string | null;
+  checkoutSessionId?: string | null;
   abandonmentFee?: number;
+  stripeClient?: Stripe | null;
+  appUrl?: string;
 }
 
-export async function executeCompleteRideCommand(input: CompleteRideInput) {
+export async function executeCompleteRideCommand(input: CompleteRideInput): Promise<any> {
   const { db, caller, rideId, action } = input;
   if (!caller?.uid) throw new UnauthorizedError("Authentication required.");
   if (!db) throw new BadRequestError("Database backend unavailable");
   if (!rideId || typeof rideId !== "string" || !rideId.trim()) {
     throw new BadRequestError("Missing or invalid rideId");
+  }
+
+  // Real off-session Stripe Connect Destination Charge for auto_card when Stripe is wired
+  if (action === "auto_card" && input.stripeClient) {
+    const chargeResult = await executeAutoCardRideChargeCommand({
+      db,
+      caller,
+      rideId,
+      stripeClient: input.stripeClient,
+      paidWaitSeconds: input.paidWaitSeconds,
+    });
+
+    if (chargeResult.charged && chargeResult.paymentIntentId) {
+      const piId = chargeResult.paymentIntentId;
+      await fulfillTaxiTripCheckout({
+        db,
+        event: { id: `direct_pi_${piId}` },
+        session: {
+          id: piId,
+          currency: "gbp",
+          amount_total: chargeResult.amountPence || chargeResult.fareBreakdown.totalCollectedPence,
+          payment_intent: piId,
+          metadata: chargeResult.metadata || {},
+        },
+        intent: {
+          intentId: chargeResult.metadata?.intentId || piId,
+          amount: chargeResult.fareBreakdown.totalCollectedPence,
+          metadata: chargeResult.metadata || {},
+        },
+        paymentMethodOverride: "stripe_auto",
+      });
+
+      return {
+        success: true,
+        rideId,
+        status: "completed",
+        paymentMethod: "stripe_auto",
+        paymentStatus: "paid",
+        payoutTransferred: true,
+        paymentIntentId: piId,
+        finalFare: chargeResult.fareBreakdown.baseFareGbp,
+        tipAmount: chargeResult.fareBreakdown.tipGbp,
+        totalFarePaid: chargeResult.fareBreakdown.totalCollectedGbp,
+        driverEarnings: chargeResult.fareBreakdown.driverEarningsGbp,
+        platformFee: chargeResult.fareBreakdown.platformFeeGbp,
+        cashFeesRecoveredGbp: penceToGbp(chargeResult.feeAllocation.recoveredCashFeesPence),
+        passengerId: chargeResult.passengerId,
+        assignedDriverId: chargeResult.driverId,
+      };
+    }
+
+    // Zero-money-loss fallback: saved card missing/declined/requires 3DS -> generate live QR Checkout link
+    const qrCheckout = await executeCreateTripPaymentCommand({
+      db,
+      caller,
+      body: {
+        rideId,
+        paidWaitSeconds: input.paidWaitSeconds,
+      },
+      stripeClient: input.stripeClient,
+      appUrl: input.appUrl,
+    });
+
+    const pendingRes = await executeCompleteRideCommand({
+      ...input,
+      action: "qr_pending",
+      stripeClient: null,
+      paymentUrl: qrCheckout.url,
+      checkoutSessionId: qrCheckout.sessionId || null,
+    });
+
+    return {
+      ...pendingRes,
+      fallbackToQr: true,
+      fallbackReason: chargeResult.reason || "card_charge_failed",
+      fallbackMessage:
+        chargeResult.message ||
+        "Passenger card requires confirmation. Show the QR code or ask passenger to tap Pay in app.",
+      paymentUrl: qrCheckout.url,
+      sessionId: qrCheckout.sessionId,
+      intentId: qrCheckout.intentId,
+    };
+  }
+
+  // Live Stripe verification for qr_manual_close: never close an unpaid QR ride as completed
+  if (action === "qr_manual_close" && input.stripeClient) {
+    const verifyRes = await verifyAndSyncTripCheckoutPayment({
+      db,
+      caller,
+      rideId,
+      stripeClient: input.stripeClient,
+    });
+    if (!verifyRes.paid) {
+      throw new ConflictError(
+        "Stripe has not confirmed payment for this QR link yet. Ask the passenger to finish checkout or tap Skip / Cash Received if paid in cash."
+      );
+    }
+    return {
+      success: true,
+      rideId,
+      status: "completed",
+      paymentMethod: "stripe_qr",
+      paymentStatus: "paid",
+      verifiedByStripe: true,
+      finalFare: verifyRes.finalFare,
+      tipAmount: verifyRes.tipAmount,
+      totalFarePaid: verifyRes.totalFarePaid,
+      driverEarnings: verifyRes.driverEarnings,
+      platformFee: verifyRes.platformFee,
+      ...(verifyRes.passengerId ? { passengerId: verifyRes.passengerId } : {}),
+      ...(verifyRes.assignedDriverId ? { assignedDriverId: verifyRes.assignedDriverId } : {}),
+    };
   }
 
   const isAdmin = caller.isAdmin === true || caller.admin === true;
@@ -422,6 +563,9 @@ export async function executeCompleteRideCommand(input: CompleteRideInput) {
       };
       if (input.paymentUrl && typeof input.paymentUrl === "string") {
         qrPatch.paymentUrl = input.paymentUrl;
+      }
+      if (input.checkoutSessionId && typeof input.checkoutSessionId === "string") {
+        qrPatch.latestCheckoutSessionId = input.checkoutSessionId;
       }
       if (input.earlyCompletionReason) {
         qrPatch.earlyCompletionReason = String(input.earlyCompletionReason).trim().slice(0, 200);
@@ -939,9 +1083,10 @@ export async function fulfillTaxiTripCheckout(params: {
   intent: Record<string, any>;
   eventRef?: any;
   claimToken?: string | null;
+  paymentMethodOverride?: string;
 }) {
-  const { db, event, session, intent, eventRef, claimToken } = params;
-  const meta = intent?.metadata || {};
+  const { db, event, session, intent, eventRef, claimToken, paymentMethodOverride } = params;
+  const meta = intent?.metadata || session?.metadata || {};
   const rideId = String(meta.rideId || "").trim();
   if (!db || !rideId) {
     throw new BadRequestError("Taxi trip webhook fulfillment is missing rideId.");
@@ -1060,9 +1205,29 @@ export async function fulfillTaxiTripCheckout(params: {
     const today = new Date().toISOString().split("T")[0];
     const mileage = (Number(ride.distanceToPickupMiles) || 0) + (Number(ride.distanceMiles) || 0);
 
+    // Automatic cash-commission clawback reconciliation:
+    // Decrements `users/{driverId}.pendingPlatformFees` atomically when Stripe's
+    // `application_fee_amount` included owed cash commissions.
+    const requestedRecoveredPence = Math.max(0, Math.round(Number(meta.recoveredCashFeesPence || 0)));
+    const processingFeeFloorTopUpPence = Math.max(
+      0,
+      Math.round(Number(meta.processingFeeFloorTopUpPence || 0))
+    );
+    const currentPendingPence = driverData ? roundToPence(Number(driverData.pendingPlatformFees || 0)) : 0;
+    const actualRecoveredPence =
+      ride.cashFeesRecoveryApplied !== true && requestedRecoveredPence > 0 && driverData
+        ? Math.min(currentPendingPence, requestedRecoveredPence)
+        : 0;
+    const nextPendingPlatformFeesGbp = penceToGbp(Math.max(0, currentPendingPence - actualRecoveredPence));
+    const cashFeesRecoveredGbp = penceToGbp(actualRecoveredPence);
+
+    const resolvedPaymentMethod =
+      paymentMethodOverride ||
+      (meta.paymentFlow === "auto_card" ? "stripe_auto" : ride.paymentMethod || "stripe_qr");
+
     tx.update(rideRef, {
       status: "completed",
-      paymentMethod: ride.paymentMethod || "stripe_qr",
+      paymentMethod: resolvedPaymentMethod,
       paymentStatus: "paid",
       paid: true,
       isPaid: true,
@@ -1076,6 +1241,12 @@ export async function fulfillTaxiTripCheckout(params: {
       calculatedPlatformFee: platformFeeGbp,
       driverEarnings: driverEarningsGbp,
       calculatedDriverEarnings: driverEarningsGbp,
+      ...(actualRecoveredPence > 0
+        ? { cashFeesRecoveredGbp, cashFeesRecoveryApplied: true }
+        : {}),
+      ...(processingFeeFloorTopUpPence > 0
+        ? { processingFeeFloorTopUpGbp: penceToGbp(processingFeeFloorTopUpPence) }
+        : {}),
       appliedCommissionRate: commissionRate,
       appliedDriverTier: tier,
       stripeSessionId: session.id,
@@ -1098,33 +1269,41 @@ export async function fulfillTaxiTripCheckout(params: {
       });
     }
 
-    if (shouldCreditMetrics && assignedDriverId) {
-      if (driverRef) {
-        tx.update(driverRef, {
-          totalEarnings: admin.firestore.FieldValue.increment(driverEarningsGbp),
-          jobsCompleted: admin.firestore.FieldValue.increment(1),
-          totalBusinessMileage: admin.firestore.FieldValue.increment(mileage),
+    if (assignedDriverId && driverRef) {
+      const driverPatch: Record<string, any> = {};
+      if (shouldCreditMetrics) {
+        driverPatch.totalEarnings = admin.firestore.FieldValue.increment(driverEarningsGbp);
+        driverPatch.jobsCompleted = admin.firestore.FieldValue.increment(1);
+        driverPatch.totalBusinessMileage = admin.firestore.FieldValue.increment(mileage);
+      }
+      if (actualRecoveredPence > 0) {
+        driverPatch.pendingPlatformFees = nextPendingPlatformFeesGbp;
+        driverPatch.lastAutoFeeRecoveryAmount = cashFeesRecoveredGbp;
+        driverPatch.lastAutoFeeRecoveryAt = admin.firestore.FieldValue.serverTimestamp();
+      }
+      if (Object.keys(driverPatch).length > 0) {
+        driverPatch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+        tx.update(driverRef, driverPatch);
+      }
+    }
+
+    if (shouldCreditMetrics && assignedDriverId && metricsRef) {
+      const isSameDay = metricsData?.date === today;
+      const baseDailyEarnings = isSameDay ? Number(metricsData?.dailyEarnings || 0) : 0;
+      const baseJobsToday = isSameDay ? Number(metricsData?.jobsDoneToday ?? metricsData?.ridesToday ?? 0) : 0;
+      tx.set(
+        metricsRef,
+        {
+          driverId: assignedDriverId,
+          date: today,
+          dailyEarnings: penceToGbp(roundToPence(baseDailyEarnings + driverEarningsGbp)),
+          jobsDoneToday: baseJobsToday + 1,
+          ridesToday: baseJobsToday + 1,
+          ...(!isSameDay ? { onlineSecondsToday: 0, lastHeartbeatAtMs: null } : {}),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-      }
-      if (metricsRef) {
-        const isSameDay = metricsData?.date === today;
-        const baseDailyEarnings = isSameDay ? Number(metricsData?.dailyEarnings || 0) : 0;
-        const baseJobsToday = isSameDay ? Number(metricsData?.jobsDoneToday ?? metricsData?.ridesToday ?? 0) : 0;
-        tx.set(
-          metricsRef,
-          {
-            driverId: assignedDriverId,
-            date: today,
-            dailyEarnings: penceToGbp(roundToPence(baseDailyEarnings + driverEarningsGbp)),
-            jobsDoneToday: baseJobsToday + 1,
-            ridesToday: baseJobsToday + 1,
-            ...(!isSameDay ? { onlineSecondsToday: 0, lastHeartbeatAtMs: null } : {}),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
+        },
+        { merge: true }
+      );
     }
 
     releaseOrPromoteTrackingInTx({
@@ -1148,6 +1327,8 @@ export async function fulfillTaxiTripCheckout(params: {
       tipPence,
       platformFeePence,
       driverEarningsPence,
+      recoveredCashFeesPence: actualRecoveredPence,
+      processingFeeFloorTopUpPence,
       currency: "gbp",
       status: "completed",
       captured: true,
@@ -1165,6 +1346,7 @@ export async function fulfillTaxiTripCheckout(params: {
       driverId: assignedDriverId || null,
       passengerId: passengerId || null,
       amountPence: paidAmountPence,
+      recoveredCashFeesPence: actualRecoveredPence,
       currency: "gbp",
       type: "taxi_trip",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1172,6 +1354,191 @@ export async function fulfillTaxiTripCheckout(params: {
   });
 
   return { success: true, rideId, sessionId: session.id };
+}
+
+/**
+ * Verifies a taxi trip's Stripe Checkout Session directly with Stripe and
+ * reconciles fulfillment immediately if Stripe reports `payment_status === "paid"`.
+ * Prevents unpaid QR rides from being manually closed while gracefully recovering
+ * from delayed Stripe webhooks.
+ */
+export async function verifyAndSyncTripCheckoutPayment(params: {
+  db: any;
+  caller?: CallerIdentity | null;
+  rideId: string;
+  sessionId?: string | null;
+  stripeClient?: Stripe | null;
+  allowPublicReceiptLookup?: boolean;
+}) {
+  const { db, caller, rideId, stripeClient, allowPublicReceiptLookup = false } = params;
+  if (!db) throw new BadRequestError("Database backend unavailable");
+  if (!rideId || typeof rideId !== "string" || !rideId.trim()) {
+    throw new BadRequestError("Missing or invalid rideId");
+  }
+
+  let rideData: any = null;
+  let rideCollectionName: "ride_requests" | "rides" = "ride_requests";
+  const rideSnap = await db.collection("ride_requests").doc(rideId).get();
+  if (rideSnap && (typeof rideSnap.exists === "function" ? rideSnap.exists() : rideSnap.exists)) {
+    rideData = typeof rideSnap.data === "function" ? rideSnap.data() : rideSnap.data;
+  } else {
+    const legacySnap = await db.collection("rides").doc(rideId).get();
+    if (legacySnap && (typeof legacySnap.exists === "function" ? legacySnap.exists() : legacySnap.exists)) {
+      rideData = typeof legacySnap.data === "function" ? legacySnap.data() : legacySnap.data;
+      rideCollectionName = "rides";
+    }
+  }
+  if (!rideData) throw new NotFoundError("Ride record not found.");
+
+  const assignedDriverId = rideData.assignedDriverId || rideData.driverId || null;
+  const passengerId = rideData.passengerId || rideData.riderId || rideData.userId || null;
+
+  if (!allowPublicReceiptLookup) {
+    if (!caller?.uid) throw new UnauthorizedError("Authentication required.");
+    const isAdmin = caller.isAdmin === true || caller.admin === true;
+    const isParticipant =
+      (assignedDriverId && caller.uid === assignedDriverId) ||
+      (passengerId && caller.uid === passengerId);
+    if (!isAdmin && !isParticipant) {
+      throw new ForbiddenError("You are not authorized to verify payment for this trip.");
+    }
+  }
+
+  // Already paid in Firestore
+  if (rideData.paymentStatus === "paid" || rideData.paid === true || rideData.isPaid === true) {
+    return {
+      paid: true,
+      alreadySettled: true,
+      status: "paid",
+      rideId,
+      sessionId: rideData.stripeSessionId || rideData.latestCheckoutSessionId || params.sessionId || null,
+      finalFare: Number(rideData.finalFare || rideData.fareEstimate || 0),
+      tipAmount: Number(rideData.tipAmount || 0),
+      totalFarePaid: Number(rideData.totalFarePaid || rideData.finalFare || 0),
+      driverEarnings: Number(rideData.driverEarnings || 0),
+      platformFee: Number(rideData.platformFee || 0),
+      paymentMethod: rideData.paymentMethod || "stripe_qr",
+      passengerId,
+      assignedDriverId,
+    };
+  }
+
+  const candidateSessionId = String(
+    params.sessionId || rideData.latestCheckoutSessionId || rideData.stripeSessionId || ""
+  ).trim();
+
+  if (allowPublicReceiptLookup) {
+    // Public guest receipt check requires a concrete Stripe session ID bound to this ride
+    if (!candidateSessionId || !candidateSessionId.startsWith("cs_")) {
+      return {
+        paid: false,
+        status: "unpaid",
+        rideId,
+        sessionId: null,
+        finalFare: Number(rideData.finalFare || rideData.fareEstimate || 0),
+        tipAmount: Number(rideData.tipAmount || 0),
+        totalFarePaid: Number(rideData.totalFarePaid || rideData.finalFare || 0),
+      };
+    }
+  }
+
+  if (!candidateSessionId || !stripeClient || typeof stripeClient.checkout?.sessions?.retrieve !== "function") {
+    return {
+      paid: false,
+      status: "unpaid",
+      rideId,
+      sessionId: candidateSessionId || null,
+      finalFare: Number(rideData.finalFare || rideData.fareEstimate || 0),
+      tipAmount: Number(rideData.tipAmount || 0),
+      totalFarePaid: Number(rideData.totalFarePaid || rideData.finalFare || 0),
+    };
+  }
+
+  let session: any = null;
+  try {
+    session = await stripeClient.checkout.sessions.retrieve(candidateSessionId);
+  } catch (err: any) {
+    console.warn(`Stripe session retrieve failed for ride ${rideId}:`, err?.message);
+    return {
+      paid: false,
+      status: "unpaid",
+      rideId,
+      sessionId: candidateSessionId,
+      finalFare: Number(rideData.finalFare || rideData.fareEstimate || 0),
+      tipAmount: Number(rideData.tipAmount || 0),
+      totalFarePaid: Number(rideData.totalFarePaid || rideData.finalFare || 0),
+    };
+  }
+
+  // Strictly verify the Checkout Session belongs to this exact rideId!
+  const sessionRideId = String(session?.metadata?.rideId || "").trim();
+  if (sessionRideId && sessionRideId !== rideId) {
+    throw new ForbiddenError("Checkout session does not match this ride.");
+  }
+
+  if (session?.payment_status !== "paid") {
+    return {
+      paid: false,
+      status: String(session?.payment_status || "unpaid"),
+      rideId,
+      sessionId: candidateSessionId,
+      finalFare: Number(rideData.finalFare || rideData.fareEstimate || 0),
+      tipAmount: Number(rideData.tipAmount || 0),
+      totalFarePaid: Number(rideData.totalFarePaid || rideData.finalFare || 0),
+    };
+  }
+
+  // Session IS paid in Stripe! Load bound payment_intents record (if present) and fulfill idempotently.
+  const intentId = String(session?.metadata?.intentId || rideData.latestPaymentIntentDocId || "").trim();
+  let intentData: Record<string, any> = {
+    intentId: intentId || candidateSessionId,
+    amount: Number(session.amount_total || 0),
+    metadata: {
+      ...(session.metadata || {}),
+      rideId,
+      rideCollectionName,
+    },
+  };
+  if (intentId) {
+    try {
+      const intentSnap = await db.collection("payment_intents").doc(intentId).get();
+      const exists = intentSnap && (typeof intentSnap.exists === "function" ? intentSnap.exists() : intentSnap.exists);
+      if (exists) {
+        intentData = typeof intentSnap.data === "function" ? intentSnap.data() : intentSnap.data;
+      }
+    } catch {
+      // Fallback to verified Stripe session metadata
+    }
+  }
+
+  await fulfillTaxiTripCheckout({
+    db,
+    event: { id: `sync_session_${candidateSessionId}` },
+    session,
+    intent: intentData,
+  });
+
+  const refreshedSnap = await db.collection(rideCollectionName).doc(rideId).get();
+  const refreshedRide =
+    refreshedSnap && (typeof refreshedSnap.exists === "function" ? refreshedSnap.exists() : refreshedSnap.exists)
+      ? (typeof refreshedSnap.data === "function" ? refreshedSnap.data() : refreshedSnap.data)
+      : rideData;
+
+  return {
+    paid: true,
+    settledNow: true,
+    status: "paid",
+    rideId,
+    sessionId: candidateSessionId,
+    finalFare: Number(refreshedRide.finalFare || 0),
+    tipAmount: Number(refreshedRide.tipAmount || 0),
+    totalFarePaid: Number(refreshedRide.totalFarePaid || 0),
+    driverEarnings: Number(refreshedRide.driverEarnings || 0),
+    platformFee: Number(refreshedRide.platformFee || 0),
+    paymentMethod: refreshedRide.paymentMethod || "stripe_qr",
+    passengerId,
+    assignedDriverId,
+  };
 }
 
 /**
@@ -1230,13 +1597,12 @@ export async function createDriverFeeSettlementCheckout(params: {
     appUrl,
     `/platform-fee-success`
   );
-  const finalCancelUrl = sanitizeRedirectUrl(`/driver-dashboard`, appUrl, `/driver-dashboard`);
+  const finalCancelUrl = sanitizeRedirectUrl(`/billing`, appUrl, `/billing`);
 
   try {
     const session = await stripeClient.checkout.sessions.create(
       {
         mode: "payment",
-        payment_method_types: ["card"],
         client_reference_id: driverId,
         line_items: [
           {
@@ -1523,3 +1889,355 @@ export async function recordDriverOnlineHeartbeat(params: {
     };
   });
 }
+
+/**
+ * Authoritative Passenger Outstanding Balance Checkout Creation.
+ * Derives amount strictly from `users/{passengerId}.pendingCharges` (late cancellation,
+ * abandonment, or cash shortfall) and creates a verified `payment_intents` record so
+ * passengers can immediately settle and unlock booking access.
+ */
+export async function createPassengerPendingChargesCheckout(params: {
+  db: any;
+  passengerId: string;
+  stripeClient: Stripe;
+  appUrl: string;
+}) {
+  const { db, passengerId, stripeClient, appUrl } = params;
+  if (!db) throw new BadRequestError("Database backend unavailable");
+  if (!passengerId) throw new UnauthorizedError("Authentication required.");
+
+  const userDoc = await db.collection("users").doc(passengerId).get();
+  const userExists = typeof userDoc.exists === "function" ? userDoc.exists() : userDoc.exists;
+  if (!userExists) {
+    throw new NotFoundError("Passenger profile not found.");
+  }
+
+  const userData = typeof userDoc.data === "function" ? userDoc.data() : userDoc.data;
+  const pendingChargesGbp = Number(userData?.pendingCharges || 0);
+  const amountPence = roundToPence(pendingChargesGbp);
+
+  if (!Number.isFinite(pendingChargesGbp) || amountPence <= 0) {
+    throw new BadRequestError("No outstanding balance to settle.");
+  }
+
+  const hash = createHash("sha256")
+    .update(`pass-bal:${passengerId}:${amountPence}:${Math.floor(Date.now() / 60000)}`)
+    .digest("hex")
+    .slice(0, 24);
+  const intentId = `pass_bal_${hash}`;
+
+  const intentRef = db.collection("payment_intents").doc(intentId);
+  await intentRef.set({
+    intentId,
+    userId: passengerId,
+    mode: "payment",
+    currency: "gbp",
+    amount: amountPence,
+    status: "pending",
+    metadata: {
+      intentId,
+      passengerId,
+      expectedAmountPence: String(amountPence),
+      reason: String(userData?.pendingChargesReason || "Outstanding ride balance").slice(0, 120),
+      type: "passenger_pending_charges",
+    },
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  const finalSuccessUrl = sanitizeRedirectUrl(
+    `/book-ride?balance_settled=1&session_id={CHECKOUT_SESSION_ID}`,
+    appUrl,
+    `/book-ride`
+  );
+  const finalCancelUrl = sanitizeRedirectUrl(`/book-ride`, appUrl, `/book-ride`);
+
+  try {
+    const session = await stripeClient.checkout.sessions.create(
+      {
+        mode: "payment",
+        client_reference_id: passengerId,
+        ...(userData?.stripeCustomerId ? { customer: String(userData.stripeCustomerId) } : {}),
+        line_items: [
+          {
+            price_data: {
+              currency: "gbp",
+              product_data: {
+                name: "AnyRoller Outstanding Balance Settlement",
+                description: String(
+                  userData?.pendingChargesReason || "Unpaid ride cancellation or fare discrepancy balance."
+                ).slice(0, 180),
+              },
+              unit_amount: amountPence,
+            },
+            quantity: 1,
+          },
+        ],
+        metadata: {
+          intentId,
+          passengerId,
+          type: "passenger_pending_charges",
+        },
+        payment_intent_data: {
+          metadata: {
+            intentId,
+            passengerId,
+            type: "passenger_pending_charges",
+          },
+        },
+        success_url: finalSuccessUrl,
+        cancel_url: finalCancelUrl,
+      },
+      {
+        idempotencyKey: `passenger_balance_${passengerId}_${amountPence}_${hash}`,
+      }
+    );
+
+    const sessionPaymentIntentId =
+      typeof session.payment_intent === "string"
+        ? session.payment_intent
+        : typeof (session.payment_intent as any)?.id === "string"
+          ? (session.payment_intent as any).id
+          : null;
+
+    await intentRef.update({
+      checkoutSessionId: session.id,
+      currency: String(session.currency || "gbp").toLowerCase(),
+      paymentIntentId: sessionPaymentIntentId,
+      status: "session_created",
+      sessionCreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return {
+      url: session.url,
+      sessionId: session.id,
+      intentId,
+      amountPence,
+    };
+  } catch (err: any) {
+    await intentRef
+      .update({
+        status: "failed",
+        failureReason: err?.message || "stripe_passenger_balance_session_failed",
+        failedAt: admin.firestore.FieldValue.serverTimestamp(),
+      })
+      .catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Signed Webhook Fulfillment for Passenger Pending Balance Settlement
+ * (`meta.type === "passenger_pending_charges"`).
+ */
+export async function fulfillPassengerPendingChargesWebhook(params: {
+  db: any;
+  event: { id: string };
+  session: Stripe.Checkout.Session | any;
+  intent: Record<string, any>;
+  eventRef?: any;
+  claimToken?: string | null;
+}) {
+  const { db, event, session, intent, eventRef, claimToken } = params;
+  const meta = intent?.metadata || session?.metadata || {};
+  const passengerId = String(meta.passengerId || intent.userId || "").trim();
+  if (!db || !passengerId) {
+    throw new BadRequestError("Passenger balance webhook is missing passengerId.");
+  }
+
+  const currency = String(session.currency || "gbp").toLowerCase();
+  if (currency !== "gbp") {
+    throw new BadRequestError(`Invalid passenger balance settlement currency '${currency}'`);
+  }
+
+  const paidPence = Number(session.amount_total || 0);
+  const expectedPence = Number(meta.expectedAmountPence || intent.amount || 0);
+  if (!Number.isFinite(paidPence) || paidPence <= 0 || paidPence < expectedPence) {
+    throw new BadRequestError(
+      `Passenger balance underpayment detected: received ${paidPence}p, expected ${expectedPence}p`
+    );
+  }
+
+  const passengerRef = db.collection("users").doc(passengerId);
+  const fulfillmentRef = db.collection("stripe_fulfillments").doc(`passenger_balance_${session.id}`);
+  const ledgerRef = db.collection("payment_ledger").doc(`pass_bal_${session.id}`);
+  const paymentIntentId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : typeof session.payment_intent?.id === "string"
+        ? session.payment_intent.id
+        : null;
+
+  await db.runTransaction(async (tx: any) => {
+    const readPromises: Promise<any>[] = [tx.get(passengerRef), tx.get(fulfillmentRef)];
+    if (eventRef) readPromises.push(tx.get(eventRef));
+    const [passengerSnap, fulfillmentSnap, claimSnap] = await Promise.all(readPromises);
+
+    if (eventRef && claimToken) {
+      const claimData = claimSnap?.data?.() || {};
+      if (!ownsStripeWebhookClaim(claimData, claimToken)) {
+        throw new Error("Webhook claim lost before passenger balance settlement mutation.");
+      }
+    }
+
+    const fulfillmentExists =
+      fulfillmentSnap &&
+      (typeof fulfillmentSnap.exists === "function" ? fulfillmentSnap.exists() : fulfillmentSnap.exists);
+    if (fulfillmentExists) return;
+
+    const passengerExists =
+      passengerSnap &&
+      (typeof passengerSnap.exists === "function" ? passengerSnap.exists() : passengerSnap.exists);
+    if (!passengerExists) {
+      throw new NotFoundError(`Passenger ${passengerId} does not exist for balance settlement.`);
+    }
+
+    const passengerData = typeof passengerSnap.data === "function" ? passengerSnap.data() : passengerSnap.data;
+    const currentPendingPence = roundToPence(Number(passengerData?.pendingCharges || 0));
+    const remainingPendingGbp = penceToGbp(Math.max(0, currentPendingPence - paidPence));
+    const settledGbp = penceToGbp(paidPence);
+
+    tx.update(passengerRef, {
+      pendingCharges: remainingPendingGbp,
+      ...(remainingPendingGbp <= 0 ? { cancellationCount: 0, pendingChargesReason: admin.firestore.FieldValue.delete() } : {}),
+      lastBalanceSettlementAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastBalanceSettlementAmount: settledGbp,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    tx.create(ledgerRef, {
+      type: "PASSENGER_BALANCE_SETTLEMENT",
+      transactionId: paymentIntentId || session.id,
+      passengerId,
+      amount: paidPence,
+      currency: "gbp",
+      status: "completed",
+      captured: true,
+      stripeSessionId: session.id,
+      stripeEventId: event.id,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    tx.create(fulfillmentRef, {
+      eventId: event.id,
+      sessionId: session.id,
+      intentId: session.metadata?.intentId || intent.intentId || null,
+      paymentIntentId,
+      passengerId,
+      settledAmount: settledGbp,
+      amountPence: paidPence,
+      currency: "gbp",
+      type: "passenger_pending_charges",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  return {
+    success: true,
+    passengerId,
+    settledAmount: penceToGbp(paidPence),
+    sessionId: session.id,
+  };
+}
+
+/**
+ * Admin-authoritative Stripe Connect Destination Charge Ride Refund Command.
+ * Always passes `reverse_transfer: true` on Destination Charge rides so refund
+ * funds are pulled back from the driver's connected Stripe account instead of
+ * draining the platform's Stripe balance.
+ */
+export async function refundTaxiRidePaymentCommand(params: {
+  db: any;
+  caller: CallerIdentity;
+  rideId: string;
+  stripeClient: Stripe;
+  amountGbp?: number;
+  reason?: "duplicate" | "fraudulent" | "requested_by_customer";
+  refundApplicationFee?: boolean;
+}) {
+  const { db, caller, rideId, stripeClient } = params;
+  if (!caller?.uid) throw new UnauthorizedError("Authentication required.");
+  if (caller.isAdmin !== true && caller.admin !== true) {
+    throw new ForbiddenError("Only platform administrators can issue ride refunds.");
+  }
+  if (!db) throw new BadRequestError("Database backend unavailable");
+  if (!rideId || !rideId.trim()) throw new BadRequestError("Missing or invalid rideId");
+
+  const rideRef = db.collection("ride_requests").doc(rideId.trim());
+  const rideSnap = await rideRef.get();
+  const exists = rideSnap && (typeof rideSnap.exists === "function" ? rideSnap.exists() : rideSnap.exists);
+  if (!exists) throw new NotFoundError("Ride request not found.");
+
+  const ride = typeof rideSnap.data === "function" ? rideSnap.data() : rideSnap.data;
+  if (ride.paymentStatus === "refunded") {
+    throw new ConflictError("This ride has already been refunded.");
+  }
+
+  const paymentIntentId = String(ride.stripePaymentIntentId || ride.paymentIntentId || "").trim();
+  if (!paymentIntentId || !paymentIntentId.startsWith("pi_")) {
+    throw new BadRequestError("No Stripe PaymentIntent found on this ride for refund.");
+  }
+
+  const totalPaidPence = roundToPence(Number(ride.totalFarePaid || ride.finalFare || 0));
+  const requestedAmountPence =
+    params.amountGbp !== undefined && Number.isFinite(Number(params.amountGbp)) && Number(params.amountGbp) > 0
+      ? Math.min(totalPaidPence, roundToPence(Number(params.amountGbp)))
+      : totalPaidPence;
+
+  if (requestedAmountPence <= 0) {
+    throw new BadRequestError("Refund amount must be greater than zero.");
+  }
+
+  const isDestinationCharge =
+    ride.payoutStatus === "direct_destination_charge" || ride.payoutTransferred === true;
+
+  const refund = await stripeClient.refunds.create(
+    {
+      payment_intent: paymentIntentId,
+      amount: requestedAmountPence,
+      ...(isDestinationCharge ? { reverse_transfer: true } : {}),
+      refund_application_fee: params.refundApplicationFee === true,
+      reason: params.reason || "requested_by_customer",
+      metadata: {
+        rideId: rideId.trim(),
+        adminUid: caller.uid,
+        operationType: "TAXI_RIDE_REFUND",
+      },
+    },
+    { idempotencyKey: `taxi_ride_refund_${rideId.trim()}_${requestedAmountPence}` }
+  );
+
+  const isFullRefund = requestedAmountPence >= totalPaidPence;
+  await rideRef.update({
+    paymentStatus: isFullRefund ? "refunded" : "partially_refunded",
+    refundedAmountGbp: penceToGbp(requestedAmountPence),
+    stripeRefundId: refund.id,
+    refundedAt: admin.firestore.FieldValue.serverTimestamp(),
+    refundedBy: caller.uid,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection("payment_ledger").doc(`ride_refund_${refund.id}`).set({
+    type: "RIDE_REFUND",
+    transactionId: refund.id,
+    paymentIntentId,
+    rideId: rideId.trim(),
+    driverId: ride.assignedDriverId || ride.driverId || null,
+    passengerId: ride.passengerId || ride.riderId || ride.userId || null,
+    amount: requestedAmountPence,
+    reverseTransfer: isDestinationCharge,
+    refundApplicationFee: params.refundApplicationFee === true,
+    currency: "gbp",
+    status: refund.status || "succeeded",
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    rideId: rideId.trim(),
+    refundId: refund.id,
+    status: refund.status,
+    refundedAmountGbp: penceToGbp(requestedAmountPence),
+    reverseTransfer: isDestinationCharge,
+  };
+}
+

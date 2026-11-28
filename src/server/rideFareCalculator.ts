@@ -5,11 +5,33 @@
  * - finalFare: Authoritative base fare EXCLUDING tip (GBP).
  *   Includes booking fareEstimate (or legacy fare/estimatedFare/totalFare/price),
  *   server-computed wait time charge, abandonment fee, and unpaid cancellation fee carried onto the ride.
- * - tipAmount: Passenger tip in GBP (>= 0, <= 500). Driver receives 100% of tip.
+ * - tipAmount: Passenger tip in GBP (>= 0, <= 50). Driver receives 100% of tip.
  * - totalFarePaid: finalFare + tipAmount.
  * - platformFee: Commission calculated ONLY on finalFare (+ fixedTripFee if configured). Never charged on tip!
  * - driverEarnings: (finalFare - platformFee) + tipAmount.
  */
+
+export const MAX_PASSENGER_TIP_GBP = 50;
+
+export const ALLOWED_VEHICLE_CATEGORIES = [
+  "standard",
+  "electric",
+  "executive",
+  "luxury",
+  "6seater",
+  "8seater",
+  "wav",
+] as const;
+
+export const DEFAULT_VEHICLE_MULTIPLIERS: Record<string, number> = {
+  standard: 1.0,
+  electric: 1.15,
+  executive: 1.5,
+  luxury: 2.2,
+  "6seater": 1.4,
+  "8seater": 2.0,
+  wav: 2.5,
+};
 
 export interface RidesFareConfig {
   baseFare: number;
@@ -18,12 +40,17 @@ export interface RidesFareConfig {
   waitRatePerMinute: number;
   minFare: number;
   priorityFee: number;
+  petFee: number;
   commissionRate: number;
   fixedTripFee: number;
   freeWaitMinutes: number;
   driverWaitTimeLimitMins: number;
   abandonmentFeeGbp: number;
   maxDailyDriverHours: number;
+  maxPendingPlatformFeesGbp: number;
+  maxTipGbp: number;
+  allowMidJourneyEdits: boolean;
+  vehicleMultipliers: Record<string, number>;
 }
 
 export const DEFAULT_RIDES_FARE_CONFIG: RidesFareConfig = {
@@ -33,13 +60,65 @@ export const DEFAULT_RIDES_FARE_CONFIG: RidesFareConfig = {
   waitRatePerMinute: 0.25,
   minFare: 5.0,
   priorityFee: 3.0,
+  petFee: 3.0,
   commissionRate: 0.12,
   fixedTripFee: 0,
   freeWaitMinutes: 3,
   driverWaitTimeLimitMins: 5,
   abandonmentFeeGbp: 5.0,
   maxDailyDriverHours: 24,
+  maxPendingPlatformFeesGbp: 50.0,
+  maxTipGbp: MAX_PASSENGER_TIP_GBP,
+  allowMidJourneyEdits: true,
+  vehicleMultipliers: { ...DEFAULT_VEHICLE_MULTIPLIERS },
 };
+
+export function computeServerBookingFareEstimate(params: {
+  distanceMiles: number;
+  durationMinutes: number;
+  carCategory: string;
+  ridesConfig: RidesFareConfig;
+  isPriority?: boolean;
+  isPetFriendly?: boolean;
+  surgeModel?: "fixed" | "multiplier" | string;
+  surgeMultiplier?: number;
+  surgeFixedAmount?: number;
+}): { baseCalc: number; fareEstimate: number } {
+  const { ridesConfig } = params;
+  const dist = Number.isFinite(params.distanceMiles) && params.distanceMiles > 0 ? params.distanceMiles : 0;
+  const dur = Number.isFinite(params.durationMinutes) && params.durationMinutes > 0 ? params.durationMinutes : 0;
+  const rawBase = ridesConfig.baseFare + dist * ridesConfig.distanceRate + dur * ridesConfig.timeRate;
+  const baseCalc = penceToGbp(roundToPence(Math.max(ridesConfig.minFare, rawBase)));
+
+  const normalizedCat = String(params.carCategory || "standard").trim().toLowerCase();
+  const catMultiplier =
+    Number(ridesConfig.vehicleMultipliers?.[normalizedCat]) > 0
+      ? Number(ridesConfig.vehicleMultipliers[normalizedCat])
+      : DEFAULT_VEHICLE_MULTIPLIERS[normalizedCat] || 1.0;
+
+  let fare = Math.max(baseCalc * catMultiplier, ridesConfig.minFare * catMultiplier);
+
+  const surgeModel = params.surgeModel === "multiplier" ? "multiplier" : "fixed";
+  if (surgeModel === "fixed") {
+    const fixedFee = Number(params.surgeFixedAmount);
+    if (Number.isFinite(fixedFee) && fixedFee > 0) {
+      fare += Math.min(50, fixedFee);
+    }
+  } else {
+    const mult = Number(params.surgeMultiplier);
+    if (Number.isFinite(mult) && mult > 1) {
+      fare *= Math.min(5, mult);
+    }
+  }
+
+  if (params.isPriority) fare += ridesConfig.priorityFee;
+  if (params.isPetFriendly) fare += ridesConfig.petFee;
+
+  return {
+    baseCalc,
+    fareEstimate: penceToGbp(roundToPence(Math.max(ridesConfig.minFare, fare))),
+  };
+}
 
 export function roundToPence(amountGbp: number): number {
   return Math.round(amountGbp * 100);
@@ -49,14 +128,80 @@ export function penceToGbp(pence: number): number {
   return Math.round(pence) / 100;
 }
 
-export function sanitizeTipAmount(rawTip: unknown): number {
+export function sanitizeTipAmount(
+  rawTip: unknown,
+  maxTipGbp: number = MAX_PASSENGER_TIP_GBP
+): number {
   const num = Number(rawTip);
   if (!Number.isFinite(num) || num <= 0) return 0;
-  return penceToGbp(Math.min(50000, Math.round(num * 100)));
+  const effectiveCapGbp =
+    Number.isFinite(maxTipGbp) && maxTipGbp >= 0
+      ? Math.min(MAX_PASSENGER_TIP_GBP, maxTipGbp)
+      : MAX_PASSENGER_TIP_GBP;
+  const maxPence = Math.round(effectiveCapGbp * 100);
+  return penceToGbp(Math.min(maxPence, Math.round(num * 100)));
+}
+
+export function haversineMilesBetween(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number
+): number {
+  if (
+    !Number.isFinite(lat1) ||
+    !Number.isFinite(lng1) ||
+    !Number.isFinite(lat2) ||
+    !Number.isFinite(lng2)
+  ) {
+    return 0;
+  }
+  const R = 3958.8;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1 - a)));
+  return R * c;
+}
+
+/**
+ * Computes a road-adjusted Haversine floor across an ordered list of waypoints
+ * so client-supplied distances cannot under-report route distance or erase
+ * miles already driven before a mid-journey edit.
+ */
+export function computeRouteHaversineFloorMiles(
+  points: Array<{ lat: number; lng: number }>,
+  roadFactor = 1.2
+): number {
+  if (!Array.isArray(points) || points.length < 2) return 0;
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    if (
+      a &&
+      b &&
+      Number.isFinite(a.lat) &&
+      Number.isFinite(a.lng) &&
+      Number.isFinite(b.lat) &&
+      Number.isFinite(b.lng)
+    ) {
+      total += haversineMilesBetween(a.lat, a.lng, b.lat, b.lng);
+    }
+  }
+  return Math.round(total * roadFactor * 10) / 10;
 }
 
 export async function loadRidesFareConfig(db: any, tx?: any): Promise<RidesFareConfig> {
-  const config: RidesFareConfig = { ...DEFAULT_RIDES_FARE_CONFIG };
+  const config: RidesFareConfig = {
+    ...DEFAULT_RIDES_FARE_CONFIG,
+    vehicleMultipliers: { ...DEFAULT_VEHICLE_MULTIPLIERS },
+  };
   if (!db || typeof db.collection !== "function") return config;
 
   try {
@@ -75,6 +220,9 @@ export async function loadRidesFareConfig(db: any, tx?: any): Promise<RidesFareC
         if (Number(data.minFare) > 0) config.minFare = Number(data.minFare);
         if (Number(data.priorityFee) >= 0 && data.priorityFee !== undefined) {
           config.priorityFee = Number(data.priorityFee);
+        }
+        if (Number(data.petFee) >= 0 && data.petFee !== undefined) {
+          config.petFee = Number(data.petFee);
         }
         if (Number(data.commissionRate) >= 0 && data.commissionRate !== undefined) {
           config.commissionRate = Number(data.commissionRate);
@@ -95,6 +243,21 @@ export async function loadRidesFareConfig(db: any, tx?: any): Promise<RidesFareC
         }
         if (Number(data.maxDailyDriverHours) > 0) {
           config.maxDailyDriverHours = Number(data.maxDailyDriverHours);
+        }
+        if (Number(data.maxPendingPlatformFeesGbp) > 0) {
+          config.maxPendingPlatformFeesGbp = Number(data.maxPendingPlatformFeesGbp);
+        }
+        if (Number(data.maxTipGbp) >= 0 && data.maxTipGbp !== undefined) {
+          config.maxTipGbp = Math.min(MAX_PASSENGER_TIP_GBP, Number(data.maxTipGbp));
+        }
+        if (typeof data.allowMidJourneyEdits === "boolean") {
+          config.allowMidJourneyEdits = data.allowMidJourneyEdits;
+        }
+        if (data.vehicleMultipliers && typeof data.vehicleMultipliers === "object") {
+          config.vehicleMultipliers = {
+            ...DEFAULT_VEHICLE_MULTIPLIERS,
+            ...data.vehicleMultipliers,
+          };
         }
       }
     }
@@ -269,7 +432,7 @@ export function computeAuthoritativeRideFare(params: {
 
   const resolvedTipRaw =
     params.tipAmountOverride !== undefined ? params.tipAmountOverride : (ride.tipAmount ?? 0);
-  const tipGbp = sanitizeTipAmount(resolvedTipRaw);
+  const tipGbp = sanitizeTipAmount(resolvedTipRaw, ridesConfig.maxTipGbp);
   const tipPence = roundToPence(tipGbp);
 
   const totalCollectedPence = baseFarePence + tipPence;
@@ -304,3 +467,83 @@ export function computeAuthoritativeRideFare(params: {
     driverEarningsPence,
   };
 }
+
+export interface StripeConnectFeeAllocation {
+  basePlatformFeePence: number;
+  estimatedStripeProcessingFeePence: number;
+  processingFeeFloorTopUpPence: number;
+  recoveredCashFeesPence: number;
+  stripeApplicationFeePence: number;
+  driverNetPayoutPence: number;
+}
+
+/**
+ * Computes Stripe Connect Destination Charge `application_fee_amount` with two
+ * zero-money-loss safeguards while preserving canonical trip commission & tip accounting:
+ *
+ * 1. Processing-Fee Floor Protection:
+ *    Because Stripe deducts card processing fees from the platform's application fee
+ *    on Destination Charges, small fares with large 0%-commission tips (or international cards)
+ *    could otherwise create a negative platform margin. When base commission alone is below
+ *    the estimated Stripe processing cost (2.9% + 25p), adds only the exact shortfall needed
+ *    so the platform never takes a net loss on a transaction.
+ *
+ * 2. Automatic Cash-Commission Recovery:
+ *    Automatically recovers owed `users/{driverId}.pendingPlatformFees` from card payouts,
+ *    capped at 50% of the driver's remaining base fare share (never touching passenger tips
+ *    and always ensuring positive payout on the trip).
+ */
+export function computeStripeConnectFeeAllocation(params: {
+  baseFarePence: number;
+  tipPence: number;
+  platformFeePence: number;
+  pendingPlatformFeesGbp?: number;
+  maxRecoveryShareOfDriverBase?: number;
+}): StripeConnectFeeAllocation {
+  const baseFarePence = Math.max(0, Math.round(Number(params.baseFarePence) || 0));
+  const tipPence = Math.max(0, Math.round(Number(params.tipPence) || 0));
+  const totalCollectedPence = baseFarePence + tipPence;
+  const basePlatformFeePence = Math.min(
+    totalCollectedPence,
+    Math.max(0, Math.round(Number(params.platformFeePence) || 0))
+  );
+
+  // Conservative upper-bound estimate of Stripe processing cost (2.9% + 25p) so UK & international cards never cause loss
+  const estimatedStripeProcessingFeePence =
+    totalCollectedPence > 0 ? Math.ceil(totalCollectedPence * 0.029) + 25 : 0;
+
+  const rawFloorShortfall = Math.max(0, estimatedStripeProcessingFeePence - basePlatformFeePence);
+  const maxFloorTopUp = Math.max(0, totalCollectedPence - basePlatformFeePence);
+  const processingFeeFloorTopUpPence = Math.min(maxFloorTopUp, rawFloorShortfall);
+
+  const driverBaseShareAfterFloorPence = Math.max(
+    0,
+    baseFarePence - basePlatformFeePence - processingFeeFloorTopUpPence
+  );
+
+  const recoveryCapRatio =
+    typeof params.maxRecoveryShareOfDriverBase === "number" &&
+    Number.isFinite(params.maxRecoveryShareOfDriverBase)
+      ? Math.max(0, Math.min(0.8, params.maxRecoveryShareOfDriverBase))
+      : 0.5;
+
+  const pendingFeesPence = Math.max(0, roundToPence(Number(params.pendingPlatformFeesGbp || 0)));
+  const maxRecoverableThisTripPence = Math.floor(driverBaseShareAfterFloorPence * recoveryCapRatio);
+  const recoveredCashFeesPence = Math.min(pendingFeesPence, maxRecoverableThisTripPence);
+
+  const stripeApplicationFeePence = Math.min(
+    totalCollectedPence,
+    basePlatformFeePence + processingFeeFloorTopUpPence + recoveredCashFeesPence
+  );
+  const driverNetPayoutPence = Math.max(0, totalCollectedPence - stripeApplicationFeePence);
+
+  return {
+    basePlatformFeePence,
+    estimatedStripeProcessingFeePence,
+    processingFeeFloorTopUpPence,
+    recoveredCashFeesPence,
+    stripeApplicationFeePence,
+    driverNetPayoutPence,
+  };
+}
+

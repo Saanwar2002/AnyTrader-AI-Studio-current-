@@ -14,10 +14,14 @@ import admin from "firebase-admin";
 import { UnauthorizedError, ForbiddenError, BadRequestError, ConflictError } from "./httpErrors.ts";
 import {
   computeAuthoritativeRideFare,
+  computeStripeConnectFeeAllocation,
   loadRidesFareConfig,
   penceToGbp,
   roundToPence,
+  type ComputedRideFareBreakdown,
+  type StripeConnectFeeAllocation,
 } from "./rideFareCalculator.ts";
+import { listCustomerPaymentMethods } from "./stripePaymentMethods.ts";
 
 export interface AuthenticatedUser {
   uid: string;
@@ -64,7 +68,11 @@ export interface AuthoritativeTripPaymentResult {
   sanitizedTip: number;
   totalAmount: number;
   feeAmount: number;
+  stripeApplicationFeePence?: number;
+  recoveredCashFeesGbp?: number;
+  processingFeeFloorTopUpGbp?: number;
   intentId?: string;
+  sessionId?: string;
   reused?: boolean;
   session?: any;
 }
@@ -204,6 +212,15 @@ export async function executeCreateTripPaymentCommand(
     throw new BadRequestError("Driver has not completed Stripe onboarding.");
   }
 
+  if (
+    driverData?.chargesEnabled === false ||
+    driverData?.stripeCapabilities?.transfers === "inactive"
+  ) {
+    throw new BadRequestError(
+      "Driver's Stripe Connect payouts are not fully verified yet. Complete Stripe onboarding before accepting card payments."
+    );
+  }
+
   // 7. Compute canonical live fare & tip contract (body.amount and body.baseFare are strictly ignored)
   const ridesConfig = await loadRidesFareConfig(db);
   const resolvedPaidWaitSeconds =
@@ -238,6 +255,14 @@ export async function executeCreateTripPaymentCommand(
     throw new BadRequestError("Trip amount must be greater than zero.");
   }
 
+  const feeAllocation = computeStripeConnectFeeAllocation({
+    baseFarePence: fareBreakdown.baseFarePence,
+    tipPence: fareBreakdown.tipPence,
+    platformFeePence: feeAmount,
+    pendingPlatformFeesGbp: Number(driverData?.pendingPlatformFees || 0),
+  });
+  const stripeApplicationFeePence = feeAllocation.stripeApplicationFeePence;
+
   const resolvedAppUrl = appUrl || process.env.APP_URL || "http://localhost:3000";
   let checkoutUrl = `${resolvedAppUrl}/payment-success?rideId=${rideId}&fare=${effectiveBaseFare}&tip=${sanitizedTip}`;
   let createdSession: any = null;
@@ -245,7 +270,7 @@ export async function executeCreateTripPaymentCommand(
   const payerUserId = authoritativePassengerId || callerUid;
   const tripCheckoutHash = createHash("sha256")
     .update(
-      `trip-checkout:${rideId}:${authoritativeDriverId}:${authoritativeStripeAccountId}:${fareBreakdown.baseFarePence}:${fareBreakdown.tipPence}:${isAbandonmentMode ? "abandoned" : "standard"}`
+      `trip-checkout:${rideId}:${authoritativeDriverId}:${authoritativeStripeAccountId}:${fareBreakdown.baseFarePence}:${fareBreakdown.tipPence}:${feeAllocation.recoveredCashFeesPence}:${feeAllocation.processingFeeFloorTopUpPence}:${isAbandonmentMode ? "abandoned" : "standard"}`
     )
     .digest("hex");
   const stripeIdempotencyKey = `trip_checkout_${tripCheckoutHash.slice(0, 40)}`;
@@ -288,7 +313,11 @@ export async function executeCreateTripPaymentCommand(
             sanitizedTip,
             totalAmount,
             feeAmount,
+            stripeApplicationFeePence,
+            recoveredCashFeesGbp: penceToGbp(feeAllocation.recoveredCashFeesPence),
+            processingFeeFloorTopUpGbp: penceToGbp(feeAllocation.processingFeeFloorTopUpPence),
             intentId: existingData.intentId || intentId,
+            sessionId: existingData.sessionId,
             reused: true,
             session: { id: existingData.sessionId, url: existingData.checkoutUrl },
           };
@@ -313,6 +342,9 @@ export async function executeCreateTripPaymentCommand(
     totalAmountPence: String(totalAmountPence),
     driverEarningsPence: String(fareBreakdown.driverEarningsPence),
     platformFeePence: String(feeAmount),
+    processingFeeFloorTopUpPence: String(feeAllocation.processingFeeFloorTopUpPence),
+    recoveredCashFeesPence: String(feeAllocation.recoveredCashFeesPence),
+    stripeApplicationFeePence: String(stripeApplicationFeePence),
     commissionRate: String(fareBreakdown.commissionRate),
     driverTier: fareBreakdown.driverTier,
     isDestinationCharge: "true",
@@ -342,7 +374,6 @@ export async function executeCreateTripPaymentCommand(
     try {
       const sessionPayload: Stripe.Checkout.SessionCreateParams = {
         mode: "payment",
-        payment_method_types: ["card"],
         client_reference_id: payerUserId,
         line_items: [
           {
@@ -358,7 +389,7 @@ export async function executeCreateTripPaymentCommand(
           },
         ],
         payment_intent_data: {
-          application_fee_amount: feeAmount,
+          application_fee_amount: stripeApplicationFeePence,
           transfer_data: {
             destination: authoritativeStripeAccountId,
           },
@@ -405,9 +436,24 @@ export async function executeCreateTripPaymentCommand(
           totalAmountPence,
           baseFarePence: fareBreakdown.baseFarePence,
           tipPence: fareBreakdown.tipPence,
+          recoveredCashFeesPence: feeAllocation.recoveredCashFeesPence,
+          processingFeeFloorTopUpPence: feeAllocation.processingFeeFloorTopUpPence,
+          stripeApplicationFeePence,
           status: "session_created",
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+
+        // Stamp latestCheckoutSessionId onto the ride doc so live verification & guest receipt lookups are O(1)
+        const rideDocRef = db.collection(rideCollectionName).doc(rideId);
+        if (typeof rideDocRef?.update === "function") {
+          await rideDocRef
+            .update({
+              latestCheckoutSessionId: createdSession.id,
+              latestPaymentIntentDocId: intentId,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            })
+            .catch(() => undefined);
+        }
       }
     } catch (stripeErr: any) {
       console.warn("Stripe trip payment session creation failed:", stripeErr?.message);
@@ -436,8 +482,309 @@ export async function executeCreateTripPaymentCommand(
     sanitizedTip,
     totalAmount,
     feeAmount,
+    stripeApplicationFeePence,
+    recoveredCashFeesGbp: penceToGbp(feeAllocation.recoveredCashFeesPence),
+    processingFeeFloorTopUpGbp: penceToGbp(feeAllocation.processingFeeFloorTopUpPence),
     intentId,
+    sessionId: createdSession?.id,
     reused: false,
     session: createdSession,
   };
 }
+
+export interface AutoCardRideChargeResult {
+  charged: boolean;
+  fallbackToQr: boolean;
+  reason?: string;
+  message?: string;
+  rideId: string;
+  rideCollectionName: "ride_requests" | "rides";
+  driverId: string;
+  passengerId: string;
+  stripeAccountId: string;
+  paymentIntentId?: string;
+  amountPence?: number;
+  fareBreakdown: ComputedRideFareBreakdown;
+  feeAllocation: StripeConnectFeeAllocation;
+  metadata?: Record<string, string>;
+}
+
+/**
+ * Executes a real off-session Stripe Connect Destination Charge PaymentIntent
+ * against the passenger's saved card on file for `action: "auto_card"`.
+ *
+ * Zero-money-loss guarantee:
+ * - Never marks a ride paid unless Stripe returns `status === "succeeded"`.
+ * - If the passenger has no verified saved card, the card declines, or 3DS/SCA
+ *   is required (`authentication_required`), returns `{ charged: false, fallbackToQr: true }`
+ *   so the caller seamlessly generates a live QR Checkout session instead.
+ */
+export async function executeAutoCardRideChargeCommand(params: {
+  db: any;
+  caller: AuthenticatedUser;
+  rideId: string;
+  stripeClient: Stripe;
+  paidWaitSeconds?: number;
+}): Promise<AutoCardRideChargeResult> {
+  const { db, caller, rideId, stripeClient, paidWaitSeconds } = params;
+  if (!caller?.uid) throw new UnauthorizedError("Authentication required.");
+  if (!db) throw new BadRequestError("Database backend unavailable");
+  if (!rideId || !rideId.trim()) throw new BadRequestError("Missing or invalid rideId");
+
+  const isCallerAdmin = caller.isAdmin === true || caller.admin === true;
+
+  let rideData: any = null;
+  let rideCollectionName: "ride_requests" | "rides" = "ride_requests";
+  const rideSnap = await db.collection("ride_requests").doc(rideId).get();
+  if (rideSnap && (typeof rideSnap.exists === "function" ? rideSnap.exists() : rideSnap.exists)) {
+    rideData = typeof rideSnap.data === "function" ? rideSnap.data() : rideSnap.data;
+  } else {
+    const legacySnap = await db.collection("rides").doc(rideId).get();
+    if (legacySnap && (typeof legacySnap.exists === "function" ? legacySnap.exists() : legacySnap.exists)) {
+      rideData = typeof legacySnap.data === "function" ? legacySnap.data() : legacySnap.data;
+      rideCollectionName = "rides";
+    }
+  }
+  if (!rideData) throw new BadRequestError("Ride record not found");
+  if (rideData.status === "cancelled") throw new ConflictError("Cannot charge a cancelled ride.");
+  if (rideData.paymentStatus === "paid" || rideData.paid === true || rideData.isPaid === true) {
+    throw new ConflictError("This ride has already been paid.");
+  }
+
+  if (
+    rideData.driverId &&
+    rideData.assignedDriverId &&
+    rideData.driverId !== rideData.assignedDriverId
+  ) {
+    throw new BadRequestError("Conflicting authoritative driver identities detected on ride record");
+  }
+
+  const authoritativeDriverId = String(rideData.driverId || rideData.assignedDriverId || "").trim();
+  const authoritativePassengerId = String(
+    rideData.passengerId || rideData.userId || rideData.riderId || ""
+  ).trim();
+
+  if (!authoritativeDriverId) throw new BadRequestError("No assigned driver found for this ride");
+  if (!isCallerAdmin && caller.uid !== authoritativeDriverId) {
+    throw new ForbiddenError("Only the assigned driver can initiate auto-card capture for this trip.");
+  }
+  if (!authoritativePassengerId) {
+    throw new BadRequestError("Passenger identity missing on ride record.");
+  }
+  if (authoritativePassengerId === authoritativeDriverId) {
+    throw new ForbiddenError("Self-payment is prohibited: the passenger and driver cannot be the same account.");
+  }
+
+  const [driverSnap, passengerSnap, ridesConfig] = await Promise.all([
+    db.collection("users").doc(authoritativeDriverId).get(),
+    db.collection("users").doc(authoritativePassengerId).get(),
+    loadRidesFareConfig(db),
+  ]);
+
+  const driverExists = driverSnap && (typeof driverSnap.exists === "function" ? driverSnap.exists() : driverSnap.exists);
+  if (!driverExists) throw new BadRequestError("Authoritative driver profile not found");
+  const driverData = typeof driverSnap.data === "function" ? driverSnap.data() : driverSnap.data;
+
+  const authoritativeStripeAccountId = String(driverData?.stripeAccountId || "").trim();
+  if (!authoritativeStripeAccountId) {
+    throw new BadRequestError("Driver has not completed Stripe onboarding.");
+  }
+  if (
+    driverData?.chargesEnabled === false ||
+    driverData?.stripeCapabilities?.transfers === "inactive"
+  ) {
+    throw new BadRequestError(
+      "Driver's Stripe Connect payouts are not fully verified yet. Complete Stripe onboarding before accepting card payments."
+    );
+  }
+
+  const resolvedPaidWaitSeconds =
+    paidWaitSeconds !== undefined && Number.isFinite(Number(paidWaitSeconds))
+      ? Math.max(Number(rideData.paidWaitSeconds || 0), Math.min(7200, Math.round(Number(paidWaitSeconds))))
+      : Number(rideData.paidWaitSeconds || 0);
+
+  const fareBreakdown = computeAuthoritativeRideFare({
+    rideData,
+    driverData,
+    ridesConfig,
+    paidWaitSecondsOverride: resolvedPaidWaitSeconds,
+  });
+
+  if (fareBreakdown.baseFarePence <= 0 || fareBreakdown.totalCollectedPence <= 0) {
+    throw new BadRequestError("Authoritative trip fare could not be resolved from ride record.");
+  }
+
+  const feeAllocation = computeStripeConnectFeeAllocation({
+    baseFarePence: fareBreakdown.baseFarePence,
+    tipPence: fareBreakdown.tipPence,
+    platformFeePence: fareBreakdown.platformFeePence,
+    pendingPlatformFeesGbp: Number(driverData?.pendingPlatformFees || 0),
+  });
+
+  const passengerExists =
+    passengerSnap && (typeof passengerSnap.exists === "function" ? passengerSnap.exists() : passengerSnap.exists);
+  const passengerData = passengerExists
+    ? (typeof passengerSnap.data === "function" ? passengerSnap.data() : passengerSnap.data)
+    : null;
+  const stripeCustomerId = String(passengerData?.stripeCustomerId || "").trim();
+
+  if (!stripeCustomerId) {
+    return {
+      charged: false,
+      fallbackToQr: true,
+      reason: "no_stripe_customer",
+      message: "Passenger does not have a saved card on file.",
+      rideId,
+      rideCollectionName,
+      driverId: authoritativeDriverId,
+      passengerId: authoritativePassengerId,
+      stripeAccountId: authoritativeStripeAccountId,
+      fareBreakdown,
+      feeAllocation,
+    };
+  }
+
+  let selectedPaymentMethodId: string | null = null;
+  try {
+    const { paymentMethods, defaultPaymentMethodId } = await listCustomerPaymentMethods({
+      stripe: stripeClient,
+      stripeCustomerId,
+    });
+    selectedPaymentMethodId = defaultPaymentMethodId || paymentMethods[0]?.id || null;
+  } catch (pmErr: any) {
+    return {
+      charged: false,
+      fallbackToQr: true,
+      reason: "payment_method_lookup_failed",
+      message: pmErr?.message || "Could not verify saved payment card.",
+      rideId,
+      rideCollectionName,
+      driverId: authoritativeDriverId,
+      passengerId: authoritativePassengerId,
+      stripeAccountId: authoritativeStripeAccountId,
+      fareBreakdown,
+      feeAllocation,
+    };
+  }
+
+  if (!selectedPaymentMethodId) {
+    return {
+      charged: false,
+      fallbackToQr: true,
+      reason: "no_saved_card",
+      message: "Passenger has no saved card attached.",
+      rideId,
+      rideCollectionName,
+      driverId: authoritativeDriverId,
+      passengerId: authoritativePassengerId,
+      stripeAccountId: authoritativeStripeAccountId,
+      fareBreakdown,
+      feeAllocation,
+    };
+  }
+
+  const chargeHash = createHash("sha256")
+    .update(
+      `trip-autocard:${rideId}:${authoritativeDriverId}:${authoritativeStripeAccountId}:${fareBreakdown.baseFarePence}:${fareBreakdown.tipPence}:${feeAllocation.recoveredCashFeesPence}`
+    )
+    .digest("hex");
+  const intentId = `trip_auto_${chargeHash.slice(0, 24)}`;
+  const stripeIdempotencyKey = `trip_autocard_${chargeHash.slice(0, 40)}`;
+
+  const metadata: Record<string, string> = {
+    intentId,
+    rideId,
+    rideCollectionName,
+    driverId: authoritativeDriverId,
+    recipientId: authoritativeDriverId,
+    stripeAccountId: authoritativeStripeAccountId,
+    passengerId: authoritativePassengerId,
+    baseFare: fareBreakdown.baseFareGbp.toFixed(2),
+    finalFarePence: String(fareBreakdown.baseFarePence),
+    tipAmount: fareBreakdown.tipGbp.toFixed(2),
+    tipPence: String(fareBreakdown.tipPence),
+    totalAmountPence: String(fareBreakdown.totalCollectedPence),
+    driverEarningsPence: String(fareBreakdown.driverEarningsPence),
+    platformFeePence: String(fareBreakdown.platformFeePence),
+    processingFeeFloorTopUpPence: String(feeAllocation.processingFeeFloorTopUpPence),
+    recoveredCashFeesPence: String(feeAllocation.recoveredCashFeesPence),
+    stripeApplicationFeePence: String(feeAllocation.stripeApplicationFeePence),
+    commissionRate: String(fareBreakdown.commissionRate),
+    driverTier: fareBreakdown.driverTier,
+    isDestinationCharge: "true",
+    fareContractVersion: "v2_excl_tip",
+    paymentFlow: "auto_card",
+    type: "taxi_trip",
+  };
+
+  try {
+    const paymentIntent = await stripeClient.paymentIntents.create(
+      {
+        amount: fareBreakdown.totalCollectedPence,
+        currency: "gbp",
+        customer: stripeCustomerId,
+        payment_method: selectedPaymentMethodId,
+        off_session: true,
+        confirm: true,
+        application_fee_amount: feeAllocation.stripeApplicationFeePence,
+        transfer_data: {
+          destination: authoritativeStripeAccountId,
+        },
+        description: `AnyRoller Trip Payment (Ride #${rideId.substring(0, 8)})`,
+        metadata,
+      },
+      { idempotencyKey: stripeIdempotencyKey }
+    );
+
+    if (paymentIntent?.status === "succeeded") {
+      return {
+        charged: true,
+        fallbackToQr: false,
+        rideId,
+        rideCollectionName,
+        driverId: authoritativeDriverId,
+        passengerId: authoritativePassengerId,
+        stripeAccountId: authoritativeStripeAccountId,
+        paymentIntentId: paymentIntent.id,
+        amountPence: Number(paymentIntent.amount_received || paymentIntent.amount || fareBreakdown.totalCollectedPence),
+        fareBreakdown,
+        feeAllocation,
+        metadata,
+      };
+    }
+
+    return {
+      charged: false,
+      fallbackToQr: true,
+      reason: paymentIntent?.status || "requires_action",
+      message: "Card requires customer verification. Falling back to QR payment link.",
+      rideId,
+      rideCollectionName,
+      driverId: authoritativeDriverId,
+      passengerId: authoritativePassengerId,
+      stripeAccountId: authoritativeStripeAccountId,
+      paymentIntentId: paymentIntent?.id,
+      fareBreakdown,
+      feeAllocation,
+      metadata,
+    };
+  } catch (stripeErr: any) {
+    const code = String(stripeErr?.code || stripeErr?.raw?.code || "card_charge_failed");
+    console.warn(`Auto-card off-session charge fell back to QR for ride ${rideId}:`, code, stripeErr?.message);
+    return {
+      charged: false,
+      fallbackToQr: true,
+      reason: code,
+      message: stripeErr?.message || "Saved card could not be charged automatically. Switching to QR Checkout.",
+      rideId,
+      rideCollectionName,
+      driverId: authoritativeDriverId,
+      passengerId: authoritativePassengerId,
+      stripeAccountId: authoritativeStripeAccountId,
+      fareBreakdown,
+      feeAllocation,
+      metadata,
+    };
+  }
+}
+

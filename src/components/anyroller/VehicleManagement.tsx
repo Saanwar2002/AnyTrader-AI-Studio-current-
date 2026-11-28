@@ -3,12 +3,13 @@ import { collection, onSnapshot, doc, updateDoc, query, limit } from "firebase/f
 import { db } from "../../firebase";
 import { 
   Search, Car, Shield, AlertTriangle, CheckCircle, 
-  X, UserCheck, Star, Activity, Info, Dog
+  X, UserCheck, Star, Activity, Info, Dog, Leaf
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 const CATEGORIES = [
   { id: 'standard', name: 'Standard', icon: Car, desc: 'Everyday rides (4 seats)' },
+  { id: 'electric', name: 'Electric', icon: Leaf, desc: 'Zero-emission electric vehicles' },
   { id: 'executive', name: 'Executive', icon: Shield, desc: 'Premium vehicles for business' },
   { id: 'luxury', name: 'Luxury', icon: Star, desc: 'High-end luxury vehicles' },
   { id: '6seater', name: '6-Seater', icon: UserCheck, desc: 'Large capacity vehicles' },

@@ -5,11 +5,12 @@ import {
   MessageSquare, ChevronRight, ChevronLeft, ArrowLeft, ArrowRight, Zap, History, Loader2, 
   Mic, MicOff, Star, Users, User, Repeat, Shield, Plus, Heart, Bookmark,
   Home, Briefcase, Dog, Accessibility, MessageCircle, Phone, AlertCircle, Hammer, ArrowDownToLine, Delete, Dumbbell,
-  AlertTriangle, CreditCard
+  AlertTriangle, CreditCard, Leaf
 } from "lucide-react";
 import RideChat from "../driver/RideChat";
 import { cn } from "@/src/lib/utils";
 import { openSafeExternalUrl } from "@/src/lib/safeExternalUrl";
+import { downloadRideReceipt } from "@/src/lib/rideReceiptExport";
 import { db, addDoc, collection, serverTimestamp, doc, updateDoc, arrayUnion, arrayRemove, onSnapshot, setDoc, increment, query, where, getDocs, orderBy, limit, deleteField, getDoc, runTransaction } from "@/src/firebase";
 import { playSound } from "@/src/lib/sound";
 import { useAuth } from "../AuthProvider";
@@ -251,6 +252,7 @@ type BookingStep = "details" | "searching" | "confirmed" | "receipt";
 
 const CAR_CATEGORIES = [
   { id: 'standard', name: 'Standard Car', multiplier: 1.0, wait: '3-5', capacity: 4, icon: Car },
+  { id: 'electric', name: 'Electric', multiplier: 1.15, wait: '4-7', capacity: 4, icon: Leaf },
   { id: 'executive', name: 'Executive', multiplier: 1.5, wait: '5-8', capacity: 4, icon: Shield },
   { id: 'luxury', name: 'Luxury', multiplier: 2.2, wait: '8-12', capacity: 4, icon: Star },
   { id: '6seater', name: '6-Seater XL', multiplier: 1.4, wait: '6-10', capacity: 6, icon: Users },
@@ -430,7 +432,7 @@ export default function PassengerBooking() {
         const q = query(
           collection(db, "ride_requests"),
           where("riderId", "==", user.uid),
-          where("status", "in", ["pending", "offered", "accepted", "arrived", "in_progress"]),
+          where("status", "in", ["pending", "offered", "accepted", "arrived", "in_progress", "awaiting_payment", "awaiting_cash_confirm"]),
           orderBy("createdAt", "desc"),
           limit(1)
         );
@@ -440,20 +442,23 @@ export default function PassengerBooking() {
           const data = activeRide.data();
           setCurrentRideId(activeRide.id);
 
-          setPickup(data.pickup || "");
-          setDropoff(data.dropoff || "");
+          setPickup(data.pickup || data.pickupAddress || "");
+          setDropoff(data.dropoff || data.dropoffAddress || "");
           if (data.pickupLat && data.pickupLng) setPickupCoords({lat: data.pickupLat, lng: data.pickupLng});
           if (data.dropoffLat && data.dropoffLng) setDropoffCoords({lat: data.dropoffLat, lng: data.dropoffLng});
           if (data.stops) setStops(data.stops);
-          setSelectedCategory(data.carCategory || "standard");
+          setSelectedCategory(data.carCategory || data.vehicleCategory || "standard");
           setComments(data.comments || "");
+          if (data.rideContext === "business" || data.rideContext === "personal") {
+            setRideContext(data.rideContext);
+          }
           if (data.isPriority) setIsPriority(data.isPriority);
           if (data.isPetFriendly) setIsPetFriendly(data.isPetFriendly);
           if (data.baseCalc) {
             setFareEstimate(data.baseCalc);
           } else if (data.fareEstimate) {
             // Backwards compat if baseCalc isn't populated
-            const extras = (data.isPriority ? 3 : 0) + (data.isPetFriendly ? 3 : 0);
+            const extras = (data.isPriority ? Number(data.priorityFee ?? 3) : 0) + (data.isPetFriendly ? Number(data.petFee ?? 3) : 0);
             setFareEstimate(Math.max(data.fareEstimate - extras, 5.0));
           }
           if (data.surgeModel !== undefined) {
@@ -477,9 +482,50 @@ export default function PassengerBooking() {
     checkActiveRide();
   }, [user, currentRideId, editId, step]);
 
-  // Mock settings for demonstrating corporate and card functionality
-  const hasCorporateAccount = profile?.corporateAccountId ? true : true; 
-  const hasCardOnFile = profile?.hasCardOnFile ? true : false;
+  const hasCorporateAccount = Boolean(profile?.corporateAccountId);
+  const [verifiedCardCount, setVerifiedCardCount] = useState<number | null>(null);
+  const hasCardOnFile =
+    verifiedCardCount !== null ? verifiedCardCount > 0 : Boolean(profile?.hasCardOnFile);
+
+  // Verify real attached cards in Stripe (never trust stripeCustomerId presence alone)
+  useEffect(() => {
+    if (!user) {
+      setVerifiedCardCount(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch(`/api/payment-methods/${encodeURIComponent(user.uid)}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json().catch(() => ({}));
+        if (!cancelled) {
+          const list = Array.isArray(data.paymentMethods) ? data.paymentMethods : [];
+          setVerifiedCardCount(list.length);
+        }
+      } catch {
+        // Keep profile fallback silently on transient offline errors
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.uid, profile?.stripeCustomerId]);
+
+  // Surface confirmation when returning from Outstanding Balance Stripe Checkout
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("balance_settled") === "1") {
+      toast.success("Outstanding balance payment submitted! Your booking access is being unlocked.");
+      params.delete("balance_settled");
+      params.delete("session_id");
+      const nextSearch = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}`);
+    }
+  }, []);
   
   const { isLoaded, loadError } = useJsApiLoader({
     id: 'google-map-script',
@@ -537,25 +583,35 @@ export default function PassengerBooking() {
   const [driversAvailableSoonCount, setDriversAvailableSoonCount] = useState<number>(0);
   const [estimatedWaitEta, setEstimatedWaitEta] = useState<number | null>(null);
   const [nearbyDriversLocations, setNearbyDriversLocations] = useState<{lat: number, lng: number, id: string}[]>([]);
-  const [availableCategories, setAvailableCategories] = useState<Set<string>>(new Set(['standard']));
+  const [availableCategories, setAvailableCategories] = useState<Set<string>>(
+    new Set(CAR_CATEGORIES.map((c) => c.id))
+  );
   const [showRideInfo, setShowRideInfo] = useState(false);
   const [rideInfoTimerTick, setRideInfoTimerTick] = useState(0);
   const [assignedDriverInfo, setAssignedDriverInfo] = useState<any>(null);
   const lastSoundStatusRef = useRef<string | null>(null);
   const currentRideStatusRef = useRef<string | null>(null);
   const hasTriggeredTipModalRef = useRef(false);
+  const userHasPannedMapRef = useRef(false);
+  const lastAutoFitStatusRef = useRef<string | null>(null);
+  const lastServerEtaSyncRef = useRef<number>(0);
   const [fareConfig, setFareConfig] = useState({ 
     baseFare: 3.5, 
     distanceRate: 1.3, 
     timeRate: 0.15, 
     waitRatePerMinute: 0.25, 
     minFare: 5.0, 
+    priorityFee: 3.0,
+    petFee: 3.0,
+    maxTipGbp: 50.0,
+    allowMidJourneyEdits: true,
     commissionRate: 0.12,
     autoDispatchEnabled: true,
     dispatchRadiusMiles: 15,
     dispatchTimeoutSeconds: 15,
     vehicleMultipliers: {
       standard: 1.0,
+      electric: 1.15,
       executive: 1.5,
       luxury: 2.2,
       '6seater': 1.4,
@@ -563,6 +619,8 @@ export default function PassengerBooking() {
       wav: 2.5
     } as Record<string, number>
   });
+  const [isRecalculatingRoute, setIsRecalculatingRoute] = useState(false);
+  const [alreadyDrivenMiles, setAlreadyDrivenMiles] = useState<number>(0);
 
   const [liveRouteLine, setLiveRouteLine] = useState<{lat: number, lng: number}[]>([]);
   const [liveEtaMins, setLiveEtaMins] = useState<number | null>(null);
@@ -575,11 +633,29 @@ export default function PassengerBooking() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch remote config
+  // Single authoritative remote pricing config listener
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, "platform_config", "rides"), (doc) => {
-      if (doc.exists()) {
-        setFareConfig(prev => ({ ...prev, ...doc.data() }));
+    const unsub = onSnapshot(doc(db, "platform_config", "rides"), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setFareConfig(prev => ({
+          ...prev,
+          ...data,
+          baseFare: Number(data.baseFare) > 0 ? Number(data.baseFare) : prev.baseFare,
+          distanceRate: Number(data.distanceRate) > 0 ? Number(data.distanceRate) : prev.distanceRate,
+          timeRate: Number(data.timeRate) >= 0 && data.timeRate !== undefined ? Number(data.timeRate) : prev.timeRate,
+          waitRatePerMinute: Number(data.waitRatePerMinute) >= 0 && data.waitRatePerMinute !== undefined ? Number(data.waitRatePerMinute) : prev.waitRatePerMinute,
+          minFare: Number(data.minFare) > 0 ? Number(data.minFare) : prev.minFare,
+          priorityFee: Number(data.priorityFee) >= 0 && data.priorityFee !== undefined ? Number(data.priorityFee) : prev.priorityFee,
+          petFee: Number(data.petFee) >= 0 && data.petFee !== undefined ? Number(data.petFee) : prev.petFee,
+          maxTipGbp: data.maxTipGbp !== undefined ? Math.min(50, Math.max(0, Number(data.maxTipGbp))) : prev.maxTipGbp,
+          allowMidJourneyEdits: typeof data.allowMidJourneyEdits === "boolean" ? data.allowMidJourneyEdits : prev.allowMidJourneyEdits,
+          commissionRate: Number(data.commissionRate) >= 0 && data.commissionRate !== undefined ? Number(data.commissionRate) : prev.commissionRate,
+          vehicleMultipliers: {
+            ...prev.vehicleMultipliers,
+            ...(data.vehicleMultipliers || {}),
+          },
+        }));
       }
     }, (err) => console.error("onSnapshot ERROR platform_config/rides:", err));
     return () => unsub();
@@ -886,24 +962,80 @@ export default function PassengerBooking() {
     }
   }, [mapCenter, map, step]);
 
-  // Routing and Distance Calculation (consolidated)
+  // Routing and Distance Calculation (consolidated + mid-journey actual-driven + remaining route)
   useEffect(() => {
     let timeoutId: NodeJS.Timeout;
+    let cancelled = false;
     if (pickupCoords && dropoffCoords && isLoaded) {
+      if (isEditingJourney && hasModifiedRouteByUser) {
+        setIsRecalculatingRoute(true);
+      }
+      const calcHaversineMiles = (a: { lat: number; lng: number }, b: { lat: number; lng: number }) => {
+        const R = 3958.8;
+        const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+        const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+        const h =
+          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos((a.lat * Math.PI) / 180) *
+            Math.cos((b.lat * Math.PI) / 180) *
+            Math.sin(dLng / 2) *
+            Math.sin(dLng / 2);
+        return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
+      };
+
       const getRoute = async () => {
-        if (Math.abs(pickupCoords.lat) < 0.1 && Math.abs(pickupCoords.lng) < 0.1) return;
-        if (Math.abs(dropoffCoords.lat) < 0.1 && Math.abs(dropoffCoords.lng) < 0.1) return;
-        if (Math.abs(pickupCoords.lat - dropoffCoords.lat) < 0.0001 && Math.abs(pickupCoords.lng - dropoffCoords.lng) < 0.0001) return;
+        if (Math.abs(pickupCoords.lat) < 0.1 && Math.abs(pickupCoords.lng) < 0.1) {
+          setIsRecalculatingRoute(false);
+          return;
+        }
+        if (Math.abs(dropoffCoords.lat) < 0.1 && Math.abs(dropoffCoords.lng) < 0.1) {
+          setIsRecalculatingRoute(false);
+          return;
+        }
+        if (Math.abs(pickupCoords.lat - dropoffCoords.lat) < 0.0001 && Math.abs(pickupCoords.lng - dropoffCoords.lng) < 0.0001) {
+          setIsRecalculatingRoute(false);
+          return;
+        }
 
         try {
           const directionsService = new window.google.maps.DirectionsService();
-          const validStops = stops.filter(s => s.coords !== null).map(s => ({
+          const isMidJourneyEdit =
+            isEditingJourney &&
+            assignedDriverInfo?.status === "in_progress" &&
+            driverPos !== null;
+
+          let drivenMiles = 0;
+          let drivenMins = 0;
+          let originPoint = pickupCoords;
+          let routeStops = stops.filter(s => s.coords !== null);
+
+          if (isMidJourneyEdit && driverPos) {
+            const stopIdx = Math.max(0, Math.floor(Number(assignedDriverInfo?.currentStopIndex || 0)));
+            const completedPoints = [
+              pickupCoords,
+              ...stops
+                .slice(0, stopIdx)
+                .map(s => s.coords)
+                .filter((c): c is { lat: number; lng: number } => Boolean(c)),
+              driverPos,
+            ];
+            let rawDriven = 0;
+            for (let i = 0; i < completedPoints.length - 1; i++) {
+              rawDriven += calcHaversineMiles(completedPoints[i], completedPoints[i + 1]);
+            }
+            drivenMiles = Math.round(rawDriven * 1.15 * 10) / 10;
+            drivenMins = Math.round(drivenMiles * 2.2);
+            originPoint = driverPos;
+            routeStops = stops.slice(stopIdx).filter(s => s.coords !== null);
+          }
+
+          const validStops = routeStops.map(s => ({
             location: new window.google.maps.LatLng(s.coords!.lat, s.coords!.lng),
             stopover: true
           }));
 
           const routeReq: google.maps.DirectionsRequest = {
-            origin: new window.google.maps.LatLng(pickupCoords.lat, pickupCoords.lng),
+            origin: new window.google.maps.LatLng(originPoint.lat, originPoint.lng),
             destination: new window.google.maps.LatLng(dropoffCoords.lat, dropoffCoords.lng),
             travelMode: window.google.maps.TravelMode.DRIVING,
           };
@@ -912,6 +1044,8 @@ export default function PassengerBooking() {
           }
 
           directionsService.route(routeReq, (result, status) => {
+            if (cancelled) return;
+            setIsRecalculatingRoute(false);
             if (status === window.google.maps.DirectionsStatus.OK && result) {
               // Draw the line
               const path = result.routes[0].overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
@@ -941,9 +1075,12 @@ export default function PassengerBooking() {
                 if (leg.distance) totalDistanceMeters += leg.distance.value;
                 if (leg.duration) totalDurationSeconds += leg.duration.value;
               });
-              const dMiles = totalDistanceMeters / 1609.34;
-              const dMins = totalDurationSeconds / 60;
+              const routeMiles = totalDistanceMeters / 1609.34;
+              const routeMins = totalDurationSeconds / 60;
+              const dMiles = isMidJourneyEdit ? drivenMiles + routeMiles : routeMiles;
+              const dMins = isMidJourneyEdit ? drivenMins + routeMins : routeMins;
               
+              setAlreadyDrivenMiles(isMidJourneyEdit ? drivenMiles : 0);
               setDistanceMiles(dMiles);
               setDurationMinutes(dMins);
 
@@ -954,19 +1091,25 @@ export default function PassengerBooking() {
               }
             }
           }).catch(() => {
-            // Silently catch the unhandled promise rejection that Maps API throws for UNKNOWN_ERROR
+            if (!cancelled) setIsRecalculatingRoute(false);
           });
         } catch (e: any) {
-          // completely silence routing errors to avoid unhandled rejection/console noise
+          if (!cancelled) setIsRecalculatingRoute(false);
         }
       };
       timeoutId = setTimeout(getRoute, 800);
-      return () => clearTimeout(timeoutId);
+      return () => {
+        cancelled = true;
+        clearTimeout(timeoutId);
+      };
     } else {
       setRouteLine([]);
+      setIsRecalculatingRoute(false);
     }
-  }, [pickupCoords, dropoffCoords, stops, map, fareConfig, isLoaded, currentRideId, editId, hasModifiedRouteByUser]);
+  }, [pickupCoords, dropoffCoords, stops, map, fareConfig, isLoaded, currentRideId, editId, hasModifiedRouteByUser, isEditingJourney, assignedDriverInfo?.status, assignedDriverInfo?.currentStopIndex]);
 
+
+  const autoGeocodedMountRef = useRef(false);
 
   useEffect(() => {
     if (navigator.geolocation && !pickupCoords && !searchParams.get("pickup")) {
@@ -975,17 +1118,46 @@ export default function PassengerBooking() {
         setMapCenter(c);
         setPickupCoords(c);
         setMapZoom(16);
-      });
+      }, () => {});
     }
   }, [pickupCoords, searchParams]);
+
+  // Reverse-geocode initial auto-detected GPS coords once Google Maps loads so Pickup input is populated
+  useEffect(() => {
+    if (
+      !isLoaded ||
+      !pickupCoords ||
+      pickup.trim().length > 0 ||
+      autoGeocodedMountRef.current ||
+      searchParams.get("pickup") ||
+      !window.google?.maps?.Geocoder
+    ) {
+      return;
+    }
+    autoGeocodedMountRef.current = true;
+    const geocoder = new window.google.maps.Geocoder();
+    geocoder.geocode({ location: pickupCoords }, (results, status) => {
+      if (status === "OK" && results && results[0]) {
+        const res = results[0];
+        let addr = res.formatted_address;
+        const postcode = res.address_components?.find((c: any) => c.types.includes("postal_code"))?.long_name;
+        if (postcode && !addr.includes(postcode)) {
+          addr += `, ${postcode}`;
+        }
+        setPickup((prev) => (prev.trim().length === 0 ? addr : prev));
+      }
+    });
+  }, [isLoaded, pickupCoords, pickup, searchParams]);
 
   useEffect(() => {
     if (!user || !pickupCoords) {
       setNearbyDriversCount(0);
       setDriversAvailableSoonCount(0);
+      setNearbyDriversLocations([]);
+      setAvailableCategories(new Set(CAR_CATEGORIES.map((c) => c.id)));
       return;
     }
-    
+
     // Check if pickup is in a busy/surge zone
     const checkZone = async () => {
       if (currentRideId && !isEditingJourney) return;
@@ -1013,135 +1185,74 @@ export default function PassengerBooking() {
       setActiveSurge({multiplier: highestMult, fee: highestFee, isFixed: isFixedMode});
     };
     checkZone();
-    
-    // Reset ETA estimation
-    setEstimatedWaitEta(null);
-    const q = query(collection(db, "live_tracking"), where("isOnline", "==", true));
-    const unsub = onSnapshot(q, (snapshot) => {
-      const maxRadius = fareConfig?.dispatchRadiusMiles || 15;
-      const eligibleDrivers: {
-        id: string;
-        data: any;
-        distToPickup: number;
-        distFromCurrentToDropoff: number;
-        isStacked: boolean;
-        categories: string[];
-      }[] = [];
 
-      const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-        const R = 3958.8; // Radius of Earth in miles
-        const dLat = (lat2 - lat1) * Math.PI / 180;
-        const dLon = (lon2 - lon1) * Math.PI / 180;
-        const a = 
-          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-          Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-          Math.sin(dLon / 2) * Math.sin(dLon / 2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        return R * c; 
-      };
-
-      snapshot.docs.forEach(docSnap => {
-        const data = docSnap.data();
-        
-        // Match user's pet preference
-        if (isPetFriendly && data.isPetFriendly !== true) {
-          return;
-        }
-        if (data.isLastJob === true) {
-          return;
-        }
-
-        let driverCategories = data.vehicleCategories || [data.vehicleCategory || 'standard'];
-        const isStacked = data.status === 'on_ride';
-
-        let distToPickup = Infinity;
-        let distFromCurrentToDropoff = 0;
-
-        if (isStacked) {
-          if (data.isStackingEnabled !== false && data.dropoffLat && data.dropoffLng) {
-            distFromCurrentToDropoff = (data.lat && data.lng) ? calculateDistance(data.lat, data.lng, data.dropoffLat, data.dropoffLng) : 0;
-            distToPickup = calculateDistance(pickupCoords.lat, pickupCoords.lng, data.dropoffLat, data.dropoffLng);
-          } else {
-            return; // Not stackable
-          }
-        } else if (data.lat && data.lng) {
-          distToPickup = calculateDistance(pickupCoords.lat, pickupCoords.lng, data.lat, data.lng);
-        } else {
-          return;
-        }
-
-        eligibleDrivers.push({
-          id: docSnap.id,
-          data,
-          distToPickup,
-          distFromCurrentToDropoff,
-          isStacked,
-          categories: driverCategories,
+    // Privacy-safe server polling for nearby online drivers (avoids PL-04 live_tracking permission-denied)
+    let cancelled = false;
+    const fetchNearby = async () => {
+      try {
+        const token = await user.getIdToken();
+        const radius = fareConfig?.dispatchRadiusMiles || 15;
+        const params = new URLSearchParams({
+          lat: String(pickupCoords.lat),
+          lng: String(pickupCoords.lng),
+          radiusMiles: String(radius),
+          ...(isPetFriendly ? { isPetFriendly: "true" } : {}),
         });
-      });
+        const res = await fetch(`/api/rides/nearby-drivers?${params.toString()}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
 
-      // Progressive Ring Boundaries Search (Ring 1: 3mi, Ring 2: 8mi, Ring 3: platform maxRadius)
-      let activeRadius = 3;
-      const scanRings = [3, 8, maxRadius].filter(r => r <= maxRadius);
-      for (const r of scanRings) {
-        const matchesInRing = eligibleDrivers.filter(d => d.distToPickup <= r);
-        if (matchesInRing.length > 0) {
-          activeRadius = r;
-          break;
+        const driversList: Array<{ lat: number; lng: number; distanceMiles?: number }> = Array.isArray(data.drivers)
+          ? data.drivers
+          : [];
+        const countNow = Number(data.count ?? driversList.length) || 0;
+        const countSoon = Number(data.availableSoonCount || 0) || 0;
+        const serverEta =
+          typeof data.estimatedWaitEta === "number" && Number.isFinite(data.estimatedWaitEta)
+            ? data.estimatedWaitEta
+            : null;
+        const serverCats: string[] = Array.isArray(data.availableCategories)
+          ? data.availableCategories
+          : [];
+
+        setNearbyDriversCount(countNow);
+        setDriversAvailableSoonCount(countSoon);
+        setEstimatedWaitEta(serverEta);
+
+        const within1Mile = driversList.filter((d) => (d.distanceMiles ?? 99) <= 1);
+        const topPins = (within1Mile.length > 0 ? within1Mile : driversList).slice(0, 5);
+        setNearbyDriversLocations(
+          topPins.map((d, idx) => ({
+            lat: d.lat,
+            lng: d.lng,
+            id: `nearby-${idx}-${d.lat}-${d.lng}`,
+          }))
+        );
+
+        // When online drivers exist, reflect real available vehicle tiers; when 0 are online,
+        // keep all tiers selectable so passengers can still request & queue with honest wait notice.
+        if (serverCats.length > 0) {
+          setAvailableCategories(new Set(serverCats));
+        } else {
+          setAvailableCategories(new Set(CAR_CATEGORIES.map((c) => c.id)));
         }
-        if (r === maxRadius) {
-          activeRadius = maxRadius;
+      } catch (err: any) {
+        if (!cancelled) {
+          console.warn("Nearby drivers fetch notice:", err?.message || err);
         }
       }
+    };
 
-      let countNow = 0;
-      let countSoon = 0;
-      let minEtaMins: number | null = null;
-      const cats = new Set<string>();
-      const locations: {lat: number, lng: number, id: string, dist?: number}[] = [];
-
-      eligibleDrivers.forEach(d => {
-        if (d.distToPickup <= activeRadius) {
-          d.categories.forEach((cat: string) => cats.add(cat));
-          if (d.isStacked) {
-            countSoon++;
-            const driverEta = (d.distFromCurrentToDropoff * 4) + 3 + (d.distToPickup * 4);
-            if (minEtaMins === null || driverEta < minEtaMins) minEtaMins = driverEta;
-          } else {
-            countNow++;
-            locations.push({ lat: d.data.lat, lng: d.data.lng, id: d.id, dist: d.distToPickup });
-            const driverEta = d.distToPickup * 4;
-            if (minEtaMins === null || driverEta < minEtaMins) minEtaMins = driverEta;
-          }
-        }
-      });
-
-      setNearbyDriversCount(countNow);
-      setDriversAvailableSoonCount(countSoon);
-      setEstimatedWaitEta(minEtaMins);
-      
-      // Take max 5 closest drivers (prioritize within 1 mile, fallback to within activeRadius)
-      locations.sort((a, b) => (a as any).dist - (b as any).dist);
-      const within1Mile = locations.filter((l: any) => l.dist <= 1);
-      if (within1Mile.length > 0) {
-        setNearbyDriversLocations(within1Mile.slice(0, 5));
-      } else {
-        setNearbyDriversLocations(locations.slice(0, 5));
-      }
-      setAvailableCategories(cats.size > 0 ? cats : new Set(['standard'])); // always show at least standard as fallback
-    }, (err: any) => {
-      if (err?.code === "permission-denied" || err?.message?.includes("Missing or insufficient permissions")) {
-        // PL-04: Unassigned passengers cannot directly enumerate driver GPS locations.
-        // Gracefully supply default fleet category availability and nominal wait time without error.
-        setAvailableCategories(new Set(['standard', 'comfort', 'xl']));
-        setNearbyDriversCount(prev => prev > 0 ? prev : 3);
-        setEstimatedWaitEta(prev => prev !== null ? prev : 4);
-      } else {
-        console.warn("live_tracking listener notice:", err?.message || err);
-      }
-    });
-    return () => unsub();
-  }, [pickupCoords, isPetFriendly, fareConfig?.dispatchRadiusMiles, user]);
+    fetchNearby();
+    const interval = step === "details" ? setInterval(fetchNearby, 12000) : null;
+    return () => {
+      cancelled = true;
+      if (interval) clearInterval(interval);
+    };
+  }, [pickupCoords, isPetFriendly, fareConfig?.dispatchRadiusMiles, user, step]);
 
   useEffect(() => {
     if (!availableCategories.has(selectedCategory)) {
@@ -1151,25 +1262,6 @@ export default function PassengerBooking() {
       }
     }
   }, [availableCategories, selectedCategory]);
-
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, "platform_config", "rides"), (doc) => {
-      if (doc.exists()) {
-        const data = doc.data();
-        setFareConfig(prev => ({
-          ...prev,
-          baseFare: Number(data.baseFare) || 3.5,
-          distanceRate: Number(data.distanceRate) || 1.3,
-          timeRate: Number(data.timeRate) || 0.15,
-          waitRatePerMinute: Number(data.waitRatePerMinute) || 0.25,
-          minFare: Number(data.minFare) || 5.0,
-          commissionRate: Number(data.commissionRate) || 0.12,
-          vehicleMultipliers: data.vehicleMultipliers || prev.vehicleMultipliers
-        }));
-      }
-    }, (err) => console.error("onSnapshot ERROR platform_config/rides 2:", err));
-    return () => unsub();
-  }, []);
 
   const [favoriteAddresses, setFavoriteAddresses] = useState<any[]>([]);
   const [savingFavorite, setSavingFavorite] = useState<{address: string} | null>(null);
@@ -1678,20 +1770,21 @@ export default function PassengerBooking() {
   }, [pickup, dropoff, stops, activeField, mapCenter, isLoaded]);
 
   const handleDetectLocation = () => {
+    if (assignedDriverInfo) return;
     triggerHaptic(ImpactStyle.Light);
     setIsDetecting(true);
     navigator.geolocation.getCurrentPosition(async (pos) => {
       const { latitude, longitude, accuracy } = pos.coords;
       
-      if (accuracy > 100) {
-        toast.warning(`GPS accuracy too low (${Math.round(accuracy)}m). Please enter manually for better precision.`);
+      if (accuracy > 1500) {
+        toast.warning(`GPS accuracy very low (${Math.round(accuracy)}m). Please enter your pickup address manually.`);
         setIsDetecting(false);
         setActiveField("pickup");
         return;
       }
       
-      if (accuracy > 30) {
-        toast.info(`Adjust location slightly on map if needed (Accuracy: ${Math.round(accuracy)}m)`);
+      if (accuracy > 50) {
+        toast.info(`Approximate location detected (${Math.round(accuracy)}m). Drag the pin to fine-tune if needed.`);
       }
       
       const c = { lat: latitude, lng: longitude };
@@ -1744,7 +1837,7 @@ export default function PassengerBooking() {
 
   const getComputedFare = (catId: string) => {
     const defaultMultipliers: Record<string, number> = {
-      standard: 1.0, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5
+      standard: 1.0, electric: 1.15, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5
     };
     const catMultiplier = fareConfig.vehicleMultipliers?.[catId] || defaultMultipliers[catId] || 1.0;
     const base = fareEstimate || 5.0;
@@ -1818,37 +1911,52 @@ export default function PassengerBooking() {
     }
     
     if (pendingCharges > 0) {
-      const reason = profile?.pendingChargesReason || "unpaid balance / fees";
       toast.error(`Please pay your outstanding balance of £${pendingCharges.toFixed(2)} to book a new ride.`);
       return;
     }
 
-    const isUpdatingActiveRide = assignedDriverInfo && (assignedDriverInfo.status === 'accepted' || assignedDriverInfo.status === 'arrived' || assignedDriverInfo.status === 'in_progress');
+    const isUpdatingActiveRide = Boolean(
+      assignedDriverInfo &&
+      (assignedDriverInfo.status === 'accepted' || assignedDriverInfo.status === 'arrived' || assignedDriverInfo.status === 'in_progress')
+    );
+
+    const trimmedHouse = houseNumber.trim();
+    const trimmedPickup = pickup.trim();
+    const cleanPickup =
+      trimmedHouse && !trimmedPickup.toLowerCase().startsWith(trimmedHouse.toLowerCase())
+        ? `${trimmedHouse} ${trimmedPickup}`
+        : trimmedPickup;
 
     if (isUpdatingActiveRide) {
       setStep("confirmed");
-      toast.success("Ride Updated", { description: "Your driver has been notified of the changes." });
     } else {
       setStep("searching");
       searchingStartTimeRef.current = Date.now();
     }
     
     try {
+      const priorityFeeVal = fareConfig.priorityFee ?? 3;
+      const petFeeVal = fareConfig.petFee ?? 3;
       const rideData = {
         riderId: user.uid,
+        passengerId: user.uid,
         passengerName: profile?.firstName || "Passenger",
         passengerPhone: profile?.phone || profile?.phoneNumber || "",
-        pickup: houseNumber ? `${houseNumber} ${pickup}` : pickup,
+        pickup: cleanPickup,
+        pickupAddress: cleanPickup,
         pickupLat: pickupCoords?.lat || mapCenter.lat,
         pickupLng: pickupCoords?.lng || mapCenter.lng,
         dropoff,
+        dropoffAddress: dropoff,
         dropoffLat: dropoffCoords?.lat,
         dropoffLng: dropoffCoords?.lng,
         stops: stops.filter(s => s.coords !== null),
         distanceMiles: Number(distanceMiles.toFixed(1)),
         durationMinutes: Number(durationMinutes.toFixed(0)),
-        fareEstimate: getComputedFare(selectedCategory) + (isPriority ? 3 : 0) + (isPetFriendly ? 3 : 0),
+        fareEstimate: getComputedFare(selectedCategory) + (isPriority ? priorityFeeVal : 0) + (isPetFriendly ? petFeeVal : 0),
         baseCalc: fareEstimate || 5.0,
+        priorityFee: priorityFeeVal,
+        petFee: petFeeVal,
         surgeMultiplier: activeSurge.multiplier, 
         surgeModel: activeSurge.isFixed ? 'fixed' : 'multiplier',
         surgeFixedAmount: activeSurge.fee,
@@ -1858,37 +1966,108 @@ export default function PassengerBooking() {
         isPriority,
         waitTolerance,
         comments,
+        rideContext,
         status: isUpdatingActiveRide ? assignedDriverInfo.status : "pending",
-        hasCardOnFile: !!profile?.stripeCustomerId,
+        hasCardOnFile,
         currency: "GBP",
         handshakeCode: (profile?.phone || profile?.phoneNumber || "").replace(/\D/g, "").slice(-4) || Math.floor(1000 + Math.random() * 9000).toString(),
         requirePasscode: profile?.requirePasscode === true,
       };
       
       const activeId = editId || currentRideId;
-      let dispatchedRideId = activeId;
+      const token = await user.getIdToken();
       if (activeId) {
-         await updateDoc(doc(db, "ride_requests", activeId), { ...rideData, updatedAt: serverTimestamp(), isModifiedByPassenger: true });
+         const res = await fetch(`/api/rides/${encodeURIComponent(activeId)}/passenger-update`, {
+           method: "POST",
+           headers: {
+             "Content-Type": "application/json",
+             Authorization: `Bearer ${token}`,
+           },
+           body: JSON.stringify({
+             pickup: cleanPickup,
+             pickupLat: rideData.pickupLat,
+             pickupLng: rideData.pickupLng,
+             dropoff: rideData.dropoff,
+             dropoffLat: rideData.dropoffLat,
+             dropoffLng: rideData.dropoffLng,
+             stops: rideData.stops,
+             distanceMiles: rideData.distanceMiles,
+             durationMinutes: rideData.durationMinutes,
+             alreadyDrivenMiles: alreadyDrivenMiles > 0 ? alreadyDrivenMiles : undefined,
+             carCategory: rideData.carCategory,
+             isPetFriendly: rideData.isPetFriendly,
+             isPriority: rideData.isPriority,
+             waitTolerance: rideData.waitTolerance,
+             comments: rideData.comments,
+             rideContext: rideData.rideContext,
+             surgeModel: rideData.surgeModel,
+             surgeMultiplier: rideData.surgeMultiplier,
+             surgeFixedAmount: rideData.surgeFixedAmount,
+           }),
+         });
+         if (!res.ok) {
+           const errData = await res.json().catch(() => ({}));
+           throw new Error(errData?.error || "Could not update your ride right now.");
+         }
+         const updatedData = await res.json().catch(() => ({}));
+         if (typeof updatedData.baseCalc === "number" && updatedData.baseCalc > 0) {
+           setFareEstimate(updatedData.baseCalc);
+         }
+         setHasModifiedRouteByUser(false);
          setCurrentRideId(activeId);
+         if (isUpdatingActiveRide) {
+           const summaryMsg =
+             updatedData.editSummary || "Your driver has been notified of the updated route and fare.";
+           toast.success("Ride Updated", { description: summaryMsg });
+         }
       } else {
-         const docRef = await addDoc(collection(db, "ride_requests"), { ...rideData, createdAt: serverTimestamp() });
-         setCurrentRideId(docRef.id);
-         dispatchedRideId = docRef.id;
+         const res = await fetch("/api/rides/create", {
+           method: "POST",
+           headers: {
+             "Content-Type": "application/json",
+             Authorization: `Bearer ${token}`,
+           },
+           body: JSON.stringify({
+             passengerName: rideData.passengerName,
+             passengerPhone: rideData.passengerPhone,
+             pickup: rideData.pickup,
+             pickupLat: rideData.pickupLat,
+             pickupLng: rideData.pickupLng,
+             dropoff: rideData.dropoff,
+             dropoffLat: rideData.dropoffLat,
+             dropoffLng: rideData.dropoffLng,
+             stops: rideData.stops,
+             distanceMiles: rideData.distanceMiles,
+             durationMinutes: rideData.durationMinutes,
+             carCategory: rideData.carCategory,
+             isPetFriendly: rideData.isPetFriendly,
+             isPriority: rideData.isPriority,
+             waitTolerance: rideData.waitTolerance,
+             comments: rideData.comments,
+             rideContext: rideData.rideContext,
+             surgeModel: rideData.surgeModel,
+             surgeMultiplier: rideData.surgeMultiplier,
+             surgeFixedAmount: rideData.surgeFixedAmount,
+             hasCardOnFile: rideData.hasCardOnFile,
+             requirePasscode: rideData.requirePasscode,
+           }),
+         });
+         const createdData = await res.json().catch(() => ({}));
+         if (!res.ok || !createdData?.rideId) {
+           throw new Error(createdData?.error || "Failed to confirm booking. Please try again.");
+         }
+         if (typeof createdData.baseCalc === "number" && createdData.baseCalc > 0) {
+           setFareEstimate(createdData.baseCalc);
+         }
+         setCurrentRideId(createdData.rideId);
       }
-
-      if (dispatchedRideId && !isUpdatingActiveRide) {
-         user.getIdToken().then((token) =>
-           fetch(`/api/rides/${encodeURIComponent(dispatchedRideId)}/dispatch-offers`, {
-             method: "POST",
-             headers: {
-               "Content-Type": "application/json",
-               Authorization: `Bearer ${token}`,
-             },
-             body: JSON.stringify({}),
-           })
-         ).catch(() => {});
+    } catch (err: any) {
+      console.error("handleConfirmBooking failed:", err);
+      toast.error(err?.message || "Failed to confirm booking. Please try again.");
+      if (!isUpdatingActiveRide) {
+        setStep("details");
       }
-    } catch (err) { setStep("details"); }
+    }
   };
 
   const handleTogglePriorityClick = () => {
@@ -1901,174 +2080,52 @@ export default function PassengerBooking() {
   };
 
   const confirmTogglePriority = async (newPriority: boolean) => {
-    if (!currentRideId) return;
+    if (!currentRideId || !user) return;
     try {
       setIsPriority(newPriority);
-      await updateDoc(doc(db, "ride_requests", currentRideId), {
-         isPriority: newPriority,
-         fareEstimate: increment(newPriority ? 3 : -3)
+      const token = await user.getIdToken();
+      const res = await fetch(`/api/rides/${encodeURIComponent(currentRideId)}/passenger-update`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ isPriority: newPriority }),
       });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.error || "Failed to update priority");
+      }
       setShowPriorityPrompt(false);
       if (!newPriority) {
         setPriorityInlineToast({ message: "Priority Boost removed.", type: "info" });
         setTimeout(() => setPriorityInlineToast(null), 3000);
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
       setIsPriority(!newPriority);
-      toast.error("Failed to update priority");
+      toast.error(e?.message || "Failed to update priority");
     }
   };
 
   const handleCancelSearching = async () => {
-    if (currentRideId) {
-      await updateDoc(doc(db, "ride_requests", currentRideId), { status: "draft" });
+    if (currentRideId && user) {
+      try {
+        const token = await user.getIdToken();
+        await fetch(`/api/rides/${encodeURIComponent(currentRideId)}/passenger-update`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ pauseSearch: true }),
+        });
+      } catch (err) {
+        console.warn("Could not pause searching ride to draft:", err);
+      }
     }
     setStep("details");
     // Do not clear currentRideId here, just let them edit
-  };
-
-  const simulateDriverAccepts = async () => {
-    if (!currentRideId) return;
-    try {
-      const simData = {
-        status: "accepted",
-        driverId: "sim-driver-123",
-        driverName: "Sim Driver",
-        driverPhone: "07700900000",
-        vehicleInfo: "Silver Toyota",
-        vehiclePlate: "SIM 123",
-        driverRequirePasscode: false,
-        acceptedAt: serverTimestamp(),
-      };
-      
-      // Force local optimistic UI update to bypass snapshot delay issues
-      setAssignedDriverInfo((prev: any) => ({
-         uid: simData.driverId, 
-         name: simData.driverName, 
-         vehicle: simData.vehicleInfo, 
-         plate: simData.vehiclePlate,
-         code: "---", 
-         requirePasscode: false,
-         phone: simData.driverPhone, 
-         status: "accepted",
-         fareEstimate: fareEstimate || 0,
-         rating: "5.0",
-         acceptedAt: Date.now(),
-         isFinishingTrip: false,
-         stackedDriverDelay: undefined
-      }));
-      setStep("confirmed");
-      triggerHaptic(ImpactStyle.Heavy);
-      playSound('success');
-      setShowDriverFoundOverlay(true);
-
-      await updateDoc(doc(db, "ride_requests", currentRideId), simData);
-      if (pickupCoords) {
-        await setDoc(doc(db, "live_tracking", "sim-driver-123"), {
-           lat: pickupCoords.lat - 0.003,
-           lng: pickupCoords.lng - 0.003,
-           updatedAt: serverTimestamp(),
-           isOnline: true
-        });
-      }
-      toast.success("Simulated match!");
-    } catch(err) {
-      console.error(err);
-    }
-  };
-
-  const simulateNextState = async () => {
-    if (!currentRideId || !assignedDriverInfo) return;
-    const currentStatus = assignedDriverInfo.status;
-    let nextStatus = "arrived";
-    if (currentStatus === "accepted") nextStatus = "arrived";
-    else if (currentStatus === "arrived") nextStatus = "in_progress";
-    else if (currentStatus === "in_progress") {
-       nextStatus = profile?.stripeCustomerId ? "completed" : "awaiting_payment";
-    }
-    else if (currentStatus === "awaiting_payment" || currentStatus === "awaiting_cash_confirm") {
-      nextStatus = "completed";
-    }
-
-    try {
-      const rideDoc = await getDoc(doc(db, "ride_requests", currentRideId));
-      const rideData = rideDoc.exists() ? rideDoc.data() : null;
-
-      const updateData: any = { status: nextStatus };
-      
-      // Optimistic updates
-      if (nextStatus === "arrived") {
-         updateData.arrivedAt = serverTimestamp();
-         setAssignedDriverInfo((prev: any) => prev ? { ...prev, status: "arrived", arrivedAt: Date.now() } : null);
-         triggerHaptic(ImpactStyle.Heavy);
-         playSound('notification');
-         if (navigator.vibrate) navigator.vibrate([300, 150, 300, 150, 500]);
-         toast.success("Your driver has arrived!", { duration: 8000, position: "top-center" });
-      }
-      if (nextStatus === "in_progress") {
-         updateData.startedAt = serverTimestamp();
-         
-         let waitSeconds = 0;
-         if (rideData && rideData.arrivedAt) {
-            const arrivedTime = rideData.arrivedAt.seconds ? rideData.arrivedAt.seconds * 1000 : (typeof rideData.arrivedAt.toMillis === 'function' ? rideData.arrivedAt.toMillis() : rideData.arrivedAt);
-            const elapsed = Math.floor((Date.now() - arrivedTime) / 1000);
-            if (elapsed > freeWaitSeconds) {
-               waitSeconds = elapsed - freeWaitSeconds;
-            }
-         }
-         updateData.paidWaitSeconds = (rideData?.paidWaitSeconds || 0) + waitSeconds;
-
-         setAssignedDriverInfo((prev: any) => prev ? { ...prev, status: "in_progress", startedAt: Date.now(), paidWaitSeconds: updateData.paidWaitSeconds } : null);
-         playSound('notification');
-      }
-      if (nextStatus === "awaiting_payment") {
-         updateData.paymentUrl = "https://example.com/pay";
-         setAssignedDriverInfo((prev: any) => prev ? { ...prev, status: "awaiting_payment", paymentUrl: updateData.paymentUrl } : null);
-         playSound('notification');
-      }
-      if (nextStatus === "completed") {
-         updateData.completedAt = serverTimestamp();
-         updateData.paymentMethod = profile?.stripeCustomerId ? "stripe_auto" : "stripe_qr";
-         if (rideData) {
-            let waitSeconds = 0;
-            if (rideData.arrivedAt && !rideData.startedAt) {
-               // Fast forward simulation without in_progress
-               const arrivedTime = rideData.arrivedAt.seconds ? rideData.arrivedAt.seconds * 1000 : (typeof rideData.arrivedAt.toMillis === 'function' ? rideData.arrivedAt.toMillis() : rideData.arrivedAt);
-               const elapsed = Math.floor((Date.now() - arrivedTime) / 1000);
-               if (elapsed > freeWaitSeconds) {
-                  waitSeconds = elapsed - freeWaitSeconds;
-               }
-            }
-            const finalWaitSeconds = (rideData.paidWaitSeconds || updateData.paidWaitSeconds || 0) + waitSeconds;
-            updateData.paidWaitSeconds = finalWaitSeconds;
-            
-            const waitFare = (finalWaitSeconds / 60) * fareConfig.waitRatePerMinute;
-            updateData.finalFare = (rideData.fareEstimate || fareConfig.baseFare) + waitFare + (rideData.tipAmount || 0) + (rideData.cancellationFee || 0);
-         }
-         
-         const completedData = {
-           status: "completed",
-           id: currentRideId,
-           ...rideData,
-           ...updateData,
-         };
-         if (updateData.completedAt) completedData.completedAt = { toMillis: () => Date.now() };
-
-         setCompletedRideData(completedData);
-         setStep("receipt"); 
-         setCurrentRideId(null); 
-         setAssignedDriverInfo(null); 
-         hasTriggeredTipModalRef.current = false;
-         setShowTipModal(false);
-         // Outstanding balance / strikes are settled strictly server-side via Stripe webhook fulfillment
-      }
-      
-      await updateDoc(doc(db, "ride_requests", currentRideId), updateData);
-    } catch(err: any) { 
-       console.error("simulateNextState error:", err); 
-       toast.error("Error: " + err.message); 
-    }
   };
 
   const handleAbandonSearch = async () => {
@@ -2142,25 +2199,31 @@ export default function PassengerBooking() {
   };
 
   const handleFindAnotherDriver = async () => {
-     if (!currentRideId) return;
+     if (!currentRideId || !user) return;
      try {
-       await updateDoc(doc(db, "ride_requests", currentRideId), {
-          status: "pending",
-          driverId: deleteField(),
-          assignedDriverId: deleteField(),
-          driverName: deleteField(),
-          driverPhone: deleteField(),
-          vehicleInfo: deleteField(),
-          vehiclePlate: deleteField(),
-          acceptedAt: deleteField(),
-          stackedDriverDelay: deleteField(),
-          updatedAt: serverTimestamp()
+       const token = await user.getIdToken();
+       const res = await fetch(`/api/rides/${encodeURIComponent(currentRideId)}/reassign`, {
+         method: "POST",
+         headers: {
+           "Content-Type": "application/json",
+           Authorization: `Bearer ${token}`,
+         },
        });
+       const data = await res.json().catch(() => ({}));
+       if (!res.ok) {
+         throw new Error(data?.error || "Failed to search for another driver.");
+       }
        setAssignedDriverInfo(null);
+       setDriverPos(null);
+       setLiveEtaSeconds(null);
+       setLiveEtaMins(null);
+       lastSoundStatusRef.current = null;
        setStep("searching");
        searchingStartTimeRef.current = Date.now();
-     } catch (err) {
-       console.error(err);
+       toast.info("Searching for another driver...");
+     } catch (err: any) {
+       console.error("handleFindAnotherDriver error:", err);
+       toast.error(err?.message || "Could not reassign driver right now.");
      }
   };
 
@@ -2267,9 +2330,36 @@ export default function PassengerBooking() {
   };
 
   const handleAddTip = async (amount: number) => {
-    if (currentRideId) {
-       await updateDoc(doc(db, "ride_requests", currentRideId), { tipAmount: amount, tipAddedAt: serverTimestamp() });
-       toast.success(amount > 0 ? `Tip added successfully!` : "Tip skipped.");
+    const maxAllowedTip = Math.min(50, Math.max(0, Number(fareConfig.maxTipGbp ?? 50)));
+    if (!Number.isFinite(amount) || amount < 0) {
+      toast.error("Please enter a valid tip amount.");
+      return;
+    }
+    if (amount > maxAllowedTip) {
+      toast.error(`Maximum allowed tip is £${maxAllowedTip.toFixed(2)}`);
+      return;
+    }
+    if (currentRideId && user) {
+      try {
+        const token = await user.getIdToken();
+        const res = await fetch(`/api/rides/${encodeURIComponent(currentRideId)}/tip`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ tipAmount: amount }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data?.error || "Failed to update tip.");
+        }
+        toast.success(amount > 0 ? `£${Number(data.tipAmount ?? amount).toFixed(2)} tip added — 100% goes to your driver!` : "Tip skipped.");
+      } catch (err: any) {
+        console.error("Failed to save tip:", err);
+        toast.error(err?.message || "Could not add tip right now.");
+        return;
+      }
     }
     setShowTipModal(false);
   };
@@ -2288,211 +2378,36 @@ export default function PassengerBooking() {
     }, 2000);
   };
 
-  const [driverDispatchIntervalId, setDriverDispatchIntervalId] = useState<NodeJS.Timeout | null>(null);
-
-  // Auto-Dispatch Engine Effect
+  // Server-authoritative offer dispatch heartbeat while searching
+  // Replaces legacy browser-side live_tracking polling (which conflicted with PL-04 rules & server fairness dispatch).
   useEffect(() => {
-    if (step !== "searching" || !currentRideId || !pickupCoords || fareConfig.autoDispatchEnabled !== true) return;
+    if (step !== "searching" || !currentRideId || !user) return;
 
-    let dispatchInterval: NodeJS.Timeout;
-
-    const runDispatch = async () => {
-       const rideRef = doc(db, "ride_requests", currentRideId);
-       const rideDoc = await getDoc(rideRef);
-       if (!rideDoc.exists()) return;
-       const rideInfo = rideDoc.data();
-       
-       if (rideInfo.status !== "pending") {
-          // If status is "offered", wait until timeout passes
-          if (rideInfo.status === "offered" && rideInfo.offerExpiresAt) {
-             if (Date.now() > rideInfo.offerExpiresAt) {
-                // Timeout! Update it back to pending and decline this driver
-                await runTransaction(db, async (t) => {
-                  const latestDoc = await t.get(rideRef);
-                  if (latestDoc.exists() && latestDoc.data().status === "offered") {
-                    t.update(rideRef, {
-                      status: "pending",
-                      assignedDriverId: deleteField(),
-                      offerExpiresAt: deleteField(),
-                      declinedBy: arrayUnion(rideInfo.assignedDriverId)
-                    });
-                  }
-                });
-             }
-          }
-          return; // Wait for next tick
-       }
-
-       // Ride is "pending". Let's find the best driver logically.
-        const q = query(collection(db, "live_tracking"), where("isOnline", "==", true));
-        const snapshot = await getDocs(q);
-        const declinedBy = rideInfo.declinedBy || [];
-        console.log(`[AnyRoller Dispatch] Checking dispatch for ride:${currentRideId}. Found ${snapshot.size} online driver(s) in live_tracking database.`);
-
-       let bestDriver: any = null;
-       let bestDistance = Infinity;
-
-       snapshot.forEach(docSnap => {
-          const driver = docSnap.data();
-          if (docSnap.id === user?.uid) return; // Passenger can't be own driver
-          if (declinedBy.includes(docSnap.id)) return; // Already declined or timed out
-
-
-          
-          // Category check logic
-          const cats = driver.vehicleCategories || [driver.vehicleCategory || 'standard'];
-          if (!cats.includes(selectedCategory)) return;
-
-          // Stacking & Last Job logic
-          if (driver.isLastJob) return; // Never dispatch if it's their last job
-          
-          if (driver.status !== "available") { // e.g. on_ride
-             if (driver.status === "on_ride" && driver.isStackingEnabled) {
-                // We can stack. But only if we have their dropoff coordinates to compute ETA/Distance
-                if (!driver.dropoffLat || !driver.dropoffLng) return;
-             } else {
-                return; // Busy and not stackable
-             }
-          }
-
-          // Distance logic (either from current location or future dropoff location)
-          const startLat = driver.status === "on_ride" ? driver.dropoffLat : driver.lat;
-          const startLng = driver.status === "on_ride" ? driver.dropoffLng : driver.lng;
-          
-          if (!startLat || !startLng) return;
-
-          const R = 3958.8; // miles
-          const dist = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-             const rLat1 = lat1 * Math.PI / 180;
-             const rLat2 = lat2 * Math.PI / 180;
-             const deltaLat = (lat2 - lat1) * Math.PI / 180;
-             const deltaLng = (lon2 - lon1) * Math.PI / 180;
-             const a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) + Math.cos(rLat1) * Math.cos(rLat2) * Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2);
-             const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-             return R * c;
-          };
-
-          const d = dist(startLat, startLng, pickupCoords.lat, pickupCoords.lng);
-
-          const radius = fareConfig.dispatchRadiusMiles || 15;
-          if (d > radius) return;
-
-          // Destination Mode Logic
-          // If the driver is heading home, the ride's dropoff must be closer to their home than the pickup
-          if (driver.destinationModeActive && driver.homeLat && driver.homeLng && dropoffCoords) {
-             const distToHomeFromPickup = dist(pickupCoords.lat, pickupCoords.lng, driver.homeLat, driver.homeLng);
-             const distToHomeFromDropoff = dist(dropoffCoords.lat, dropoffCoords.lng, driver.homeLat, driver.homeLng);
-             
-             // If this ride takes them further away from home, skip this driver
-             if (distToHomeFromDropoff > distToHomeFromPickup) {
-                 return;
-             }
-          }
-
-          // Working Zone filter
-          if (driver.zoneEnabled && driver.zoneMaxDistance > 0 && driver.homeLat && driver.homeLng) {
-             const distPickupToHome = dist(pickupCoords.lat, pickupCoords.lng, driver.homeLat, driver.homeLng);
-             if (distPickupToHome > driver.zoneMaxDistance) {
-                 return;
-             }
-             if (dropoffCoords) {
-                 const distDropoffToHome = dist(dropoffCoords.lat, dropoffCoords.lng, driver.homeLat, driver.homeLng);
-                 if (distDropoffToHome > driver.zoneMaxDistance) {
-                     return;
-                 }
-             }
-          }
-
-          // Match closest driver within the radius limit
-          if (d < bestDistance) {
-            bestDistance = d;
-            bestDriver = docSnap.id;
-          }
-       });
-
-       if (!bestDriver && declinedBy.length > 0) {
-           console.log(`[AnyRoller Dispatch] No eligible driver found but some have declined. Resetting declinedBy logic to re-ping available drivers.`);
-           await updateDoc(rideRef, { declinedBy: deleteField() });
-           return;
-       }
-
-       // QUEUE PRIORITY SYSTEM:
-       // Check if there are other pending jobs older than ours
-       if (bestDriver) {
-           const pendingQuery = query(collection(db, "ride_requests"), where("status", "==", "pending"));
-           const pendingSnaps = await getDocs(pendingQuery);
-           let shouldYield = false;
-           pendingSnaps.forEach(snap => {
-              if (snap.id !== currentRideId) {
-                 const otherData = snap.data();
-                 if (otherData.createdAt?.toMillis && rideInfo.createdAt?.toMillis) {
-                    const otherAgeMs = Date.now() - otherData.createdAt.toMillis();
-                    if (otherAgeMs < 1 * 60 * 1000 && otherData.createdAt.toMillis() < rideInfo.createdAt.toMillis()) {
-                       // There is an older job. Let's see if it's close enough that the driver could take it instead.
-                       const oldPickupLat = otherData.pickupLat;
-                       const oldPickupLng = otherData.pickupLng;
-                       if (oldPickupLat && oldPickupLng) {
-                           // If the older job is within 5 miles of us, we yield to give them priority
-                           const distToOther = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-                              const rLat1 = lat1 * Math.PI / 180;
-                              const rLat2 = lat2 * Math.PI / 180;
-                              return 3958.8 * 2 * Math.asin(Math.sqrt(Math.sin((lat2-lat1)*Math.PI/180/2)**2 + Math.cos(rLat1)*Math.cos(rLat2)*Math.sin((lon2-lon1)*Math.PI/180/2)**2));
-                           };
-                           const d = distToOther(pickupCoords.lat, pickupCoords.lng, oldPickupLat, oldPickupLng);
-                           if (d <= 5) {
-                               shouldYield = true;
-                           }
-                       }
-                    }
-                 }
-              }
-           });
-           
-           if (shouldYield) {
-               // We randomly wait or skip this tick so the older job gets first dibs
-               if (Math.random() < 0.0) {
-                   return; // Yield to older job 70% of the time
-               }
-           }
-       }
-
-       if (bestDriver) {
-          // Surge / Offer dispatch correctly matching the logic
-          const timeoutMs = (fareConfig.dispatchTimeoutSeconds || 15) * 1000;
-          await updateDoc(rideRef, {
-             status: "offered",
-             assignedDriverId: bestDriver,
-             offerExpiresAt: Date.now() + timeoutMs
-          });
-          
-          // Trigger remote FCM push notification to driver for new ride offer
-          const token = await user?.getIdToken().catch(() => null);
-          if (token) {
-            fetch("/api/chat-push", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${token}`,
-              },
-              body: JSON.stringify({
-                recipientId: bestDriver,
-                title: "New Ride Offer",
-                body: "You have a new incoming ride request",
-                rideId: currentRideId,
-                type: "ride_offer",
-                channelId: "ride_offers_urgent"
-              })
-            }).catch(err => console.error("FCM API error:", err));
-          }
-       }
+    let cancelled = false;
+    const pingServerDispatch = async () => {
+      if (cancelled) return;
+      try {
+        const token = await user.getIdToken();
+        if (cancelled) return;
+        await fetch(`/api/rides/${encodeURIComponent(currentRideId)}/dispatch-offers`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({}),
+        });
+      } catch {
+        // Non-fatal; background server Fairness Dispatch Worker continues matching
+      }
     };
 
-    dispatchInterval = setInterval(runDispatch, 3000);
-    runDispatch(); // initial tick
-
-    return () => clearInterval(dispatchInterval);
-
-  }, [step, currentRideId, pickupCoords, selectedCategory, user, fareConfig]);
+    const interval = setInterval(pingServerDispatch, 12000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [step, currentRideId, user]);
 
   useEffect(() => {
     if (!user || !currentRideId) return;
@@ -2503,6 +2418,7 @@ export default function PassengerBooking() {
         
         // Synchronize active ETA timers directly from the Firestore document (updated in real-time by driver terminal)
         if (data.liveEtaSeconds !== undefined && data.liveEtaSeconds !== null) {
+          lastServerEtaSyncRef.current = Date.now();
           setLiveEtaSeconds(data.liveEtaSeconds);
           setLiveEtaMins(data.durationMinutes || Math.ceil(data.liveEtaSeconds / 60));
         } else if (data.durationMinutes !== undefined && data.durationMinutes !== null && liveEtaSeconds === null) {
@@ -2544,6 +2460,15 @@ export default function PassengerBooking() {
              phone: data.driverPhone || "", 
              status: "accepted",
              fareEstimate: data.fareEstimate || 0,
+             paidWaitSeconds: Number(data.paidWaitSeconds || 0),
+             hasCardOnFile: data.hasCardOnFile !== undefined ? Boolean(data.hasCardOnFile) : hasCardOnFile,
+             isPetFriendly: Boolean(data.isPetFriendly),
+             isPriority: Boolean(data.isPriority),
+             petFee: Number(data.petFee ?? fareConfig.petFee ?? 3),
+             priorityFee: Number(data.priorityFee ?? fareConfig.priorityFee ?? 3),
+             tipAmount: Number(data.tipAmount || 0),
+             journeyRevision: Number(data.journeyRevision || 0),
+             lastPassengerEditSummary: data.lastPassengerEditSummary,
              rating: data.driverRating || "4.8",
              acceptedAt: data.acceptedAt?.toMillis() || Date.now(),
              isFinishingTrip: prev?.isFinishingTrip !== undefined ? prev.isFinishingTrip : (nearbyDriversCount === 0 && driversAvailableSoonCount > 0),
@@ -2586,7 +2511,13 @@ export default function PassengerBooking() {
               ...base,
               status: "arrived",
               arrivedAt: data.arrivedAt?.toMillis ? data.arrivedAt.toMillis() : (data.arrivedAt || Date.now()),
-              tipAmount: data.tipAmount,
+              tipAmount: data.tipAmount !== undefined ? Number(data.tipAmount) : (base.tipAmount || 0),
+              paidWaitSeconds: data.paidWaitSeconds !== undefined ? Number(data.paidWaitSeconds) : (base.paidWaitSeconds || 0),
+              hasCardOnFile: data.hasCardOnFile !== undefined ? Boolean(data.hasCardOnFile) : (base.hasCardOnFile ?? hasCardOnFile),
+              isPetFriendly: data.isPetFriendly !== undefined ? Boolean(data.isPetFriendly) : base.isPetFriendly,
+              isPriority: data.isPriority !== undefined ? Boolean(data.isPriority) : base.isPriority,
+              petFee: data.petFee !== undefined ? Number(data.petFee) : (base.petFee ?? fareConfig.petFee ?? 3),
+              priorityFee: data.priorityFee !== undefined ? Number(data.priorityFee) : (base.priorityFee ?? fareConfig.priorityFee ?? 3),
               currentStopIndex: data.currentStopIndex || 0,
               stops: data.stops || [],
               fareEstimate: data.fareEstimate || base.fareEstimate
@@ -2619,7 +2550,15 @@ export default function PassengerBooking() {
               startedAt: data.startedAt?.toMillis ? data.startedAt.toMillis() : (data.startedAt || Date.now()),
               currentStopIndex: data.currentStopIndex || 0,
               stops: data.stops || [],
-              tipAmount: data.tipAmount,
+              tipAmount: data.tipAmount !== undefined ? Number(data.tipAmount) : (base.tipAmount || 0),
+              paidWaitSeconds: data.paidWaitSeconds !== undefined ? Number(data.paidWaitSeconds) : (base.paidWaitSeconds || 0),
+              hasCardOnFile: data.hasCardOnFile !== undefined ? Boolean(data.hasCardOnFile) : (base.hasCardOnFile ?? hasCardOnFile),
+              isPetFriendly: data.isPetFriendly !== undefined ? Boolean(data.isPetFriendly) : base.isPetFriendly,
+              isPriority: data.isPriority !== undefined ? Boolean(data.isPriority) : base.isPriority,
+              petFee: data.petFee !== undefined ? Number(data.petFee) : (base.petFee ?? fareConfig.petFee ?? 3),
+              priorityFee: data.priorityFee !== undefined ? Number(data.priorityFee) : (base.priorityFee ?? fareConfig.priorityFee ?? 3),
+              journeyRevision: Number(data.journeyRevision || base.journeyRevision || 0),
+              lastPassengerEditSummary: data.lastPassengerEditSummary || base.lastPassengerEditSummary,
               fareEstimate: data.fareEstimate || base.fareEstimate
             };
           });
@@ -2648,6 +2587,13 @@ export default function PassengerBooking() {
               ...base,
               status: "awaiting_payment",
               paymentUrl: data.paymentUrl,
+              tipAmount: data.tipAmount !== undefined ? Number(data.tipAmount) : (base.tipAmount || 0),
+              paidWaitSeconds: data.paidWaitSeconds !== undefined ? Number(data.paidWaitSeconds) : (base.paidWaitSeconds || 0),
+              hasCardOnFile: data.hasCardOnFile !== undefined ? Boolean(data.hasCardOnFile) : (base.hasCardOnFile ?? hasCardOnFile),
+              isPetFriendly: data.isPetFriendly !== undefined ? Boolean(data.isPetFriendly) : base.isPetFriendly,
+              isPriority: data.isPriority !== undefined ? Boolean(data.isPriority) : base.isPriority,
+              petFee: data.petFee !== undefined ? Number(data.petFee) : (base.petFee ?? fareConfig.petFee ?? 3),
+              priorityFee: data.priorityFee !== undefined ? Number(data.priorityFee) : (base.priorityFee ?? fareConfig.priorityFee ?? 3),
               fareEstimate: data.fareEstimate || base.fareEstimate
             };
           });
@@ -2671,6 +2617,9 @@ export default function PassengerBooking() {
               status: "awaiting_cash_confirm",
               reportedCashCollected: data.reportedCashCollected,
               reportedCashDiscrepancy: data.reportedCashDiscrepancy,
+              tipAmount: data.tipAmount !== undefined ? Number(data.tipAmount) : (base.tipAmount || 0),
+              paidWaitSeconds: data.paidWaitSeconds !== undefined ? Number(data.paidWaitSeconds) : (base.paidWaitSeconds || 0),
+              hasCardOnFile: data.hasCardOnFile !== undefined ? Boolean(data.hasCardOnFile) : (base.hasCardOnFile ?? hasCardOnFile),
               fareEstimate: data.fareEstimate || base.fareEstimate
             };
           });
@@ -2720,16 +2669,22 @@ export default function PassengerBooking() {
         if (data.lat && data.lng) {
           const newPos = { lat: data.lat, lng: data.lng };
           setDriverPos(newPos);
-          if (map) {
+          const statusNow = currentRideStatusRef.current || "";
+          const statusChanged = lastAutoFitStatusRef.current !== statusNow;
+          if (statusChanged) {
+            lastAutoFitStatusRef.current = statusNow;
+            userHasPannedMapRef.current = false;
+          }
+          if (map && !userHasPannedMapRef.current) {
              const bounds = new window.google.maps.LatLngBounds();
              bounds.extend(newPos);
              
              // If driver is accepted, they are heading to pick you up
-             if (currentRideStatusRef.current === "accepted" && pickupCoords) bounds.extend(pickupCoords);
+             if (statusNow === "accepted" && pickupCoords) bounds.extend(pickupCoords);
              // If driver is in progress, they are heading to the dropoff
-             if (currentRideStatusRef.current === "in_progress" && dropoffCoords) bounds.extend(dropoffCoords);
+             if (statusNow === "in_progress" && dropoffCoords) bounds.extend(dropoffCoords);
 
-             if (currentRideStatusRef.current === "arrived") {
+             if (statusNow === "arrived") {
                  map.setCenter(newPos);
                  map.setZoom(17);
                  setMapCenter(newPos);
@@ -2965,16 +2920,29 @@ export default function PassengerBooking() {
           const lat2 = currentDriverPos.lat;
           const lng2 = currentDriverPos.lng;
           const dist = Math.sqrt(Math.pow((lat1 - lat2) * 111320, 2) + Math.pow((lng1 - lng2) * 111000 * Math.cos(lat1 * Math.PI / 180), 2));
-          if (dist < 30) {
+          if (dist < 80) {
             return;
           }
         }
 
         try {
           const directionsService = new window.google.maps.DirectionsService();
+          const remainingStopWaypoints =
+            assignedDriverInfo?.status === "in_progress" && Array.isArray(stops)
+              ? stops
+                  .slice(Math.max(0, Number(assignedDriverInfo?.currentStopIndex || 0)))
+                  .filter((s) => s?.coords)
+                  .map((s) => ({
+                    location: new window.google.maps.LatLng(s.coords!.lat, s.coords!.lng),
+                    stopover: true,
+                  }))
+              : [];
+
           directionsService.route({
             origin: new window.google.maps.LatLng(currentDriverPos.lat, currentDriverPos.lng),
             destination: new window.google.maps.LatLng(destinationCoords.lat, destinationCoords.lng),
+            waypoints: remainingStopWaypoints.length > 0 ? remainingStopWaypoints : undefined,
+            optimizeWaypoints: false,
             travelMode: window.google.maps.TravelMode.DRIVING,
           }, (result, status) => {
             if (status === window.google.maps.DirectionsStatus.OK && result && result.routes && result.routes[0]) {
@@ -2983,17 +2951,21 @@ export default function PassengerBooking() {
               const path = result.routes[0].overview_path.map(p => ({ lat: p.lat(), lng: p.lng() }));
               setLiveRouteLine(path);
               
-              let totalSecs = 0;
-              result.routes[0].legs.forEach((leg: any) => {
-                if (leg.duration?.value) totalSecs += leg.duration.value;
-              });
-              
-              if (assignedDriverInfo?.status === "accepted" && assignedDriverInfo?.stackedDriverDelay) {
-                 totalSecs += assignedDriverInfo.stackedDriverDelay * 60;
-              }
+              // Only overwrite liveEtaSeconds if driver terminal hasn't pushed a fresh Firestore ETA recently
+              const hasFreshServerEta = Date.now() - lastServerEtaSyncRef.current < 35000;
+              if (!hasFreshServerEta) {
+                let totalSecs = 0;
+                result.routes[0].legs.forEach((leg: any) => {
+                  if (leg.duration?.value) totalSecs += leg.duration.value;
+                });
+                
+                if (assignedDriverInfo?.status === "accepted" && assignedDriverInfo?.stackedDriverDelay) {
+                   totalSecs += assignedDriverInfo.stackedDriverDelay * 60;
+                }
 
-              setLiveEtaMins(Math.ceil(totalSecs / 60));
-              setLiveEtaSeconds(totalSecs);
+                setLiveEtaMins(Math.ceil(totalSecs / 60));
+                setLiveEtaSeconds(totalSecs);
+              }
             }
           }).catch(() => {
             // Silently catch the unhandled promise rejection that Maps API throws for UNKNOWN_ERROR
@@ -3005,7 +2977,7 @@ export default function PassengerBooking() {
       
       // Delay initial live route fetch slightly to avoid racing with initial load
       const timeoutId = setTimeout(getLiveRoute, 1000);
-      const interval = setInterval(getLiveRoute, 15000); // refresh every 15s
+      const interval = setInterval(getLiveRoute, 30000); // refresh every 30s (matches cost discipline)
       return () => {
          clearTimeout(timeoutId);
          clearInterval(interval);
@@ -3015,7 +2987,7 @@ export default function PassengerBooking() {
       setLiveEtaMins(null);
       setLiveEtaSeconds(null);
     }
-  }, [assignedDriverInfo?.status, dropoffCoords, pickupCoords, isLoaded]);
+  }, [assignedDriverInfo?.status, assignedDriverInfo?.currentStopIndex, dropoffCoords, pickupCoords, stops, isLoaded]);
 
   useEffect(() => {
     let timer: any;
@@ -3149,6 +3121,9 @@ export default function PassengerBooking() {
               }
             }}
             onDragEnd={() => {
+              if (step === "confirmed") {
+                userHasPannedMapRef.current = true;
+              }
               if (map) {
                 const c = map.getCenter();
                 if (c) {
@@ -3171,7 +3146,7 @@ export default function PassengerBooking() {
                   let typeToUpdate = "";
                   let stopIdx = -1;
                   
-                  if (activeField === "pickup" || (!activeField && !pickupCoords)) {
+                  if ((activeField === "pickup" || (!activeField && !pickupCoords)) && !assignedDriverInfo) {
                     setPickupCoords(coords);
                     typeToUpdate = "pickup";
                   } else if (activeField === "dropoff" || (!activeField && pickupCoords && !dropoffCoords)) {
@@ -3455,6 +3430,7 @@ export default function PassengerBooking() {
            onClose={() => setIsChatOpen(false)}
            otherPartyName={assignedDriverInfo?.name || "Driver"}
            otherPartyPhone={assignedDriverInfo?.phone || undefined}
+           passengerId={assignedDriverInfo?.uid || undefined}
            quickReplies={[
              "OK, got it!",
              "I'll be right there",
@@ -3525,26 +3501,23 @@ export default function PassengerBooking() {
                             setIsClearingBalance(true);
                             try {
                               const token = await user.getIdToken();
-                              const res = await fetch("/api/create-customer-portal-session", {
+                              const res = await fetch("/api/passenger/settle-pending-charges", {
                                 method: "POST",
                                 headers: {
                                   "Content-Type": "application/json",
                                   Authorization: `Bearer ${token}`,
                                 },
-                                body: JSON.stringify({
-                                  returnUrl: `${window.location.origin}/book-ride`,
-                                }),
+                                body: JSON.stringify({}),
                               });
                               const data = await res.json().catch(() => ({}));
                               if (res.ok && data.url) {
                                 window.location.href = data.url;
                                 return;
                               }
-                              toast.info("Please open Billing to add a payment card and settle your outstanding balance.");
-                              window.location.assign("/billing");
+                              toast.error(data.error || "Unable to start balance settlement right now. Please try again.");
                             } catch (err) {
-                              console.error("Failed to open billing portal:", err);
-                              toast.error("Unable to open secure payment portal right now. Please try via Billing.");
+                              console.error("Failed to start passenger balance settlement:", err);
+                              toast.error("Unable to start secure balance checkout right now. Please try again.");
                             } finally {
                               setIsClearingBalance(false);
                             }
@@ -3603,7 +3576,11 @@ export default function PassengerBooking() {
                             <button onClick={() => { setPickup(""); setPickupCoords(null); setHasModifiedRouteByUser(true); }} className="p-2 text-text-muted hover:text-text-main rounded-full shrink-0 outline-none"><X className="w-4 h-4" /></button>
                           )}
                           <div className="pl-1.5 pr-0.5 py-1.5 border-l border-emerald-200/60 flex items-center justify-center shrink-0 h-full">
-                            <button onClick={handleDetectLocation} className="p-1.5 text-emerald-600 hover:bg-emerald-100 hover:text-emerald-700 rounded-lg tooltip-trigger shrink-0 transition-colors">
+                            <button
+                              onClick={handleDetectLocation}
+                              disabled={!!assignedDriverInfo}
+                              className="p-1.5 text-emerald-600 hover:bg-emerald-100 hover:text-emerald-700 rounded-lg tooltip-trigger shrink-0 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
                               {isDetecting ? (
                                 <Loader2 className="w-5 h-5 animate-spin" />
                               ) : (
@@ -4119,7 +4096,12 @@ export default function PassengerBooking() {
                           {(isPriority || isPetFriendly) && (
                             <motion.div initial={{opacity:0, height:0}} animate={{opacity:1, height:"auto"}} exit={{opacity:0, height:0}} className="overflow-hidden">
                               <div className="text-[10px] font-bold text-slate-900 bg-white shadow-sm p-2 rounded-[8px] text-center border border-black">
-                                <span className="text-[#2563EB]">Notice:</span> Each active option adds <span className="font-bold">£3.00</span> to the base fare.
+                                <span className="text-[#2563EB]">Notice:</span>{" "}
+                                {isPriority && isPetFriendly
+                                  ? <>Priority (+£{(fareConfig.priorityFee ?? 3).toFixed(2)}) &amp; Pet (+£{(fareConfig.petFee ?? 3).toFixed(2)}) added to fare.</>
+                                  : isPriority
+                                    ? <>Priority adds <span className="font-bold">£{(fareConfig.priorityFee ?? 3).toFixed(2)}</span> to the base fare.</>
+                                    : <>Pet Friendly adds <span className="font-bold">£{(fareConfig.petFee ?? 3).toFixed(2)}</span> to the base fare.</>}
                               </div>
                             </motion.div>
                           )}
@@ -4128,12 +4110,14 @@ export default function PassengerBooking() {
                         {/* Fare Summary */}
                         {(() => {
                            const base = Math.max(fareEstimate || 5.0, fareConfig.minFare);
-                           const defaultMultipliers: Record<string, number> = { standard: 1.0, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5 };
+                           const defaultMultipliers: Record<string, number> = { standard: 1.0, electric: 1.15, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5 };
                            const catMultiplier = fareConfig.vehicleMultipliers?.[selectedCategory] || defaultMultipliers[selectedCategory] || 1.0;
                            const vehicleSubtotal = Math.max((fareEstimate || 5.0) * catMultiplier, fareConfig.minFare * catMultiplier);
                            const vehicleExtra = vehicleSubtotal - base;
                            const finalFare = getComputedFare(selectedCategory);
                            const surgeExtra = finalFare - vehicleSubtotal;
+                           const pFee = fareConfig.priorityFee ?? 3.0;
+                           const petAddOnFee = fareConfig.petFee ?? 3.0;
                            return (
                              <div className="bg-white shadow-sm rounded-[8px] pb-2 pt-3 px-3 border border-black">
                                <p className="text-[10px] font-bold uppercase text-slate-900 tracking-widest mb-2">Fare Breakdown</p>
@@ -4141,18 +4125,18 @@ export default function PassengerBooking() {
                                  <div className="flex justify-between"><span>Journey Fare:</span><span>£{base.toFixed(2)}</span></div>
                                  {vehicleExtra > 0 && <div className="flex justify-between text-slate-600"><span>Vehicle Upgrade ({CAR_CATEGORIES.find(c => c.id === selectedCategory)?.name}):</span><span>+£{vehicleExtra.toFixed(2)}</span></div>}
                                  {surgeExtra > 0 && <div className="flex justify-between text-red-600 font-bold"><span>High Demand Surge:</span><span>+£{surgeExtra.toFixed(2)}</span></div>}
-                                 {isPriority && <div className="flex justify-between text-[#2563EB] font-bold"><span>Priority:</span><span>+£3.00</span></div>}
-                                 {isPetFriendly && <div className="flex justify-between text-[#2563EB] font-bold"><span>Pet:</span><span>+£3.00</span></div>}
+                                 {isPriority && <div className="flex justify-between text-[#2563EB] font-bold"><span>Priority:</span><span>+£{pFee.toFixed(2)}</span></div>}
+                                 {isPetFriendly && <div className="flex justify-between text-[#2563EB] font-bold"><span>Pet:</span><span>+£{petAddOnFee.toFixed(2)}</span></div>}
                                  {((assignedDriverInfo?.tipAmount || 0) > 0) && <div className="flex justify-between text-emerald-600 font-bold"><span>Driver Tip:</span><span>+£{(assignedDriverInfo?.tipAmount || 0).toFixed(2)}</span></div>}
                                </div>
                                <div className="border-t border-black pt-2 flex flex-col font-black text-[17px] text-slate-900 border-b pb-2 mb-1">
                                  <div className="flex items-center justify-between">
                                    <span>Total estimate:</span>
-                                   <span className="text-[20px]">£{(finalFare + (isPriority ? 3 : 0) + (isPetFriendly ? 3 : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</span>
+                                   <span className="text-[20px]">£{(finalFare + (isPriority ? pFee : 0) + (isPetFriendly ? petAddOnFee : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</span>
                                  </div>
                                  <div className="flex items-center justify-between mt-2">
                                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest leading-none">Payment Method</span>
-                              {!!profile?.stripeCustomerId ? (
+                              {hasCardOnFile ? (
                                 <div className="inline-block bg-white border-2 border-emerald-600 px-2 py-0.5 rounded-md shadow-sm">
                                   <span className="text-emerald-700 text-[10px] font-black uppercase tracking-wider block leading-none">Auto Payment</span>
                                 </div>
@@ -4268,12 +4252,21 @@ export default function PassengerBooking() {
                                <p className="text-[13px] font-bold text-red-900 text-center">Cancel this ride?</p>
                                <div className="flex gap-2">
                                  <button 
-                                   onClick={() => {
-                                     setPickup("");
-                                     setPickupCoords(null);
-                                     setDropoff("");
-                                     setDropoffCoords(null);
-                                     setComments("");
+                                   onClick={async () => {
+                                     if (currentRideId && user) {
+                                       try {
+                                         const token = await user.getIdToken();
+                                         await fetch("/api/rides/cancel", {
+                                           method: "POST",
+                                           headers: {
+                                             "Content-Type": "application/json",
+                                             Authorization: `Bearer ${token}`,
+                                           },
+                                           body: JSON.stringify({ rideId: currentRideId, cancelledBy: "passenger" }),
+                                         });
+                                       } catch {}
+                                     }
+                                     clearBookingInputsAndState();
                                      setWaitWarningAcknowledged(false);
                                      setShowCancelConfirm(false);
                                      navigate("/");
@@ -4321,9 +4314,9 @@ export default function PassengerBooking() {
 
                 <div className="w-full max-w-[320px] bg-[#f0f9ff] rounded-[16px] py-1.5 px-4 border border-black flex flex-col items-center justify-center shadow-[0_2px_10px_-4px_rgba(0,0,0,0.05)] mb-2 mt-1">
                   <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-0">Total Fare Estimate</p>
-                  <p className="text-2xl font-black text-[#0f172a] leading-tight mb-1">£{(getComputedFare(selectedCategory) + (isPriority ? 3 : 0) + (isPetFriendly ? 3 : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</p>
+                  <p className="text-2xl font-black text-[#0f172a] leading-tight mb-1">£{(getComputedFare(selectedCategory) + (isPriority ? (fareConfig.priorityFee ?? 3) : 0) + (isPetFriendly ? (fareConfig.petFee ?? 3) : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</p>
                   
-                  {!!profile?.stripeCustomerId ? (
+                  {hasCardOnFile ? (
                     <div className="inline-block bg-white border-2 border-emerald-600 px-2 py-0.5 rounded-md shadow-sm mb-1.5">
                       <span className="text-emerald-700 text-[9px] font-black uppercase tracking-wider block leading-none">Auto Payment</span>
                     </div>
@@ -4575,17 +4568,23 @@ export default function PassengerBooking() {
                         </div>
                       )}
 
-                      {((assignedDriverInfo?.tipAmount || 0) > 0 || isPriority) && (
+                      {((assignedDriverInfo?.tipAmount || 0) > 0 || isPriority || isPetFriendly || (assignedDriverInfo?.paidWaitSeconds || 0) > 0) && (
                           <p className="text-[11px] font-bold text-slate-600 mt-1.5 leading-tight">
-                              Includes{isPriority ? " £3.00 priority" : ""}{isPriority && (assignedDriverInfo?.tipAmount || 0) > 0 ? " & " : ""}{(assignedDriverInfo?.tipAmount || 0) > 0 ? `£${assignedDriverInfo!.tipAmount.toFixed(2)} tip` : ""}
+                              Includes {[
+                                isPriority ? `£${(assignedDriverInfo?.priorityFee ?? fareConfig.priorityFee ?? 3).toFixed(2)} priority` : null,
+                                isPetFriendly ? `£${(assignedDriverInfo?.petFee ?? fareConfig.petFee ?? 3).toFixed(2)} pet` : null,
+                                (assignedDriverInfo?.paidWaitSeconds || 0) > 0 ? `£${(((assignedDriverInfo?.paidWaitSeconds || 0) / 60) * fareConfig.waitRatePerMinute).toFixed(2)} wait` : null,
+                                (assignedDriverInfo?.tipAmount || 0) > 0 ? `£${assignedDriverInfo!.tipAmount.toFixed(2)} tip` : null,
+                              ].filter(Boolean).join(" • ")}
                           </p>
                       )}
                    </div>
                 </div>
 
-                {!assignedDriverInfo?.hasCardOnFile && (
+                {(!assignedDriverInfo?.hasCardOnFile ||
+                  (assignedDriverInfo?.status === "awaiting_payment" && Boolean(assignedDriverInfo?.paymentUrl))) && (
                   <button
-                    disabled={assignedDriverInfo?.status !== "awaiting_payment"}
+                    disabled={assignedDriverInfo?.status !== "awaiting_payment" || !assignedDriverInfo?.paymentUrl}
                     onClick={() => {
                        if (assignedDriverInfo?.status === "awaiting_payment" && assignedDriverInfo.paymentUrl) {
                           if (!openSafeExternalUrl(assignedDriverInfo.paymentUrl)) {
@@ -4595,7 +4594,7 @@ export default function PassengerBooking() {
                     }}
                     className={cn(
                       "w-full py-2.5 mt-3 rounded-xl font-bold text-[15px] transition-all flex items-center justify-center gap-2 border border-black",
-                      assignedDriverInfo?.status === "awaiting_payment" ? "bg-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)] hover:bg-emerald-600 animate-[pulse_2s_ease-in-out_infinite]" : "bg-slate-100 text-slate-400 border border-black"
+                      assignedDriverInfo?.status === "awaiting_payment" && assignedDriverInfo?.paymentUrl ? "bg-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)] hover:bg-emerald-600 animate-[pulse_2s_ease-in-out_infinite]" : "bg-slate-100 text-slate-400 border border-black"
                     )}
                   >
                      <Zap className="w-4 h-4 fill-current" /> Pay by Card / Scan QR
@@ -4661,7 +4660,7 @@ export default function PassengerBooking() {
                     )}
                   </button>
                   <a href={`tel:${assignedDriverInfo?.phone || ""}`} className="flex-1 py-3 bg-white border border-black rounded-[16px] flex items-center justify-center shadow-[0_2px_8px_-2px_rgba(0,0,0,0.05)] active:scale-95 transition-transform"><Phone className="w-[22px] h-[22px] text-[#0a1930]" /></a>
-                  <button onClick={() => setIsMapFullScreen(true)} className="flex-[2] py-3 bg-[#0a1930] border border-white/20 text-white rounded-[16px] font-bold text-[15px] shadow-lg shadow-blue-900/20 active:scale-[0.98] transition-transform">Track Live Driver</button>
+                  <button onClick={() => { userHasPannedMapRef.current = false; setIsMapFullScreen(true); }} className="flex-[2] py-3 bg-[#0a1930] border border-white/20 text-white rounded-[16px] font-bold text-[15px] shadow-lg shadow-blue-900/20 active:scale-[0.98] transition-transform">Track Live Driver</button>
                 </div>
                 
                 {assignedDriverInfo?.status !== "in_progress" && assignedDriverInfo?.status !== "awaiting_payment" && assignedDriverInfo?.status !== "awaiting_cash_confirm" && (
@@ -4678,7 +4677,7 @@ export default function PassengerBooking() {
                   </div>
                 )}
                 
-                {assignedDriverInfo?.status === "in_progress" && (
+                {assignedDriverInfo?.status === "in_progress" && fareConfig.allowMidJourneyEdits !== false && (
                   <div className="mt-3">
                     <button onClick={() => { setIsEditingJourney(true); }} className="w-full py-2.5 border border-black bg-[#4fa764] text-white rounded-[16px] font-bold text-[14px] shadow-sm active:scale-[0.98] transition-transform">Edit Journey Options</button>
                   </div>
@@ -4805,7 +4804,11 @@ export default function PassengerBooking() {
                         <h3 className="text-xl font-black text-slate-900 mb-2">Cancel Ride?</h3>
                         <p className="text-[13px] font-medium text-slate-600 mb-6 leading-relaxed">
                           {cancelFeeToApply > 0 ? (
-                            <>Your driver has been on the way for over 2 minutes. A cancellation fee of <span className="text-slate-900 font-bold">£{cancelFeeToApply.toFixed(2)}</span> will apply.</>
+                            assignedDriverInfo?.status === "arrived" ? (
+                              <>Your driver has waited past the free waiting period. A cancellation fee of <span className="text-slate-900 font-bold">£{cancelFeeToApply.toFixed(2)}</span> will apply.</>
+                            ) : (
+                              <>Your driver has been on the way for over 2 minutes. A cancellation fee of <span className="text-slate-900 font-bold">£{cancelFeeToApply.toFixed(2)}</span> will apply.</>
+                            )
                           ) : (
                             <>Are you sure you want to cancel your ride? No cancellation fee will be charged at this time.</>
                           )}
@@ -4824,7 +4827,10 @@ export default function PassengerBooking() {
                     <motion.div initial={{ opacity: 0, y: "100%" }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: "100%" }} className="fixed inset-0 z-[200] bg-[#f8fafc] flex flex-col pointer-events-auto h-full overflow-hidden">
                       <div className="flex items-center justify-between p-4 pb-2 pt-[env(safe-area-inset-top,20px)] shrink-0">
                          <div className="w-10"></div>
-                         <h2 className="text-xl font-bold text-[#0a1930] mb-0">Custom Tip</h2>
+                         <div className="text-center">
+                           <h2 className="text-xl font-bold text-[#0a1930] mb-0">Custom Tip</h2>
+                           <p className="text-[11px] font-bold text-slate-500">Maximum £{Math.min(50, fareConfig.maxTipGbp ?? 50).toFixed(2)}</p>
+                         </div>
                          <button onClick={() => setShowCustomTipKeypad(false)} className="w-10 h-10 bg-slate-200/60 rounded-full flex items-center justify-center active:scale-95 transition-transform">
                            <X className="w-5 h-5 text-slate-800" />
                          </button>
@@ -4842,9 +4848,10 @@ export default function PassengerBooking() {
                                    setCustomTip(prev => prev.slice(0, -1));
                                    return;
                                 }
+                                const maxTipLimit = Math.min(50, Math.max(0, Number(fareConfig.maxTipGbp ?? 50)));
                                 const newValue = customTip + key.toString();
-                                if (parseFloat(newValue) > 50) {
-                                   toast.error("Maximum allowed tip is £50");
+                                if (parseFloat(newValue) > maxTipLimit) {
+                                   toast.error(`Maximum allowed tip is £${maxTipLimit.toFixed(2)}`);
                                    return;
                                 }
                                 if (newValue.includes('.')) {
@@ -4860,15 +4867,20 @@ export default function PassengerBooking() {
                         </div>
                         
                         <div className="mt-auto px-6 pb-2 shrink-0">
-                           <p className="text-center text-slate-700 font-medium text-[15px] mb-4">Your driver receives 100% of the tip.</p>
+                           <p className="text-center text-slate-700 font-medium text-[15px] mb-4">Your driver receives 100% of the tip (max £{Math.min(50, fareConfig.maxTipGbp ?? 50).toFixed(0)}).</p>
                            <button onClick={() => {
                               const amount = parseFloat(customTip);
+                              const maxTipLimit = Math.min(50, Math.max(0, Number(fareConfig.maxTipGbp ?? 50)));
+                              if (amount > maxTipLimit) {
+                                toast.error(`Maximum allowed tip is £${maxTipLimit.toFixed(2)}`);
+                                return;
+                              }
                               if (amount > 0) {
                                 handleAddTip(amount);
                                 setSelectedTip(null);
                                 setShowCustomTipKeypad(false);
                               }
-                           }} disabled={!customTip || parseFloat(customTip) <= 0} className="w-full py-4 rounded-[16px] bg-[#0a1930] text-white font-black text-lg shadow-lg active:scale-95 transition-transform disabled:opacity-50 disabled:active:scale-100">
+                           }} disabled={!customTip || parseFloat(customTip) <= 0 || parseFloat(customTip) > Math.min(50, fareConfig.maxTipGbp ?? 50)} className="w-full py-4 rounded-[16px] bg-[#0a1930] text-white font-black text-lg shadow-lg active:scale-95 transition-transform disabled:opacity-50 disabled:active:scale-100">
                              Add Tip
                            </button>
                         </div>
@@ -4926,9 +4938,13 @@ export default function PassengerBooking() {
                       </div>
                     )}
                   </div>
-                  {((completedRideData.tipAmount || 0) > 0 || completedRideData.isPriority) && (
+                  {((completedRideData.tipAmount || 0) > 0 || completedRideData.isPriority || completedRideData.isPetFriendly) && (
                       <p className="text-[12px] font-bold text-slate-500 mt-3 leading-tight">
-                          Includes{completedRideData.isPriority ? " £3.00 priority" : ""}{completedRideData.isPriority && (completedRideData.tipAmount || 0) > 0 ? " & " : ""}{(completedRideData.tipAmount || 0) > 0 ? `£${completedRideData.tipAmount.toFixed(2)} tip` : ""}
+                          Includes {[
+                            completedRideData.isPriority ? `£${Number(completedRideData.priorityFee ?? fareConfig.priorityFee ?? 3).toFixed(2)} priority` : null,
+                            completedRideData.isPetFriendly ? `£${Number(completedRideData.petFee ?? fareConfig.petFee ?? 3).toFixed(2)} pet` : null,
+                            (completedRideData.tipAmount || 0) > 0 ? `£${completedRideData.tipAmount.toFixed(2)} tip` : null,
+                          ].filter(Boolean).join(" • ")}
                       </p>
                   )}
                 </div>
@@ -4945,11 +4961,13 @@ export default function PassengerBooking() {
                       const waitFee = completedRideData.finalFare !== undefined
                         ? ((completedRideData.paidWaitSeconds || 0) / 60) * fareConfig.waitRatePerMinute
                         : 0;
+                      const pFee = Number(completedRideData.priorityFee ?? fareConfig.priorityFee ?? 3);
+                      const petFeeAmt = Number(completedRideData.petFee ?? fareConfig.petFee ?? 3);
                       const base =
                         basePlusExtras -
                         (completedRideData.unpaidCancellationFeesOwed || completedRideData.cancellationFee || 0) -
-                        (completedRideData.isPriority ? 3 : 0) -
-                        (completedRideData.isPetFriendly ? 3 : 0) -
+                        (completedRideData.isPriority ? pFee : 0) -
+                        (completedRideData.isPetFriendly ? petFeeAmt : 0) -
                         waitFee;
                       return Math.max(0, base).toFixed(2);
                     })()}</span>
@@ -4957,13 +4975,13 @@ export default function PassengerBooking() {
                   {completedRideData.isPriority && (
                     <div className="flex justify-between text-sm font-bold text-blue-600">
                       <span>Priority Boost</span>
-                      <span>+£3.00</span>
+                      <span>+£{Number(completedRideData.priorityFee ?? fareConfig.priorityFee ?? 3).toFixed(2)}</span>
                     </div>
                   )}
                   {completedRideData.isPetFriendly && (
                     <div className="flex justify-between text-sm font-bold text-orange-600">
                       <span>Pet Friendly</span>
-                      <span>+£3.00</span>
+                      <span>+£{Number(completedRideData.petFee ?? fareConfig.petFee ?? 3).toFixed(2)}</span>
                     </div>
                   )}
                   {((completedRideData.paidWaitSeconds || 0) > 0) && (
@@ -5250,12 +5268,14 @@ export default function PassengerBooking() {
                      
                      {(() => {
                         const base = Math.max(fareEstimate || 5.0, fareConfig.minFare);
-                        const defaultMultipliers: Record<string, number> = { standard: 1.0, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5 };
+                        const defaultMultipliers: Record<string, number> = { standard: 1.0, electric: 1.15, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5 };
                         const catMultiplier = fareConfig.vehicleMultipliers?.[selectedCategory] || defaultMultipliers[selectedCategory] || 1.0;
                         const vehicleSubtotal = Math.max((fareEstimate || 5.0) * catMultiplier, fareConfig.minFare * catMultiplier);
                         const vehicleExtra = vehicleSubtotal - base;
                         const finalFare = getComputedFare(selectedCategory);
                         const surgeExtra = finalFare - vehicleSubtotal;
+                        const pFee = fareConfig.priorityFee ?? 3.0;
+                        const petAddOn = fareConfig.petFee ?? 3.0;
                         return (
                            <div className="rounded-[16px] p-5 flex flex-col bg-white shadow-sm border border-black">
                               <p className="font-extrabold text-[#0a1930] text-[11px] uppercase tracking-wider border-b border-black pb-3 mb-3">Fare Breakdown</p>
@@ -5278,13 +5298,13 @@ export default function PassengerBooking() {
                               {isPriority && (
                                 <div className="flex justify-between items-center text-[15px] mb-2 text-[#2563EB] font-bold">
                                    <span className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5 text-[#2563EB] fill-[#2563EB]"/> Priority</span>
-                                   <span>+£3.00</span>
+                                   <span>+£{pFee.toFixed(2)}</span>
                                 </div>
                               )}
                               {isPetFriendly && (
                                 <div className="flex justify-between items-center text-[15px] mb-2 text-[#2563EB] font-bold">
                                    <span className="flex items-center gap-1.5"><Dog className="w-3.5 h-3.5 text-[#2563EB]"/> Pet</span>
-                                   <span>+£3.00</span>
+                                   <span>+£{petAddOn.toFixed(2)}</span>
                                 </div>
                               )}
                               {((assignedDriverInfo?.tipAmount || 0) > 0) && (
@@ -5295,7 +5315,7 @@ export default function PassengerBooking() {
                               )}
                               <div className="flex justify-between items-center pt-3 border-t border-black mt-2">
                                  <span className="font-extrabold text-[#0a1930] text-[18px]">Total Estimate</span>
-                                 <span className="font-black text-[#0a1930] text-[22px] tracking-tight">£{(finalFare + (isPriority ? 3 : 0) + (isPetFriendly ? 3 : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</span>
+                                 <span className="font-black text-[#0a1930] text-[22px] tracking-tight">£{(finalFare + (isPriority ? pFee : 0) + (isPetFriendly ? petAddOn : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</span>
                               </div>
                            </div>
                         )
@@ -5432,26 +5452,36 @@ export default function PassengerBooking() {
                        </div>
 
                        {/* Stops */}
-                       {stops.map((stop, i) => (
+                       {stops.map((stop, i) => {
+                         const isStopCompleted = assignedDriverInfo?.status === "in_progress" && i < Number(assignedDriverInfo?.currentStopIndex || 0);
+                         return (
                          <div key={i} className="flex flex-col relative w-full">
-                           <div className="flex bg-white border border-black rounded-xl px-2 py-1 items-center relative gap-2 focus-within:border-amber-500 focus-within:ring-2 focus-within:ring-amber-100 transition-all">
-                               <div className="w-6 shrink-0 flex justify-center"><div className="w-2 h-2 rounded-full border-2 border-amber-500 bg-white" /></div>
-                               <input 
-                                   type="text" 
-                                   value={stop.address}
-                                   onChange={(e) => {
-                                       const ns = [...stops]; ns[i].address = e.target.value; setStops(ns);
-                                       setActiveField(`stop-${i}`);
-                                       setHasModifiedRouteByUser(true);
-                                   }}
-                                   onFocus={() => setActiveField(`stop-${i}`)}
-                                   className="flex-1 min-w-0 font-bold bg-transparent border-none focus:outline-none text-[15px] text-slate-800 py-3"
-                                   placeholder={`Stop ${i+1}`}
-                               />
-                               {stop.address && (
-                                   <button onClick={() => { const ns = [...stops]; ns[i].address = ""; ns[i].coords = null; setStops(ns); setHasModifiedRouteByUser(true); }} className="p-2 text-slate-400 hover:text-slate-600 rounded-full shrink-0 outline-none"><X className="w-4 h-4" /></button>
+                           <div className={cn("flex bg-white border border-black rounded-xl px-2 py-1 items-center relative gap-2 transition-all", isStopCompleted ? "opacity-60 bg-slate-50" : "focus-within:border-amber-500 focus-within:ring-2 focus-within:ring-amber-100")}>
+                               <div className="w-6 shrink-0 flex justify-center"><div className={cn("w-2 h-2 rounded-full border-2 bg-white", isStopCompleted ? "border-emerald-500 bg-emerald-500" : "border-amber-500")} /></div>
+                               {isStopCompleted ? (
+                                 <div className="flex-1 min-w-0 font-bold text-[15px] text-slate-600 py-3 truncate">
+                                   {stop.address} <span className="text-[11px] text-emerald-600 font-extrabold uppercase ml-1">(Completed)</span>
+                                 </div>
+                               ) : (
+                                 <>
+                                   <input 
+                                       type="text" 
+                                       value={stop.address}
+                                       onChange={(e) => {
+                                           const ns = [...stops]; ns[i].address = e.target.value; setStops(ns);
+                                           setActiveField(`stop-${i}`);
+                                           setHasModifiedRouteByUser(true);
+                                       }}
+                                       onFocus={() => setActiveField(`stop-${i}`)}
+                                       className="flex-1 min-w-0 font-bold bg-transparent border-none focus:outline-none text-[15px] text-slate-800 py-3"
+                                       placeholder={`Stop ${i+1}`}
+                                   />
+                                   {stop.address && (
+                                       <button onClick={() => { const ns = [...stops]; ns[i].address = ""; ns[i].coords = null; setStops(ns); setHasModifiedRouteByUser(true); }} className="p-2 text-slate-400 hover:text-slate-600 rounded-full shrink-0 outline-none"><X className="w-4 h-4" /></button>
+                                   )}
+                                   <button onClick={() => { setStops(stops.filter((_, idx) => idx !== i)); setHasModifiedRouteByUser(true); }} className="p-2 text-slate-400 hover:text-red-500 outline-none"><X className="w-4 h-4" /></button>
+                                 </>
                                )}
-                               <button onClick={() => { setStops(stops.filter((_, idx) => idx !== i)); setHasModifiedRouteByUser(true); }} className="p-2 text-slate-400 hover:text-red-500 outline-none"><X className="w-4 h-4" /></button>
                            </div>
                            <AnimatePresence>
                              {activeField === `stop-${i}` && (suggestions.length > 0 || isLoadingAddress) && (
@@ -5479,7 +5509,8 @@ export default function PassengerBooking() {
                              )}
                            </AnimatePresence>
                          </div>
-                       ))}
+                         );
+                       })}
 
                        {/* Dropoff */}
                        <div className="flex flex-col relative w-full mt-1">
@@ -5534,34 +5565,67 @@ export default function PassengerBooking() {
                    </div>
 
                    {/* Fare Display */}
-                   <div className="bg-emerald-50 border border-emerald-100 rounded-[20px] p-5 flex flex-col items-center shadow-inner relative overflow-hidden">
-                       <div className="absolute -right-4 -top-4 w-16 h-16 bg-emerald-200/40 rounded-full blur-xl pointer-events-none" />
-                       <div className="absolute -left-4 -bottom-4 w-16 h-16 bg-emerald-200/40 rounded-full blur-xl pointer-events-none" />
-                       <span className="text-emerald-700 font-bold text-[12px] uppercase tracking-widest mb-1 relative z-10">Total Estimated Fare</span>
-                       <div className="flex items-start tracking-tight relative z-10">
-                           <span className="text-emerald-900 font-black text-2xl mt-1">£</span>
-                           <span className="text-emerald-900 font-black text-5xl">{(getComputedFare(selectedCategory) + (isPriority ? 3 : 0) + (isPetFriendly ? 3 : 0) + (assignedDriverInfo?.tipAmount || 0)).toFixed(2)}</span>
-                       </div>
-                       
-                       <div className="mt-4 w-full flex items-center justify-center gap-2 border-t border-emerald-200/50 pt-3 relative z-10">
-                          {(() => {
-                             const cat = CAR_CATEGORIES.find(c => c.id === selectedCategory);
-                             if (!cat) return null;
-                             const Icon = cat.icon;
-                             return (
-                               <div className="flex items-center gap-2">
-                                  <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center">
-                                    <Icon className="w-4 h-4 text-emerald-700" />
+                   {(() => {
+                      const nextTotal =
+                        getComputedFare(selectedCategory) +
+                        (isPriority ? (fareConfig.priorityFee ?? 3) : 0) +
+                        (isPetFriendly ? (fareConfig.petFee ?? 3) : 0) +
+                        (assignedDriverInfo?.tipAmount || 0);
+                      const currentTotal =
+                        (assignedDriverInfo?.fareEstimate || 0) + (assignedDriverInfo?.tipAmount || 0);
+                      const delta = currentTotal > 0 ? nextTotal - currentTotal : 0;
+                      return (
+                        <div className="bg-emerald-50 border border-black rounded-[20px] p-5 flex flex-col items-center shadow-inner relative overflow-hidden">
+                            <span className="text-emerald-800 font-bold text-[12px] uppercase tracking-widest mb-1 relative z-10">
+                              {isRecalculatingRoute ? "Recalculating Route & Fare..." : "Updated Estimated Fare"}
+                            </span>
+                            <div className="flex items-start tracking-tight relative z-10">
+                                {isRecalculatingRoute ? (
+                                  <div className="py-2 flex items-center gap-2 text-emerald-900 font-black text-xl">
+                                    <Loader2 className="w-6 h-6 animate-spin" /> Calculating...
                                   </div>
-                                  <div>
-                                    <span className="block text-emerald-900 font-black text-[13px]">{cat.name}</span>
-                                    <span className="block text-emerald-700 font-bold text-[11px] leading-tight opacity-80">Selected Category</span>
-                                  </div>
-                               </div>
-                             );
-                          })()}
-                       </div>
-                   </div>
+                                ) : (
+                                  <>
+                                    <span className="text-emerald-900 font-black text-2xl mt-1">£</span>
+                                    <span className="text-emerald-900 font-black text-5xl">{nextTotal.toFixed(2)}</span>
+                                  </>
+                                )}
+                            </div>
+                            {!isRecalculatingRoute && Math.abs(delta) >= 0.01 && (
+                              <span className={cn(
+                                "mt-2 px-3 py-1 rounded-lg text-xs font-black border border-black",
+                                delta > 0 ? "bg-amber-100 text-black" : "bg-emerald-200 text-black"
+                              )}>
+                                {delta > 0 ? `+£${delta.toFixed(2)}` : `-£${Math.abs(delta).toFixed(2)}`} vs previous (£{currentTotal.toFixed(2)})
+                              </span>
+                            )}
+                            {assignedDriverInfo?.status === "in_progress" && alreadyDrivenMiles > 0 && (
+                              <span className="mt-1.5 text-[11px] font-bold text-emerald-900/80">
+                                Includes ~{alreadyDrivenMiles.toFixed(1)} mi already driven + remaining route
+                              </span>
+                            )}
+                            
+                            <div className="mt-4 w-full flex items-center justify-center gap-2 border-t border-emerald-200/80 pt-3 relative z-10">
+                               {(() => {
+                                  const cat = CAR_CATEGORIES.find(c => c.id === selectedCategory);
+                                  if (!cat) return null;
+                                  const Icon = cat.icon;
+                                  return (
+                                    <div className="flex items-center gap-2">
+                                       <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center">
+                                         <Icon className="w-4 h-4 text-emerald-700" />
+                                       </div>
+                                       <div>
+                                         <span className="block text-emerald-900 font-black text-[13px]">{cat.name}</span>
+                                         <span className="block text-emerald-700 font-bold text-[11px] leading-tight opacity-80">Selected Category</span>
+                                       </div>
+                                    </div>
+                                  );
+                               })()}
+                            </div>
+                        </div>
+                      );
+                   })()}
                 </div>
                 
                 <div className="p-3 pb-[calc(env(safe-area-inset-bottom,0px)+0.75rem)] border-t border-black shrink-0 bg-white shadow-[0_-4px_10px_rgba(0,0,0,0.02)]">
@@ -5570,10 +5634,14 @@ export default function PassengerBooking() {
                            await handleConfirmBooking();
                            setIsEditingJourney(false);
                        }}
-                       disabled={!dropoff}
+                       disabled={!dropoff || isRecalculatingRoute}
                        className="w-full py-3.5 rounded-[14px] bg-[#0a1930] text-white font-bold text-[15px] shadow-lg shadow-blue-900/20 active:scale-[0.98] transition-transform disabled:opacity-50 flex items-center justify-center gap-2"
                     >
-                       Confirm Update <ArrowRight className="w-5 h-5 opacity-70" />
+                       {isRecalculatingRoute ? (
+                         <><Loader2 className="w-4 h-4 animate-spin" /> Updating Route...</>
+                       ) : (
+                         <>Confirm Update <ArrowRight className="w-5 h-5 opacity-70" /></>
+                       )}
                     </button>
                 </div>
             </motion.div>

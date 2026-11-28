@@ -50,6 +50,16 @@ import {
   Volume1,
   VolumeX,
   ChevronLeft,
+  Coffee,
+  ArrowUp,
+  ArrowUpLeft,
+  ArrowUpRight,
+  CornerUpLeft,
+  CornerUpRight,
+  RotateCcw,
+  Share2,
+  Copy,
+  ShieldAlert,
 } from "lucide-react";
 import {
   GoogleMap,
@@ -94,6 +104,45 @@ import { SwipeButton } from "../shared/SwipeButton";
 import RideChat from "./RideChat";
 import { MessageCircle } from "lucide-react";
 import { BatteryStatus } from "./BatteryStatus";
+import { analyzeOfferIntelligence } from "@/src/lib/offerIntelligence";
+import {
+  loadDriverCockpitPrefs,
+  saveDriverCockpitPrefs,
+  DriverCockpitPrefs,
+} from "@/src/lib/driverCockpitPrefs";
+
+const DARK_COCKPIT_MAP_STYLES: google.maps.MapTypeStyle[] = [
+  { elementType: "geometry", stylers: [{ color: "#121826" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#94a3b8" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#0b1120" }] },
+  { featureType: "administrative", elementType: "geometry.stroke", stylers: [{ color: "#334155" }] },
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#1e293b" }] },
+  { featureType: "road", elementType: "geometry.stroke", stylers: [{ color: "#0f172a" }] },
+  { featureType: "road.arterial", elementType: "geometry", stylers: [{ color: "#334155" }] },
+  { featureType: "road.highway", elementType: "geometry", stylers: [{ color: "#475569" }] },
+  { featureType: "road.highway", elementType: "geometry.stroke", stylers: [{ color: "#1e293b" }] },
+  { featureType: "road", elementType: "labels.text.fill", stylers: [{ color: "#e2e8f0" }] },
+  { featureType: "transit", stylers: [{ visibility: "simplified" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#09111f" }] },
+  { featureType: "water", elementType: "labels.text.fill", stylers: [{ color: "#475569" }] },
+];
+
+function renderManeuverIcon(maneuver?: string) {
+  const m = (maneuver || "").toLowerCase();
+  const cls = "w-7 h-7 text-[#2563EB] drop-shadow-[0_2px_4px_rgba(255,255,255,0.9)] shrink-0";
+  if (m.includes("uturn")) return <RotateCcw className={cls} strokeWidth={3} />;
+  if (m.includes("roundabout")) return <RotateCcw className={cls} strokeWidth={3} />;
+  if (m.includes("slight-left") || m.includes("keep-left") || m.includes("ramp-left")) {
+    return <ArrowUpLeft className={cls} strokeWidth={3} />;
+  }
+  if (m.includes("slight-right") || m.includes("keep-right") || m.includes("ramp-right")) {
+    return <ArrowUpRight className={cls} strokeWidth={3} />;
+  }
+  if (m.includes("left")) return <CornerUpLeft className={cls} strokeWidth={3} />;
+  if (m.includes("right")) return <CornerUpRight className={cls} strokeWidth={3} />;
+  return <ArrowUp className={cls} strokeWidth={3} />;
+}
 
 type RideState =
   | "idle"
@@ -476,6 +525,173 @@ export default function DriverTerminal() {
   const [activeHazards, setActiveHazards] = useState<any[]>([]);
   const [todayEarnings, setTodayEarnings] = useState(0);
 
+  // Android Driver App Parity: Cockpit Prefs, Coffee Cup Break, Live Speed, Shift Metrics, Wake Lock
+  const [cockpitPrefs, setCockpitPrefs] = useState<DriverCockpitPrefs>(() => loadDriverCockpitPrefs());
+  const updateCockpitPrefs = useCallback((patch: Partial<DriverCockpitPrefs>) => {
+    setCockpitPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      saveDriverCockpitPrefs(next);
+      return next;
+    });
+  }, []);
+
+  const [isOnBreak, setIsOnBreak] = useState(false);
+  const isOnBreakRef = useRef(false);
+  useEffect(() => {
+    isOnBreakRef.current = isOnBreak;
+  }, [isOnBreak]);
+  const [breakEndsAtMs, setBreakEndsAtMs] = useState<number | null>(null);
+  const [breakRemainingSeconds, setBreakRemainingSeconds] = useState<number | null>(null);
+  const [currentSpeedMph, setCurrentSpeedMph] = useState<number>(0);
+  const [shiftTripsCount, setShiftTripsCount] = useState<number>(0);
+  const [shiftPaidMiles, setShiftPaidMiles] = useState<number>(0);
+  const [shiftDeadheadMiles, setShiftDeadheadMiles] = useState<number>(0);
+  const [fatigueDismissed, setFatigueDismissed] = useState<boolean>(false);
+
+  const gpsAccuracyRef = useRef<number | null>(null);
+  const offRouteConsecutiveRef = useRef<number>(0);
+  const lastSpeedAlertAtRef = useRef<number>(0);
+  const lastEtaSyncAtRef = useRef<number>(0);
+  const autoAcceptedOfferIdRef = useRef<string | null>(null);
+  const activeRideRef = useRef<any>(null);
+  const rideStateRef = useRef<RideState>("idle");
+  useEffect(() => {
+    rideStateRef.current = rideState;
+  }, [rideState]);
+
+  const handleStartBreak = useCallback(async (minutes: number | null) => {
+    if (!isOnline || rideStateRef.current !== "idle") return;
+    setIsOnBreak(true);
+    isOnBreakRef.current = true;
+    const endsAt = minutes && minutes > 0 ? Date.now() + minutes * 60_000 : null;
+    setBreakEndsAtMs(endsAt);
+    setBreakRemainingSeconds(minutes && minutes > 0 ? minutes * 60 : null);
+    setFatigueDismissed(true);
+
+    if (user) {
+      await Promise.allSettled([
+        setDoc(
+          doc(db, "driver_status", user.uid),
+          { status: "busy", isBusy: true, onBreak: true, online: true, updatedAt: serverTimestamp() },
+          { merge: true }
+        ),
+        setDoc(
+          doc(db, "live_tracking", user.uid),
+          { status: "busy", onBreak: true, isOnline: true, updatedAt: serverTimestamp() },
+          { merge: true }
+        ),
+      ]);
+    }
+    toast.info(minutes ? `Coffee Break started (${minutes}m)` : "Open Coffee Break started", {
+      description: "New ride offers are paused while you stay online.",
+    });
+  }, [isOnline, user]);
+
+  const handleResumeFromBreak = useCallback(async () => {
+    setIsOnBreak(false);
+    isOnBreakRef.current = false;
+    setBreakEndsAtMs(null);
+    setBreakRemainingSeconds(null);
+
+    if (user && isOnline) {
+      await Promise.allSettled([
+        setDoc(
+          doc(db, "driver_status", user.uid),
+          { status: "online", isBusy: false, onBreak: false, online: true, updatedAt: serverTimestamp() },
+          { merge: true }
+        ),
+        setDoc(
+          doc(db, "live_tracking", user.uid),
+          { status: "available", onBreak: false, isOnline: true, updatedAt: serverTimestamp() },
+          { merge: true }
+        ),
+      ]);
+    }
+    toast.success("Back online & ready for rides");
+  }, [isOnline, user]);
+
+  // Coffee Cup Break countdown timer (auto-resumes when timed break finishes)
+  useEffect(() => {
+    if (!isOnBreak || !breakEndsAtMs) return;
+    const timer = setInterval(() => {
+      const rem = Math.max(0, Math.ceil((breakEndsAtMs - Date.now()) / 1000));
+      setBreakRemainingSeconds(rem);
+      if (rem <= 0) {
+        void handleResumeFromBreak();
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isOnBreak, breakEndsAtMs, handleResumeFromBreak]);
+
+  // Keep Screen Awake (Screen Wake Lock API) while online when enabled
+  useEffect(() => {
+    if (!isOnline || !cockpitPrefs.keepScreenAwake) return;
+    if (typeof navigator === "undefined" || !(navigator as any).wakeLock?.request) return;
+    let wakeLock: any = null;
+    let cancelled = false;
+    const acquire = async () => {
+      try {
+        wakeLock = await (navigator as any).wakeLock.request("screen");
+      } catch {
+        // Ignore unsupported or background tab errors
+      }
+    };
+    void acquire();
+    const onVisibility = () => {
+      if (!cancelled && document.visibilityState === "visible") {
+        void acquire();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      wakeLock?.release?.().catch(() => {});
+    };
+  }, [isOnline, cockpitPrefs.keepScreenAwake]);
+
+  // Listen to Accepted Stacked Ride for Passenger Cancellations (without disrupting active trip)
+  useEffect(() => {
+    if (!acceptedStackedRideOffer?.isReal || !acceptedStackedRideOffer?.id) return;
+    const unsub = onSnapshot(
+      doc(db, "ride_requests", acceptedStackedRideOffer.id),
+      (snapshot) => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data();
+        if (data.status === "cancelled" && data.cancelledBy === "passenger") {
+          const fee = Number(data.cancellationFee || 0);
+          setAcceptedStackedRideOffer(null);
+          playSound("alert");
+          if (navigator.vibrate) navigator.vibrate([250, 150, 250]);
+          const msg =
+            fee > 0
+              ? `Queued next ride was cancelled by passenger. Cancellation fee £${fee.toFixed(2)} applied.`
+              : "Your queued next ride was cancelled by the passenger.";
+          toast.warning("Queued Ride Cancelled", {
+            description: msg,
+            duration: 6000,
+          });
+          if (profile?.voiceNavigationEnabled !== false) {
+            speakText(
+              fee > 0
+                ? `Your next queued ride was cancelled by the passenger. A cancellation fee of ${fee.toFixed(2)} pounds has been credited.`
+                : "Your next queued ride was cancelled by the passenger."
+            );
+          }
+          // Re-enable stacking on live_tracking so driver can receive another queued ride
+          if (user && profile?.isStackingEnabled !== false) {
+            updateDoc(doc(db, "live_tracking", user.uid), {
+              isStackingEnabled: true,
+              updatedAt: serverTimestamp(),
+            }).catch(() => {});
+          }
+        }
+      },
+      (err) => console.warn("Stacked ride cancellation listener error:", err)
+    );
+    return () => unsub();
+  }, [acceptedStackedRideOffer?.id, acceptedStackedRideOffer?.isReal, profile?.isStackingEnabled, profile?.voiceNavigationEnabled, user]);
+
   // Fetch active hazards
   useEffect(() => {
     if (!user) return;
@@ -563,6 +779,12 @@ export default function DriverTerminal() {
     waitRatePerMinute: number;
     minFare: number;
     priorityFee: number;
+    petFee: number;
+    maxTipGbp: number;
+    freeWaitMinutes: number;
+    abandonmentFee: number;
+    allowMidJourneyEdits: boolean;
+    vehicleMultipliers?: Record<string, number>;
     commissionRate: number;
     fixedTripFee?: number;
     allowRiderAbandonment?: boolean;
@@ -577,7 +799,12 @@ export default function DriverTerminal() {
     timeRate: 0.15,
     waitRatePerMinute: 0.25,
     minFare: 5,
-    priorityFee: 2.5,
+    priorityFee: 3.0,
+    petFee: 3.0,
+    maxTipGbp: 50,
+    freeWaitMinutes: 3,
+    abandonmentFee: 5.0,
+    allowMidJourneyEdits: true,
     commissionRate: 0.12,
     maxDailyDriverHours: 24,
   });
@@ -674,7 +901,16 @@ export default function DriverTerminal() {
     originLng: number;
     destLat: number;
     destLng: number;
+    stopsSignature: string;
+    journeyRevision: number;
     time: number;
+  } | null>(null);
+  const lastSeenJourneyRevisionRef = useRef<number>(0);
+  const lastSeenTipAmountRef = useRef<number>(0);
+  const [journeyUpdateBanner, setJourneyUpdateBanner] = useState<{
+    summary: string;
+    fareDeltaGbp?: number;
+    newFare?: number;
   } | null>(null);
   const [recalcCount, setRecalcCount] = useState<number>(0);
   const recalcCountRef = useRef<number>(0);
@@ -685,6 +921,9 @@ export default function DriverTerminal() {
 
   useEffect(() => {
     updateRecalcCount(0);
+    lastSeenJourneyRevisionRef.current = Number(activeRide?.journeyRevision || 0);
+    lastSeenTipAmountRef.current = Number(activeRide?.tipAmount || 0);
+    setJourneyUpdateBanner(null);
   }, [rideState, activeRide?.id]);
   const [lastSpokenInstruction, setLastSpokenInstruction] =
     useState<string>("");
@@ -1418,115 +1657,165 @@ export default function DriverTerminal() {
       )
         return;
 
-      // Smart API call reduction logic
+      // Smart API call reduction logic (always bypass throttle on passenger stop/destination edit)
       const now = Date.now();
+      const stopsSignature = JSON.stringify(
+        Array.isArray(activeRide?.stops)
+          ? activeRide.stops.map((s: any) => ({
+              address: s?.address || "",
+              lat: s?.coords?.lat ?? null,
+              lng: s?.coords?.lng ?? null,
+            }))
+          : [],
+      );
+      const currentJourneyRevision = Number(activeRide?.journeyRevision || 0);
       let isRecalculation = false;
       if (lastDirectionsFetchRef.current) {
         const last = lastDirectionsFetchRef.current;
-        const originMoved = getDistanceInMeters(
-          last.originLat,
-          last.originLng,
-          originLat,
-          originLng,
-        );
-        const destMoved = getDistanceInMeters(
-          last.destLat,
-          last.destLng,
-          destLat,
-          destLng,
-        );
-        const timeSinceLastFetch = now - last.time;
+        const isPassengerRouteUpdate =
+          last.stopsSignature !== stopsSignature ||
+          last.journeyRevision !== currentJourneyRevision;
 
-        let isOffRoute = false;
+        if (isPassengerRouteUpdate) {
+          // Force immediate Directions API refresh on passenger mid-journey or pre-journey edit
+          offRouteConsecutiveRef.current = 0;
+        } else {
+          const originMoved = getDistanceInMeters(
+            last.originLat,
+            last.originLng,
+            originLat,
+            originLng,
+          );
+          const destMoved = getDistanceInMeters(
+            last.destLat,
+            last.destLng,
+            destLat,
+            destLng,
+          );
+          const timeSinceLastFetch = now - last.time;
 
-        // Calculate distance from current driver location to the defined route polyline
-        if (currentDirectionsRef.current?.routes?.[0]?.overview_path) {
-          let minDistanceToRoute = Infinity;
-          const path = currentDirectionsRef.current.routes[0].overview_path;
-          
-          if (path.length > 0) {
-            const toRad = Math.PI / 180;
-            const R = 6371e3; // Earth radius in meters
-            const lat0 = originLat * toRad;
-            const lng0 = originLng * toRad;
+          let isOffRoute = false;
 
-            for (let i = 0; i < path.length - 1; i++) {
-              const p1 = path[i];
-              const p2 = path[i + 1];
-              const lat1 = (typeof p1.lat === "function" ? p1.lat() : p1.lat as unknown as number) * toRad;
-              const lng1 = (typeof p1.lng === "function" ? p1.lng() : p1.lng as unknown as number) * toRad;
-              const lat2 = (typeof p2.lat === "function" ? p2.lat() : p2.lat as unknown as number) * toRad;
-              const lng2 = (typeof p2.lng === "function" ? p2.lng() : p2.lng as unknown as number) * toRad;
+          // Calculate distance from current driver location to the defined route polyline
+          if (currentDirectionsRef.current?.routes?.[0]?.overview_path) {
+            let minDistanceToRoute = Infinity;
+            const path = currentDirectionsRef.current.routes[0].overview_path;
 
-              const x0 = lng0 * Math.cos(lat1);
-              const y0 = lat0;
-              const x1 = lng1 * Math.cos(lat1);
-              const y1 = lat1;
-              const x2 = lng2 * Math.cos(lat2);
-              const y2 = lat2;
+            if (path.length > 0) {
+              const toRad = Math.PI / 180;
+              const R = 6371e3; // Earth radius in meters
+              const lat0 = originLat * toRad;
+              const lng0 = originLng * toRad;
 
-              const dx = x2 - x1;
-              const dy = y2 - y1;
-              const l2 = dx * dx + dy * dy;
+              for (let i = 0; i < path.length - 1; i++) {
+                const p1 = path[i];
+                const p2 = path[i + 1];
+                const lat1 = (typeof p1.lat === "function" ? p1.lat() : p1.lat as unknown as number) * toRad;
+                const lng1 = (typeof p1.lng === "function" ? p1.lng() : p1.lng as unknown as number) * toRad;
+                const lat2 = (typeof p2.lat === "function" ? p2.lat() : p2.lat as unknown as number) * toRad;
+                const lng2 = (typeof p2.lng === "function" ? p2.lng() : p2.lng as unknown as number) * toRad;
 
-              let t = 0;
-              if (l2 > 0) {
-                t = Math.max(0, Math.min(1, ((x0 - x1) * dx + (y0 - y1) * dy) / l2));
+                const x0 = lng0 * Math.cos(lat1);
+                const y0 = lat0;
+                const x1 = lng1 * Math.cos(lat1);
+                const y1 = lat1;
+                const x2 = lng2 * Math.cos(lat2);
+                const y2 = lat2;
+
+                const dx = x2 - x1;
+                const dy = y2 - y1;
+                const l2 = dx * dx + dy * dy;
+
+                let t = 0;
+                if (l2 > 0) {
+                  t = Math.max(0, Math.min(1, ((x0 - x1) * dx + (y0 - y1) * dy) / l2));
+                }
+                const px = x1 + t * dx;
+                const py = y1 + t * dy;
+
+                const dRad = Math.sqrt((x0 - px) ** 2 + (y0 - py) ** 2);
+                const dist = dRad * R;
+
+                if (dist < minDistanceToRoute) {
+                  minDistanceToRoute = dist;
+                }
               }
-              const px = x1 + t * dx;
-              const py = y1 + t * dy;
 
-              const dRad = Math.sqrt((x0 - px) ** 2 + (y0 - py) ** 2);
-              const dist = dRad * R;
-
-              if (dist < minDistanceToRoute) {
-                minDistanceToRoute = dist;
+              // Handle edge case of 1 waypoint only path
+              if (path.length === 1) {
+                const p = path[0];
+                const plat = typeof p.lat === "function" ? p.lat() : p.lat as unknown as number;
+                const plng = typeof p.lng === "function" ? p.lng() : p.lng as unknown as number;
+                minDistanceToRoute = getDistanceInMeters(plat, plng, originLat, originLng);
               }
             }
-            
-            // Handle edge case of 1 waypoint only path
-            if (path.length === 1) {
-              const p = path[0];
-              const plat = typeof p.lat === "function" ? p.lat() : p.lat as unknown as number;
-              const plng = typeof p.lng === "function" ? p.lng() : p.lng as unknown as number;
-              minDistanceToRoute = getDistanceInMeters(plat, plng, originLat, originLng);
-            }
-          }
 
-          // If the minimum distance to the polyline is > 50 meters, they are "off route"
-          if (minDistanceToRoute > 50) {
+            // Upgraded off-route check (Android Heads-Up Navigation v2 parity):
+            // Ignore noisy GPS fixes (>35m accuracy), require >70m off polyline + 2 consecutive fixes
+            const gpsAcc = gpsAccuracyRef.current;
+            const hasReliableFix = gpsAcc === null || gpsAcc <= 35;
+            if (hasReliableFix && minDistanceToRoute > 70) {
+              offRouteConsecutiveRef.current += 1;
+              if (offRouteConsecutiveRef.current >= 2) {
+                isOffRoute = true;
+              }
+            } else if (hasReliableFix) {
+              offRouteConsecutiveRef.current = 0;
+            }
+          } else {
             isOffRoute = true;
           }
-        } else {
-          isOffRoute = true;
-        }
 
-        // If both origin (driver location) and destination moved less than 30 meters, do not fetch new directions
-        if (originMoved < 30 && destMoved < 30) {
-          return;
-        }
-
-        // Smart API call reduction logic to save $$$
-        // We SKIP fetching new directions IF:
-        // 1. Destination hasn't changed (destMoved < 50m)
-        // AND 2. Less than 60 seconds have passed since last fetch (prevents spamming API for traffic/ETA updates)
-        // AND 3. The driver is ON ROUTE (not off route)
-        if (destMoved < 50) {
-          if (isOffRoute) {
-            isRecalculation = true;
-          }
-
-          if (isRecalculation && recalcCountRef.current >= 3) {
-            console.log("Recalculation limit reached (3/3). Skipping directions API fetch to save costs.");
+          // If both origin (driver location) and destination moved less than 30 meters, do not fetch new directions
+          if (originMoved < 30 && destMoved < 30) {
             return;
           }
 
-          if (!isOffRoute && timeSinceLastFetch < 60000) {
-            return; // Skip fetch, they are on route and data is fresh enough (saves MASSIVE costs)
+          // Smart API call reduction logic to save $$$ (Basic SKU discipline)
+          if (destMoved < 50) {
+            if (isOffRoute) {
+              isRecalculation = true;
+            }
+
+            if (isRecalculation && recalcCountRef.current >= 3) {
+              console.log("Recalculation limit reached (3/3). Skipping directions API fetch to save costs.");
+              return;
+            }
+
+            if (!isOffRoute && timeSinceLastFetch < 60000) {
+              return; // Skip fetch, they are on route and data is fresh enough (saves MASSIVE costs)
+            }
+            if (isOffRoute && timeSinceLastFetch < 12000) {
+              return; // 12-second cooldown between off-route recalculations
+            }
           }
-          if (isOffRoute && timeSinceLastFetch < 5000) {
-            return; // Throttle off-route recalculations to max once every 5 seconds to prevent spam
+        }
+      }
+
+      // Single-call multi-stop Basic SKU routing (optimizeWaypoints: false)
+      const remainingWaypoints: google.maps.DirectionsWaypoint[] = [];
+      let routeDestLat = destLat;
+      let routeDestLng = destLng;
+      if (
+        rideState === "in_progress" &&
+        activeRide?.dropoffLat &&
+        activeRide?.dropoffLng &&
+        Array.isArray(activeRide?.stops) &&
+        activeRide.stops.length > 0 &&
+        currentLegIndex < activeRide.stops.length
+      ) {
+        const upcomingStops = activeRide.stops.slice(currentLegIndex, currentLegIndex + 10);
+        upcomingStops.forEach((s: any) => {
+          if (s?.coords?.lat && s?.coords?.lng) {
+            remainingWaypoints.push({
+              location: new window.google.maps.LatLng(s.coords.lat, s.coords.lng),
+              stopover: true,
+            });
           }
+        });
+        if (remainingWaypoints.length > 0) {
+          routeDestLat = activeRide.dropoffLat;
+          routeDestLng = activeRide.dropoffLng;
         }
       }
 
@@ -1535,7 +1824,10 @@ export default function DriverTerminal() {
       directionsService.route(
         {
           origin: new window.google.maps.LatLng(originLat, originLng),
-          destination: new window.google.maps.LatLng(destLat, destLng),
+          destination: new window.google.maps.LatLng(routeDestLat, routeDestLng),
+          ...(remainingWaypoints.length > 0
+            ? { waypoints: remainingWaypoints, optimizeWaypoints: false }
+            : {}),
           travelMode: window.google.maps.TravelMode.DRIVING,
           region: "GB",
           language: "en-GB",
@@ -1543,7 +1835,8 @@ export default function DriverTerminal() {
         (result, status) => {
           if (status === window.google.maps.DirectionsStatus.OK && result) {
             setDirections(result);
-            
+            offRouteConsecutiveRef.current = 0;
+
             // Calculate total legs duration in seconds and update states
             let totalSecs = 0;
             if (result.routes && result.routes[0] && result.routes[0].legs) {
@@ -1554,13 +1847,36 @@ export default function DriverTerminal() {
             if (totalSecs > 0) {
               setLiveEtaMins(Math.ceil(totalSecs / 60));
               setLiveEtaSeconds(totalSecs);
-              
+
+              // Authoritative throttled ETA sync via POST /api/rides/transition (action: "update_eta")
               const activeId = activeRide?.id;
-              if (activeId && !activeRide?.isSimulated) {
-                updateDoc(doc(db, "ride_requests", activeId), {
-                  durationMinutes: Math.ceil(totalSecs / 60),
-                  liveEtaSeconds: totalSecs
-                }).catch(err => console.warn("Failed to synchronize live ETA to ride request:", err));
+              const nowSync = Date.now();
+              if (
+                activeId &&
+                !activeRide?.isSimulated &&
+                user &&
+                nowSync - lastEtaSyncAtRef.current >= 15000
+              ) {
+                lastEtaSyncAtRef.current = nowSync;
+                user
+                  .getIdToken()
+                  .then((token) =>
+                    fetch("/api/rides/transition", {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${token}`,
+                      },
+                      body: JSON.stringify({
+                        rideId: activeId,
+                        action: "update_eta",
+                        liveEtaSeconds: totalSecs,
+                      }),
+                    })
+                  )
+                  .catch((err) =>
+                    console.warn("Failed to synchronize live ETA via server API:", err)
+                  );
               }
             }
 
@@ -1585,8 +1901,10 @@ export default function DriverTerminal() {
             lastDirectionsFetchRef.current = {
               originLat,
               originLng,
-              destLat,
-              destLng,
+              destLat: routeDestLat,
+              destLng: routeDestLng,
+              stopsSignature,
+              journeyRevision: currentJourneyRevision,
               time: now,
             };
           } else {
@@ -1598,8 +1916,8 @@ export default function DriverTerminal() {
                 originLat,
                 originLng,
                 "Dest:",
-                destLat,
-                destLng
+                routeDestLat,
+                routeDestLng
               );
             }
           }
@@ -1610,6 +1928,10 @@ export default function DriverTerminal() {
     };
 
     const updateDynamicDirections = () => {
+      // Cost-saving: never fetch Directions while parked in WAITING state
+      if (rideState === "waiting") {
+        return;
+      }
       if (
         rideState === "en_route_pickup" &&
         activeRide?.pickupLat &&
@@ -1622,13 +1944,20 @@ export default function DriverTerminal() {
         activeRide?.dropoffLat &&
         activeRide?.dropoffLng
       ) {
+        // If we already fetched a multi-stop route covering all remaining stops + final dropoff, reuse it at £0 cost!
+        const existingLegs = currentDirectionsRef.current?.routes?.[0]?.legs;
+        const expectedLegs =
+          Array.isArray(activeRide.stops) && activeRide.stops.length > 0
+            ? activeRide.stops.length - currentLegIndex + 1
+            : 1;
         let destLat = activeRide.dropoffLat;
         let destLng = activeRide.dropoffLng;
 
         if (
           activeRide.stops &&
           activeRide.stops.length > 0 &&
-          currentLegIndex < activeRide.stops.length
+          currentLegIndex < activeRide.stops.length &&
+          (!existingLegs || existingLegs.length < expectedLegs)
         ) {
           const currentStop = activeRide.stops[currentLegIndex];
           if (currentStop?.coords) {
@@ -1657,6 +1986,7 @@ export default function DriverTerminal() {
     isLoaded,
     mapInstance,
     currentLegIndex,
+    activeRide?.journeyRevision,
     JSON.stringify(activeRide?.stops),
   ]);
 
@@ -1856,7 +2186,19 @@ export default function DriverTerminal() {
             timeRate: Number(data.timeRate) || 0.15,
             waitRatePerMinute: Number(data.waitRatePerMinute) || 0.25,
             minFare: Number(data.minFare) || 5.0,
-            priorityFee: Number(data.priorityFee) || 3.0,
+            priorityFee: data.priorityFee !== undefined ? Number(data.priorityFee) : 3.0,
+            petFee: data.petFee !== undefined ? Number(data.petFee) : 3.0,
+            maxTipGbp:
+              data.maxTipGbp !== undefined
+                ? Math.min(50, Math.max(0, Number(data.maxTipGbp)))
+                : 50,
+            freeWaitMinutes:
+              data.freeWaitMinutes !== undefined ? Number(data.freeWaitMinutes) : 3,
+            abandonmentFee:
+              data.abandonmentFee !== undefined ? Number(data.abandonmentFee) : 5.0,
+            allowMidJourneyEdits:
+              data.allowMidJourneyEdits !== undefined ? Boolean(data.allowMidJourneyEdits) : true,
+            vehicleMultipliers: data.vehicleMultipliers || prev.vehicleMultipliers,
             commissionRate:
               remoteConfig?.platformCommissionRate !== undefined
                 ? remoteConfig.platformCommissionRate
@@ -1919,7 +2261,7 @@ export default function DriverTerminal() {
 
   // Listen for REAL incoming live ride requests (offered to this driver)
   useEffect(() => {
-    if (!isOnline || !user) return;
+    if (!isOnline || !user || isOnBreak) return;
     if (rideState !== "idle" && rideState !== "incoming" && rideState !== "in_progress") return;
 
     const q = query(
@@ -1932,11 +2274,12 @@ export default function DriverTerminal() {
       if (!snapshot.empty) {
         const rideDoc = snapshot.docs[0];
         const data = rideDoc.data();
+        const resolvedPassengerId = data.riderId || data.passengerId || data.userId;
 
         const rideData = {
           id: rideDoc.id,
-          userId: data.riderId,
-          riderId: data.riderId,
+          userId: resolvedPassengerId,
+          riderId: resolvedPassengerId,
           name: data.passengerName || "Live Passenger",
           passengerPhone: data.passengerPhone || undefined,
           pickupAddress: data.pickup,
@@ -1953,8 +2296,15 @@ export default function DriverTerminal() {
           isReal: true,
           offerExpiresAt: data.offerExpiresAt,
           isPriority: data.isPriority || false,
+          isPetFriendly: data.isPetFriendly || false,
+          priorityFee: data.priorityFee !== undefined ? Number(data.priorityFee) : undefined,
+          petFee: data.petFee !== undefined ? Number(data.petFee) : undefined,
+          carCategory: data.carCategory || "standard",
+          journeyRevision: Number(data.journeyRevision || 0),
+          lastPassengerEditSummary: data.lastPassengerEditSummary || undefined,
+          fareDeltaGbp: data.fareDeltaGbp !== undefined ? Number(data.fareDeltaGbp) : undefined,
           hasCardOnFile: data.hasCardOnFile || false,
-          tipAmount: data.tipAmount || 0,
+          tipAmount: Math.min(50, Math.max(0, Number(data.tipAmount || 0))),
           paymentMethod: data.paymentMethod,
           isSimulated: false,
           surgeMultiplier: data.surgeMultiplier || 1.0,
@@ -2003,7 +2353,7 @@ export default function DriverTerminal() {
     });
 
     return () => unsub();
-  }, [isOnline, rideState, user, stackedRideOffer]);
+  }, [isOnline, isOnBreak, rideState, user, stackedRideOffer]);
 
   // Listen to Active Ride for Cancellations
   useEffect(() => {
@@ -2082,132 +2432,115 @@ export default function DriverTerminal() {
               setLiveEtaSeconds(data.liveEtaSeconds);
               setLiveEtaMins(data.durationMinutes || Math.ceil(data.liveEtaSeconds / 60));
             }
+
+            const incomingRevision = Number(data.journeyRevision || 0);
+            const incomingTip = Math.min(50, Math.max(0, Number(data.tipAmount || 0)));
+            const incomingFare = Number(data.fareEstimate || data.totalFare || 0);
+
+            // Real-time passenger tip notification (no client write needed)
+            if (incomingTip > lastSeenTipAmountRef.current + 0.009) {
+              lastSeenTipAmountRef.current = incomingTip;
+              playSound("notification");
+              speakText(`Passenger added a ${incomingTip.toFixed(2)} pound tip`);
+              toast.success("Tip Received!", {
+                description: `Passenger added a £${incomingTip.toFixed(2)} tip (100% yours).`,
+                duration: 7000,
+              });
+            } else if (incomingTip !== lastSeenTipAmountRef.current) {
+              lastSeenTipAmountRef.current = incomingTip;
+            }
+
+            let detectedPassengerEdit = false;
             setActiveRide((prev) => {
               if (!prev) return prev;
-              const isModified =
-                prev.pickupAddress !== data.pickup ||
-                prev.dropoffAddress !== data.dropoff ||
-                prev.fareEstimate !== data.fareEstimate ||
-                JSON.stringify(prev.stops) !== JSON.stringify(data.stops || []);
-              if (isModified) {
-                setTimeout(() => {
-                  toast.info("Ride Updated", {
-                    description:
-                      "The passenger has updated the journey details.",
-                  });
-                }, 500);
+              const prevStopsJson = JSON.stringify(prev.stops || []);
+              const nextStopsJson = JSON.stringify(data.stops || []);
+              const contentChanged =
+                (data.pickup && prev.pickupAddress !== data.pickup) ||
+                (data.dropoff && prev.dropoffAddress !== data.dropoff) ||
+                prevStopsJson !== nextStopsJson ||
+                (incomingFare > 0 && Math.abs(Number(prev.fareEstimate || 0) - incomingFare) >= 0.01);
+
+              const revisionAdvanced = incomingRevision > lastSeenJourneyRevisionRef.current;
+              if (revisionAdvanced || (data.isModifiedByPassenger && contentChanged)) {
+                detectedPassengerEdit = true;
+                if (incomingRevision > lastSeenJourneyRevisionRef.current) {
+                  lastSeenJourneyRevisionRef.current = incomingRevision;
+                }
               }
+
               return {
                 ...prev,
-                pickupAddress: data.pickup,
-                dropoffAddress: data.dropoff,
-                pickupLat: data.pickupLat,
-                pickupLng: data.pickupLng,
-                dropoffLat: data.dropoffLat,
-                dropoffLng: data.dropoffLng,
+                pickupAddress: data.pickup || prev.pickupAddress,
+                dropoffAddress: data.dropoff || prev.dropoffAddress,
+                pickupLat: data.pickupLat ?? prev.pickupLat,
+                pickupLng: data.pickupLng ?? prev.pickupLng,
+                dropoffLat: data.dropoffLat ?? prev.dropoffLat,
+                dropoffLng: data.dropoffLng ?? prev.dropoffLng,
                 stops: data.stops || [],
-                fareEstimate: data.fareEstimate || prev.fareEstimate,
-                distanceMiles: data.distanceMiles || prev.distanceMiles,
-                durationMinutes: data.durationMinutes || prev.durationMinutes,
-                tipAmount: data.tipAmount !== undefined ? data.tipAmount : prev.tipAmount,
+                fareEstimate: incomingFare > 0 ? incomingFare : prev.fareEstimate,
+                distanceMiles: data.distanceMiles ?? prev.distanceMiles,
+                durationMinutes: data.durationMinutes ?? prev.durationMinutes,
+                tipAmount: incomingTip,
+                isPriority: data.isPriority !== undefined ? Boolean(data.isPriority) : prev.isPriority,
+                isPetFriendly: data.isPetFriendly !== undefined ? Boolean(data.isPetFriendly) : prev.isPetFriendly,
+                priorityFee: data.priorityFee !== undefined ? Number(data.priorityFee) : prev.priorityFee,
+                petFee: data.petFee !== undefined ? Number(data.petFee) : prev.petFee,
+                carCategory: data.carCategory || prev.carCategory,
+                journeyRevision: incomingRevision || prev.journeyRevision || 0,
+                fareDeltaGbp: data.fareDeltaGbp !== undefined ? Number(data.fareDeltaGbp) : prev.fareDeltaGbp,
+                lastPassengerEditSummary: data.lastPassengerEditSummary || prev.lastPassengerEditSummary,
+                routePricingMode: data.routePricingMode || prev.routePricingMode,
               };
             });
-          }
 
-          if (data.isModifiedByPassenger) {
-            // Close external navigation if open
-            if (
-              externalNavWindowRef.current &&
-              !externalNavWindowRef.current.closed
-            ) {
-              externalNavWindowRef.current.close();
-              toast.warning("Navigation Stopped", {
-                description:
-                  "Navigation was stopped because passenger updated the job details. Please restart navigation.",
-                duration: 8000,
+            if (detectedPassengerEdit) {
+              // Force immediate Directions API refresh by clearing lastDirectionsFetchRef
+              lastDirectionsFetchRef.current = null;
+              updateRecalcCount(0);
+
+              const summaryText =
+                typeof data.lastPassengerEditSummary === "string" && data.lastPassengerEditSummary.trim()
+                  ? data.lastPassengerEditSummary.trim()
+                  : "Destination, stops, or fare updated by passenger.";
+              const deltaNum = typeof data.fareDeltaGbp === "number" ? data.fareDeltaGbp : undefined;
+              const deltaLabel =
+                deltaNum !== undefined && Math.abs(deltaNum) >= 0.01
+                  ? ` (${deltaNum > 0 ? "+" : "-"}£${Math.abs(deltaNum).toFixed(2)})`
+                  : "";
+
+              setJourneyUpdateBanner({
+                summary: summaryText,
+                fareDeltaGbp: deltaNum,
+                newFare: incomingFare > 0 ? incomingFare : undefined,
+              });
+              setTimeout(() => {
+                setJourneyUpdateBanner((curr) =>
+                  curr && curr.summary === summaryText ? null : curr
+                );
+              }, 14000);
+
+              // Close external navigation if open so driver restarts with updated route
+              if (
+                externalNavWindowRef.current &&
+                !externalNavWindowRef.current.closed
+              ) {
+                externalNavWindowRef.current.close();
+                toast.warning("External Navigation Closed", {
+                  description:
+                    "Passenger updated the route. Please restart navigation with the updated destination.",
+                  duration: 8000,
+                });
+              }
+
+              // Play alert chime + TTS announcement + toast
+              playSound("notification");
+              speakText(`Journey updated by passenger. ${summaryText}`);
+              toast.info(`Journey Updated${deltaLabel}`, {
+                description: summaryText,
+                duration: 9000,
               });
             }
-
-            // Play loud alert notification
-            playSound("notification");
-            speakText("Job details updated by passenger");
-            toast.info("Ride Details Updated", {
-              description:
-                "The passenger has updated the ride details or fare.",
-              duration: 8000,
-            });
-
-            if (
-              data.dropoffLat &&
-              data.dropoffLng &&
-              activeRide?.dropoffLat &&
-              activeRide?.dropoffLng &&
-              user?.uid
-            ) {
-              const R = 6371e3;
-              const p1 = (activeRide.dropoffLat * Math.PI) / 180;
-              const p2 = (data.dropoffLat * Math.PI) / 180;
-              const dp =
-                ((data.dropoffLat - activeRide.dropoffLat) * Math.PI) / 180;
-              const dl =
-                ((data.dropoffLng - activeRide.dropoffLng) * Math.PI) / 180;
-              const a =
-                Math.sin(dp / 2) * Math.sin(dp / 2) +
-                Math.cos(p1) *
-                  Math.cos(p2) *
-                  Math.sin(dl / 2) *
-                  Math.sin(dl / 2);
-              const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-              if (dist > 1609.34) {
-                // More than 1 mile away
-                const delayMins = Math.max(5, Math.round(dist / 400)); // Rough estimate of 1 min per 400m
-                const stackedQuery = query(
-                  collection(db, "ride_requests"),
-                  where("driverId", "==", user.uid),
-                  where("status", "==", "accepted"),
-                );
-                getDocs(stackedQuery)
-                  .then((snap) => {
-                    snap.forEach((d) => {
-                      if (d.id !== activeRide.id) {
-                        updateDoc(doc(db, "ride_requests", d.id), {
-                          stackedDriverDelay: delayMins,
-                          updatedAt: serverTimestamp(),
-                        });
-                        toast.warning("Stacked passenger notified", {
-                          description:
-                            "Your next passenger has been asked if they want to wait due to your destination change.",
-                          duration: 10000,
-                        });
-                      }
-                    });
-                  })
-                  .catch(console.error);
-              }
-            }
-
-            setActiveRide((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    dropoffAddress: data.dropoff || prev.dropoffAddress,
-                    dropoffLat: data.dropoffLat || prev.dropoffLat,
-                    dropoffLng: data.dropoffLng || prev.dropoffLng,
-                    pickupAddress: data.pickup || prev.pickupAddress,
-                    pickupLat: data.pickupLat || prev.pickupLat,
-                    pickupLng: data.pickupLng || prev.pickupLng,
-                    fareEstimate: data.fareEstimate || prev.fareEstimate,
-                    distanceMiles: data.distanceMiles || prev.distanceMiles,
-                    stops: data.stops || prev.stops,
-                    tipAmount: data.tipAmount !== undefined ? data.tipAmount : prev.tipAmount,
-                  }
-                : null,
-            );
-
-            updateDoc(doc(db, "ride_requests", activeRide.id), {
-              isModifiedByPassenger: false,
-            }).catch(console.error);
           }
         }
       },
@@ -2317,6 +2650,11 @@ export default function DriverTerminal() {
     setActiveTab("home");
 
     if (newStatus) {
+      setIsOnBreak(false);
+      isOnBreakRef.current = false;
+      setBreakEndsAtMs(null);
+      setBreakRemainingSeconds(null);
+      setFatigueDismissed(false);
       setOnlineStartTime(new Date());
       setOnlineDurationText("0 min");
       // Immediate direct seed write to Firestore so driver is discoverable instantly upon going online
@@ -2329,6 +2667,7 @@ export default function DriverTerminal() {
             lng: driverLocation[1],
             updatedAt: serverTimestamp(),
             isOnline: true,
+            onBreak: false,
             status: activeRide ? "on_ride" : "available",
             dropoffLat: activeRide?.dropoffLat || null,
             dropoffLng: activeRide?.dropoffLng || null,
@@ -2352,6 +2691,9 @@ export default function DriverTerminal() {
           doc(db, "driver_status", user.uid),
           {
             online: true,
+            status: "online",
+            isBusy: false,
+            onBreak: false,
             updatedAt: serverTimestamp(),
           },
           { merge: true }
@@ -2360,10 +2702,14 @@ export default function DriverTerminal() {
         console.log(`[AnyRoller Driver] Instantly seeded live_tracking for driver:${user.uid} at location [${driverLocation[0]}, ${driverLocation[1]}]`);
       }
     } else {
+      setIsOnBreak(false);
+      isOnBreakRef.current = false;
+      setBreakEndsAtMs(null);
+      setBreakRemainingSeconds(null);
       setOnlineStartTime(null);
       if (user) {
-        updateDoc(doc(db, "driver_status", user.uid), { online: false }).catch(console.error);
-        updateDoc(doc(db, "live_tracking", user.uid), { isOnline: false }).catch(console.error);
+        updateDoc(doc(db, "driver_status", user.uid), { online: false, status: "offline", isBusy: false, onBreak: false }).catch(console.error);
+        updateDoc(doc(db, "live_tracking", user.uid), { isOnline: false, onBreak: false }).catch(console.error);
         console.log(`[AnyRoller Driver] Switched offline in Firestore for driver:${user.uid}`);
       }
     }
@@ -2441,8 +2787,25 @@ export default function DriverTerminal() {
 
     const watchId = navigator.geolocation.watchPosition(
       async (pos) => {
-        const { latitude, longitude, heading } = pos.coords;
+        const { latitude, longitude, heading, accuracy, speed } = pos.coords;
         const nowMs = Date.now();
+        gpsAccuracyRef.current = typeof accuracy === "number" && Number.isFinite(accuracy) ? accuracy : null;
+        if (typeof speed === "number" && Number.isFinite(speed) && speed >= 0) {
+          const mph = Math.round(speed * 2.23694);
+          setCurrentSpeedMph(mph);
+          if (
+            cockpitPrefs.speedAlertMph > 0 &&
+            mph > cockpitPrefs.speedAlertMph &&
+            nowMs - lastSpeedAlertAtRef.current >= 20_000
+          ) {
+            lastSpeedAlertAtRef.current = nowMs;
+            playSound("alert");
+            toast.warning(`Speed Alert: ${mph} mph`, {
+              description: `Above your ${cockpitPrefs.speedAlertMph} mph cockpit alert limit.`,
+              duration: 4000,
+            });
+          }
+        }
         
         // Fast-path Firestore sync logic without rate limiting for vital dispatches
         const timeSinceLastSync = nowMs - lastLocationSyncRef.current;
@@ -2514,7 +2877,12 @@ export default function DriverTerminal() {
                 lng: longitude,
                 updatedAt: serverTimestamp(),
                 isOnline: true,
-                status: activeRide ? "on_ride" : "available",
+                onBreak: isOnBreakRef.current,
+                status: isOnBreakRef.current
+                  ? "busy"
+                  : activeRide
+                    ? "on_ride"
+                    : "available",
                 dropoffLat: activeRide?.dropoffLat || null,
                 dropoffLng: activeRide?.dropoffLng || null,
                 isStackingEnabled: profile?.isStackingEnabled !== false,
@@ -2537,6 +2905,7 @@ export default function DriverTerminal() {
               doc(db, "driver_status", user.uid),
               {
                 online: true,
+                onBreak: isOnBreakRef.current,
                 updatedAt: serverTimestamp(),
               },
               { merge: true },
@@ -2768,62 +3137,24 @@ export default function DriverTerminal() {
     setConsecutiveMissedOffers(0);
     if (isAcceptingRide) return;
     setIsAcceptingRide(true);
-    // If it's a real ride from Firestore, claim it!
+    // Authoritative Server API ride claim (Android Driver App parity)
     if (activeRide?.isReal && activeRide?.id && user) {
       try {
-        await runTransaction(db, async (t) => {
-          const rideRef = doc(db, "ride_requests", activeRide.id);
-          const docSnap = await t.get(rideRef);
-          if (!docSnap.exists()) throw new Error("Ride not found");
-          if (docSnap.data().status !== "offered")
-            throw new Error("Ride no longer available");
-
-          t.update(rideRef, {
-            status: "accepted",
-            driverId: user.uid,
-            driverName: profile?.firstName || "Driver",
-            driverPhone: profile?.phone || profile?.phoneNumber || "",
-            vehicleInfo: profile?.vehicle || "Silver Toyota Prius",
-            vehiclePlate:
-              profile?.vehicleRegistration || profile?.plate || "WK71 BCF",
-            driverRequirePasscode: profile?.requirePasscode === true,
-            acceptedAt: serverTimestamp(),
-          });
+        const token = await user.getIdToken();
+        const resp = await fetch("/api/rides/accept", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: activeRide.id,
+          }),
         });
-
-        if (activeRide?.userId) {
-          const token = await user.getIdToken().catch(() => null);
-          if (token) {
-            fetch("/api/chat-push", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${token}`,
-              },
-              body: JSON.stringify({
-                recipientId: activeRide.userId,
-                title: "Driver Assigned",
-                body: "Your driver is on the way to pick you up",
-                rideId: activeRide.id,
-                type: "ride_update",
-                channelId: "ride_chat_updates"
-              })
-            }).catch(err => console.error("FCM API error:", err));
-          }
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data?.success === false) {
+          throw new Error(data?.error || "Failed to accept ride. It might have expired.");
         }
-
-        // Instant availability switch so other passengers don't receive confusing ETAs
-        await updateDoc(doc(db, "live_tracking", user.uid), {
-          status: "on_ride",
-          dropoffLat: activeRide?.dropoffLat || null,
-          dropoffLng: activeRide?.dropoffLng || null,
-          updatedAt: serverTimestamp(),
-        }).catch(console.error);
-
-        await updateDoc(doc(db, "driver_status", user.uid), {
-          isBusy: true,
-          pendingRideId: deleteField(),
-        } as any);
       } catch (err: any) {
         console.error("Failed to claim ride:", err);
         toast.error(
@@ -2842,13 +3173,59 @@ export default function DriverTerminal() {
     setIsAcceptingRide(false);
   };
 
+  // Opt-In Auto-Accept Mode (IDLE only, respects Min Fare £ + Max Pickup Miles filters)
+  useEffect(() => {
+    if (
+      !cockpitPrefs.autoAcceptEnabled ||
+      isOnBreak ||
+      rideState !== "incoming" ||
+      !activeRide?.isReal ||
+      !activeRide?.id ||
+      isAcceptingRide ||
+      autoAcceptedOfferIdRef.current === activeRide.id
+    ) {
+      return;
+    }
+    const intel = analyzeOfferIntelligence({
+      offer: activeRide,
+      driverLat: driverLocationRef.current[0],
+      driverLng: driverLocationRef.current[1],
+      homeLat: profile?.homeLat,
+      homeLng: profile?.homeLng,
+    });
+    const fare = Number(activeRide.fareEstimate || 0);
+    if (
+      fare >= cockpitPrefs.autoAcceptMinFare &&
+      intel.pickupDeadheadMiles <= cockpitPrefs.autoAcceptMaxPickupMiles
+    ) {
+      autoAcceptedOfferIdRef.current = activeRide.id;
+      toast.success("Auto-Accepted Ride", {
+        description: `£${fare.toFixed(2)} • ${intel.pickupDeadheadMiles.toFixed(1)} mi pickup matched your filter.`,
+      });
+      void handleAcceptRide();
+    }
+  }, [
+    cockpitPrefs.autoAcceptEnabled,
+    cockpitPrefs.autoAcceptMinFare,
+    cockpitPrefs.autoAcceptMaxPickupMiles,
+    isOnBreak,
+    rideState,
+    activeRide?.id,
+    activeRide?.isReal,
+    isAcceptingRide,
+  ]);
+
   const handleForceOffline = async () => {
+    setIsOnBreak(false);
+    isOnBreakRef.current = false;
+    setBreakEndsAtMs(null);
+    setBreakRemainingSeconds(null);
     setOnlineStartTime(null);
     setIsOnline(false);
     if (user) {
       try {
-        await updateDoc(doc(db, "driver_status", user.uid), { online: false });
-        await updateDoc(doc(db, "live_tracking", user.uid), { isOnline: false });
+        await updateDoc(doc(db, "driver_status", user.uid), { online: false, status: "offline", isBusy: false, onBreak: false });
+        await updateDoc(doc(db, "live_tracking", user.uid), { isOnline: false, onBreak: false });
         console.log(`[AnyRoller Driver] Switched offline due to missing 3 consecutive ride offers.`);
         toast.error("Auto-Offline Mode Activated", {
           description: "You have been set offline for missing 3 ride offers in a row.",
@@ -2862,37 +3239,17 @@ export default function DriverTerminal() {
   const handleDeclineRide = async (userInitiated: boolean = false) => {
     if (activeRide?.id && activeRide?.isReal && user) {
       try {
-        await setDoc(doc(db, "driver_status", user.uid), {
-          pendingRideId: deleteField(),
-          consecutiveDeclines: increment(1),
-        } as any, { merge: true });
-      } catch (err) {
-        console.error("Error declining ride - driver_status update:", err);
-      }
-
-      try {
-        // Put ride back into search pool only if it's still offered
-        await runTransaction(db, async (t) => {
-          const rideRef = doc(db, "ride_requests", activeRide.id);
-          const docSnap = await t.get(rideRef);
-          if (docSnap.exists() && docSnap.data().status === "offered") {
-            t.update(rideRef, {
-              status: "pending",
-              assignedDriverId: deleteField(),
-              driverId: deleteField(),
-              driverName: deleteField(),
-              driverPhone: deleteField(),
-              vehicleInfo: deleteField(),
-              vehiclePlate: deleteField(),
-              driverRequirePasscode: deleteField(),
-              acceptedAt: deleteField(),
-              offerExpiresAt: deleteField(),
-              declinedBy: arrayUnion(user.uid)
-            });
-          }
+        const token = await user.getIdToken();
+        await fetch("/api/rides/decline", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ rideId: activeRide.id }),
         });
       } catch (err) {
-        console.error("Error declining ride - ride_requests transaction:", err);
+        console.error("Error declining ride via server API:", err);
       }
     }
 
@@ -2923,36 +3280,17 @@ export default function DriverTerminal() {
   const handleDeclineStackedRide = async () => {
     if (stackedRideOffer?.id && stackedRideOffer?.isReal && user) {
       try {
-        await setDoc(doc(db, "driver_status", user.uid), {
-          pendingRideId: deleteField(),
-          consecutiveDeclines: increment(1),
-        } as any, { merge: true });
-      } catch (err) {
-        console.error("Error declining stacked ride - driver_status update:", err);
-      }
-
-      try {
-        await runTransaction(db, async (t) => {
-          const rideRef = doc(db, "ride_requests", stackedRideOffer.id);
-          const docSnap = await t.get(rideRef);
-          if (docSnap.exists() && docSnap.data().status === "offered") {
-            t.update(rideRef, {
-              status: "pending",
-              assignedDriverId: deleteField(),
-              driverId: deleteField(),
-              driverName: deleteField(),
-              driverPhone: deleteField(),
-              vehicleInfo: deleteField(),
-              vehiclePlate: deleteField(),
-              driverRequirePasscode: deleteField(),
-              acceptedAt: deleteField(),
-              offerExpiresAt: deleteField(),
-              declinedBy: arrayUnion(user.uid)
-            });
-          }
+        const token = await user.getIdToken();
+        await fetch("/api/rides/decline", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ rideId: stackedRideOffer.id }),
         });
       } catch (err) {
-        console.error("Error declining stacked ride - ride_requests transaction:", err);
+        console.error("Error declining stacked ride via server API:", err);
       }
     }
     setStackedRideOffer(null);
@@ -2964,59 +3302,22 @@ export default function DriverTerminal() {
     let success = false;
     if (stackedRideOffer?.isReal && stackedRideOffer?.id && user) {
       try {
-        await runTransaction(db, async (t) => {
-          const rideRef = doc(db, "ride_requests", stackedRideOffer.id);
-          const docSnap = await t.get(rideRef);
-          if (!docSnap.exists()) throw new Error("Ride not found");
-          if (docSnap.data().status !== "offered")
-            throw new Error("Ride no longer available");
-
-          t.update(rideRef, {
-            status: "accepted",
-            driverId: user.uid,
-            driverName: profile?.firstName || "Driver",
-            driverPhone: profile?.phone || profile?.phoneNumber || "",
-            vehicleInfo: profile?.vehicle || "Silver Toyota Prius",
-            vehiclePlate:
-              profile?.vehicleRegistration || profile?.plate || "WK71 BCF",
-            driverRequirePasscode: profile?.requirePasscode === true,
-            acceptedAt: serverTimestamp(),
-          });
+        const token = await user.getIdToken();
+        const resp = await fetch("/api/rides/accept", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            rideId: stackedRideOffer.id,
+            isStacked: true,
+          }),
         });
-
-        if (stackedRideOffer?.userId) {
-          const token = await user.getIdToken().catch(() => null);
-          if (token) {
-            fetch("/api/chat-push", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${token}`,
-              },
-              body: JSON.stringify({
-                recipientId: stackedRideOffer.userId,
-                title: "Driver Assigned",
-                body: "A driver has been assigned and will head to you after their current dropoff",
-                rideId: stackedRideOffer.id,
-                type: "ride_update",
-                channelId: "ride_chat_updates"
-              })
-            }).catch(err => console.error("FCM API error:", err));
-          }
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || data?.success === false) {
+          throw new Error(data?.error || "Failed to accept stacked ride. It might have expired.");
         }
-
-        // Instant availability switch for the stacked ride (forces them invisible until current is done)
-        await updateDoc(doc(db, "live_tracking", user.uid), {
-          dropoffLat: stackedRideOffer?.dropoffLat || null,
-          dropoffLng: stackedRideOffer?.dropoffLng || null,
-          isStackingEnabled: false, // temporarily disable stacking until this ride is active
-          updatedAt: serverTimestamp(),
-        }).catch(console.error);
-
-        await updateDoc(doc(db, "driver_status", user.uid), {
-          isBusy: true,
-          pendingRideId: deleteField(),
-        } as any);
         toast.success(
           "Stacked job accepted. It will appear when your current ride is completed.",
           { duration: 5000 },
@@ -3361,10 +3662,21 @@ export default function DriverTerminal() {
       setAbandonmentWarningSent(false); // reset abandonment logic
       setAccumulatedPaidWaitSeconds((prev) => {
         const newVal = prev + currentStopWaitSeconds;
-        if (activeRide?.id && activeRide?.isReal) {
-          updateDoc(doc(db, "ride_requests", activeRide.id), {
-            paidWaitSeconds: newVal,
-          }).catch(console.error);
+        if (activeRide?.id && activeRide?.isReal && user) {
+          user.getIdToken().then((token) =>
+            fetch("/api/rides/transition", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                rideId: activeRide.id,
+                action: "sync_wait",
+                paidWaitSeconds: newVal,
+              }),
+            })
+          ).catch(console.error);
         }
         return newVal;
       });
@@ -3410,10 +3722,21 @@ export default function DriverTerminal() {
         setAbandonmentWarningSent(false);
         setAccumulatedPaidWaitSeconds((prev) => {
           const newVal = prev + currentStopWaitSeconds;
-          if (activeRide?.id && activeRide?.isReal) {
-            updateDoc(doc(db, "ride_requests", activeRide.id), {
-              paidWaitSeconds: newVal,
-            }).catch(console.error);
+          if (activeRide?.id && activeRide?.isReal && user) {
+            user.getIdToken().then((token) =>
+              fetch("/api/rides/transition", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                  rideId: activeRide.id,
+                  action: "sync_wait",
+                  paidWaitSeconds: newVal,
+                }),
+              })
+            ).catch(console.error);
           }
           return newVal;
         });
@@ -3920,6 +4243,7 @@ export default function DriverTerminal() {
             paidWaitSeconds: totalPaidWaitSeconds,
             earlyCompletionReason: isEarlyCompletion ? earlyCompletionReason : undefined,
             paymentUrl: data.url,
+            checkoutSessionId: data.sessionId || null,
           }),
         });
         const completeData = await completeRes.json();
@@ -3972,6 +4296,38 @@ export default function DriverTerminal() {
         if (!res.ok) {
           throw new Error(data?.error || "Failed to process auto payment");
         }
+
+        // Seamless zero-money-loss fallback: card missing/declined/requires 3DS -> show live QR checkout
+        if (data.fallbackToQr) {
+          if (data.paymentUrl) {
+            setPaymentUrl(data.paymentUrl);
+          }
+          setActiveRide((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: "awaiting_payment",
+                  paymentMethod: "stripe_qr",
+                  hasCardOnFile: false,
+                  finalFare: data.finalFare ?? prev.finalFare,
+                  tipAmount: data.tipAmount ?? prev.tipAmount,
+                  totalFarePaid: data.totalFarePaid ?? prev.totalFarePaid,
+                  driverEarnings: data.driverEarnings ?? prev.driverEarnings,
+                  platformFee: data.platformFee ?? prev.platformFee,
+                  fareContractVersion: "v2_excl_tip",
+                }
+              : null
+          );
+          setIsGeneratingPayment(false);
+          toast.info("Passenger Card Needs Confirmation", {
+            description:
+              data.fallbackMessage ||
+              "Ask the passenger to scan the QR code or tap Pay in their app.",
+            duration: 6000,
+          });
+          return;
+        }
+
         setActiveRide((prev) =>
           prev
             ? {
@@ -3996,8 +4352,8 @@ export default function DriverTerminal() {
     }
     setIsGeneratingPayment(false);
     setRideState("review");
-    toast.success("Payment Received", {
-      description: "Passenger's card was charged automatically.",
+    toast.success("Payment Confirmed via Stripe", {
+      description: "Passenger's saved card was charged automatically.",
     });
   };
 
@@ -4196,13 +4552,20 @@ export default function DriverTerminal() {
     mapCenter[1],
   ]);
 
-  const stabilizedMapOptions = useMemo(() => ({
-    ...premiumMapOptions,
-    heading: mapHeading || 0,
-    gestureHandling: "greedy" as any,
-    draggable: true,
-    padding: mapPadding,
-  }), [mapHeading, mapPadding]);
+  const stabilizedMapOptions = useMemo(() => {
+    const hour = new Date().getHours();
+    const useDark =
+      cockpitPrefs.mapTheme === "dark" ||
+      (cockpitPrefs.mapTheme === "auto" && (hour < 7 || hour >= 19));
+    return {
+      ...premiumMapOptions,
+      styles: useDark ? DARK_COCKPIT_MAP_STYLES : premiumMapOptions.styles,
+      heading: mapHeading || 0,
+      gestureHandling: "greedy" as any,
+      draggable: true,
+      padding: mapPadding,
+    };
+  }, [mapHeading, mapPadding, cockpitPrefs.mapTheme]);
 
   const stabilizedDriverPosition = useMemo(() => ({
     lat: driverLocation[0],
@@ -4235,30 +4598,39 @@ export default function DriverTerminal() {
                       {/* !!! USER REQUESTED DESIGN LOCK !!! */}
                       {/* The styling for this heads-up instruction text is explicitly locked by the user. */}
                       {/* IT MUST REMAIN: transparent background, #2563EB text color, white drop shadow, no webkit text stroke, no black box. */}
-                      <p
-                        className="text-[22px] text-[#2563EB] font-black leading-tight px-2 mb-2 drop-shadow-[0_2px_4px_rgba(255,255,255,0.9)]"
-                        dangerouslySetInnerHTML={{
-                          __html: (() => {
-                            const leg = directions.routes[0].legs[currentLegIndex || 0];
-                            const steps = leg?.steps || [];
-                            const currentStepIndex = mapCenter ? getCurrentStepIndex(mapCenter, steps) : 0;
-                            if (currentStepIndex >= steps.length) return "";
-                            
-                            const step0 = steps[currentStepIndex];
-                            const remainingDist = mapCenter ? getRemainingStepDistance(mapCenter, step0) : step0.distance?.value || 0;
-                            let html = formatInstructionForDisplay(step0.instructions);
-                            if (remainingDist <= 50 && currentStepIndex < steps.length - 1) {
-                              const step1 = steps[currentStepIndex + 1];
-                              html += ' <span style="opacity: 0.8; font-size: 0.85em;">then</span> <br/> ' + formatInstructionForDisplay(step1.instructions);
-                            }
-                            return DOMPurify.sanitize(html, {
-                              ALLOWED_TAGS: ['b', 'strong', 'span', 'br', 'div', 'wbr'],
-                              ALLOWED_ATTR: ['style', 'class']
-                            });
-                          })()
-                        }}
-                      />
-                      <div className="inline-flex bg-slate-900/90 backdrop-blur-sm px-4 py-1.5 rounded-lg shadow-lg border border-white/20">
+                      <div className="flex items-center justify-center gap-2 mb-2">
+                        {(() => {
+                          const leg = directions.routes[0].legs[currentLegIndex || 0];
+                          const steps = leg?.steps || [];
+                          const currentStepIndex = mapCenter ? getCurrentStepIndex(mapCenter, steps) : 0;
+                          const step0 = steps[currentStepIndex];
+                          return step0 ? renderManeuverIcon((step0 as any).maneuver) : null;
+                        })()}
+                        <p
+                          className="text-[22px] text-[#2563EB] font-black leading-tight px-2 drop-shadow-[0_2px_4px_rgba(255,255,255,0.9)]"
+                          dangerouslySetInnerHTML={{
+                            __html: (() => {
+                              const leg = directions.routes[0].legs[currentLegIndex || 0];
+                              const steps = leg?.steps || [];
+                              const currentStepIndex = mapCenter ? getCurrentStepIndex(mapCenter, steps) : 0;
+                              if (currentStepIndex >= steps.length) return "";
+                              
+                              const step0 = steps[currentStepIndex];
+                              const remainingDist = mapCenter ? getRemainingStepDistance(mapCenter, step0) : step0.distance?.value || 0;
+                              let html = formatInstructionForDisplay(step0.instructions);
+                              if (remainingDist <= 50 && currentStepIndex < steps.length - 1) {
+                                const step1 = steps[currentStepIndex + 1];
+                                html += ' <span style="opacity: 0.8; font-size: 0.85em;">then</span> <br/> ' + formatInstructionForDisplay(step1.instructions);
+                              }
+                              return DOMPurify.sanitize(html, {
+                                ALLOWED_TAGS: ['b', 'strong', 'span', 'br', 'div', 'wbr'],
+                                ALLOWED_ATTR: ['style', 'class']
+                              });
+                            })()
+                          }}
+                        />
+                      </div>
+                      <div className="inline-flex items-center gap-3 bg-slate-900/90 backdrop-blur-sm px-4 py-1.5 rounded-lg shadow-lg border border-white/20">
                         <p className="text-[14px] text-[#00D26A] font-bold tracking-wider uppercase">
                           {(() => {
                             const leg = directions.routes[0].legs[currentLegIndex || 0];
@@ -4271,6 +4643,18 @@ export default function DriverTerminal() {
                             );
                           })()}
                         </p>
+                        {currentSpeedMph > 0 && (
+                          <span
+                            className={cn(
+                              "text-[12px] font-black tracking-wider uppercase border-l border-white/20 pl-3",
+                              cockpitPrefs.speedAlertMph > 0 && currentSpeedMph > cockpitPrefs.speedAlertMph
+                                ? "text-[#FF3B30]"
+                                : "text-white"
+                            )}
+                          >
+                            {currentSpeedMph} mph
+                          </span>
+                        )}
                       </div>
                     </div>
                   </motion.div>
@@ -4957,10 +5341,12 @@ export default function DriverTerminal() {
                     <h1 className="text-[52px] leading-tight font-black text-white mb-2">
                       £
                       {(
-                        (activeRide?.fareEstimate || 38.5) +
-                        (totalPaidWaitSeconds / 60) *
-                          fareConfig.waitRatePerMinute +
-                        (activeRide?.tipAmount || 0)
+                        activeRide?.totalFarePaid !== undefined && Number.isFinite(Number(activeRide.totalFarePaid))
+                          ? Number(activeRide.totalFarePaid)
+                          : (activeRide?.fareEstimate || 38.5) +
+                            (totalPaidWaitSeconds / 60) *
+                              fareConfig.waitRatePerMinute +
+                            (activeRide?.tipAmount || 0)
                       ).toFixed(2)}
                     </h1>
                     {activeRide?.tipAmount ? (
@@ -5010,12 +5396,15 @@ export default function DriverTerminal() {
                       onClick={handleClosePayment}
                       className="w-full h-12 bg-[#00D26A] text-[#0D0D0F] rounded-2xl font-black text-sm shadow-[0_4px_25px_rgba(0,210,106,0.3)] active:scale-95 transition-transform"
                     >
-                      PAYMENT RECEIVED
+                      CHECK / CONFIRM PAYMENT
                     </button>
+                    <p className="mt-2 text-[10px] font-bold text-[#A1A1AA] uppercase tracking-wider">
+                      Closes automatically once Stripe confirms payment
+                    </p>
 
                     <button
                       onClick={() => setShowCashConfirm(true)}
-                      className="mt-6 text-xs font-bold text-[#A1A1AA] uppercase tracking-widest hover:text-white transition-colors"
+                      className="mt-4 text-xs font-bold text-[#A1A1AA] uppercase tracking-widest hover:text-white transition-colors"
                     >
                       Skip / Cash Received
                     </button>
@@ -5032,12 +5421,19 @@ export default function DriverTerminal() {
                              onClick={async () => {
                                 setIsAwaitingCashConfirm(false);
                                 setShowCashConfirm(true);
-                                if (activeRide?.id && activeRide?.isReal) {
-                                  await updateDoc(doc(db, "ride_requests", activeRide.id), {
-                                     status: "in_progress",
-                                     reportedCashCollected: deleteField(),
-                                     reportedCashDiscrepancy: deleteField()
-                                  });
+                                if (activeRide?.id && activeRide?.isReal && user) {
+                                  const token = await user.getIdToken();
+                                  await fetch("/api/rides/transition", {
+                                    method: "POST",
+                                    headers: {
+                                      "Content-Type": "application/json",
+                                      Authorization: `Bearer ${token}`,
+                                    },
+                                    body: JSON.stringify({
+                                      rideId: activeRide.id,
+                                      action: "cancel_cash_confirm",
+                                    }),
+                                  }).catch(console.error);
                                 }
                              }}
                              className="absolute top-4 left-4 flex items-center justify-center p-2.5 bg-[#2C2C30] hover:bg-white/10 rounded-full transition-colors z-50 text-white"
@@ -5272,11 +5668,16 @@ export default function DriverTerminal() {
                                 </span>
                               </div>
                             </h1>
-                            <div className="flex gap-1 items-center">
+                            <div className="flex gap-1 items-center flex-wrap justify-end">
                               {activeRide?.isPriority && (
                                 <div className="bg-white text-black px-1.5 py-0.5 rounded-md text-[9px] font-black uppercase tracking-wider flex items-center gap-1 shadow-[0_0_10px_rgba(255,255,255,0.2)] border border-white">
                                   <Zap className="w-2.5 h-2.5 fill-black text-black" />{" "}
                                   Priority
+                                </div>
+                              )}
+                              {activeRide?.isPetFriendly && (
+                                <div className="bg-white text-black px-1.5 py-0.5 rounded-md text-[9px] font-black uppercase tracking-wider flex items-center gap-1 shadow-[0_0_10px_rgba(255,255,255,0.2)] border border-white">
+                                  🐾 Pet (+£{(activeRide?.petFee ?? fareConfig.petFee ?? 3).toFixed(2)})
                                 </div>
                               )}
                               {((activeRide?.isSimulated && fareConfig.surgeEnabled) || (!activeRide?.isSimulated && ((activeRide?.surgeModel === "fixed" && (activeRide?.surgeFixedAmount || activeRide?.surgeFixed || 0) > 0) || (activeRide?.surgeModel !== "fixed" && (activeRide?.surgeMultiplier || 1) > 1.0)))) && (
@@ -5293,10 +5694,42 @@ export default function DriverTerminal() {
                             const finalPayout =
                               (activeRide?.fareEstimate || 38.5) *
                               (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0);
+                            const intel = activeRide
+                              ? analyzeOfferIntelligence({
+                                  offer: activeRide,
+                                  driverLat: driverLocation[0],
+                                  driverLng: driverLocation[1],
+                                  homeLat: profile?.homeLat,
+                                  homeLng: profile?.homeLng,
+                                })
+                              : null;
                             return (
-                              <p className="text-[#00D26A] text-[13px] font-bold mt-0.5">
-                                You earn: £{Math.max(0, finalPayout).toFixed(2)}
-                              </p>
+                              <>
+                                <p className="text-[#00D26A] text-[13px] font-bold mt-0.5">
+                                  You earn: £{Math.max(0, finalPayout).toFixed(2)}
+                                </p>
+                                {intel && intel.estimatedGbpPerHour > 0 && (
+                                  <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                    <span className="bg-slate-900 border border-white/20 text-[#00D26A] px-2 py-0.5 rounded-md text-[10px] font-black tracking-wide">
+                                      £{intel.estimatedGbpPerHour.toFixed(0)}/hr • £{intel.estimatedGbpPerMile.toFixed(2)}/mi
+                                    </span>
+                                    {intel.smartTag && (
+                                      <span className="bg-amber-400 text-black border border-black px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider">
+                                        {intel.smartTag}
+                                      </span>
+                                    )}
+                                    {intel.isHeadingTowardHome ? (
+                                      <span className="bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider">
+                                        Toward Home
+                                      </span>
+                                    ) : intel.compassShort ? (
+                                      <span className="bg-slate-900 border border-white/20 text-white px-2 py-0.5 rounded-md text-[10px] font-bold">
+                                        Heading {intel.compassShort}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                )}
+                              </>
                             );
                           })()}
                         </div>
@@ -5632,10 +6065,42 @@ export default function DriverTerminal() {
                             const finalPayout =
                               (stackedRideOffer?.fareEstimate || 38.5) *
                               (1 - fareConfig.commissionRate) - (fareConfig.fixedTripFee || 0);
+                            const intel = stackedRideOffer
+                              ? analyzeOfferIntelligence({
+                                  offer: stackedRideOffer,
+                                  driverLat: activeRide?.dropoffLat || driverLocation[0],
+                                  driverLng: activeRide?.dropoffLng || driverLocation[1],
+                                  homeLat: profile?.homeLat,
+                                  homeLng: profile?.homeLng,
+                                })
+                              : null;
                             return (
-                              <p className="text-[#00D26A] text-[13px] font-bold mt-0.5">
-                                You earn: £{Math.max(0, finalPayout).toFixed(2)}
-                              </p>
+                              <>
+                                <p className="text-[#00D26A] text-[13px] font-bold mt-0.5">
+                                  You earn: £{Math.max(0, finalPayout).toFixed(2)}
+                                </p>
+                                {intel && intel.estimatedGbpPerHour > 0 && (
+                                  <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                    <span className="bg-slate-900 border border-white/20 text-[#00D26A] px-2 py-0.5 rounded-md text-[10px] font-black tracking-wide">
+                                      £{intel.estimatedGbpPerHour.toFixed(0)}/hr • £{intel.estimatedGbpPerMile.toFixed(2)}/mi
+                                    </span>
+                                    {intel.smartTag && (
+                                      <span className="bg-amber-400 text-black border border-black px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider">
+                                        {intel.smartTag}
+                                      </span>
+                                    )}
+                                    {intel.isHeadingTowardHome ? (
+                                      <span className="bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider">
+                                        Toward Home
+                                      </span>
+                                    ) : intel.compassShort ? (
+                                      <span className="bg-slate-900 border border-white/20 text-white px-2 py-0.5 rounded-md text-[10px] font-bold">
+                                        Heading {intel.compassShort}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                )}
+                              </>
                             );
                           })()}
                         </div>
@@ -6335,6 +6800,30 @@ export default function DriverTerminal() {
                             </span>
                           </p>
                         </div>
+                        {journeyUpdateBanner && (
+                          <div
+                            onClick={() => setJourneyUpdateBanner(null)}
+                            className="mb-1.5 bg-amber-400 text-black border border-black rounded-lg px-2.5 py-1.5 flex items-center justify-between gap-2 cursor-pointer shadow-sm"
+                          >
+                            <div className="min-w-0">
+                              <p className="text-[10px] font-black uppercase tracking-wider leading-tight">
+                                Route Updated by Passenger
+                                {journeyUpdateBanner.fareDeltaGbp !== undefined &&
+                                Math.abs(journeyUpdateBanner.fareDeltaGbp) >= 0.01
+                                  ? ` (${journeyUpdateBanner.fareDeltaGbp > 0 ? "+" : "-"}£${Math.abs(journeyUpdateBanner.fareDeltaGbp).toFixed(2)})`
+                                  : ""}
+                              </p>
+                              <p className="text-[11px] font-bold truncate leading-tight">
+                                {journeyUpdateBanner.summary}
+                              </p>
+                            </div>
+                            {journeyUpdateBanner.newFare !== undefined && (
+                              <span className="text-xs font-black shrink-0 bg-white border border-black rounded px-1.5 py-0.5">
+                                £{journeyUpdateBanner.newFare.toFixed(2)}
+                              </span>
+                            )}
+                          </div>
+                        )}
                         <p className={cn(
                           "font-semibold text-white drop-shadow-sm mb-0 line-clamp-2",
                           isCardCollapsed ? "text-[19px]" : "text-[17px]"
@@ -6722,7 +7211,7 @@ export default function DriverTerminal() {
                         const timeFare = durationMins * fareConfig.timeRate;
                         const baseSubtotal = Math.max(fareConfig.minFare, fareConfig.baseFare + distFare + timeFare);
                         
-                        const defaultMultipliers: Record<string, number> = { standard: 1.0, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5 };
+                        const defaultMultipliers: Record<string, number> = { standard: 1.0, electric: 1.15, executive: 1.5, luxury: 2.2, '6seater': 1.4, '8seater': 2.0, wav: 2.5 };
                         const catMultiplier = activeRide?.carCategory ? ((fareConfig as any).vehicleMultipliers?.[activeRide.carCategory] || defaultMultipliers[activeRide.carCategory] || 1.0) : 1.0;
                         const vehicleSubtotal = Math.max(baseSubtotal * catMultiplier, fareConfig.minFare * catMultiplier);
                         const vehicleExtra = vehicleSubtotal - baseSubtotal;
@@ -6745,13 +7234,18 @@ export default function DriverTerminal() {
                              } else {
                                  const mult = activeRide?.surgeMultiplier || 1.0;
                                  const expectedSurge = (vehicleSubtotal * mult) - vehicleSubtotal;
-                                 const calculatedSurgeFallback = (activeRide?.fareEstimate || 38.5) - vehicleSubtotal - (activeRide?.isPriority ? fareConfig.priorityFee : 0);
-                                 surgeAmount = expectedSurge > 0 ? expectedSurge : calculatedSurgeFallback;
+                                 const pFeeApplied = activeRide?.isPriority ? (activeRide?.priorityFee ?? fareConfig.priorityFee) : 0;
+                                 const petFeeApplied = activeRide?.isPetFriendly ? (activeRide?.petFee ?? fareConfig.petFee) : 0;
+                                 const calculatedSurgeFallback = (activeRide?.fareEstimate || 38.5) - vehicleSubtotal - pFeeApplied - petFeeApplied;
+                                 surgeAmount = expectedSurge > 0 ? expectedSurge : Math.max(0, calculatedSurgeFallback);
                                  surgeText = mult + "x";
                              }
                         }
 
                         const waitAmount = (totalPaidWaitSeconds / 60) * fareConfig.waitRatePerMinute;
+                        const resolvedPriorityFee = activeRide?.priorityFee ?? fareConfig.priorityFee ?? 3.0;
+                        const resolvedPetFee = activeRide?.petFee ?? fareConfig.petFee ?? 3.0;
+                        const resolvedAbandonmentFee = fareConfig.abandonmentFee ?? 5.0;
 
                         return (
                           <div className="space-y-1.5 mb-3">
@@ -6785,14 +7279,21 @@ export default function DriverTerminal() {
                             {activeRide?.isPriority && (
                               <div className="flex justify-between text-xs text-[#00E5FF]">
                                 <span>Priority Booking:</span>
-                                <span className="font-bold">+£{fareConfig.priorityFee.toFixed(2)}</span>
+                                <span className="font-bold">+£{resolvedPriorityFee.toFixed(2)}</span>
+                              </div>
+                            )}
+
+                            {activeRide?.isPetFriendly && (
+                              <div className="flex justify-between text-xs text-[#00E5FF]">
+                                <span>Pet Friendly:</span>
+                                <span className="font-bold">+£{resolvedPetFee.toFixed(2)}</span>
                               </div>
                             )}
                             
                             {activeRide?.status === "rider_abandoned" && (
                               <div className="flex justify-between text-xs text-[#FF3B30]">
                                 <span>Abandonment Fee:</span>
-                                <span className="font-bold">+£5.00</span>
+                                <span className="font-bold">+£{resolvedAbandonmentFee.toFixed(2)}</span>
                               </div>
                             )}
                             
@@ -6911,6 +7412,37 @@ export default function DriverTerminal() {
                       onClick={async () => {
                         setIsAutoNavHeadUp(true);
                         setIsAutoNavPaused(false);
+
+                        // Update live "This Shift" metrics
+                        setShiftTripsCount((c) => c + 1);
+                        if (activeRide?.distanceMiles) {
+                          setShiftPaidMiles((m) => m + Number(activeRide.distanceMiles || 0));
+                        }
+                        if (activeRide?.distanceToPickupMiles) {
+                          setShiftDeadheadMiles((m) => m + Number(activeRide.distanceToPickupMiles || 0));
+                        }
+
+                        // Submit authoritative driver-to-passenger rating for real completed rides (Android parity)
+                        if (activeRide?.isReal && activeRide?.id && user) {
+                          try {
+                            const token = await user.getIdToken();
+                            await fetch("/api/rides/rate-passenger", {
+                              method: "POST",
+                              headers: {
+                                "Content-Type": "application/json",
+                                Authorization: `Bearer ${token}`,
+                              },
+                              body: JSON.stringify({
+                                rideId: activeRide.id,
+                                rating: passengerRating,
+                                comment: ratingComment.trim() || undefined,
+                              }),
+                            });
+                          } catch (ratingErr) {
+                            console.warn("Non-fatal passenger rating submit error:", ratingErr);
+                          }
+                        }
+
                         if (acceptedStackedRideOffer) {
                           setActiveRide(acceptedStackedRideOffer);
                           setRideState("en_route_pickup");
@@ -7205,6 +7737,24 @@ export default function DriverTerminal() {
           onNavigate={(tab) => setActiveTab(tab as any)}
           commissionRate={fareConfig.commissionRate}
           isOnline={isOnline}
+          isIdle={rideState === "idle"}
+          isOnBreak={isOnBreak}
+          breakRemainingSeconds={breakRemainingSeconds}
+          onStartBreak={handleStartBreak}
+          onResumeFromBreak={handleResumeFromBreak}
+          cockpitPrefs={cockpitPrefs}
+          onUpdateCockpitPrefs={updateCockpitPrefs}
+          shiftSummary={{
+            durationText: onlineDurationText,
+            trips: shiftTripsCount,
+            earnings: todayEarnings,
+            gbpPerHour:
+              onlineStartTime && todayEarnings > 0
+                ? todayEarnings / Math.max(0.25, (Date.now() - onlineStartTime.getTime()) / 3600000)
+                : 0,
+            paidMiles: shiftPaidMiles,
+            deadheadMiles: shiftDeadheadMiles,
+          }}
           onToggleOnline={handleToggleOnline}
           onClose={() => setActiveTab("home")}
         />
@@ -7223,43 +7773,104 @@ export default function DriverTerminal() {
       </AnimatePresence>
       {/* Bottom Status Widget (Sticky Floating above global nav) */}
       {rideState === "idle" && activeTab === "home" && (
-        <div className="fixed left-0 right-0 px-4 z-50 pointer-events-none flex flex-col items-center" style={{ bottom: "calc(84px + env(safe-area-inset-bottom, 0px))" }}>
+        <div className="fixed left-0 right-0 px-4 z-50 pointer-events-none flex flex-col items-center gap-2" style={{ bottom: "calc(84px + env(safe-area-inset-bottom, 0px))" }}>
+          {/* Smart Fatigue Break Reminder (IDLE-only, dismissible) */}
+          {isOnline &&
+            !isOnBreak &&
+            !fatigueDismissed &&
+            cockpitPrefs.fatigueReminderHours > 0 &&
+            onlineStartTime &&
+            (Date.now() - onlineStartTime.getTime()) / 3600000 >= cockpitPrefs.fatigueReminderHours && (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="w-full max-w-sm px-3 py-2 rounded-xl bg-amber-500/95 border border-black text-black flex items-center justify-between gap-2 pointer-events-auto shadow-lg"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <Coffee className="w-4 h-4 text-black shrink-0" />
+                  <p className="text-[11px] font-black leading-tight truncate">
+                    Online {onlineDurationText} — take a 15m break?
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => handleStartBreak(15)}
+                    className="px-2 py-1 rounded-lg bg-black text-white text-[10px] font-black uppercase"
+                  >
+                    15m Break
+                  </button>
+                  <button
+                    onClick={() => setFatigueDismissed(true)}
+                    className="p-1 rounded-lg bg-black/15 text-black"
+                    aria-label="Dismiss break reminder"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </motion.div>
+            )}
+
           <motion.div
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             className={cn(
               "w-full max-w-sm h-8 px-4 rounded-xl flex items-center justify-between border backdrop-blur-md transition-all pointer-events-auto shadow-lg",
-              isOnline
-                ? "bg-[#064e3b]/80 border-emerald-500/30 shadow-emerald-900/20"
-                : "bg-[#1A1A1E]/90 border-[#2C2C30]",
+              isOnBreak
+                ? "bg-amber-950/90 border-amber-400/50 shadow-amber-900/20"
+                : isOnline
+                  ? "bg-[#064e3b]/80 border-emerald-500/30 shadow-emerald-900/20"
+                  : "bg-[#1A1A1E]/90 border-[#2C2C30]",
             )}
           >
             <div className="flex items-center gap-3">
-              <div
-                className={cn(
-                  "w-2 h-2 rounded-full",
-                  isOnline ? "bg-[#00D26A] animate-pulse" : "bg-[#A1A1AA]",
-                )}
-              />
+              {isOnBreak ? (
+                <Coffee className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              ) : (
+                <div
+                  className={cn(
+                    "w-2 h-2 rounded-full",
+                    isOnline ? "bg-[#00D26A] animate-pulse" : "bg-[#A1A1AA]",
+                  )}
+                />
+              )}
               <span
                 className={cn(
                   "text-[10px] font-black uppercase tracking-widest",
-                  isOnline ? "text-white" : "text-[#A1A1AA]",
+                  isOnBreak
+                    ? "text-amber-300"
+                    : isOnline
+                      ? "text-white"
+                      : "text-[#A1A1AA]",
                 )}
               >
-                {isOnline ? "Waiting for Jobs" : "Offline"}
+                {isOnBreak
+                  ? breakRemainingSeconds !== null
+                    ? `On Break • ${Math.floor(breakRemainingSeconds / 60)}:${String(breakRemainingSeconds % 60).padStart(2, "0")}`
+                    : "On Coffee Break"
+                  : isOnline
+                    ? "Waiting for Jobs"
+                    : "Offline"}
               </span>
             </div>
-            <span
-              className={cn(
-                "text-[9px]",
-                isOnline
-                  ? "font-black text-[#00D26A] drop-shadow-[0_0_2px_rgba(0,210,106,1)] brightness-150"
-                  : "font-bold text-[#A1A1AA]",
-              )}
-            >
-              {isOnline ? "ACTIVE" : "STANDBY"}
-            </span>
+            {isOnBreak ? (
+              <button
+                onClick={handleResumeFromBreak}
+                className="text-[9px] font-black uppercase tracking-wider bg-amber-400 text-black px-2 py-0.5 rounded-md border border-black"
+              >
+                Resume
+              </button>
+            ) : (
+              <span
+                className={cn(
+                  "text-[9px]",
+                  isOnline
+                    ? "font-black text-[#00D26A] drop-shadow-[0_0_2px_rgba(0,210,106,1)] brightness-150"
+                    : "font-bold text-[#A1A1AA]",
+                )}
+              >
+                {isOnline ? "ACTIVE" : "STANDBY"}
+              </span>
+            )}
           </motion.div>
         </div>
       )}
@@ -7406,8 +8017,75 @@ export default function DriverTerminal() {
                 })}
               </div>
 
-              {/* SOS Button at the bottom */}
-              <div className="mt-6 pt-6 border-t border-gray-100">
+              {/* Safety Toolkit & SOS Section (Android Driver App parity — zero extra map buttons) */}
+              <div className="mt-6 pt-5 border-t border-gray-100 space-y-3">
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    onClick={async () => {
+                      const coords = `${driverLocation[0].toFixed(5)}, ${driverLocation[1].toFixed(5)}`;
+                      try {
+                        await navigator.clipboard?.writeText(coords);
+                        toast.success("GPS Coordinates Copied", { description: coords });
+                      } catch {
+                        toast.info("Live GPS", { description: coords });
+                      }
+                    }}
+                    className="flex flex-col items-center justify-center gap-1 py-2.5 px-2 rounded-xl bg-slate-50 border border-black text-black active:scale-95 transition-transform"
+                  >
+                    <Copy className="w-4 h-4 text-black" />
+                    <span className="text-[10px] font-black uppercase tracking-tight">Copy GPS</span>
+                  </button>
+                  <button
+                    onClick={async () => {
+                      const lat = driverLocation[0].toFixed(5);
+                      const lng = driverLocation[1].toFixed(5);
+                      const shareUrl = `https://maps.google.com/?q=${lat},${lng}`;
+                      const text = `My live AnyRoller driver location: ${shareUrl}`;
+                      try {
+                        if (navigator.share) {
+                          await navigator.share({ title: "Live Driver Location", text, url: shareUrl });
+                        } else {
+                          await navigator.clipboard?.writeText(text);
+                          toast.success("Location Link Copied", { description: shareUrl });
+                        }
+                      } catch {
+                        // User dismissed share sheet
+                      }
+                    }}
+                    className="flex flex-col items-center justify-center gap-1 py-2.5 px-2 rounded-xl bg-slate-50 border border-black text-black active:scale-95 transition-transform"
+                  >
+                    <Share2 className="w-4 h-4 text-black" />
+                    <span className="text-[10px] font-black uppercase tracking-tight">Share Loc</span>
+                  </button>
+                  <button
+                    onClick={async () => {
+                      if (user) {
+                        try {
+                          await addDoc(collection(db, "reported_hazards"), {
+                            type: "Safety Incident",
+                            lat: driverLocation[0],
+                            lng: driverLocation[1],
+                            reporterId: user.uid,
+                            rideId: activeRide?.id || null,
+                            createdAt: serverTimestamp(),
+                            expiresAt: new Date(Date.now() + 2 * 3600 * 1000),
+                          });
+                          toast.success("Safety Incident Logged", {
+                            description: "Timestamp & GPS location recorded for support.",
+                          });
+                          setShowHazardModal(false);
+                        } catch {
+                          toast.error("Could not save incident log");
+                        }
+                      }
+                    }}
+                    className="flex flex-col items-center justify-center gap-1 py-2.5 px-2 rounded-xl bg-amber-50 border border-black text-black active:scale-95 transition-transform"
+                  >
+                    <ShieldAlert className="w-4 h-4 text-amber-700" />
+                    <span className="text-[10px] font-black uppercase tracking-tight">Log Alert</span>
+                  </button>
+                </div>
+
                 <button
                   onClick={() => {
                     window.location.href = "tel:999";

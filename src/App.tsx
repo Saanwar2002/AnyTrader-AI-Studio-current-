@@ -82,6 +82,7 @@ const PassengerBooking = lazyWithRetry(() => import("./components/passenger/Pass
 
 // Lazy loaded secondary components
 const PassengerRideHistory = lazyWithRetry(() => import("./components/passenger/PassengerRideHistory"));
+const RidePaymentResult = lazyWithRetry(() => import("./components/passenger/RidePaymentResult"));
 const DriverEarnings = lazyWithRetry(() => import("./components/driver/DriverEarnings"));
 const DriverInbox = lazyWithRetry(() => import("./components/driver/DriverInbox"));
 const PlatformFeeSuccess = lazyWithRetry(() => import("./components/driver/PlatformFeeSuccess"));
@@ -432,9 +433,13 @@ export default function App() {
             <Route path="/move-in" element={<MoveInLanding />} />
             <Route path="/admin-invite" element={<InviteAcceptPage kind="admin" />} />
             <Route path="/team-invite" element={<InviteAcceptPage kind="business_team" />} />
+            <Route path="/payment-success" element={<RidePaymentResult mode="success" />} />
+            <Route path="/payment-failed" element={<RidePaymentResult mode="failed" />} />
           {!user ? (
             <>
               <Route path="/profile/:id" element={<PublicProfile />} />
+              <Route path="/driver-return" element={<Navigate to="/login?redirect=/driver-terminal" replace />} />
+              <Route path="/driver-dashboard" element={<Navigate to="/login?redirect=/billing" replace />} />
               <Route path="*" element={<Login />} />
             </>
           ) : !profile ? (
@@ -491,6 +496,8 @@ export default function App() {
                 
                 {/* AnyRoller specific routes inside Layout */}
                 <Route path="driver-terminal" element={<RoleRoute allowed="driver"><DriverTerminal /></RoleRoute>} />
+                <Route path="driver-return" element={<Navigate to="/driver-terminal" replace />} />
+                <Route path="driver-dashboard" element={<Navigate to="/billing" replace />} />
                 <Route path="book-ride" element={<PassengerBooking />} />
                 <Route path="my-rides" element={<PassengerRideHistory />} />
                 <Route path="saved-journeys" element={<SavedJourneys />} />

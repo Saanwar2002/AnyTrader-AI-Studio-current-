@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { db, collection, query, where, orderBy, onSnapshot, updateDoc, doc, arrayUnion, deleteDoc, serverTimestamp } from "@/src/firebase";
+import { db, collection, query, where, orderBy, onSnapshot, updateDoc, doc, arrayUnion, addDoc, serverTimestamp } from "@/src/firebase";
 import { useAuth } from "../AuthProvider";
 import { motion, AnimatePresence } from "motion/react";
 import { Car, Clock, MapPin, ChevronRight, ChevronDown, ChevronUp, CheckCircle2, XCircle, Loader2, Edit2, Bookmark, Trash2, AlertCircle, Info, Calendar, User, FileText, X, ArrowDownToLine, HelpCircle } from "lucide-react";
 import { cn } from "@/src/lib/utils";
 import { useNavigate, useLocation } from "react-router-dom";
 import { toast } from "sonner";
+import { downloadRideReceipt } from "@/src/lib/rideReceiptExport";
 
 export default function PassengerRideHistory() {
   const { user, profile } = useAuth();
@@ -35,6 +36,34 @@ export default function PassengerRideHistory() {
     setSelectedRideDetails(null);
   }, [activeTab]);
   const [selectedRideDetails, setSelectedRideDetails] = useState<any | null>(null);
+  const [reportingIssueRide, setReportingIssueRide] = useState<any | null>(null);
+  const [issueReason, setIssueReason] = useState("");
+  const [submittingIssue, setSubmittingIssue] = useState(false);
+
+  const handleSubmitRideIssue = async () => {
+    if (!user || !reportingIssueRide || !issueReason.trim()) return;
+    setSubmittingIssue(true);
+    try {
+      await addDoc(collection(db, "support_tickets"), {
+        userId: user.uid,
+        rideId: reportingIssueRide.id,
+        driverId: reportingIssueRide.driverId || reportingIssueRide.assignedDriverId || null,
+        category: "ride_issue",
+        subject: `Ride Issue (${reportingIssueRide.id.slice(0, 8)})`,
+        description: issueReason.trim().slice(0, 1000),
+        status: "open",
+        createdAt: serverTimestamp(),
+      });
+      toast.success("Support ticket submitted. Our team will review your ride shortly.");
+      setReportingIssueRide(null);
+      setIssueReason("");
+    } catch (err) {
+      console.error("Failed to submit ride issue:", err);
+      toast.error("Could not submit support ticket. Please try again.");
+    } finally {
+      setSubmittingIssue(false);
+    }
+  };
 
   const handleSaveJourney = async (ride: any) => {
     if (!user) return;
@@ -63,18 +92,34 @@ export default function PassengerRideHistory() {
   };
 
   const handleCancelRide = async (rideId: string) => {
+    if (!user) return;
     setCancellingId(rideId);
     try {
-      await updateDoc(doc(db, "ride_requests", rideId), {
-        status: "cancelled",
-        cancelledBy: "passenger",
-        updatedAt: serverTimestamp()
+      const token = await user.getIdToken();
+      const res = await fetch("/api/rides/cancel", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          rideId,
+          cancelledBy: "passenger",
+        }),
       });
-      toast.success("Ride cancelled successfully");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || "Failed to cancel ride.");
+      }
+      toast.success(
+        Number(data?.cancellationFee || 0) > 0
+          ? `Ride cancelled (£${Number(data.cancellationFee).toFixed(2)} fee applied).`
+          : "Ride cancelled successfully"
+      );
       setActiveTab("cancelled");
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error cancelling ride:", error);
-      toast.error("Failed to cancel ride. Please try again.");
+      toast.error(error?.message || "Failed to cancel ride. Please try again.");
     } finally {
       setCancellingId(null);
       setConfirmCancelId(null);
@@ -298,9 +343,18 @@ export default function PassengerRideHistory() {
                       </span>
                     </div>
                     <div className="flex items-center gap-3">
-                      {ride.price && (
-                        <span className="font-extrabold text-slate-900">£{parseFloat(ride.price).toFixed(2)}</span>
-                      )}
+                      {(() => {
+                        const displayAmount =
+                          ride.totalFarePaid ??
+                          (ride.finalFare !== undefined && ride.finalFare !== null
+                            ? ride.fareContractVersion === "v2_excl_tip"
+                              ? Number(ride.finalFare) + Number(ride.tipAmount || 0)
+                              : Number(ride.finalFare)
+                            : ride.fareEstimate ?? ride.price);
+                        return displayAmount !== undefined && displayAmount !== null && !Number.isNaN(Number(displayAmount)) ? (
+                          <span className="font-extrabold text-slate-900">£{Number(displayAmount).toFixed(2)}</span>
+                        ) : null;
+                      })()}
                       {(ride.status === "cancelled" || ride.status === "draft" || ride.status === "completed") && (
                         <div className="relative flex items-center justify-center">
                           {confirmDeleteId === ride.id && (
@@ -689,11 +743,24 @@ export default function PassengerRideHistory() {
 
                 {/* Support Actions */}
                 <div className="grid grid-cols-2 gap-3 mb-2">
-                  <button onClick={() => toast.success("Receipt sent to your email!")} className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-50 border border-black text-slate-600 hover:bg-slate-100 transition-colors">
+                  <button
+                    onClick={() => {
+                      const ok = downloadRideReceipt(selectedRideDetails);
+                      if (ok) toast.success("Receipt downloaded.");
+                      else toast.error("Could not generate receipt.");
+                    }}
+                    className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-50 border border-black text-slate-600 hover:bg-slate-100 transition-colors"
+                  >
                     <ArrowDownToLine className="w-5 h-5 mb-1.5 text-slate-400" />
                     <span className="text-xs font-bold">Get Receipt</span>
                   </button>
-                  <button onClick={() => toast.info("Opening support chat...")} className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-50 border border-black text-slate-600 hover:bg-slate-100 transition-colors">
+                  <button
+                    onClick={() => {
+                      setReportingIssueRide(selectedRideDetails);
+                      setIssueReason("");
+                    }}
+                    className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-50 border border-black text-slate-600 hover:bg-slate-100 transition-colors"
+                  >
                     <HelpCircle className="w-5 h-5 mb-1.5 text-blue-400" />
                     <span className="text-xs font-bold">Report Issue</span>
                   </button>
@@ -705,6 +772,60 @@ export default function PassengerRideHistory() {
              </div>
           </motion.div>
         </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Report Ride Issue Modal */}
+      <AnimatePresence>
+        {reportingIssueRide && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setReportingIssueRide(null)}
+            className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-sm bg-white rounded-3xl border border-black p-5 shadow-2xl space-y-4"
+            >
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-black text-slate-900">Report a Ride Issue</h3>
+                <button onClick={() => setReportingIssueRide(null)} className="p-1.5 rounded-full bg-slate-100 text-slate-600 hover:bg-slate-200">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <p className="text-xs font-medium text-slate-600">
+                Describe what happened on your trip from {reportingIssueRide.pickup?.split(",")[0]} to {reportingIssueRide.dropoff?.split(",")[0]}.
+              </p>
+              <textarea
+                rows={4}
+                value={issueReason}
+                onChange={(e) => setIssueReason(e.target.value)}
+                maxLength={1000}
+                placeholder="e.g. Lost item in vehicle, fare query, route issue..."
+                className="w-full rounded-xl border border-black p-3 text-sm font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setReportingIssueRide(null)}
+                  className="flex-1 py-2.5 rounded-xl border border-black bg-white text-slate-800 font-bold text-sm"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={!issueReason.trim() || submittingIssue}
+                  onClick={handleSubmitRideIssue}
+                  className="flex-1 py-2.5 rounded-xl bg-slate-900 text-white font-bold text-sm disabled:opacity-50"
+                >
+                  {submittingIssue ? "Submitting..." : "Submit Ticket"}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
         )}
       </AnimatePresence>
     </div>
